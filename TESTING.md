@@ -34,6 +34,21 @@ anchor build              # Generates target/idl/*.json AND target/deploy/*.so
 
 **Exception: ario-arns** — see next section.
 
+## Git hooks (optional)
+
+This repo ships [version-controlled hooks](https://git-scm.com/docs/githooks) under `.githooks/` (plain bash — no Husky / `package.json`). They mirror the **fast** part of `.github/workflows/build-test.yml` (`fmt-clippy` job): `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --no-deps -- -D warnings`.
+
+Install once per clone:
+
+```bash
+bash scripts/install-git-hooks.sh
+```
+
+That sets `git config core.hooksPath .githooks` for this repository only.
+
+* **Emergency bypass:** `AR_IO_SKIP_PREPUSH=1 git push …`
+* **Full CI parity** still needs Anchor, Solana, BPF fixtures, etc. Run `anchor build`, `cargo test`, and `node scripts/idl-event-snapshot.mjs` as in CI before merging large changes — or rely on GitHub Actions on the PR.
+
 ## ario-arns Setup (Metaplex Core)
 
 ario-arns tests CPI into Metaplex Core's `UpdatePluginV1` for ANT trait sync. The real `mpl_core.so` binary must be in `target/deploy/`:

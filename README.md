@@ -145,6 +145,13 @@ See [`TESTING.md`](TESTING.md) for the full testing guide
 (boilerplate, zero-copy registries, CU assertions, Surfpool cheatcodes,
 how to add a new test).
 
+Optional — run the same fast checks CI runs before push (rustfmt +
+clippy, no Anchor install required):
+
+```bash
+bash scripts/install-git-hooks.sh
+```
+
 ---
 
 ## Development guide
