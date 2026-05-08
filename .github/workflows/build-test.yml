@@ -48,6 +48,7 @@ env:
   # lints stay identical.
   RUST_TOOLCHAIN_HOST: 1.90.0
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   fmt-clippy:
@@ -85,6 +86,20 @@ jobs:
 
       - id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Standard runners ship ~14 GB free but the debug target/ for
+      # five Solana programs can exceed that.  Reclaim ~30 GB by
+      # removing pre-installed tools we never use.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
 
       - name: Install Rust toolchains
         run: |

@@ -12,6 +12,17 @@ resolver = "2"
 [profile.release]
 overflow-checks = true
 
+# CI runners have ~14 GB free; five Solana programs in debug mode
+# (with full DWARF from solana-zk-sdk, curve25519, etc.) blow past
+# that.  Stripping debug info cuts target/ roughly in half and
+# doesn't affect test correctness.  Developers who want local
+# debugger support can override: CARGO_PROFILE_DEV_DEBUG=2 cargo test
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
 # Workspace-wide lint policy.  Anchor's proc macros and the Lua→Rust port
 # trigger many newer clippy lints that are harmless in this codebase.
 # Keep -D warnings in CI and allow the noisy categories here.
