@@ -93,17 +93,20 @@ edge exists.
 
 | Tool                | Version    | Notes |
 |---------------------|------------|-------|
-| Rust (host)         | `1.79.0`   | matches `cargo-build-sbf`'s embedded compiler |
+| Rust (host)         | `1.86.0`   | fmt, clippy, avm, `cargo test`. Needs >= 1.80 (avm's `LazyLock`) and >= 1.85 (edition2024 manifests in transitive deps). |
+| Rust (BPF)          | `1.79.0`   | bundled inside `cargo-build-sbf`; Cargo.lock must stay parseable by its Cargo 1.79 (see note below). |
 | Solana (Agave) CLI  | `2.1.0`    | newer 2.x releases drop Cargo 1.79 manifest support |
 | Anchor              | `0.31.1`   | `avm install 0.31.1 && avm use 0.31.1` |
 | [Surfpool](https://github.com/solana-foundation/surfpool) | `1.1+` | local validator with mainnet-style SVM gates |
 | `cargo-fuzz` *(optional)* | latest | for the escrow signature-verifier fuzz targets |
 
-`contracts/Cargo.toml` pins several workspace deps (`solana-*=2.1.0`,
+`Cargo.toml` pins several workspace deps (`solana-*=2.1.0`,
 `blake3=1.5.5`, `proc-macro-crate=3.2.0`, `indexmap=2.11.0`,
 `unicode-segmentation=1.12.0`) so `cargo-build-sbf`'s bundled Cargo 1.79
-can resolve the dep graph. Don't bump these without verifying the BPF
-build still works.
+can resolve the dep graph. **Transitive deps that use `edition = "2024"`
+in their manifest also break Cargo 1.79** — `Cargo.lock` pins
+`time-macros` and `time` to pre-edition2024 versions for this reason.
+Don't bump these without verifying the BPF build still works.
 
 ---
 

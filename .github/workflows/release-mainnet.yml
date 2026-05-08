@@ -58,6 +58,7 @@ env:
   ANCHOR_VERSION: 0.31.1
   SOLANA_VERSION: v2.1.0
   RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.86.0
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -79,10 +80,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,9 +97,8 @@ jobs:
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
-          # See note in build-test.yml: must pin avm to the matching tag
-          # + --locked, otherwise cargo install pulls anchor's HEAD whose
-          # workspace requires edition2024.
+          # avm 0.31.1 requires LazyLock (Rust >= 1.80). Build with the
+          # host toolchain; see build-test.yml for full rationale.
           cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}

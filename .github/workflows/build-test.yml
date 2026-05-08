@@ -39,7 +39,14 @@ on:
 env:
   ANCHOR_VERSION: 0.31.1
   SOLANA_VERSION: v2.1.0
+  # BPF toolchain: cargo-build-sbf bundles Cargo/rustc 1.79; the dep
+  # graph (Cargo.lock) must stay parseable by that Cargo. See the
+  # time-macros / time pin in Cargo.lock.
   RUST_TOOLCHAIN: 1.79.0
+  # Host toolchain: used for fmt, clippy, avm install, cargo test.
+  # Needs >= 1.80 (LazyLock, required by avm 0.31.1) and >= 1.85
+  # (edition2024 manifest parsing) to resolve the full dep graph.
+  RUST_TOOLCHAIN_HOST: 1.86.0
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -52,7 +59,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -63,10 +70,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (host target)
-        # `--all-features` would require BPF tools for `cargo build-sbf`; we
-        # run clippy on the host target with default features (which exercise
-        # the entrypoint!() expansions and CPI imports).
-        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        # --locked: honour Cargo.lock pins (time-macros < 0.2.27, etc.)
+        # so the dep graph stays compatible with cargo-build-sbf's Cargo 1.79.
+        run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 
   build:
     name: anchor build + cargo test
@@ -79,10 +85,16 @@ jobs:
       - id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install Rust toolchains
+        run: |
+          # Host toolchain (avm install, cargo test). Must be >= 1.80
+          # for avm's LazyLock usage.
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
+          # BPF toolchain: cargo-build-sbf's platform-tools ships its
+          # own 1.79 compiler; this install just ensures the host
+          # resolver can fall back if needed.
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,10 +107,9 @@ jobs:
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
-          # Pin avm to the same tag as ANCHOR_VERSION + --locked. Without
-          # the tag, cargo install pulls anchor's HEAD, whose workspace
-          # currently requires edition2024 (Cargo >= 1.85). Pinning keeps
-          # us on a tree the build toolchain can actually parse.
+          # avm 0.31.1 uses std::sync::LazyLock (stable in Rust 1.80).
+          # Build it with the host toolchain (>= 1.86), then avm manages
+          # the anchor CLI binary separately.
           cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
