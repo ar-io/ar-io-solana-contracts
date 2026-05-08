@@ -305,6 +305,7 @@ impl GatewayWeights {
 
     /// Compute gateway weights from current state
     /// Uses u128 intermediates to avoid overflow
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         total_stake: u64,
         min_operator_stake: u64,
@@ -366,11 +367,7 @@ impl GatewayWeights {
                 .unwrap_or(0)
                 .checked_mul(observer_performance_ratio as u128)
                 .unwrap_or(0);
-            let scale_cubed = scale
-                .checked_mul(scale)
-                .unwrap_or(u128::MAX)
-                .checked_mul(scale)
-                .unwrap_or(u128::MAX);
+            let scale_cubed = scale.saturating_mul(scale).saturating_mul(scale);
             let w = product.checked_div(scale_cubed).unwrap_or(0);
             u64::try_from(w).unwrap_or(u64::MAX)
         };

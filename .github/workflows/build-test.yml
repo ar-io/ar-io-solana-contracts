@@ -72,6 +72,7 @@ jobs:
       - name: Clippy (host target)
         # --locked: honour Cargo.lock pins (time-macros < 0.2.27, etc.)
         # so the dep graph stays compatible with cargo-build-sbf's Cargo 1.79.
+        # Allowed lint categories live in [workspace.lints] (Cargo.toml).
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 
   build:
@@ -123,13 +124,14 @@ jobs:
 
       # Linking the five programs + their integration test binaries in
       # debug mode can exceed the runner's 7 GB RAM (LLD OOMs / bus
-      # errors on ario-ant-escrow). Provision 10 GB swap as a safety net.
+      # errors on ario-ant-escrow). Provision extra swap as a safety net.
+      # Use a unique path — /swapfile is already in use on some runners.
       - name: Provision swap (linker memory)
         run: |
-          sudo fallocate -l 10G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 10G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
 
       # `anchor build` produces both target/idl/*.json and target/deploy/*.so.
       # Required before `cargo test` (programs load the .so via SPT) and

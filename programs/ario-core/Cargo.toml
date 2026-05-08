@@ -41,3 +41,6 @@ tokio.workspace = true
 ario-ant = { path = "../ario-ant", features = ["no-entrypoint"] }
 ario-gar = { path = "../ario-gar", features = ["cpi"] }
 ario-test-utils = { path = "../../test-utils" }
+
+[lints]
+workspace = true

@@ -337,10 +337,8 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                 cumulative += slot.composite_weight as u128;
                 if cumulative > random_value && slot.composite_weight > 0 {
                     // Check if already selected
-                    let already = epoch.prescribed_observer_gateways[..selected_count]
-                        .iter()
-                        .any(|p| *p == slot.address);
-                    if !already {
+                    if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
+                    {
                         epoch.prescribed_observer_gateways[selected_count] = slot.address;
                         epoch.prescribed_observers[selected_count] = slot.address;
                         selected_count += 1;
@@ -360,10 +358,8 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                     if slot.composite_weight == 0 {
                         continue;
                     }
-                    let already = epoch.prescribed_observer_gateways[..selected_count]
-                        .iter()
-                        .any(|p| *p == slot.address);
-                    if !already {
+                    if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
+                    {
                         epoch.prescribed_observer_gateways[selected_count] = slot.address;
                         epoch.prescribed_observers[selected_count] = slot.address;
                         selected_count += 1;
@@ -481,10 +477,8 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                         if let Some(name_hash_bytes) =
                             read_name_entry(&name_data, names_offset, idx)
                         {
-                            let already = epoch.prescribed_names[..names_selected]
-                                .iter()
-                                .any(|n| *n == name_hash_bytes);
-                            if !already {
+                            if !epoch.prescribed_names[..names_selected].contains(&name_hash_bytes)
+                            {
                                 epoch.prescribed_names[names_selected] = name_hash_bytes;
                                 names_selected += 1;
                                 break;

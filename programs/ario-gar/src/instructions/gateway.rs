@@ -9,10 +9,9 @@ use crate::{
     GatewayFinalizedEvent, GatewayJoinedEvent, GatewayLeavingEvent, GatewayPrunedEvent,
     GatewaySettingsUpdatedEvent, JoinNetworkParams, ObserverAddressUpdatedEvent,
     UpdateGatewayParams, GATEWAY_LEAVE_PERIOD, GATEWAY_SETTINGS_FIELD_ALLOW_DELEGATED_STAKING,
-    GATEWAY_SETTINGS_FIELD_AUTO_STAKE, GATEWAY_SETTINGS_FIELD_DELEGATE_REWARD_SHARE_RATIO,
-    GATEWAY_SETTINGS_FIELD_FQDN, GATEWAY_SETTINGS_FIELD_LABEL,
-    GATEWAY_SETTINGS_FIELD_MIN_DELEGATE_STAKE, GATEWAY_SETTINGS_FIELD_NOTE,
-    GATEWAY_SETTINGS_FIELD_PORT, GATEWAY_SETTINGS_FIELD_PROPERTIES,
+    GATEWAY_SETTINGS_FIELD_DELEGATE_REWARD_SHARE_RATIO, GATEWAY_SETTINGS_FIELD_FQDN,
+    GATEWAY_SETTINGS_FIELD_LABEL, GATEWAY_SETTINGS_FIELD_MIN_DELEGATE_STAKE,
+    GATEWAY_SETTINGS_FIELD_NOTE, GATEWAY_SETTINGS_FIELD_PORT, GATEWAY_SETTINGS_FIELD_PROPERTIES,
     GATEWAY_SETTINGS_FIELD_PROTOCOL, MAX_DELEGATE_REWARD_SHARE,
 };
 
@@ -1044,7 +1043,7 @@ fn finalize_gone_expiry(gateway: &Gateway, current_epoch_duration: i64) -> Resul
     // surface a clean error than overflow.
     let effective_duration = snapshot.max(current_epoch_duration).max(0);
     let epoch_window = effective_duration.saturating_mul(7);
-    let total = (GATEWAY_LEAVE_PERIOD as i64).saturating_add(epoch_window);
+    let total = GATEWAY_LEAVE_PERIOD.saturating_add(epoch_window);
     Ok(leave_ts.saturating_add(total))
 }
 
