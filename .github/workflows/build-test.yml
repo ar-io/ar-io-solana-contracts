@@ -84,7 +84,11 @@ jobs:
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
-          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          # Pin avm to the same tag as ANCHOR_VERSION + --locked. Without
+          # the tag, cargo install pulls anchor's HEAD, whose workspace
+          # currently requires edition2024 (Cargo >= 1.85). Pinning keeps
+          # us on a tree the build toolchain can actually parse.
+          cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
 

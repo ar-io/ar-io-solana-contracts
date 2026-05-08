@@ -115,7 +115,7 @@ cd ar-io-solana-contracts
 
 # 1. Install the toolchain (one-time — see the table above).
 sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.0/install)"
-cargo install --git https://github.com/coral-xyz/anchor avm
+cargo install --git https://github.com/coral-xyz/anchor --tag v0.31.1 avm --locked
 avm install 0.31.1 && avm use 0.31.1
 
 # 2. Build everything (this also generates target/idl/*.json).
