@@ -121,6 +121,16 @@ jobs:
           solana --version
           anchor --version
 
+      # Linking the five programs + their integration test binaries in
+      # debug mode can exceed the runner's 7 GB RAM (LLD OOMs / bus
+      # errors on ario-ant-escrow). Provision 10 GB swap as a safety net.
+      - name: Provision swap (linker memory)
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
       # `anchor build` produces both target/idl/*.json and target/deploy/*.so.
       # Required before `cargo test` (programs load the .so via SPT) and
       # before the IDL ABI / event-snapshot checks.
