@@ -33,8 +33,11 @@ name: Release (mainnet)
 #                                         upgrade authority on each
 #                                         program.
 
+# Serialize mainnet releases; do not cancel in-progress buffer staging /
+# uploads — partial runs can leave orphaned buffers or half-published
+# artifacts. Rapid pushes queue behind the active run instead.
 concurrency:
-  group: release-mainnet
+  group: release-mainnet-${{ github.ref }}
   cancel-in-progress: false
 
 on:
@@ -92,7 +95,10 @@ jobs:
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
-          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          # See note in build-test.yml: must pin avm to the matching tag
+          # + --locked, otherwise cargo install pulls anchor's HEAD whose
+          # workspace requires edition2024.
+          cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
 

@@ -4,8 +4,19 @@ name: Build & Test
 # targeting develop or main. The release pipelines (release-devnet,
 # release-mainnet) call this workflow via `workflow_call` so we don't
 # duplicate the build steps.
+#
+# Concurrency: cancel superseded runs, but —
+# - PR + push-to-head used to double-fire (different github.ref groups).
+#   We key PRs by number so synchronize/push reuse one group.
+# - Reusable callers must NOT share a single refs/heads/develop group or
+#   concurrent merges cancel each other's in-flight build-test runs.
 concurrency:
-  group: build-test-${{ github.ref }}
+  group: >-
+    ${{ github.event_name == 'workflow_call' &&
+       format('build-test-call-{0}', github.sha) ||
+       github.event_name == 'pull_request' &&
+       format('build-test-pr-{0}', github.event.pull_request.number) ||
+       format('build-test-{0}', github.ref) }}
   cancel-in-progress: true
 
 on:
@@ -84,7 +95,11 @@ jobs:
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
-          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          # Pin avm to the same tag as ANCHOR_VERSION + --locked. Without
+          # the tag, cargo install pulls anchor's HEAD, whose workspace
+          # currently requires edition2024 (Cargo >= 1.85). Pinning keeps
+          # us on a tree the build toolchain can actually parse.
+          cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
 

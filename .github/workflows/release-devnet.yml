@@ -44,9 +44,13 @@ name: Release (devnet)
 #   Vars:
 #     DEVNET_RPC_URL              default: https://api.devnet.solana.com
 
+# One active devnet pipeline per branch. New pushes cancel superseded runs
+# (saves queued duplicate deploys during rapid merges). If a cancelled run
+# had already mutated devnet before GitHub tore it down, re-run manually
+# from the Actions tab.
 concurrency:
-  group: release-devnet
-  cancel-in-progress: false   # don't kill a deploy mid-flight
+  group: release-devnet-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   push:
@@ -99,7 +103,10 @@ jobs:
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
-          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          # See note in build-test.yml: must pin avm to the matching tag
+          # + --locked, otherwise cargo install pulls anchor's HEAD whose
+          # workspace requires edition2024.
+          cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
 

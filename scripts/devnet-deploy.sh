@@ -124,7 +124,7 @@ authority_pubkey() {
 step 0 "Environment check"
 # ------------------------------------------------------------
 command -v solana >/dev/null || fail "Solana CLI not found. Install Agave 2.1.x (https://docs.anza.xyz/cli/install)."
-command -v anchor >/dev/null || fail "Anchor CLI not found. Install: cargo install --git https://github.com/coral-xyz/anchor avm && avm install 0.31.1"
+command -v anchor >/dev/null || fail "Anchor CLI not found. Install: cargo install --git https://github.com/coral-xyz/anchor --tag v0.31.1 avm --locked && avm install 0.31.1"
 command -v jq     >/dev/null || fail "jq required (parse $PROGRAM_IDS_PATH). brew install jq / apt-get install jq."
 echo "Solana: $(solana --version)"
 echo "Anchor: $(anchor --version)"

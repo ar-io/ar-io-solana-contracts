@@ -641,7 +641,8 @@ async fn test_request_primary_name() {
     arns_data.extend_from_slice(&[0u8; 32]); // ant: 32 bytes (placeholder)
     arns_data.push(1); // purchase_type = Permabuy
     arns_data.extend_from_slice(&0i64.to_le_bytes()); // start_timestamp
-    arns_data.push(0); arns_data.extend_from_slice(&[0u8; 8]); // end_timestamp: None
+    arns_data.push(0);
+    arns_data.extend_from_slice(&[0u8; 8]); // end_timestamp: None
     arns_data.extend_from_slice(&10u16.to_le_bytes()); // undername_limit
     arns_data.extend_from_slice(&0u64.to_le_bytes()); // purchase_price
     arns_data.push(0); // bump
@@ -794,12 +795,15 @@ async fn get_token_balance(
     token_data.amount
 }
 
-
 /// Helper: build fake ArNS record account data for a given name and owner.
 /// Layout: disc(8) + name_hash(32) + owner(32) + ant(32) + purchase_type(1)
 ///       + start_ts(8) + end_ts(1+8) + undername_limit(2) + purchase_price(8)
 ///       + bump(1) + name(4+N)
-fn build_arns_record_data(name: &str, owner: &solana_sdk::pubkey::Pubkey, ant: &solana_sdk::pubkey::Pubkey) -> Vec<u8> {
+fn build_arns_record_data(
+    name: &str,
+    owner: &solana_sdk::pubkey::Pubkey,
+    ant: &solana_sdk::pubkey::Pubkey,
+) -> Vec<u8> {
     let name_hash = solana_sdk::hash::hash(name.as_bytes());
     let arns_disc = solana_sdk::hash::hash(b"account:ArnsRecord");
     let mut data = arns_disc.as_ref()[..8].to_vec();
@@ -808,7 +812,8 @@ fn build_arns_record_data(name: &str, owner: &solana_sdk::pubkey::Pubkey, ant: &
     data.extend_from_slice(ant.as_ref()); // ant: 32 bytes (Metaplex Core asset)
     data.push(1); // purchase_type = Permabuy
     data.extend_from_slice(&0i64.to_le_bytes()); // start_timestamp
-    data.push(0); data.extend_from_slice(&[0u8; 8]); // end_timestamp: None
+    data.push(0);
+    data.extend_from_slice(&[0u8; 8]); // end_timestamp: None
     data.extend_from_slice(&10u16.to_le_bytes()); // undername_limit
     data.extend_from_slice(&0u64.to_le_bytes()); // purchase_price
     data.push(0); // bump
