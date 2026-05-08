@@ -1,27 +1,25 @@
 name: CodeQL
 
-# Static analysis on Rust + JS workflow / scripts. Runs on push to
-# develop / main and on a weekly schedule so dormant branches still get
-# coverage. Findings surface in the GitHub Security tab.
+# Static analysis on Rust + JS workflow / scripts. Findings surface in
+# the GitHub Security tab.
 #
-# Cancel older CodeQL matrix legs when a newer commit lands on the same
-# logical branch / PR so pushes don't pile up parallel analyses.
-concurrency:
-  group: >-
-    ${{ github.event_name == 'pull_request' &&
-       format('codeql-pr-{0}', github.event.pull_request.number) ||
-       github.event_name == 'schedule' &&
-       format('codeql-schedule-{0}', github.ref) ||
-       format('codeql-{0}', github.ref) }}
-  cancel-in-progress: true
+# TEMPORARILY DISABLED (2026-05): automatic triggers are off while CodeQL
+# integration is sorted out. Re-enable by restoring push / pull_request /
+# schedule under `on:` below (see git history). Manual runs still work:
+#   Actions → CodeQL → Run workflow
+#
+# When re-enabled, keep concurrency so pushes do not pile up analyses:
+#   concurrency:
+#     group: >-
+#       ${{ github.event_name == 'pull_request' &&
+#          format('codeql-pr-{0}', github.event.pull_request.number) ||
+#          github.event_name == 'schedule' &&
+#          format('codeql-schedule-{0}', github.ref) ||
+#          format('codeql-{0}', github.ref) }}
+#     cancel-in-progress: true
 
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
-  schedule:
-    - cron: '23 11 * * 1'   # Mondays 11:23 UTC
+  workflow_dispatch:   # only — no push / PR / schedule until re-enabled
 
 jobs:
   analyze:
