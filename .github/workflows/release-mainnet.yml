@@ -33,8 +33,11 @@ name: Release (mainnet)
 #                                         upgrade authority on each
 #                                         program.
 
+# Serialize mainnet releases; do not cancel in-progress buffer staging /
+# uploads — partial runs can leave orphaned buffers or half-published
+# artifacts. Rapid pushes queue behind the active run instead.
 concurrency:
-  group: release-mainnet
+  group: release-mainnet-${{ github.ref }}
   cancel-in-progress: false
 
 on:

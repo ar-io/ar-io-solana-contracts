@@ -3,6 +3,18 @@ name: CodeQL
 # Static analysis on Rust + JS workflow / scripts. Runs on push to
 # develop / main and on a weekly schedule so dormant branches still get
 # coverage. Findings surface in the GitHub Security tab.
+#
+# Cancel older CodeQL matrix legs when a newer commit lands on the same
+# logical branch / PR so pushes don't pile up parallel analyses.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request' &&
+       format('codeql-pr-{0}', github.event.pull_request.number) ||
+       github.event_name == 'schedule' &&
+       format('codeql-schedule-{0}', github.ref) ||
+       format('codeql-{0}', github.ref) }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main, develop]
