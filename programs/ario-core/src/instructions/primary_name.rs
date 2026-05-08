@@ -140,12 +140,16 @@ fn verify_arns_record_active(arns_record_info: &AccountInfo, current_timestamp: 
         if purchase_type == 0 {
             // Lease: check end_timestamp + grace period
             let end_ts_offset = purchase_type_offset + 1 + 8; // skip purchase_type(1) + start_timestamp(8) = 113
-            // end_timestamp is Option<i64>: 1 byte discriminant + 8 bytes
+                                                              // end_timestamp is Option<i64>: 1 byte discriminant + 8 bytes
             if data.len() >= end_ts_offset + 1 + 8 && data[end_ts_offset] == 1 {
                 let end_ts = i64::from_le_bytes(
-                    data[end_ts_offset + 1..end_ts_offset + 9].try_into().unwrap_or([0; 8])
+                    data[end_ts_offset + 1..end_ts_offset + 9]
+                        .try_into()
+                        .unwrap_or([0; 8]),
                 );
-                let grace_end = end_ts.checked_add(constants::LEASE_GRACE_PERIOD).unwrap_or(i64::MAX);
+                let grace_end = end_ts
+                    .checked_add(constants::LEASE_GRACE_PERIOD)
+                    .unwrap_or(i64::MAX);
                 require!(
                     grace_end >= current_timestamp,
                     ArioError::ArnsRecordNotFound
@@ -448,7 +452,10 @@ pub mod request_and_set_primary_name {
         let ant = {
             let data = arns_record_info.try_borrow_data()?;
             let ant_offset: usize = 8 + 32 + 32; // 72
-            require!(data.len() >= ant_offset + 32, ArioError::InvalidAccountState);
+            require!(
+                data.len() >= ant_offset + 32,
+                ArioError::InvalidAccountState
+            );
 
             // M-4: Validate ArnsRecord discriminator
             let expected_disc = anchor_lang::solana_program::hash::hash(b"account:ArnsRecord");
@@ -588,7 +595,10 @@ pub mod approve_primary_name {
         let ant = {
             let data = arns_record_info.try_borrow_data()?;
             let ant_offset: usize = 8 + 32 + 32; // 72
-            require!(data.len() >= ant_offset + 32, ArioError::InvalidAccountState);
+            require!(
+                data.len() >= ant_offset + 32,
+                ArioError::InvalidAccountState
+            );
 
             // M-4: Validate ArnsRecord discriminator
             let expected_disc = anchor_lang::solana_program::hash::hash(b"account:ArnsRecord");
@@ -596,7 +606,6 @@ pub mod approve_primary_name {
                 data[..8] == expected_disc.to_bytes()[..8],
                 ArioError::InvalidAccountState
             );
-
 
             Pubkey::try_from(&data[ant_offset..ant_offset + 32])
                 .map_err(|_| ArioError::InvalidAccountState)?
@@ -763,7 +772,10 @@ pub mod remove_primary_name_for_base_name {
         let ant = {
             let data = arns_record_info.try_borrow_data()?;
             let ant_offset: usize = 8 + 32 + 32; // 72
-            require!(data.len() >= ant_offset + 32, ArioError::InvalidAccountState);
+            require!(
+                data.len() >= ant_offset + 32,
+                ArioError::InvalidAccountState
+            );
 
             // M-4: Validate ArnsRecord discriminator
             let expected_disc = anchor_lang::solana_program::hash::hash(b"account:ArnsRecord");
@@ -1362,9 +1374,11 @@ pub mod request_and_set_primary_name_from_funding_plan {
         let ant = {
             let data = arns_record_info.try_borrow_data()?;
             let ant_offset: usize = 8 + 32 + 32; // 72
-            require!(data.len() >= ant_offset + 32, ArioError::InvalidAccountState);
-            let expected_disc =
-                anchor_lang::solana_program::hash::hash(b"account:ArnsRecord");
+            require!(
+                data.len() >= ant_offset + 32,
+                ArioError::InvalidAccountState
+            );
+            let expected_disc = anchor_lang::solana_program::hash::hash(b"account:ArnsRecord");
             require!(
                 data[..8] == expected_disc.to_bytes()[..8],
                 ArioError::InvalidAccountState

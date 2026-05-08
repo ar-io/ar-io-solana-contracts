@@ -1768,7 +1768,11 @@ mod tests {
         };
         let mut buf = Vec::new();
         c.try_serialize(&mut buf).unwrap();
-        assert_eq!(buf.len(), WithdrawalCounter::SIZE, "WithdrawalCounter::SIZE drift");
+        assert_eq!(
+            buf.len(),
+            WithdrawalCounter::SIZE,
+            "WithdrawalCounter::SIZE drift"
+        );
     }
 
     #[test]
@@ -1781,6 +1785,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         a.try_serialize(&mut buf).unwrap();
-        assert_eq!(buf.len(), AllowlistEntry::SIZE, "AllowlistEntry::SIZE drift");
+        assert_eq!(
+            buf.len(),
+            AllowlistEntry::SIZE,
+            "AllowlistEntry::SIZE drift"
+        );
     }
 }
