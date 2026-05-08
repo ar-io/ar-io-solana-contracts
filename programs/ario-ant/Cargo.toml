@@ -1,0 +1,47 @@
+[package]
+name = "ario-ant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AR.IO ANT (Arweave Name Token) Program - Metaplex Core NFT-based name tokens with records, controllers, and metadata"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ario_ant"
+
+[features]
+# Sprint 3: idl-build must propagate to ario-arns (and through it, ario-gar
+# + anchor-spl) — without that propagation, anchor build's IDL extraction
+# resolves anchor-spl without idl-build for the transitive ario-gar edge,
+# and the Accounts derive macro emits references to DISCRIMINATOR /
+# create_type / insert_types that aren't compiled in.
+idl-build = ["anchor-lang/idl-build", "ario-arns/idl-build"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang.workspace = true
+blake3.workspace = true
+proc-macro-crate.workspace = true
+indexmap.workspace = true
+unicode-segmentation.workspace = true
+solana-program.workspace = true
+
+# Sprint 3 reshape: ario-ant reads ArnsRecord PDAs (owned by ario-arns) when
+# syncing the Metaplex Core Attributes plugin. The `cpi` feature pulls in the
+# typed `ArnsRecord` + `ario_arns::ID` constant without emitting an
+# entrypoint, and is the standard Anchor pattern for cross-program account
+# deserialization (mirrors ario-arns → ario-gar).
+ario-arns = { path = "../ario-arns", features = ["cpi"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+tokio.workspace = true
+ario-test-utils = { path = "../../test-utils" }

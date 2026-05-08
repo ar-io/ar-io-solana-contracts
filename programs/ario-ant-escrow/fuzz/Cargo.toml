@@ -1,0 +1,33 @@
+[package]
+name = "ario-ant-escrow-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+ario-ant-escrow = { path = ".." }
+
+[[bin]]
+name = "verify_rsa_pss"
+path = "fuzz_targets/verify_rsa_pss.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_personal_sign"
+path = "fuzz_targets/verify_personal_sign.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz needs an explicit workspace exclude or its own workspace block
+# so it doesn't get pulled into the main contracts workspace (which uses a
+# pinned Solana 2.1.0 toolchain, while libfuzzer-sys wants something newer).
+[workspace]
+members = ["."]

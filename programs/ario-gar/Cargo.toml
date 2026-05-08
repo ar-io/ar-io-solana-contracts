@@ -1,0 +1,36 @@
+[package]
+name = "ario-gar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AR.IO GAR Program - Gateway Address Registry with staking, delegation, epochs, observations, and rewards"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ario_gar"
+
+[features]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+blake3.workspace = true
+proc-macro-crate.workspace = true
+indexmap.workspace = true
+unicode-segmentation.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+tokio.workspace = true
+proptest.workspace = true
+ario-test-utils = { path = "../../test-utils" }

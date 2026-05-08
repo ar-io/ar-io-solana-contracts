@@ -1,0 +1,26 @@
+{
+  "_comment": "Raw AO `State` reply for an ANT process — same shape the snapshot exporter writes to migration/snapshot/output/ants/<processId>.json. Used by migration/import `yarn test:ant-fixture` to roundtrip raw → transformAntState → buildImportAccountIx → BorshAccountsCoder.decode without needing a running validator.",
+  "processId": "--55AVXmgefk61QNMDJ15llgjdcCT5ehhWxKeDLEpx4",
+  "Owner": "Sie_26dvgyok0PZD_-iQAFOhOd5YxDTkczOLoqTTL_A",
+  "Name": "AOS",
+  "Ticker": "aos",
+  "Logo": "Sie_26dvgyok0PZD_-iQAFOhOd5YxDTkczOLoqTTL_A",
+  "Description": "",
+  "Keywords": [],
+  "Controllers": ["Sie_26dvgyok0PZD_-iQAFOhOd5YxDTkczOLoqTTL_A"],
+  "Records": {
+    "@": {
+      "transactionId": "f5cfcb570b7edac2ed16e1a025d50155d6148de7397f4068790cdfc14230007a",
+      "ttlSeconds": 900,
+      "priority": 0
+    },
+    "nexus": {
+      "transactionId": "c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae",
+      "ttlSeconds": 900
+    },
+    "sagas": {
+      "transactionId": "0402594e5f30e9aebaa8b9c7febbd215eaf622184a52311e418ea07a1f9121bf",
+      "ttlSeconds": 900
+    }
+  }
+}

@@ -1,0 +1,2495 @@
+{
+  "ario_core": [
+    {
+      "name": "ConfigUpdatedEvent",
+      "discriminator": [
+        245,
+        158,
+        129,
+        99,
+        60,
+        100,
+        214,
+        220
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "field",
+          "type": "u8"
+        },
+        {
+          "name": "new_value",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "CoreMigrationFinalizedEvent",
+      "discriminator": [
+        236,
+        251,
+        207,
+        206,
+        220,
+        247,
+        122,
+        75
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "total_supply",
+          "type": "u64"
+        },
+        {
+          "name": "slot",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "PrimaryNameRemovedEvent",
+      "discriminator": [
+        97,
+        221,
+        251,
+        3,
+        243,
+        128,
+        218,
+        62
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "PrimaryNameRequestedEvent",
+      "discriminator": [
+        196,
+        78,
+        183,
+        83,
+        101,
+        42,
+        21,
+        87
+      ],
+      "fields": [
+        {
+          "name": "initiator",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "fee",
+          "type": "u64"
+        },
+        {
+          "name": "request_pda",
+          "type": "pubkey"
+        },
+        {
+          "name": "funding_source",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "PrimaryNameRequestExpiredEvent",
+      "discriminator": [
+        10,
+        221,
+        140,
+        144,
+        236,
+        59,
+        109,
+        38
+      ],
+      "fields": [
+        {
+          "name": "initiator",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "refunded",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "PrimaryNameSetEvent",
+      "discriminator": [
+        74,
+        97,
+        37,
+        124,
+        254,
+        87,
+        132,
+        105
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "SupplyFinalizedEvent",
+      "discriminator": [
+        169,
+        134,
+        53,
+        210,
+        14,
+        17,
+        212,
+        239
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "total_supply",
+          "type": "u64"
+        },
+        {
+          "name": "decimals",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "TransferEvent",
+      "discriminator": [
+        100,
+        10,
+        46,
+        113,
+        8,
+        28,
+        179,
+        125
+      ],
+      "fields": [
+        {
+          "name": "from",
+          "type": "pubkey"
+        },
+        {
+          "name": "to",
+          "type": "pubkey"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "VaultCreatedEvent",
+      "discriminator": [
+        81,
+        80,
+        244,
+        58,
+        136,
+        54,
+        236,
+        111
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "end_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "revocable",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "VaultExtendedEvent",
+      "discriminator": [
+        110,
+        225,
+        73,
+        182,
+        61,
+        157,
+        83,
+        230
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "new_end_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "VaultIncreasedEvent",
+      "discriminator": [
+        6,
+        216,
+        168,
+        161,
+        150,
+        38,
+        148,
+        100
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "added_amount",
+          "type": "u64"
+        },
+        {
+          "name": "new_balance",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "VaultReleasedEvent",
+      "discriminator": [
+        2,
+        209,
+        149,
+        219,
+        204,
+        98,
+        19,
+        14
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "VaultRevokedEvent",
+      "discriminator": [
+        253,
+        117,
+        237,
+        208,
+        53,
+        166,
+        153,
+        54
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "vault_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "controller",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    }
+  ],
+  "ario_gar": [
+    {
+      "name": "AllowlistToggledEvent",
+      "discriminator": [
+        195,
+        162,
+        180,
+        126,
+        241,
+        12,
+        101,
+        68
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "DelegateAllowlistedEvent",
+      "discriminator": [
+        196,
+        145,
+        14,
+        164,
+        216,
+        200,
+        59,
+        140
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "delegate",
+          "type": "pubkey"
+        },
+        {
+          "name": "allowed",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "DelegationClosedEvent",
+      "discriminator": [
+        135,
+        106,
+        33,
+        122,
+        137,
+        235,
+        202,
+        117
+      ],
+      "fields": [
+        {
+          "name": "delegator",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "DelegationDecreasedEvent",
+      "discriminator": [
+        186,
+        223,
+        36,
+        69,
+        170,
+        63,
+        123,
+        91
+      ],
+      "fields": [
+        {
+          "name": "delegator",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "decrease",
+          "type": "u64"
+        },
+        {
+          "name": "new_total",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "DelegationEvent",
+      "discriminator": [
+        218,
+        157,
+        197,
+        166,
+        52,
+        67,
+        225,
+        105
+      ],
+      "fields": [
+        {
+          "name": "delegator",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "total",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochClosedEvent",
+      "discriminator": [
+        251,
+        137,
+        115,
+        56,
+        29,
+        45,
+        19,
+        87
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "rent_recovered",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochCreatedEvent",
+      "discriminator": [
+        69,
+        116,
+        184,
+        14,
+        81,
+        137,
+        13,
+        62
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "start_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "end_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochDistributedEvent",
+      "discriminator": [
+        218,
+        24,
+        57,
+        51,
+        215,
+        107,
+        52,
+        17
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "gateways_processed",
+          "type": "u32"
+        },
+        {
+          "name": "total_eligible_rewards",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochPrescribedEvent",
+      "discriminator": [
+        238,
+        115,
+        216,
+        115,
+        117,
+        120,
+        97,
+        202
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "observer_count",
+          "type": "u8"
+        },
+        {
+          "name": "per_gateway_reward",
+          "type": "u64"
+        },
+        {
+          "name": "per_observer_reward",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochsToggledEvent",
+      "discriminator": [
+        154,
+        186,
+        122,
+        128,
+        179,
+        122,
+        161,
+        76
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "enabled",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochWeightsTalliedEvent",
+      "discriminator": [
+        122,
+        18,
+        133,
+        134,
+        18,
+        202,
+        209,
+        240
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "gateway_count",
+          "type": "u32"
+        },
+        {
+          "name": "total_weight",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "FundingPlanAppliedEvent",
+      "discriminator": [
+        86,
+        57,
+        200,
+        134,
+        154,
+        130,
+        119,
+        186
+      ],
+      "fields": [
+        {
+          "name": "payer",
+          "type": "pubkey"
+        },
+        {
+          "name": "total_funded",
+          "type": "u64"
+        },
+        {
+          "name": "source_count",
+          "type": "u8"
+        },
+        {
+          "name": "created_residue_vault",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "GarMigrationFinalizedEvent",
+      "discriminator": [
+        209,
+        18,
+        165,
+        224,
+        248,
+        7,
+        167,
+        23
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway_count",
+          "type": "u32"
+        },
+        {
+          "name": "slot",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "GatewayFinalizedEvent",
+      "discriminator": [
+        148,
+        10,
+        244,
+        127,
+        146,
+        162,
+        210,
+        68
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "pruner",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "GatewayJoinedEvent",
+      "discriminator": [
+        224,
+        82,
+        153,
+        171,
+        228,
+        228,
+        37,
+        245
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "stake",
+          "type": "u64"
+        },
+        {
+          "name": "fqdn",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "GatewayLeavingEvent",
+      "discriminator": [
+        163,
+        248,
+        188,
+        112,
+        155,
+        8,
+        192,
+        239
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "GatewayPrunedEvent",
+      "discriminator": [
+        203,
+        40,
+        160,
+        189,
+        86,
+        139,
+        186,
+        96
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "pruner",
+          "type": "pubkey"
+        },
+        {
+          "name": "slashed_amount",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "GatewaySettingsUpdatedEvent",
+      "discriminator": [
+        171,
+        169,
+        8,
+        225,
+        141,
+        102,
+        51,
+        148
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "fields_changed",
+          "type": "u32"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "InstantWithdrawalEvent",
+      "discriminator": [
+        138,
+        49,
+        120,
+        239,
+        238,
+        101,
+        116,
+        61
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "withdrawal_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "fee",
+          "type": "u64"
+        },
+        {
+          "name": "payout",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ObservationSubmittedEvent",
+      "discriminator": [
+        99,
+        197,
+        240,
+        208,
+        253,
+        133,
+        182,
+        103
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "observer",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway_count",
+          "type": "u16"
+        },
+        {
+          "name": "report_tx_id",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ObserverAddressUpdatedEvent",
+      "discriminator": [
+        206,
+        127,
+        53,
+        239,
+        166,
+        80,
+        249,
+        202
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_observer",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "OperatorStakeIncreasedEvent",
+      "discriminator": [
+        198,
+        94,
+        192,
+        211,
+        15,
+        92,
+        64,
+        9
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "added",
+          "type": "u64"
+        },
+        {
+          "name": "new_total",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RedelegationEvent",
+      "discriminator": [
+        64,
+        133,
+        89,
+        6,
+        101,
+        5,
+        120,
+        177
+      ],
+      "fields": [
+        {
+          "name": "delegator",
+          "type": "pubkey"
+        },
+        {
+          "name": "from_gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "to_gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "fee",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ResidueVaultCreatedEvent",
+      "discriminator": [
+        17,
+        116,
+        103,
+        92,
+        169,
+        105,
+        253,
+        31
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "withdrawal_id",
+          "type": "u64"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "available_at",
+          "type": "i64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RewardsCompoundedEvent",
+      "discriminator": [
+        13,
+        249,
+        30,
+        35,
+        73,
+        151,
+        186,
+        66
+      ],
+      "fields": [
+        {
+          "name": "delegator",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "compounded",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "StakePaymentEvent",
+      "discriminator": [
+        11,
+        219,
+        152,
+        247,
+        11,
+        11,
+        18,
+        93
+      ],
+      "fields": [
+        {
+          "name": "payer",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "is_delegate",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "WithdrawalCancelledEvent",
+      "discriminator": [
+        40,
+        218,
+        165,
+        230,
+        31,
+        49,
+        238,
+        127
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "withdrawal_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "is_delegate",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "WithdrawalClaimedEvent",
+      "discriminator": [
+        112,
+        246,
+        33,
+        174,
+        230,
+        205,
+        121,
+        26
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "withdrawal_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "WithdrawalCreatedEvent",
+      "discriminator": [
+        173,
+        205,
+        34,
+        150,
+        97,
+        42,
+        211,
+        30
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "withdrawal_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "available_at",
+          "type": "i64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "WithdrawalPaymentEvent",
+      "discriminator": [
+        58,
+        7,
+        105,
+        48,
+        99,
+        164,
+        154,
+        51
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "withdrawal_id",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "residue",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    }
+  ],
+  "ario_arns": [
+    {
+      "name": "DemandFactorUpdatedEvent",
+      "discriminator": [
+        102,
+        140,
+        94,
+        136,
+        202,
+        16,
+        34,
+        60
+      ],
+      "fields": [
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_demand_factor",
+          "type": "u64"
+        },
+        {
+          "name": "period_index",
+          "type": "u64"
+        },
+        {
+          "name": "fees_halved",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "LeaseExtendedEvent",
+      "discriminator": [
+        27,
+        88,
+        104,
+        159,
+        232,
+        95,
+        251,
+        162
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "years",
+          "type": "u8"
+        },
+        {
+          "name": "cost",
+          "type": "u64"
+        },
+        {
+          "name": "new_end_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "funding_source",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NamePurchasedEvent",
+      "discriminator": [
+        192,
+        80,
+        21,
+        253,
+        201,
+        100,
+        227,
+        213
+      ],
+      "fields": [
+        {
+          "name": "buyer",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "purchase_type",
+          "type": "u8"
+        },
+        {
+          "name": "years",
+          "type": "u8"
+        },
+        {
+          "name": "cost",
+          "type": "u64"
+        },
+        {
+          "name": "ant",
+          "type": "pubkey"
+        },
+        {
+          "name": "funding_source",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NameReassignedEvent",
+      "discriminator": [
+        147,
+        141,
+        198,
+        214,
+        72,
+        70,
+        196,
+        102
+      ],
+      "fields": [
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "old_ant",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_ant",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NameReleasedEvent",
+      "discriminator": [
+        254,
+        128,
+        244,
+        207,
+        37,
+        227,
+        120,
+        233
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NameReservedEvent",
+      "discriminator": [
+        76,
+        43,
+        79,
+        185,
+        194,
+        174,
+        1,
+        194
+      ],
+      "fields": [
+        {
+          "name": "authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "target",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "expires_at",
+          "type": {
+            "option": "i64"
+          }
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NamesPrunedEvent",
+      "discriminator": [
+        9,
+        45,
+        7,
+        248,
+        99,
+        110,
+        152,
+        70
+      ],
+      "fields": [
+        {
+          "name": "pruner",
+          "type": "pubkey"
+        },
+        {
+          "name": "kind",
+          "type": "u8"
+        },
+        {
+          "name": "count",
+          "type": "u16"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NameUnreservedEvent",
+      "discriminator": [
+        189,
+        93,
+        184,
+        41,
+        117,
+        239,
+        54,
+        196
+      ],
+      "fields": [
+        {
+          "name": "authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "NameUpgradedEvent",
+      "discriminator": [
+        210,
+        159,
+        164,
+        89,
+        190,
+        145,
+        74,
+        254
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "cost",
+          "type": "u64"
+        },
+        {
+          "name": "funding_source",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ReservedNameClaimedEvent",
+      "discriminator": [
+        36,
+        178,
+        143,
+        191,
+        198,
+        51,
+        59,
+        239
+      ],
+      "fields": [
+        {
+          "name": "claimer",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ReturnedNamePurchasedEvent",
+      "discriminator": [
+        242,
+        151,
+        105,
+        57,
+        31,
+        206,
+        76,
+        97
+      ],
+      "fields": [
+        {
+          "name": "buyer",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "cost",
+          "type": "u64"
+        },
+        {
+          "name": "premium",
+          "type": "u64"
+        },
+        {
+          "name": "ant",
+          "type": "pubkey"
+        },
+        {
+          "name": "funding_source",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "UndernameIncreasedEvent",
+      "discriminator": [
+        95,
+        201,
+        124,
+        230,
+        190,
+        233,
+        90,
+        89
+      ],
+      "fields": [
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "quantity",
+          "type": "u32"
+        },
+        {
+          "name": "new_limit",
+          "type": "u32"
+        },
+        {
+          "name": "cost",
+          "type": "u64"
+        },
+        {
+          "name": "funding_source",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    }
+  ],
+  "ario_ant": [
+    {
+      "name": "AclEntryAddedEvent",
+      "discriminator": [
+        228,
+        106,
+        189,
+        52,
+        242,
+        250,
+        201,
+        207
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "address",
+          "type": "pubkey"
+        },
+        {
+          "name": "role",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AclEntryRemovedEvent",
+      "discriminator": [
+        209,
+        241,
+        89,
+        130,
+        231,
+        176,
+        194,
+        205
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "address",
+          "type": "pubkey"
+        },
+        {
+          "name": "role",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AntMetadataUpdatedEvent",
+      "discriminator": [
+        25,
+        131,
+        15,
+        221,
+        37,
+        69,
+        161,
+        39
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "field",
+          "type": "u8"
+        },
+        {
+          "name": "new_value",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AntReconciledEvent",
+      "discriminator": [
+        110,
+        18,
+        20,
+        124,
+        108,
+        87,
+        45,
+        255
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "previous_owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "controllers_cleared",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AntTransferredEvent",
+      "discriminator": [
+        39,
+        121,
+        216,
+        35,
+        28,
+        193,
+        32,
+        0
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "from",
+          "type": "pubkey"
+        },
+        {
+          "name": "to",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AttributesClearedEvent",
+      "discriminator": [
+        142,
+        201,
+        211,
+        18,
+        10,
+        119,
+        231,
+        254
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "kept_program",
+          "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AttributesSyncedEvent",
+      "discriminator": [
+        202,
+        245,
+        92,
+        186,
+        216,
+        44,
+        252,
+        127
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ControllerAddedEvent",
+      "discriminator": [
+        182,
+        145,
+        162,
+        62,
+        24,
+        44,
+        90,
+        232
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "controller",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "ControllerRemovedEvent",
+      "discriminator": [
+        61,
+        210,
+        53,
+        189,
+        120,
+        139,
+        215,
+        201
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "controller",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RecordMetadataPrunedEvent",
+      "discriminator": [
+        166,
+        25,
+        253,
+        184,
+        153,
+        144,
+        111,
+        87
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername",
+          "type": "string"
+        },
+        {
+          "name": "pruner",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RecordMetadataRemovedEvent",
+      "discriminator": [
+        70,
+        54,
+        101,
+        100,
+        60,
+        248,
+        35,
+        43
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RecordMetadataUpdatedEvent",
+      "discriminator": [
+        68,
+        199,
+        0,
+        3,
+        46,
+        22,
+        209,
+        52
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername",
+          "type": "string"
+        },
+        {
+          "name": "field",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RecordRemovedEvent",
+      "discriminator": [
+        184,
+        68,
+        235,
+        148,
+        11,
+        106,
+        172,
+        3
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername",
+          "type": "string"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RecordSetEvent",
+      "discriminator": [
+        69,
+        141,
+        234,
+        219,
+        156,
+        207,
+        173,
+        193
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername",
+          "type": "string"
+        },
+        {
+          "name": "target",
+          "type": "string"
+        },
+        {
+          "name": "target_protocol",
+          "type": "u8"
+        },
+        {
+          "name": "ttl_seconds",
+          "type": "u32"
+        },
+        {
+          "name": "priority",
+          "type": "u32"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "RecordTransferredEvent",
+      "discriminator": [
+        111,
+        199,
+        54,
+        84,
+        95,
+        251,
+        113,
+        251
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "caller",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername",
+          "type": "string"
+        },
+        {
+          "name": "previous_owner",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "new_owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    }
+  ],
+  "ario_ant_escrow": [
+    {
+      "name": "EscrowCancelledEvent",
+      "discriminator": [
+        185,
+        105,
+        9,
+        145,
+        0,
+        228,
+        166,
+        60
+      ],
+      "fields": [
+        {
+          "name": "escrow",
+          "type": "pubkey"
+        },
+        {
+          "name": "depositor",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_id",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_type",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EscrowClaimedEvent",
+      "discriminator": [
+        102,
+        255,
+        155,
+        116,
+        206,
+        56,
+        249,
+        241
+      ],
+      "fields": [
+        {
+          "name": "escrow",
+          "type": "pubkey"
+        },
+        {
+          "name": "claimer",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_id",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_type",
+          "type": "u8"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "claim_protocol",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EscrowDepositedEvent",
+      "discriminator": [
+        12,
+        69,
+        17,
+        182,
+        204,
+        183,
+        134,
+        87
+      ],
+      "fields": [
+        {
+          "name": "escrow",
+          "type": "pubkey"
+        },
+        {
+          "name": "depositor",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_id",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_type",
+          "type": "u8"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "recipient_protocol",
+          "type": "u8"
+        },
+        {
+          "name": "recipient_pubkey",
+          "type": {
+            "array": [
+              "u8",
+              64
+            ]
+          }
+        },
+        {
+          "name": "recipient_pubkey_len",
+          "type": "u16"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EscrowRecipientUpdatedEvent",
+      "discriminator": [
+        31,
+        38,
+        4,
+        8,
+        192,
+        192,
+        147,
+        33
+      ],
+      "fields": [
+        {
+          "name": "escrow",
+          "type": "pubkey"
+        },
+        {
+          "name": "depositor",
+          "type": "pubkey"
+        },
+        {
+          "name": "asset_type",
+          "type": "u8"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    }
+  ]
+}

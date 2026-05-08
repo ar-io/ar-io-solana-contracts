@@ -1,0 +1,152 @@
+name: Build & Test
+
+# Default CI: runs on every push to feature branches and on every PR
+# targeting develop or main. The release pipelines (release-devnet,
+# release-mainnet) call this workflow via `workflow_call` so we don't
+# duplicate the build steps.
+concurrency:
+  group: build-test-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!main'
+      - '!develop'
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      sha:
+        description: "Commit SHA used for this build"
+        value: ${{ jobs.build.outputs.sha }}
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-clippy:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-host
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (host target)
+        # `--all-features` would require BPF tools for `cargo build-sbf`; we
+        # run clippy on the host target with default features (which exercise
+        # the entrypoint!() expansions and CPI imports).
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+  build:
+    name: anchor build + cargo test
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+          solana --version
+          anchor --version
+
+      # `anchor build` produces both target/idl/*.json and target/deploy/*.so.
+      # Required before `cargo test` (programs load the .so via SPT) and
+      # before the IDL ABI / event-snapshot checks.
+      - name: anchor build
+        run: anchor build
+
+      - name: declare_id drift guard
+        run: bash build-sbf.sh --check-only
+
+      - name: Stage Metaplex Core fixture for ario-arns / ario-ant-escrow
+        run: |
+          cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
+
+      - name: cargo test (BPF dispatch)
+        env:
+          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
+        run: cargo test --workspace --no-fail-fast
+
+      - name: IDL event ABI stability check
+        run: node scripts/idl-event-snapshot.mjs
+
+      - name: Upload build artifacts (idl + so)
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-build-${{ steps.commit.outputs.sha }}
+          path: |
+            target/idl/*.json
+            target/deploy/*.so
+          if-no-files-found: error
+          retention-days: 14
+
+  fuzz-smoke:
+    # Quick fuzz smoke (~30s budget per target) on the escrow signature
+    # verifiers — full overnight fuzzing runs out-of-band, this is just
+    # a regression net for breakage on CPI / parsing paths.
+    name: fuzz smoke (ario-ant-escrow)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Smoke run verify_personal_sign (30s)
+        working-directory: programs/ario-ant-escrow/fuzz
+        run: cargo +nightly fuzz run verify_personal_sign -- -max_total_time=30
+      - name: Smoke run verify_rsa_pss (30s)
+        working-directory: programs/ario-ant-escrow/fuzz
+        run: cargo +nightly fuzz run verify_rsa_pss -- -max_total_time=30

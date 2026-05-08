@@ -1,0 +1,43 @@
+[package]
+name = "ario-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AR.IO Core Program - Token, Vaults, Config, Primary Names"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ario_core"
+
+[features]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+blake3.workspace = true
+proc-macro-crate.workspace = true
+indexmap.workspace = true
+unicode-segmentation.workspace = true
+solana-program.workspace = true
+ario-ant = { path = "../ario-ant", features = ["no-entrypoint"] }
+# Phase 3 of FUND_FROM_PLAN.md: primary-name fund-from variants CPI into
+# ario-gar's pay_from_funding_plan. New CPI direction; pattern follows
+# ario-arns. CPI depth: user → ario-core → ario-gar → SPL Token = 3 hops
+# (under Solana's 4-deep limit).
+ario-gar = { path = "../ario-gar", features = ["cpi"] }
+
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+tokio.workspace = true
+ario-ant = { path = "../ario-ant", features = ["no-entrypoint"] }
+ario-gar = { path = "../ario-gar", features = ["cpi"] }
+ario-test-utils = { path = "../../test-utils" }

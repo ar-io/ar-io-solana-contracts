@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "programs/ario-core",
+    "programs/ario-gar",
+    "programs/ario-arns",
+    "programs/ario-ant",
+    "programs/ario-ant-escrow",
+    "test-utils",
+]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ar-io/ar-io-solana-contracts"
+
+[workspace.dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"
+bytemuck = { version = "1.14", features = ["derive"] }
+# Pin 2.1.x to match Agave CLI and avoid pulling newer solana-* crates that require a newer
+# `cargo-build-sbf` / platform-tools than ships with Solana 2.1.0 (rustc 1.79 cannot parse
+# blake3 1.8+ manifests that use edition2024).
+solana-program = "=2.1.0"
+solana-program-test = "=2.1.0"
+solana-sdk = "=2.1.0"
+spl-token = "7.0"
+spl-associated-token-account = "6.0"
+mpl-token-metadata = "5.1"
+tokio = { version = "1", features = ["full"] }
+# Pin so `cargo-build-sbf`'s older Cargo (bundled with Solana 2.1.0) can parse the manifest
+# (blake3 1.8+ uses edition2024). `traits-preview` matches `solana-program`'s blake3 feature set.
+blake3 = { version = "=1.5.5", features = ["traits-preview"] }
+# proc-macro-crate 3.5+ pulls toml_edit / toml_parser with edition2024 manifests (unsupported by SBF Cargo 1.79).
+proc-macro-crate = "=3.2.0"
+# indexmap 2.12+ raises MSRV past SBF rustc 1.79; 2.14+ also pulls hashbrown 0.17 (edition2024 manifests).
+indexmap = "=2.11.0"
+# unicode-segmentation 1.13.2 requires rustc 1.85 (rejected by SBF rustc 1.79).
+unicode-segmentation = "=1.12.0"
+proptest = "1"

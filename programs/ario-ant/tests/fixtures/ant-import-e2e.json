@@ -1,0 +1,9 @@
+{
+  "description": "Expected logical state for test_e2e_migration_import_full_ant_state in tests/integration.rs. Serialized Anchor account bytes are built in Rust so borsh always matches on-chain structs.",
+  "expected": {
+    "config_name": "E2E Migration ANT",
+    "ticker": "E2E",
+    "record_undername": "blog",
+    "ttl_seconds": 3600
+  }
+}

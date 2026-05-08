@@ -1,0 +1,38 @@
+{
+  "_comment": "Variant of ant-state-sample.json with two records carrying metadata fields (display_name, logo, description, keywords). Used to exercise the AntRecordMetadata-PDA emission path in validate-ant-import-fixture.ts via ANT_IMPORT_FIXTURE=...",
+  "processId": "--55AVXmgefk61QNMDJ15llgjdcCT5ehhWxKeDLEpx4",
+  "Owner": "Sie_26dvgyok0PZD_-iQAFOhOd5YxDTkczOLoqTTL_A",
+  "Name": "AOS",
+  "Ticker": "aos",
+  "Logo": "Sie_26dvgyok0PZD_-iQAFOhOd5YxDTkczOLoqTTL_A",
+  "Description": "",
+  "Keywords": [],
+  "Controllers": [
+    "Sie_26dvgyok0PZD_-iQAFOhOd5YxDTkczOLoqTTL_A"
+  ],
+  "Records": {
+    "@": {
+      "transactionId": "f5cfcb570b7edac2ed16e1a025d50155d6148de7397f4068790cdfc14230007a",
+      "ttlSeconds": 900,
+      "priority": 0
+    },
+    "nexus": {
+      "transactionId": "c3641f8544d7c02f3580b07c0f9887f0c6a27ff5ab1d4a3e29caf197cfc299ae",
+      "ttlSeconds": 900,
+      "displayName": "Nexus Hub",
+      "logo": "AnYvLJTWcG9lr2Ll5MwYWZR2o5uTE39WbpYB0zCxwKM",
+      "description": "A test undername with all metadata fields populated.",
+      "keywords": [
+        "test",
+        "metadata",
+        "ant",
+        "split"
+      ]
+    },
+    "sagas": {
+      "transactionId": "0402594e5f30e9aebaa8b9c7febbd215eaf622184a52311e418ea07a1f9121bf",
+      "ttlSeconds": 900,
+      "displayName": "Sagas"
+    }
+  }
+}

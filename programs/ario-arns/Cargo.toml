@@ -1,0 +1,43 @@
+[package]
+name = "ario-arns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AR.IO ArNS Registry Program - Name registration, leasing, demand factor pricing"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ario_arns"
+
+[features]
+# Propagate idl-build to ario-gar so its Accounts-derive emission resolves
+# anchor-spl's DISCRIMINATOR / create_type / insert_types — required when
+# ario-ant pulls ario-arns in via the `cpi` feature and then builds with
+# `--features idl-build` for IDL extraction (Anchor 0.31.1 cargo feature
+# unification doesn't activate transitive idl-build automatically).
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "ario-gar/idl-build"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+blake3.workspace = true
+proc-macro-crate.workspace = true
+indexmap.workspace = true
+unicode-segmentation.workspace = true
+bytemuck.workspace = true
+solana-program.workspace = true
+ario-gar = { path = "../ario-gar", features = ["cpi"] }
+
+[dev-dependencies]
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+tokio.workspace = true
+proptest.workspace = true
+ario-test-utils = { path = "../../test-utils" }

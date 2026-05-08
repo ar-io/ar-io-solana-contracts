@@ -1,0 +1,15 @@
+[package]
+name = "ario-test-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared test helpers for AR.IO Solana programs (event log parsing, CU baseline scaffolding)."
+publish = false
+
+[lib]
+name = "ario_test_utils"
+path = "src/lib.rs"
+
+[dependencies]
+anchor-lang = { workspace = true }
+base64 = "0.22"

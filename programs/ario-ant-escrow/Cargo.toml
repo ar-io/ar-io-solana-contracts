@@ -1,0 +1,95 @@
+[package]
+name = "ario-ant-escrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AR.IO Trustless Escrow Program - Multi-protocol (Arweave RSA-PSS-4096 / Ethereum ECDSA secp256k1) on-chain custody for ANT NFTs, ARIO tokens, and time-locked vaults"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ario_ant_escrow"
+
+[lints.rust]
+# Anchor's `#[program]` macro expands to `solana_program::entrypoint!`,
+# which contains `cfg(target_os = "solana")` blocks. Standard `cargo
+# check` runs on the host target (linux/mac/etc) and the lint flags
+# the unknown value. Declare it explicitly so check-cfg passes.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[features]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+# Declared (empty) to silence `unexpected cfg condition value: <name>`
+# warnings emitted by Anchor's `#[program]` macro probing optional
+# features that this crate doesn't actually use. The linter's
+# check-cfg pass scopes per-crate, so even features used only inside
+# `solana_program` macros need to be declared here. The Anchor / Solana
+# toolchain expands these conditionals away in the BPF target, so the
+# empty feature gates have zero runtime effect.
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+solana = []
+# Network string baked into the canonical claim message at compile time.
+# Exactly one of these features must be enabled. The default ("network-mainnet")
+# is overridden in CI / devnet builds via
+# `--no-default-features --features network-devnet`. lib.rs has a compile_error!
+# guard that fires if neither (or both) is set.
+network-mainnet = []
+network-devnet = []
+# F-4 escape hatch: integration tests + localnet builds need the
+# deterministic test ATTESTOR_PUBKEY (derived from public seed
+# `[1u8; 32]`) so they can construct valid Ed25519Program ixs without
+# provisioning a real attestor key. Real-network builds (mainnet,
+# devnet) are blocked at compile time by `state.rs` from shipping
+# this test value unless this feature is also explicitly enabled.
+# **NEVER set this on a real-network build.** Default-on for tests so
+# the `cargo test` flow Just Works; default deploy paths
+# (`anchor build`, `cargo build-sbf`) opt out via
+# `--no-default-features --features network-mainnet` (or
+# `network-devnet`).
+unsafe-allow-test-attestor-pubkey = []
+# Default flips to unsafe-allow-test-attestor-pubkey for non-SBF
+# builds (`cargo check`, `cargo test`) so the test attestor seed
+# `[1u8; 32]` works out of the box. SBF deploys must opt out of the
+# default and pick a real network explicitly via
+# `cargo build-sbf --no-default-features --features network-mainnet`
+# (or network-devnet) — `build-sbf.sh` does this for us.
+default = ["network-mainnet", "unsafe-allow-test-attestor-pubkey"]
+
+[dependencies]
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+blake3.workspace = true
+proc-macro-crate.workspace = true
+indexmap.workspace = true
+unicode-segmentation.workspace = true
+solana-program.workspace = true
+ario-core = { path = "../ario-core", features = ["cpi"] }
+# Arweave production claim path is the off-chain attestor service
+# (`migration/attestor/`) — RSA-PSS verified off-chain, re-signed
+# with Ed25519, verified on-chain via the always-enabled native
+# Ed25519 sigverify program (~720 CU). The earlier on-chain RSA-PSS
+# verifier was removed because it referenced the feature-gated
+# `sol_big_mod_exp` syscall, which prevented the .so from loading
+# on devnet/mainnet. See ADR-017 in `docs/DECISIONS.md`.
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-program-test.workspace = true
+solana-sdk.workspace = true
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+tokio.workspace = true
+# Used by claim_*_attested integration tests to sign canonical messages
+# with the deterministic test attestor seed `[1u8; 32]`. Pinned to the
+# version solana-sdk uses transitively so we share the same crate.
+ed25519-dalek = "=1.0.1"
+# Used by Ethereum verifier vector tests to produce reference signatures.
+# Same version solana-program itself dev-deps so Cargo de-dupes.
+libsecp256k1 = "0.6.0"
+ario-test-utils = { path = "../../test-utils" }
