@@ -44,9 +44,9 @@ env:
   # time-macros / time pin in Cargo.lock.
   RUST_TOOLCHAIN: 1.79.0
   # Host toolchain: used for fmt, clippy, avm install, cargo test.
-  # Needs >= 1.80 (LazyLock, required by avm 0.31.1) and >= 1.85
-  # (edition2024 manifest parsing) to resolve the full dep graph.
-  RUST_TOOLCHAIN_HOST: 1.86.0
+  # Must match the channel in rust-toolchain.toml so local and CI
+  # lints stay identical.
+  RUST_TOOLCHAIN_HOST: 1.90.0
   CARGO_TERM_COLOR: always
 
 jobs:

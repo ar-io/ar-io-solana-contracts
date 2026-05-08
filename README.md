@@ -93,7 +93,7 @@ edge exists.
 
 | Tool                | Version    | Notes |
 |---------------------|------------|-------|
-| Rust (host)         | `1.86.0`   | fmt, clippy, avm, `cargo test`. Needs >= 1.80 (avm's `LazyLock`) and >= 1.85 (edition2024 manifests in transitive deps). |
+| Rust (host)         | `1.90.0`   | fmt, clippy, avm, `cargo test`. Pinned in `rust-toolchain.toml`; auto-installed by `rustup`. |
 | Rust (BPF)          | `1.79.0`   | bundled inside `cargo-build-sbf`; Cargo.lock must stay parseable by its Cargo 1.79 (see note below). |
 | Solana (Agave) CLI  | `2.1.0`    | newer 2.x releases drop Cargo 1.79 manifest support |
 | Anchor              | `0.31.1`   | `avm install 0.31.1 && avm use 0.31.1` |
