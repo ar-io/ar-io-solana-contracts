@@ -114,7 +114,7 @@ jobs:
       # — otherwise SPT loads stale .so files and recently-added instructions
       # fail with InstructionFallbackNotFound (101).
       - name: cargo test — native dispatch (core, gar, ant, test-utils)
-        run: cargo test -p ario-core -p ario-gar -p ario-ant -p test-utils --no-fail-fast
+        run: cargo test -p ario-core -p ario-gar -p ario-ant -p ario-test-utils --no-fail-fast
 
       - name: cargo test — BPF dispatch (arns, ant-escrow)
         env:
