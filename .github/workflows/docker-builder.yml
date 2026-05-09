@@ -9,7 +9,6 @@ name: Build builder image
 
 on:
   push:
-    branches: [main, develop]
     paths:
       - docker/Dockerfile
       - .github/workflows/docker-builder.yml
