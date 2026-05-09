@@ -1,20 +1,22 @@
-name: Build & Test
+name: Lint & Test
 
-# Runs on PRs targeting develop/main, manual dispatch, and reusable
-# workflow_call from the release pipelines.  No push trigger — PRs
-# already cover feature branches and this avoids double-firing when
-# a push updates an open PR.
+# Fast PR feedback: fmt, clippy, and native-dispatch tests.
+# No anchor build, no BPF dispatch, no Docker image — just Rust on a
+# bare runner with cached deps.  Typically completes in 3-5 minutes.
+#
+# Full BPF build + test happens in the release pipelines
+# (release-devnet.yml, release-mainnet.yml) which call this workflow
+# first and then run anchor build + BPF tests in their own jobs.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_call' &&
-       format('build-test-call-{0}', github.sha) ||
-       format('build-test-pr-{0}',
+       format('lint-test-call-{0}', github.sha) ||
+       format('lint-test-pr-{0}',
          github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  packages: read      # pull container image from GHCR
 
 on:
   pull_request:
@@ -23,19 +25,9 @@ on:
       - develop
   workflow_dispatch:
   workflow_call:
-    outputs:
-      sha:
-        description: "Commit SHA used for this build"
-        value: ${{ jobs.build.outputs.sha }}
 
 env:
-  ANCHOR_VERSION: 0.31.1
-  SOLANA_VERSION: v2.1.0
-  # BPF toolchain: cargo-build-sbf bundles Cargo/rustc 1.79; the dep
-  # graph (Cargo.lock) must stay parseable by that Cargo. See the
-  # time-macros / time pin in Cargo.lock.
-  RUST_TOOLCHAIN: 1.79.0
-  # Host toolchain: used for fmt, clippy, avm install, cargo test.
+  # Host toolchain: used for fmt, clippy, cargo test.
   # Must match the channel in rust-toolchain.toml so local and CI
   # lints stay identical.
   RUST_TOOLCHAIN_HOST: 1.90.0
@@ -63,175 +55,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (host target)
-        # --locked: honour Cargo.lock pins (time-macros < 0.2.27, etc.)
-        # so the dep graph stays compatible with cargo-build-sbf's Cargo 1.79.
-        # Allowed lint categories live in [workspace.lints] (Cargo.toml).
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 
-  build:
-    name: anchor build
+  test:
+    name: native tests
     runs-on: ubuntu-latest
-    container: ghcr.io/ar-io/anchor-builder:latest
-    outputs:
-      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - id: commit
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Versions
-        run: |
-          rustc --version
-          cargo --version
-          solana --version
-          anchor --version
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ar-io-contracts-bpf
-          cache-targets: true
-          cache-directories: /root/.cache/solana
-        env:
-          CARGO_HOME: /root/.cargo
+          shared-key: ar-io-contracts-host
 
-      - name: anchor build
-        run: anchor build
-
-      - name: Stage Metaplex Core fixture
-        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-
-      - name: IDL event ABI stability check
-        run: node scripts/idl-event-snapshot.mjs
-
-      - name: Upload build artifacts (idl + so)
-        uses: actions/upload-artifact@v4
-        with:
-          name: contracts-build-${{ steps.commit.outputs.sha }}
-          path: |
-            target/idl/*.json
-            target/deploy/*.so
-          if-no-files-found: error
-          retention-days: 14
-
-  # ── Test jobs — fan out after build ──────────────────────────────
-  #
-  # BPF_OUT_DIR pitfall (see CLAUDE.md): ario-arns, ario-ant, and
-  # ario-ant-escrow CPI into Metaplex Core → need BPF dispatch.
-  # ario-core / ario-gar use native dispatch (no BPF_OUT_DIR).
-  #
-  # BPF tests run single-threaded (--test-threads=1) to avoid
-  # AccountInUse races and blockhash expiry under parallel load.
-
-  test-native:
-    name: test (core, gar, test-utils)
-    runs-on: ubuntu-latest
-    container: ghcr.io/ar-io/anchor-builder:latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ar-io-contracts-bpf
-          cache-targets: true
-          cache-directories: /root/.cache/solana
-          save-if: false
-        env:
-          CARGO_HOME: /root/.cargo
-      - name: cargo nextest — native dispatch
-        run: cargo nextest run -p ario-core -p ario-gar -p ario-test-utils --no-fail-fast
-
-  test-ant:
-    name: test (ario-ant)
-    runs-on: ubuntu-latest
-    container: ghcr.io/ar-io/anchor-builder:latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ar-io-contracts-bpf
-          cache-targets: true
-          cache-directories: /root/.cache/solana
-          save-if: false
-        env:
-          CARGO_HOME: /root/.cargo
-      - name: Stage Metaplex Core fixture
-        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-      # BPF dispatch uses cargo test (not nextest) — nextest changes the
-      # working directory per test process, breaking SPT's BPF_OUT_DIR
-      # file resolution.
-      - name: cargo test — BPF dispatch
-        env:
-          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p ario-ant --no-fail-fast -- --test-threads=1
-
-  test-arns:
-    name: test (ario-arns)
-    runs-on: ubuntu-latest
-    container: ghcr.io/ar-io/anchor-builder:latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ar-io-contracts-bpf
-          cache-targets: true
-          cache-directories: /root/.cache/solana
-          save-if: false
-        env:
-          CARGO_HOME: /root/.cargo
-      - name: Stage Metaplex Core fixture
-        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-      - name: cargo test — BPF dispatch
-        env:
-          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p ario-arns --no-fail-fast -- --test-threads=1
-
-  test-escrow:
-    name: test (ario-ant-escrow)
-    runs-on: ubuntu-latest
-    container: ghcr.io/ar-io/anchor-builder:latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ar-io-contracts-bpf
-          cache-targets: true
-          cache-directories: /root/.cache/solana
-          save-if: false
-        env:
-          CARGO_HOME: /root/.cargo
-      - name: Stage Metaplex Core fixture
-        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-      - name: cargo test — BPF dispatch
-        env:
-          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p ario-ant-escrow --no-fail-fast -- --test-threads=1
-
-  # fuzz-smoke disabled — run out-of-band rather than on every PR.
-  # The fuzz targets need a nightly toolchain + cargo-fuzz which adds
-  # ~5min to CI for a 30s smoke run.  Re-enable when the verify::arweave
-  # import issue is fixed.
-  # fuzz-smoke:
-  #   name: fuzz smoke (ario-ant-escrow)
-  #   runs-on: ubuntu-latest
-  #   needs: build
-  #   if: github.event_name == 'pull_request'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #       with:
-  #         toolchain: nightly
-  #     - uses: Swatinem/rust-cache@v2
-  #       with:
-  #         shared-key: ar-io-contracts-fuzz
-  #     - name: Install cargo-fuzz
-  #       run: cargo install cargo-fuzz --locked
-  #     - name: Smoke run verify_personal_sign (30s)
-  #       working-directory: programs/ario-ant-escrow/fuzz
-  #       run: cargo +nightly fuzz run verify_personal_sign -- -max_total_time=30
-  #     - name: Smoke run verify_rsa_pss (30s)
-  #       working-directory: programs/ario-ant-escrow/fuzz
-  #       run: cargo +nightly fuzz run verify_rsa_pss -- -max_total_time=30
+      - name: cargo test — native dispatch (all programs)
+        run: cargo test --workspace --no-fail-fast
