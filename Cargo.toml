@@ -22,6 +22,7 @@ debug = 0
 
 [profile.test]
 debug = 0
+opt-level = 1
 
 # Workspace-wide lint policy.  Anchor's proc macros and the Lua→Rust port
 # trigger many newer clippy lints that are harmless in this codebase.

@@ -31,7 +31,7 @@ ENV PATH="${HOME}/.nvm/versions/node/${NODE_VERSION}/bin:${PATH}"
 RUN mkdir -p /workdir && mkdir -p /tmp && \
     apt-get update -qq && apt-get upgrade -qq && apt-get install -qq \
     build-essential git curl wget jq pkg-config python3-pip \
-    libssl-dev libudev-dev
+    libssl-dev libudev-dev clang mold
 
 # Rust — pinned to $RUST_TOOLCHAIN for reproducible lints.
 RUN curl "https://sh.rustup.rs" -sfo rustup.sh && \
@@ -52,6 +52,9 @@ RUN sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_CLI}/install)"
 
 # Anchor CLI — built with the pinned host toolchain.
 RUN cargo install --git https://github.com/coral-xyz/anchor --tag ${ANCHOR_CLI} anchor-cli --locked
+
+# cargo-nextest — faster test runner with per-test process isolation.
+RUN cargo install cargo-nextest --locked
 
 # NOTE: we intentionally skip the dummy-project BPF bootstrap that
 # upstream solanafoundation/anchor does.  The dummy's unpinned

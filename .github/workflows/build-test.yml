@@ -81,11 +81,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 
   build:
-    name: anchor build + cargo test
+    name: anchor build
     runs-on: ubuntu-latest
-    # Purpose-built image: Rust 1.90 + Solana 2.1.0 + Anchor 0.31.1 + Node 20.
-    # No Android/dotnet/Haskell bloat, no toolchain install steps.
-    # Built by .github/workflows/docker-builder.yml → GHCR.
     container: ghcr.io/ar-io/anchor-builder:latest
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
@@ -102,9 +99,6 @@ jobs:
           solana --version
           anchor --version
 
-      # Swatinem/rust-cache works inside containers — just needs the
-      # right CARGO_HOME.  Caches registry downloads + compiled deps
-      # in target/, cutting repeat builds from ~10min to ~2-3min.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ar-io-contracts-bpf
@@ -116,23 +110,12 @@ jobs:
       - name: anchor build
         run: anchor build
 
-      - name: Stage Metaplex Core fixture for ario-arns / ario-ant-escrow
+      - name: Stage Metaplex Core fixture
         run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
 
-      # BPF_OUT_DIR pitfall (see CLAUDE.md): ario-arns and ario-ant-escrow
-      # CPI into Metaplex Core, so they MUST load .so files via BPF dispatch.
-      # ario-core / ario-gar / ario-ant use native dispatch (no BPF_OUT_DIR)
-      # — otherwise SPT loads stale .so files and recently-added instructions
-      # fail with InstructionFallbackNotFound (101).
-      - name: cargo test — native dispatch (core, gar, test-utils)
-        run: cargo test -p ario-core -p ario-gar -p ario-test-utils --no-fail-fast
-
-      # BPF tests run single-threaded (--test-threads=1) to avoid
-      # AccountInUse races and blockhash expiry under parallel load.
-      - name: cargo test — BPF dispatch (ant, arns, ant-escrow)
-        env:
-          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p ario-ant -p ario-arns -p ario-ant-escrow --no-fail-fast -- --test-threads=1
+      # Pre-compile all test binaries so test jobs skip compilation.
+      - name: Compile test binaries
+        run: cargo nextest run --workspace --no-run --locked
 
       - name: IDL event ABI stability check
         run: node scripts/idl-event-snapshot.mjs
@@ -146,6 +129,99 @@ jobs:
             target/deploy/*.so
           if-no-files-found: error
           retention-days: 14
+
+  # ── Test jobs — fan out after build ──────────────────────────────
+  #
+  # BPF_OUT_DIR pitfall (see CLAUDE.md): ario-arns, ario-ant, and
+  # ario-ant-escrow CPI into Metaplex Core → need BPF dispatch.
+  # ario-core / ario-gar use native dispatch (no BPF_OUT_DIR).
+  #
+  # BPF tests run single-threaded (--test-threads=1) to avoid
+  # AccountInUse races and blockhash expiry under parallel load.
+
+  test-native:
+    name: test (core, gar, test-utils)
+    runs-on: ubuntu-latest
+    container: ghcr.io/ar-io/anchor-builder:latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf
+          cache-targets: true
+          cache-directories: /root/.cache/solana
+          save-if: false
+        env:
+          CARGO_HOME: /root/.cargo
+      - name: cargo nextest — native dispatch
+        run: cargo nextest run -p ario-core -p ario-gar -p ario-test-utils --no-fail-fast
+
+  test-ant:
+    name: test (ario-ant)
+    runs-on: ubuntu-latest
+    container: ghcr.io/ar-io/anchor-builder:latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf
+          cache-targets: true
+          cache-directories: /root/.cache/solana
+          save-if: false
+        env:
+          CARGO_HOME: /root/.cargo
+      - name: Stage Metaplex Core fixture
+        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
+      - name: cargo nextest — BPF dispatch
+        env:
+          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
+        run: cargo nextest run -p ario-ant --no-fail-fast -j 1
+
+  test-arns:
+    name: test (ario-arns)
+    runs-on: ubuntu-latest
+    container: ghcr.io/ar-io/anchor-builder:latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf
+          cache-targets: true
+          cache-directories: /root/.cache/solana
+          save-if: false
+        env:
+          CARGO_HOME: /root/.cargo
+      - name: Stage Metaplex Core fixture
+        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
+      - name: cargo nextest — BPF dispatch
+        env:
+          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
+        run: cargo nextest run -p ario-arns --no-fail-fast -j 1
+
+  test-escrow:
+    name: test (ario-ant-escrow)
+    runs-on: ubuntu-latest
+    container: ghcr.io/ar-io/anchor-builder:latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf
+          cache-targets: true
+          cache-directories: /root/.cache/solana
+          save-if: false
+        env:
+          CARGO_HOME: /root/.cargo
+      - name: Stage Metaplex Core fixture
+        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
+      - name: cargo nextest — BPF dispatch
+        env:
+          BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
+        run: cargo nextest run -p ario-ant-escrow --no-fail-fast -j 1
 
   fuzz-smoke:
     # Quick fuzz smoke (~30s budget per target) on the escrow signature

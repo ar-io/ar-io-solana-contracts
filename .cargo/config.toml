@@ -1,0 +1,6 @@
+# Use mold linker on Linux for ~3-5x faster linking of test binaries.
+# macOS uses the default linker (mold doesn't support Mach-O).
+# BPF builds (cargo-build-sbf) use their own linker and ignore this.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
