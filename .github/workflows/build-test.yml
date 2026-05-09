@@ -1,11 +1,13 @@
 name: Lint & Test
 
-# Fast PR feedback: fmt, clippy, and native-dispatch tests.
-# No anchor build, no BPF dispatch, no Docker image — just Rust on a
-# bare runner with cached deps.  Typically completes in 3-5 minutes.
+# Fast PR feedback: fmt, clippy, and native tests in one job (one cache
+# restore, one rustc link of the workspace).  mold speeds up linking
+# large test binaries vs. the default GNU ld.
+#
+# No anchor build, no BPF dispatch, no Docker image.
 #
 # Full BPF build + test happens in the release pipelines
-# (release-devnet.yml, release-mainnet.yml) which call this workflow
+# (release-devnet.yml, release-mainnet.yml), which call this workflow
 # first and then run anchor build + BPF tests in their own jobs.
 concurrency:
   group: >-
@@ -33,10 +35,12 @@ env:
   RUST_TOOLCHAIN_HOST: 1.90.0
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
-  fmt-clippy:
-    name: rustfmt + clippy
+  lint-and-test:
+    name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,30 +51,20 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
           components: rustfmt, clippy
 
+      - name: Install mold + clang (faster links)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold clang
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ar-io-contracts-host
+          shared-key: ar-io-contracts-lint-test
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (host target)
+      - name: Clippy
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 
-  test:
-    name: native tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ar-io-contracts-host
-
-      - name: cargo test — native dispatch (all programs)
+      - name: Test (native dispatch)
         run: cargo test --workspace --no-fail-fast
