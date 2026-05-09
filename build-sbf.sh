@@ -292,21 +292,19 @@ EOF
     ;;
 esac
 
-# Warn if the test ATTESTOR_PUBKEY is still in place.  Not --strict
-# here because build-sbf.sh is also used for binary-only releases
-# (skip_deploy path) where no on-chain upgrade happens.  The deploy
-# scripts (devnet-deploy.sh, mainnet-prepare-upgrade.sh) enforce
-# --strict before touching any cluster.  The compile-time guard in
-# state.rs is the real safety net for real-network SBF builds.
+# Check whether the test ATTESTOR_PUBKEY is still in place.  Not
+# --strict here: deploy scripts enforce that separately.  We use the
+# exit code to decide whether ario-ant-escrow can be compiled for a
+# real-network target — if the test key is present the compile-time
+# guard in state.rs would reject a network-mainnet/network-devnet build,
+# so we skip escrow and warn instead of aborting the whole build.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh"
+if "${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh" 2>/dev/null; then
+  _attestor_ok=1
+else
+  _attestor_ok=0
+fi
 
-# `ario-ant-escrow` defaults to `unsafe-allow-test-attestor-pubkey` for
-# non-SBF dev convenience (`cargo test` Just Works with the test seed).
-# Real-network SBF builds MUST opt out — F-4 compile-time guard refuses
-# a real-network build that still has the test ATTESTOR_PUBKEY unless
-# the unsafe feature is set. We never set it for SBF.
-#
 # Default network is mainnet; override with `BUILD_NETWORK=devnet`.
 build_network="${BUILD_NETWORK:-mainnet}"
 case "${build_network}" in
@@ -318,12 +316,23 @@ case "${build_network}" in
     ;;
 esac
 
-# `cargo build-sbf` doesn't expose a per-package feature override directly,
-# but the workspace Cargo.toml already lists ario-ant-escrow as a member
-# and feature flags propagate down. Use `--no-default-features --features`
-# scoped to the escrow crate.
-cargo build-sbf -- --package ario-ant-escrow --no-default-features --features "${escrow_features}"
-# Then build the rest of the workspace with default features.
+# `ario-ant-escrow` defaults to `unsafe-allow-test-attestor-pubkey` for
+# non-SBF dev convenience (`cargo test` Just Works with the test seed).
+# Real-network SBF builds MUST opt out — F-4 compile-time guard refuses
+# a real-network build that still has the test ATTESTOR_PUBKEY.
+# Skip escrow compilation when the test key is present so binary-only
+# release builds succeed; deploy scripts block on --strict before any
+# cluster upgrade, providing the real safety gate.
+if [[ "${_attestor_ok}" -eq 1 ]]; then
+  # `cargo build-sbf` doesn't expose a per-package feature override
+  # directly. Use `--no-default-features --features` scoped to escrow.
+  cargo build-sbf -- --package ario-ant-escrow --no-default-features --features "${escrow_features}"
+else
+  echo "[build-sbf] WARN: skipping ario-ant-escrow — test ATTESTOR_PUBKEY in state.rs." >&2
+  echo "[build-sbf]       Replace it before running a real cluster deploy." >&2
+fi
+
+# Build the rest of the workspace with default features.
 cargo build-sbf -- \
   --package ario-core --package ario-gar --package ario-arns --package ario-ant
 ls -la target/deploy/*.so

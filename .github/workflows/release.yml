@@ -1,0 +1,149 @@
+name: Release
+
+# Build BPF binaries, generate IDLs, package the release bundle, and
+# publish a GitHub release.  No on-chain deployment.
+#
+# Triggered manually (workflow_dispatch) with a `cluster` choice, or
+# called as a reusable workflow by upgrade-devnet.yml /
+# upgrade-mainnet.yml which pass the cluster via workflow_call inputs.
+#
+# If ATTESTOR_PUBKEY in state.rs is still the test value, ario-ant-escrow
+# is skipped from compilation with a warning.  The deploy workflows
+# (upgrade-devnet, upgrade-mainnet) call check-attestor-pubkey.sh --strict
+# before any on-chain upgrade, providing the real safety gate.
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_call' &&
+       format('release-call-{0}-{1}', inputs.cluster, github.sha) ||
+       format('release-manual-{0}-{1}', inputs.cluster, github.ref) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # create GitHub release
+  packages: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Target cluster"
+        type: choice
+        options: [devnet, mainnet]
+        default: devnet
+  workflow_call:
+    inputs:
+      cluster:
+        description: "Target cluster (devnet | mainnet)"
+        type: string
+        required: true
+    outputs:
+      version:
+        description: "Release version tag"
+        value: ${{ jobs.release.outputs.version }}
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    uses: ./.github/workflows/build-test.yml
+    secrets: inherit
+
+  release:
+    name: Build & release (${{ inputs.cluster }})
+    needs: lint-test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-${{ inputs.cluster }}
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor \
+            --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Build BPF binaries
+        env:
+          PROGRAM_IDS_PATH: program-ids/${{ inputs.cluster }}.json
+          BUILD_NETWORK: ${{ inputs.cluster }}
+        run: BUILD_NETWORK=${{ inputs.cluster }} bash build-sbf.sh --sync-from-manifest
+
+      - name: Build IDLs (anchor build)
+        run: anchor build
+
+      - name: IDL event ABI stability check
+        run: node scripts/idl-event-snapshot.mjs
+
+      - name: Compute version tag
+        id: ver
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          version="${{ inputs.cluster }}-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release bundle
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          CLUSTER: ${{ inputs.cluster }}
+        run: bash scripts/package-release.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-io-solana-contracts-${{ steps.ver.outputs.version }}
+          path: release/ar-io-solana-contracts-${{ steps.ver.outputs.version }}.tar.gz
+          retention-days: 90
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          CLUSTER: ${{ inputs.cluster }}
+        run: |
+          target_branch=$([[ "$CLUSTER" == "mainnet" ]] && echo "main" || echo "develop")
+          gh release create "$VERSION" \
+            --title "${{ inputs.cluster }} release $VERSION" \
+            --notes "Binary release (no on-chain upgrade).
+
+            **Cluster:** ${{ inputs.cluster }}
+            **Commit:** ${{ github.sha }}
+
+            ## Bundle contents
+            - \`idl/\` — Anchor 0.31 IDLs
+            - \`so/\` — compiled BPF binaries
+            - \`program-ids.json\` — program ID manifest
+            - \`VERSION\` — version, cluster, git SHA, build timestamp
+            - \`SHA256SUMS\` — checksums
+
+            To run a cluster upgrade from this build use the
+            upgrade-${{ inputs.cluster }} workflow." \
+            --target "${target_branch}" \
+            --prerelease \
+            "release/ar-io-solana-contracts-${VERSION}.tar.gz"
