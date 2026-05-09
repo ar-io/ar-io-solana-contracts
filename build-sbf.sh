@@ -292,13 +292,14 @@ EOF
     ;;
 esac
 
-# Belt-and-suspenders for F-4: also run the shell guardrail. The
-# const-eval check inside `state.rs` already refuses to compile a
-# real-network build that has the test ATTESTOR_PUBKEY, but a
-# misconfigured BUILD_NETWORK or feature override could in principle
-# slip past it. Failing fast here avoids a confusing compile error.
+# Warn if the test ATTESTOR_PUBKEY is still in place.  Not --strict
+# here because build-sbf.sh is also used for binary-only releases
+# (skip_deploy path) where no on-chain upgrade happens.  The deploy
+# scripts (devnet-deploy.sh, mainnet-prepare-upgrade.sh) enforce
+# --strict before touching any cluster.  The compile-time guard in
+# state.rs is the real safety net for real-network SBF builds.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh" --strict
+"${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh"
 
 # `ario-ant-escrow` defaults to `unsafe-allow-test-attestor-pubkey` for
 # non-SBF dev convenience (`cargo test` Just Works with the test seed).
