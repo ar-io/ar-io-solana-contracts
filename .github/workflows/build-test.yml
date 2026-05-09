@@ -126,10 +126,12 @@ jobs:
       - name: cargo test — native dispatch (core, gar, test-utils)
         run: cargo test -p ario-core -p ario-gar -p ario-test-utils --no-fail-fast
 
+      # BPF tests run single-threaded (--test-threads=1) to avoid
+      # AccountInUse races and blockhash expiry under parallel load.
       - name: cargo test — BPF dispatch (ant, arns, ant-escrow)
         env:
           BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p ario-ant -p ario-arns -p ario-ant-escrow --no-fail-fast
+        run: cargo test -p ario-ant -p ario-arns -p ario-ant-escrow --no-fail-fast -- --test-threads=1
 
       - name: IDL event ABI stability check
         run: node scripts/idl-event-snapshot.mjs
