@@ -113,13 +113,13 @@ jobs:
       # ario-core / ario-gar / ario-ant use native dispatch (no BPF_OUT_DIR)
       # — otherwise SPT loads stale .so files and recently-added instructions
       # fail with InstructionFallbackNotFound (101).
-      - name: cargo test — native dispatch (core, gar, ant, test-utils)
-        run: cargo test -p ario-core -p ario-gar -p ario-ant -p ario-test-utils --no-fail-fast
+      - name: cargo test — native dispatch (core, gar, test-utils)
+        run: cargo test -p ario-core -p ario-gar -p ario-test-utils --no-fail-fast
 
-      - name: cargo test — BPF dispatch (arns, ant-escrow)
+      - name: cargo test — BPF dispatch (ant, arns, ant-escrow)
         env:
           BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test -p ario-arns -p ario-ant-escrow --no-fail-fast
+        run: cargo test -p ario-ant -p ario-arns -p ario-ant-escrow --no-fail-fast
 
       - name: IDL event ABI stability check
         run: node scripts/idl-event-snapshot.mjs
