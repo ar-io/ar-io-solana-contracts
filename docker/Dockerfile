@@ -54,7 +54,8 @@ RUN sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_CLI}/install)"
 RUN cargo install --git https://github.com/coral-xyz/anchor --tag ${ANCHOR_CLI} anchor-cli --locked
 
 # cargo-nextest — faster test runner with per-test process isolation.
-RUN cargo install cargo-nextest --locked
+# Pre-built binary avoids a 5+ minute compile from source.
+RUN curl -LsSf https://get.nexte.st/0.9/linux | tar zxf - -C /root/.cargo/bin
 
 # NOTE: we intentionally skip the dummy-project BPF bootstrap that
 # upstream solanafoundation/anchor does.  The dummy's unpinned
