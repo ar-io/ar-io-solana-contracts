@@ -21,7 +21,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_TOOLCHAIN=1.90.0
 ARG SOLANA_CLI=v2.1.0
 ARG ANCHOR_CLI=v0.31.1
-ARG NODE_VERSION=v20.16.0
+ARG NODE_VERSION=v20.18.0
 
 ENV HOME="/root"
 ENV PATH="${HOME}/.cargo/bin:${PATH}"
@@ -53,7 +53,11 @@ RUN sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_CLI}/install)"
 # Anchor CLI — built with the pinned host toolchain.
 RUN cargo install --git https://github.com/coral-xyz/anchor --tag ${ANCHOR_CLI} anchor-cli --locked
 
-# Bootstrap the BPF SDK so first `anchor build` in CI doesn't pay for it.
-RUN mkdir -p /tmp && cd tmp && anchor init dummy && cd dummy && anchor build && rm -rf /tmp/dummy
+# NOTE: we intentionally skip the dummy-project BPF bootstrap that
+# upstream solanafoundation/anchor does.  The dummy's unpinned
+# Cargo.lock pulls HEAD crate versions that may be incompatible with
+# BPF Cargo 1.79 (e.g. cpufeatures 0.3 uses edition2024).  Real
+# builds bring their own pinned Cargo.lock; the BPF platform-tools
+# download (~30s) happens on the first `anchor build` in CI.
 
 WORKDIR /workdir
