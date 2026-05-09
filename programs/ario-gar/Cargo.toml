@@ -34,3 +34,6 @@ spl-token = { workspace = true, features = ["no-entrypoint"] }
 tokio.workspace = true
 proptest.workspace = true
 ario-test-utils = { path = "../../test-utils" }
+
+[lints]
+workspace = true

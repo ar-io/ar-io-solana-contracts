@@ -1,0 +1,43 @@
+name: Build builder image
+
+# Rebuilds the AR.IO Anchor builder image when the Dockerfile or this
+# workflow changes.  The image is pushed to GHCR and consumed by
+# build-test.yml / release-*.yml via `container:`.
+#
+# Manual trigger (`workflow_dispatch`) lets you rebuild on demand
+# (e.g. after a Rust point release).
+
+on:
+  push:
+    paths:
+      - docker/Dockerfile
+      - .github/workflows/docker-builder.yml
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/anchor-builder
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}

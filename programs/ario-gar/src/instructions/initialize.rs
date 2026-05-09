@@ -58,7 +58,7 @@ pub fn create_gateway_registry(ctx: Context<CreateGatewayRegistry>) -> Result<()
     let system = ctx.accounts.system_program.to_account_info();
     let auth_pk = ctx.accounts.settings.authority;
 
-    let current_len = registry.data_len() as usize;
+    let current_len = registry.data_len();
 
     if current_len == TARGET {
         let data = registry.try_borrow_data()?;

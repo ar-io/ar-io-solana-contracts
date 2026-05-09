@@ -45,3 +45,6 @@ solana-program-test.workspace = true
 solana-sdk.workspace = true
 tokio.workspace = true
 ario-test-utils = { path = "../../test-utils" }
+
+[lints]
+workspace = true

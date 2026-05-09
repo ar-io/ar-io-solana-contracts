@@ -10,12 +10,8 @@ description = "AR.IO Trustless Escrow Program - Multi-protocol (Arweave RSA-PSS-
 crate-type = ["cdylib", "lib"]
 name = "ario_ant_escrow"
 
-[lints.rust]
-# Anchor's `#[program]` macro expands to `solana_program::entrypoint!`,
-# which contains `cfg(target_os = "solana")` blocks. Standard `cargo
-# check` runs on the host target (linux/mac/etc) and the lint flags
-# the unknown value. Declare it explicitly so check-cfg passes.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+[lints]
+workspace = true
 
 [features]
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
