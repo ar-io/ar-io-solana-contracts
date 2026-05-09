@@ -64,4 +64,9 @@ RUN curl -LsSf https://get.nexte.st/0.9/linux | tar zxf - -C /root/.cargo/bin
 # builds bring their own pinned Cargo.lock; the BPF platform-tools
 # download (~30s) happens on the first `anchor build` in CI.
 
+# Use mold linker for ~3-5x faster linking of host-target test binaries.
+# Only affects host builds; BPF builds (cargo-build-sbf) use their own linker.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
 WORKDIR /workdir
