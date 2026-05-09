@@ -6,9 +6,13 @@ name: Lint & Test
 #
 # No anchor build, no BPF dispatch, no Docker image.
 #
-# Full BPF build + test happens in the release pipelines
-# (release-devnet.yml, release-mainnet.yml), which call this workflow
-# first and then run anchor build + BPF tests in their own jobs.
+# Packages that CPI into Metaplex Core (ario-arns, ario-ant,
+# ario-ant-escrow) are NOT tested here: native solana-program-test
+# needs mpl_core.so under BPF_OUT_DIR (see CLAUDE.md).  Run those via
+# release / local `anchor build` + staged fixture.
+#
+# Release pipelines call this workflow as a gate only; full on-chain
+# validation remains the deploy / manual test path.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_call' &&
@@ -66,5 +70,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 
-      - name: Test (native dispatch)
-        run: cargo test --workspace --no-fail-fast
+      - name: Test (native dispatch — core, gar, test-utils)
+        run: >-
+          cargo test -p ario-core -p ario-gar -p ario-test-utils
+          --no-fail-fast
