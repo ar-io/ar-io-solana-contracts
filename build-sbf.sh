@@ -292,47 +292,15 @@ EOF
     ;;
 esac
 
-# Check whether the test ATTESTOR_PUBKEY is still in place.  Not
-# --strict here: deploy scripts enforce that separately.  We use the
-# exit code to decide whether ario-ant-escrow can be compiled for a
-# real-network target — if the test key is present the compile-time
-# guard in state.rs would reject a network-mainnet/network-devnet build,
-# so we skip escrow and warn instead of aborting the whole build.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if "${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh" 2>/dev/null; then
-  _attestor_ok=1
-else
-  _attestor_ok=0
-fi
-
-# Default network is mainnet; override with `BUILD_NETWORK=devnet`.
-build_network="${BUILD_NETWORK:-mainnet}"
-case "${build_network}" in
-  mainnet) escrow_features="network-mainnet" ;;
-  devnet)  escrow_features="network-devnet"  ;;
-  *)
-    echo "[build-sbf] BUILD_NETWORK must be 'mainnet' or 'devnet', got '${build_network}'" >&2
-    exit 1
-    ;;
-esac
-
-# `ario-ant-escrow` defaults to `unsafe-allow-test-attestor-pubkey` for
-# non-SBF dev convenience (`cargo test` Just Works with the test seed).
-# Real-network SBF builds MUST opt out — F-4 compile-time guard refuses
-# a real-network build that still has the test ATTESTOR_PUBKEY.
-# Skip escrow compilation when the test key is present so binary-only
-# release builds succeed; deploy scripts block on --strict before any
-# cluster upgrade, providing the real safety gate.
-if [[ "${_attestor_ok}" -eq 1 ]]; then
-  # `cargo build-sbf` doesn't expose a per-package feature override
-  # directly. Use `--no-default-features --features` scoped to escrow.
-  cargo build-sbf -- --package ario-ant-escrow --no-default-features --features "${escrow_features}"
-else
-  echo "[build-sbf] WARN: skipping ario-ant-escrow — test ATTESTOR_PUBKEY in state.rs." >&2
-  echo "[build-sbf]       Replace it before running a real cluster deploy." >&2
-fi
-
-# Build the rest of the workspace with default features.
+# ario-ant-escrow is excluded from the standard CI build:
+#   • Its first deploy to any cluster is an offline operator action
+#     (no program ID exists in the manifests yet).
+#   • Building it for a real-network target requires the production
+#     ATTESTOR_PUBKEY in state.rs (compile-time guard enforces this).
+# To build escrow manually:
+#   BUILD_NETWORK=devnet cargo build-sbf -- \
+#     --package ario-ant-escrow \
+#     --no-default-features --features network-devnet
 cargo build-sbf -- \
   --package ario-core --package ario-gar --package ario-arns --package ario-ant
 ls -la target/deploy/*.so
