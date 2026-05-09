@@ -158,10 +158,13 @@ jobs:
           CARGO_HOME: /root/.cargo
       - name: Stage Metaplex Core fixture
         run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-      - name: cargo nextest — BPF dispatch
+      # BPF dispatch uses cargo test (not nextest) — nextest changes the
+      # working directory per test process, breaking SPT's BPF_OUT_DIR
+      # file resolution.
+      - name: cargo test — BPF dispatch
         env:
           BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo nextest run -p ario-ant --no-fail-fast -j 1
+        run: cargo test -p ario-ant --no-fail-fast -- --test-threads=1
 
   test-arns:
     name: test (ario-arns)
@@ -180,10 +183,10 @@ jobs:
           CARGO_HOME: /root/.cargo
       - name: Stage Metaplex Core fixture
         run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-      - name: cargo nextest — BPF dispatch
+      - name: cargo test — BPF dispatch
         env:
           BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo nextest run -p ario-arns --no-fail-fast -j 1
+        run: cargo test -p ario-arns --no-fail-fast -- --test-threads=1
 
   test-escrow:
     name: test (ario-ant-escrow)
@@ -202,10 +205,10 @@ jobs:
           CARGO_HOME: /root/.cargo
       - name: Stage Metaplex Core fixture
         run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-      - name: cargo nextest — BPF dispatch
+      - name: cargo test — BPF dispatch
         env:
           BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo nextest run -p ario-ant-escrow --no-fail-fast -j 1
+        run: cargo test -p ario-ant-escrow --no-fail-fast -- --test-threads=1
 
   fuzz-smoke:
     # Quick fuzz smoke (~30s budget per target) on the escrow signature
