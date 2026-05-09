@@ -108,10 +108,18 @@ jobs:
       - name: Stage Metaplex Core fixture for ario-arns / ario-ant-escrow
         run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
 
-      - name: cargo test (BPF dispatch)
+      # BPF_OUT_DIR pitfall (see CLAUDE.md): ario-arns and ario-ant-escrow
+      # CPI into Metaplex Core, so they MUST load .so files via BPF dispatch.
+      # ario-core / ario-gar / ario-ant use native dispatch (no BPF_OUT_DIR)
+      # — otherwise SPT loads stale .so files and recently-added instructions
+      # fail with InstructionFallbackNotFound (101).
+      - name: cargo test — native dispatch (core, gar, ant, test-utils)
+        run: cargo test -p ario-core -p ario-gar -p ario-ant -p test-utils --no-fail-fast
+
+      - name: cargo test — BPF dispatch (arns, ant-escrow)
         env:
           BPF_OUT_DIR: ${{ github.workspace }}/target/deploy
-        run: cargo test --workspace --no-fail-fast
+        run: cargo test -p ario-arns -p ario-ant-escrow --no-fail-fast
 
       - name: IDL event ABI stability check
         run: node scripts/idl-event-snapshot.mjs
