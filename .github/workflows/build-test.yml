@@ -113,10 +113,6 @@ jobs:
       - name: Stage Metaplex Core fixture
         run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
 
-      # Pre-compile all test binaries so test jobs skip compilation.
-      - name: Compile test binaries
-        run: cargo nextest run --workspace --no-run --locked
-
       - name: IDL event ABI stability check
         run: node scripts/idl-event-snapshot.mjs
 
