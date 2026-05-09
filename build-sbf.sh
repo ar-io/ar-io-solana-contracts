@@ -292,38 +292,15 @@ EOF
     ;;
 esac
 
-# Warn if the test ATTESTOR_PUBKEY is still in place.  Not --strict
-# here because build-sbf.sh is also used for binary-only releases
-# (skip_deploy path) where no on-chain upgrade happens.  The deploy
-# scripts (devnet-deploy.sh, mainnet-prepare-upgrade.sh) enforce
-# --strict before touching any cluster.  The compile-time guard in
-# state.rs is the real safety net for real-network SBF builds.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh"
-
-# `ario-ant-escrow` defaults to `unsafe-allow-test-attestor-pubkey` for
-# non-SBF dev convenience (`cargo test` Just Works with the test seed).
-# Real-network SBF builds MUST opt out — F-4 compile-time guard refuses
-# a real-network build that still has the test ATTESTOR_PUBKEY unless
-# the unsafe feature is set. We never set it for SBF.
-#
-# Default network is mainnet; override with `BUILD_NETWORK=devnet`.
-build_network="${BUILD_NETWORK:-mainnet}"
-case "${build_network}" in
-  mainnet) escrow_features="network-mainnet" ;;
-  devnet)  escrow_features="network-devnet"  ;;
-  *)
-    echo "[build-sbf] BUILD_NETWORK must be 'mainnet' or 'devnet', got '${build_network}'" >&2
-    exit 1
-    ;;
-esac
-
-# `cargo build-sbf` doesn't expose a per-package feature override directly,
-# but the workspace Cargo.toml already lists ario-ant-escrow as a member
-# and feature flags propagate down. Use `--no-default-features --features`
-# scoped to the escrow crate.
-cargo build-sbf -- --package ario-ant-escrow --no-default-features --features "${escrow_features}"
-# Then build the rest of the workspace with default features.
+# ario-ant-escrow is excluded from the standard CI build:
+#   • Its first deploy to any cluster is an offline operator action
+#     (no program ID exists in the manifests yet).
+#   • Building it for a real-network target requires the production
+#     ATTESTOR_PUBKEY in state.rs (compile-time guard enforces this).
+# To build escrow manually:
+#   BUILD_NETWORK=devnet cargo build-sbf -- \
+#     --package ario-ant-escrow \
+#     --no-default-features --features network-devnet
 cargo build-sbf -- \
   --package ario-core --package ario-gar --package ario-arns --package ario-ant
 ls -la target/deploy/*.so

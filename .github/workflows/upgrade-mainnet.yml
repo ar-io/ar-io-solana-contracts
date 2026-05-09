@@ -1,0 +1,184 @@
+name: Upgrade (mainnet)
+
+# Builds, stages BPF write-buffers on mainnet, and transfers buffer
+# authority to the Squads multisig.  The actual program upgrade is
+# executed by multisig signers from the Squads UI — CI never holds
+# the upgrade key.
+#
+# Required GitHub environment: "mainnet"
+#   - Required reviewers: at minimum two AR.IO core engineers.
+#   - Wait timer (recommended): 30 minutes between approval and run.
+#   Secrets:
+#     MAINNET_BUFFER_AUTHORITY_KEYPAIR    Hot wallet that pays write-buffer
+#                                         rent and signs the set-buffer-
+#                                         authority transfer to the multisig.
+#                                         Passed via env only (process
+#                                         substitution — never written to disk).
+#   Vars:
+#     MAINNET_RPC_URL                     default: https://api.mainnet-beta.solana.com
+#     SQUADS_MULTISIG_PUBKEY              Multisig PDA holding upgrade authority.
+
+# Serialize mainnet upgrades; do not cancel in-progress buffer staging —
+# partial runs can leave orphaned buffers.
+concurrency:
+  group: upgrade-mainnet-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: read
+
+on:
+  # push:
+  #   branches: [main]
+  workflow_dispatch:
+    inputs:
+      programs:
+        description: "Subset of programs to stage (space-separated). Empty = all."
+        type: string
+        default: ""
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    uses: ./.github/workflows/build-test.yml
+    secrets: inherit
+
+  upgrade:
+    name: Stage mainnet upgrade buffers
+    needs: lint-test
+    runs-on: ubuntu-latest
+    environment:
+      name: mainnet
+      url: https://app.squads.so
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-mainnet
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor \
+            --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Validate program-ids/mainnet.json is populated
+        run: |
+          if ! jq -e '.programs.ario_core | length > 0' program-ids/mainnet.json; then
+            echo "::error::program-ids/mainnet.json is missing program IDs."
+            echo "Populate it before running a mainnet upgrade."
+            exit 1
+          fi
+
+      - name: Check attestor pubkey (strict — blocks test key)
+        run: bash scripts/check-attestor-pubkey.sh --strict
+
+      - name: Build (mainnet feature flags)
+        run: |
+          BUILD_NETWORK=mainnet bash build-sbf.sh --skip-check
+          anchor build
+
+      - name: IDL event ABI stability check
+        run: node scripts/idl-event-snapshot.mjs
+
+      - name: Verify declare_id!() matches program-ids/mainnet.json
+        run: |
+          declare_ids=$(grep -h 'declare_id!' programs/*/src/lib.rs \
+            | sed -E 's/.*"([^"]+)".*/\1/' | sort)
+          manifest_ids=$(jq -r '.programs[] | select(. != null)' \
+            program-ids/mainnet.json | sort)
+          missing=$(comm -23 <(echo "$manifest_ids") <(echo "$declare_ids"))
+          if [[ -n "$missing" ]]; then
+            echo "::error::declare_id!() missing for manifest IDs:"
+            echo "$missing"
+            exit 1
+          fi
+
+      - name: Stage buffers → Squads
+        env:
+          BUFFER_AUTHORITY_KEY_JSON: ${{ secrets.MAINNET_BUFFER_AUTHORITY_KEYPAIR }}
+          SQUADS_MULTISIG_PUBKEY: ${{ vars.SQUADS_MULTISIG_PUBKEY }}
+          PROGRAM_IDS_PATH: program-ids/mainnet.json
+          RPC_URL: ${{ vars.MAINNET_RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+          PROGRAMS: ${{ inputs.programs }}
+          SKIP_BUILD: "1"
+        run: bash scripts/mainnet-prepare-upgrade.sh
+
+      - name: Compute version tag
+        id: ver
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          version="mainnet-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release bundle
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          CLUSTER: mainnet
+        run: bash scripts/package-release.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-io-solana-contracts-${{ steps.ver.outputs.version }}
+          path: release/ar-io-solana-contracts-${{ steps.ver.outputs.version }}.tar.gz
+          retention-days: 365
+
+      - name: Upload buffer manifest (multisig hand-off)
+        uses: actions/upload-artifact@v4
+        with:
+          name: buffer-manifest-${{ steps.ver.outputs.version }}
+          path: release/upgrade-*/buffer-manifest.json
+          retention-days: 365
+
+      - name: Create GitHub release (draft)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --title "Mainnet upgrade $VERSION" \
+            --notes "Upgrade buffers staged; awaiting multisig execution.
+
+            **Cluster:** mainnet-beta
+            **Commit:** ${{ github.sha }}
+
+            ## Status
+            Write-buffers have been staged and their authority transferred
+            to the Squads multisig (\`${{ vars.SQUADS_MULTISIG_PUBKEY }}\`).
+            Multisig signers must vote and execute upgrade transactions before
+            the new bytecode is live.  See \`buffer-manifest.json\` attached
+            to the workflow run for buffer pubkeys and SHA-256 hashes.
+
+            ## Bundle contents
+            - \`idl/\` — Anchor 0.31 IDLs
+            - \`so/\` — compiled BPF binaries
+            - \`program-ids.json\` — program ID manifest
+            - \`SHA256SUMS\` — checksums (must match buffer hashes)" \
+            --target main \
+            --draft \
+            "release/ar-io-solana-contracts-${VERSION}.tar.gz"

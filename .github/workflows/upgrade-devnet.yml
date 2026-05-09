@@ -1,0 +1,146 @@
+name: Upgrade (devnet)
+
+# Upgrades the live devnet programs.  Runs the lint/test gate and BPF
+# build first, then deploys via scripts/devnet-deploy.sh.
+#
+# Upgrade-only model: CI holds exactly one secret (the upgrade authority
+# keypair).  It cannot mint new program IDs — those live in
+# program-ids/devnet.json and are managed offline.
+#
+# Required GitHub environment: "devnet"
+#   Secrets:
+#     DEVNET_AUTHORITY_KEY_JSON   JSON keypair with upgrade authority
+#                                 over each deployed devnet program.
+#   Vars:
+#     DEVNET_RPC_URL              default: https://api.devnet.solana.com
+
+# Serialize devnet upgrades; cancel superseded runs (rapid pushes).
+concurrency:
+  group: upgrade-devnet-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: read
+
+on:
+  # push:
+  #   branches: [develop]
+  workflow_dispatch:
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    uses: ./.github/workflows/build-test.yml
+    secrets: inherit
+
+  upgrade:
+    name: Deploy to devnet
+    needs: lint-test
+    runs-on: ubuntu-latest
+    environment:
+      name: devnet
+      url: https://explorer.solana.com/?cluster=devnet
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-devnet
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor \
+            --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Deploy to devnet
+        env:
+          # Authority keypair lives in env only — devnet-deploy.sh feeds
+          # it to solana via process substitution, never writing to disk.
+          AUTHORITY_KEY_JSON: ${{ secrets.DEVNET_AUTHORITY_KEY_JSON }}
+          DEPLOY_CLUSTER: ${{ vars.DEVNET_RPC_URL || 'https://api.devnet.solana.com' }}
+          BUILD_NETWORK: devnet
+          PROGRAM_IDS_PATH: program-ids/devnet.json
+          SKIP_AIRDROP: "1"
+        run: bash scripts/devnet-deploy.sh
+
+      - name: Compute version tag
+        id: ver
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          version="devnet-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release bundle
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          CLUSTER: devnet
+        run: bash scripts/package-release.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-io-solana-contracts-${{ steps.ver.outputs.version }}
+          path: release/ar-io-solana-contracts-${{ steps.ver.outputs.version }}.tar.gz
+          retention-days: 90
+
+      - name: Commit & push refreshed program-ids/devnet.json
+        run: |
+          if git diff --quiet program-ids/devnet.json; then
+            echo "program-ids/devnet.json unchanged"
+            exit 0
+          fi
+          git config user.name "ar-io-ci[bot]"
+          git config user.email "ci@ar.io"
+          git add program-ids/devnet.json
+          git commit -m "chore(devnet): publish program-ids @ ${{ steps.ver.outputs.version }}"
+          git push origin HEAD:develop
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --title "Devnet upgrade $VERSION" \
+            --notes "Devnet upgrade deployed.
+
+            **Cluster:** devnet
+            **Commit:** ${{ github.sha }}
+
+            ## Bundle contents
+            - \`idl/\` — Anchor 0.31 IDLs
+            - \`so/\` — compiled BPF binaries
+            - \`program-ids.json\` — program ID manifest
+            - \`VERSION\` — version, cluster, git SHA, build timestamp
+            - \`SHA256SUMS\` — checksums
+
+            Program keypairs are not included. CI holds only the upgrade
+            authority. Program keypairs live in offline custody and are
+            needed only for first deploys (a manual operator action)." \
+            --target develop \
+            --prerelease \
+            "release/ar-io-solana-contracts-${VERSION}.tar.gz"
