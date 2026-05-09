@@ -1,22 +1,15 @@
 name: Build & Test
 
-# Default CI: runs on every push to feature branches and on every PR
-# targeting develop or main. The release pipelines (release-devnet,
-# release-mainnet) call this workflow via `workflow_call` so we don't
-# duplicate the build steps.
-#
-# Concurrency: cancel superseded runs, but —
-# - PR + push-to-head used to double-fire (different github.ref groups).
-#   We key PRs by number so synchronize/push reuse one group.
-# - Reusable callers must NOT share a single refs/heads/develop group or
-#   concurrent merges cancel each other's in-flight build-test runs.
+# Runs on PRs targeting develop/main, manual dispatch, and reusable
+# workflow_call from the release pipelines.  No push trigger — PRs
+# already cover feature branches and this avoids double-firing when
+# a push updates an open PR.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_call' &&
        format('build-test-call-{0}', github.sha) ||
-       github.event_name == 'pull_request' &&
-       format('build-test-pr-{0}', github.event.pull_request.number) ||
-       format('build-test-{0}', github.ref) }}
+       format('build-test-pr-{0}',
+         github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 permissions:
@@ -24,11 +17,6 @@ permissions:
   packages: read      # pull container image from GHCR
 
 on:
-  push:
-    branches:
-      - '**'
-      - '!main'
-      - '!develop'
   pull_request:
     branches:
       - main
