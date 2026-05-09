@@ -19,6 +19,10 @@ concurrency:
        format('build-test-{0}', github.ref) }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: read      # pull container image from GHCR
+
 on:
   push:
     branches:
@@ -79,6 +83,10 @@ jobs:
   build:
     name: anchor build + cargo test
     runs-on: ubuntu-latest
+    # Purpose-built image: Rust 1.90 + Solana 2.1.0 + Anchor 0.31.1 + Node 20.
+    # No Android/dotnet/Haskell bloat, no toolchain install steps.
+    # Built by .github/workflows/docker-builder.yml → GHCR.
+    container: ghcr.io/ar-io/anchor-builder:latest
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
     steps:
@@ -87,43 +95,6 @@ jobs:
       - id: commit
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Standard runners ship ~14 GB free but the debug target/ for
-      # five Solana programs can exceed that.  Drop the three biggest
-      # pre-installed offenders (~25 GB) in ~10s.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
-          df -h /
-
-      - name: Install Rust toolchains
-        run: |
-          # Host toolchain (avm install, cargo test). Must be >= 1.80
-          # for avm's LazyLock usage.
-          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
-          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
-          # BPF toolchain: cargo-build-sbf's platform-tools ships its
-          # own 1.79 compiler; this install just ensures the host
-          # resolver can fall back if needed.
-          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ar-io-contracts-bpf
-
-      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-
-      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
-        run: |
-          # avm 0.31.1 uses std::sync::LazyLock (stable in Rust 1.80).
-          # Build it with the host toolchain (>= 1.86), then avm manages
-          # the anchor CLI binary separately.
-          cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
-          avm install ${{ env.ANCHOR_VERSION }}
-          avm use ${{ env.ANCHOR_VERSION }}
-
       - name: Versions
         run: |
           rustc --version
@@ -131,31 +102,11 @@ jobs:
           solana --version
           anchor --version
 
-      # Linking the five programs + their integration test binaries in
-      # debug mode can exceed the runner's 7 GB RAM (LLD OOMs / bus
-      # errors on ario-ant-escrow). Provision extra swap as a safety net.
-      # Use a unique path — /swapfile is already in use on some runners.
-      - name: Provision swap (linker memory)
-        run: |
-          sudo fallocate -l 10G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-
-      # `anchor build` produces both target/idl/*.json and target/deploy/*.so.
-      # Required before `cargo test` (programs load the .so via SPT) and
-      # before the IDL ABI / event-snapshot checks.
       - name: anchor build
         run: anchor build
 
-      # declare_id drift guard (build-sbf.sh --check-only) is skipped
-      # in CI: source carries placeholder IDs and anchor build generates
-      # ephemeral keypairs — they'll never match.  The guard is useful
-      # for local dev with persistent keypairs only.
-
       - name: Stage Metaplex Core fixture for ario-arns / ario-ant-escrow
-        run: |
-          cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
+        run: cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
 
       - name: cargo test (BPF dispatch)
         env:
