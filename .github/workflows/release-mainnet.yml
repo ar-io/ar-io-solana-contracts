@@ -41,8 +41,8 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  push:
-    branches: [main]
+  # push:
+  #   branches: [main]
   workflow_dispatch:
     inputs:
       skip_buffer_stage:

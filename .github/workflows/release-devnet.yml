@@ -53,8 +53,8 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  push:
-    branches: [develop]
+  # push:
+  #   branches: [develop]
   workflow_dispatch:
     inputs:
       skip_deploy:
