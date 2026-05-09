@@ -102,6 +102,16 @@ jobs:
           solana --version
           anchor --version
 
+      # Swatinem/rust-cache works inside containers — just needs the
+      # right CARGO_HOME.  Caches registry downloads + compiled deps
+      # in target/, cutting repeat builds from ~10min to ~2-3min.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf
+          cache-targets: true
+        env:
+          CARGO_HOME: /root/.cargo
+
       - name: anchor build
         run: anchor build
 
