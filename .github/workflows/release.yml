@@ -1,36 +1,27 @@
 name: Release
 
 # Build BPF binaries, generate IDLs, package the release bundle, and
-# publish a GitHub release.  No on-chain deployment.
+# publish a GitHub release.  Only triggered via workflow_call from
+# upgrade-devnet.yml or upgrade-mainnet.yml.
 #
-# Triggered manually (workflow_dispatch) with a `cluster` choice, or
-# called as a reusable workflow by upgrade-devnet.yml /
-# upgrade-mainnet.yml which pass the cluster via workflow_call inputs.
+# Also runs the release-plz-release step, which creates the semver git
+# tag (e.g. v0.2.0) if a Release PR was merged since the last tag.
+# release-plz-update (opening the Release PR) runs in release-plz.yml.
 #
-# If ATTESTOR_PUBKEY in state.rs is still the test value, ario-ant-escrow
-# is skipped from compilation with a warning.  The deploy workflows
-# (upgrade-devnet, upgrade-mainnet) call check-attestor-pubkey.sh --strict
-# before any on-chain upgrade, providing the real safety gate.
+# Version precedence:
+#   1. Exact semver tag on HEAD  → e.g. devnet-v0.2.0
+#   2. git describe (tag+offset) → e.g. devnet-v0.2.0-3-gabc1234
+#   3. Fallback                  → devnet-YYYYMMDD-HHMMSS-sha
 
 concurrency:
-  group: >-
-    ${{ github.event_name == 'workflow_call' &&
-       format('release-call-{0}-{1}', inputs.cluster, github.sha) ||
-       format('release-manual-{0}-{1}', inputs.cluster, github.ref) }}
+  group: release-call-${{ inputs.cluster }}-${{ github.sha }}
   cancel-in-progress: true
 
 permissions:
-  contents: write   # create GitHub release
-  packages: read
+  contents: write
+  pull-requests: write
 
 on:
-  workflow_dispatch:
-    inputs:
-      cluster:
-        description: "Target cluster"
-        type: choice
-        options: [devnet, mainnet]
-        default: devnet
   workflow_call:
     inputs:
       cluster:
@@ -62,15 +53,29 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Install Rust toolchains
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
+
+      # Create the semver tag (e.g. v0.2.0) if a Release PR was merged
+      # since the last tag.  No-ops if nothing to release.
+      - name: Tag release (release-plz-release)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-plz-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust BPF toolchain
         run: |
-          rustup toolchain install ${{ env.RUST_TOOLCHAIN_HOST }}
-          rustup default ${{ env.RUST_TOOLCHAIN_HOST }}
           rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
 
       - uses: Swatinem/rust-cache@v2
@@ -101,11 +106,22 @@ jobs:
       - name: IDL event ABI stability check
         run: node scripts/idl-event-snapshot.mjs
 
-      - name: Compute version tag
+      - name: Compute version
         id: ver
         run: |
-          short_sha=$(git rev-parse --short HEAD)
-          version="${{ inputs.cluster }}-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+          # Prefer a semver tag on HEAD; fall back to git-describe; then SHA+timestamp.
+          semver=$(git describe --tags --exact-match 2>/dev/null || true)
+          if [[ -n "$semver" ]]; then
+            version="${{ inputs.cluster }}-${semver}"
+          else
+            described=$(git describe --tags --always --dirty 2>/dev/null || true)
+            if [[ -n "$described" && "$described" != *"-dirty" ]] && echo "$described" | grep -qE "^v[0-9]"; then
+              version="${{ inputs.cluster }}-${described}"
+            else
+              short_sha=$(git rev-parse --short HEAD)
+              version="${{ inputs.cluster }}-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+            fi
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Package release bundle

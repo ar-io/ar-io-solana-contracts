@@ -59,7 +59,12 @@ jobs:
         with:
           toolchain: "1.90.0"
 
-      - name: Run release-plz
+      # Only the PR-creation half of release-plz.  The tagging + build
+      # half (release-plz-release) runs inside release.yml when an
+      # operator calls it via workflow_call after the PR is merged.
+      - name: Open / refresh Release PR
         uses: release-plz/action@v0.5
+        with:
+          command: release-plz-update
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
