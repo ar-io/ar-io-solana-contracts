@@ -161,7 +161,7 @@ pub fn initialize_epochs(
     // observer/cranker iteration. See docs/DEVNET_RUNBOOK.md → "Devnet
     // vs mainnet epoch-settings deltas". Long-term fix is to surface
     // this via `InitializeEpochParams` (separate ticket).
-    settings.tenure_weight_duration = 1 * 3600; // 1 hour (DEVNET ONLY)
+    settings.tenure_weight_duration = 3600; // 1 hour (DEVNET ONLY)
     settings.max_tenure_weight = 4; // matches Lua maxTenureWeight
     settings.gateway_reward_ratio = GATEWAY_OPERATOR_REWARD_RATE;
     settings.observer_reward_ratio = OBSERVER_REWARD_RATE;
