@@ -65,6 +65,37 @@ pub fn close_epoch_settings(_ctx: Context<CloseEpochSettings>) -> Result<()> {
     Ok(())
 }
 
+/// Recovery-only: close an Epoch PDA without the normal distribute /
+/// retention / observation-closed gates that `close_epoch` enforces.
+///
+/// The use case: after a `close_epoch_settings` + `initialize_epochs`
+/// reinit, `EpochSettings.current_epoch_index` resets to 0. If the
+/// cluster previously cycled through Epochs 0..N before reinit, those
+/// PDAs still exist on chain at seeds `[EPOCH_SEED, i.to_le_bytes()]`,
+/// and the next `create_epoch` collides with the orphaned PDA at the
+/// same address. Permissionless `close_epoch` cannot clean these up
+/// because the orphans never finished `distribute_rewards` and don't
+/// satisfy the retention gate.
+///
+/// **Closing an in-flight epoch (one with submitted-but-unclosed
+/// Observations) orphans those Observation PDAs**, breaking
+/// `close_observation`'s parent-reference invariant and leaving their
+/// rent stranded. Only run this on epochs that are genuinely orphaned —
+/// i.e., after a reinit, against indices that the new lifecycle won't
+/// re-use.
+///
+/// Authority-gated AND `migration_active`-gated: after mainnet
+/// `finalize_migration` flips `GatewaySettings.migration_active` to
+/// false, this ix becomes inert. By design, it is migration-window
+/// recovery infrastructure only.
+pub fn admin_close_stale_epoch(
+    _ctx: Context<AdminCloseStaleEpoch>,
+    _epoch_index: u64,
+) -> Result<()> {
+    // Anchor's `close = authority` on the Epoch account does the rest.
+    Ok(())
+}
+
 /// Create a new epoch (F23)
 /// This is permissionless - anyone can call when the previous epoch has ended
 pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
@@ -638,6 +669,39 @@ pub struct CloseEpochSettings<'info> {
         close = authority,
     )]
     pub epoch_settings: Account<'info, EpochSettings>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct AdminCloseStaleEpoch<'info> {
+    /// Authority gate via `has_one` (matches `EpochSettings.authority`)
+    /// + `migration_active` gate via `GatewaySettings`. After mainnet
+    /// `finalize_migration` flips `migration_active` to false, this ix
+    /// becomes inert.
+    #[account(
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        constraint = settings.migration_active @ GarError::MigrationInactive,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    #[account(
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    #[account(
+        mut,
+        seeds = [EPOCH_SEED, &epoch_index.to_le_bytes()],
+        bump,
+        close = authority,
+    )]
+    pub epoch: AccountLoader<'info, Epoch>,
 
     #[account(mut)]
     pub authority: Signer<'info>,
