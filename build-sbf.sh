@@ -239,6 +239,19 @@ sync_from_manifest() {
     rm -f "${lib}.bak"
     echo "[build-sbf] patched $lib → declare_id!(\"$prog_id\")"
   done
+
+  # cargo-build-sbf 2.1.0 iterates ALL workspace members after the build to
+  # copy .so files into target/deploy/, and fails if any member's .so is
+  # absent (even one that was deliberately not built). Temporarily remove
+  # ario-ant-escrow from the workspace so it is invisible to that copy step.
+  # restore_keys() (registered in the EXIT trap) restores Cargo.toml.
+  local cargo_backup
+  cargo_backup="$SYNC_BACKUP_DIR/Cargo_toml"
+  cp Cargo.toml "$cargo_backup"
+  echo "Cargo.toml" > "$cargo_backup.path"
+  sed -i.bak '/"programs\/ario-ant-escrow"/d' Cargo.toml
+  rm -f Cargo.toml.bak
+  echo "[build-sbf] patched Cargo.toml — excluded ario-ant-escrow from workspace (restored on EXIT)"
 }
 
 case "$MODE" in
@@ -292,15 +305,15 @@ EOF
     ;;
 esac
 
-# ario-ant-escrow is excluded from the standard CI build:
-#   • Its first deploy to any cluster is an offline operator action
-#     (no program ID exists in the manifests yet).
-#   • Building it for a real-network target requires the production
-#     ATTESTOR_PUBKEY in state.rs (compile-time guard enforces this).
-# To build escrow manually:
+# Plain workspace build — no -p flags needed.  cargo-build-sbf 2.1.0
+# copies every workspace member's .so at the end of the build, so we
+# must not leave ario-ant-escrow in the workspace when it isn't being
+# compiled.  sync_from_manifest() removes it from Cargo.toml and the
+# EXIT trap restores it.
+#
+# To build escrow separately (requires real ATTESTOR_PUBKEY in state.rs):
 #   BUILD_NETWORK=devnet cargo build-sbf -- \
 #     --package ario-ant-escrow \
 #     --no-default-features --features network-devnet
-cargo build-sbf -- \
-  --package ario-core --package ario-gar --package ario-arns --package ario-ant
+cargo build-sbf
 ls -la target/deploy/*.so
