@@ -50,9 +50,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use the PAT so that the Release PR can trigger other workflows
-          # (GITHUB_TOKEN PRs are blocked from re-triggering Actions).
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
