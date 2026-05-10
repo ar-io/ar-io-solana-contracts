@@ -1,8 +1,7 @@
 name: Release
 
 # Build BPF binaries, generate IDLs, package the release bundle, and
-# publish a GitHub release.  Only triggered via workflow_call from
-# upgrade-devnet.yml or upgrade-mainnet.yml.
+# publish a GitHub release.  Triggered manually from the Actions tab.
 #
 # Also runs the release-plz-release step, which creates the semver git
 # tag (e.g. v0.2.0) if a Release PR was merged since the last tag.
@@ -14,7 +13,7 @@ name: Release
 #   3. Fallback                  → devnet-YYYYMMDD-HHMMSS-sha
 
 concurrency:
-  group: release-call-${{ inputs.cluster }}-${{ github.sha }}
+  group: release-${{ inputs.cluster }}-${{ github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -22,16 +21,15 @@ permissions:
   pull-requests: write
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       cluster:
         description: "Target cluster (devnet | mainnet)"
-        type: string
+        type: choice
+        options:
+          - devnet
+          - mainnet
         required: true
-    outputs:
-      version:
-        description: "Release version tag"
-        value: ${{ jobs.release.outputs.version }}
 
 env:
   ANCHOR_VERSION: 0.31.1
