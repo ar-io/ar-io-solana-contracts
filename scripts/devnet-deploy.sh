@@ -15,10 +15,13 @@
 # are only needed for first deploys.
 #
 # In CI the authority key is passed in via AUTHORITY_KEY_JSON (raw JSON
-# array contents of the keypair file). It is fed to solana via bash
-# process substitution (`--keypair <(printf %s "$AUTHORITY_KEY_JSON")`)
-# so the bytes never get written to the runner's filesystem. Locally,
-# operators point AUTHORITY_KEYPAIR at a file on disk instead.
+# array contents of the keypair file). It is materialized to a `chmod 600`
+# tempfile under $TMPDIR for the duration of the script run; an EXIT/INT/
+# TERM/HUP trap deletes the file. (We tried bash process substitution
+# first — `--keypair <(printf %s "$AUTHORITY_KEY_JSON")` — but Solana CLI
+# re-opens the keypair path during `program deploy`, and the second open
+# of a one-shot pipe returns EOF, breaking the deploy.) Locally, operators
+# point AUTHORITY_KEYPAIR at a file on disk and the env var is unused.
 #
 # First deploys (e.g. ario-ant-escrow before its initial bring-up):
 #   * Done manually from a maintainer laptop with the program keypair.
@@ -93,31 +96,36 @@ step() { echo -e "\n${GREEN}=== Step $1: $2 ===${NC}"; }
 warn() { echo -e "${YELLOW}!  $1${NC}"; }
 fail() { echo -e "${RED}x  $1${NC}"; exit 1; }
 
+# CI mode: materialize AUTHORITY_KEY_JSON to a tempfile and use that as the
+# keypair source. Earlier versions piped the JSON via `<(printf ...)` process
+# substitution, which works for one-shot reads (`solana-keygen pubkey`) but
+# fails for `solana program deploy` because the deploy re-opens the keypair
+# path multiple times during the buffer-write + finalize flow — second open
+# of a one-shot pipe returns EOF, and the deploy aborts with
+#   "could not read keypair file '/dev/fd/63': EOF while parsing a value".
+# A real file (chmod 600, deleted on EXIT/INT/TERM/HUP) is the simplest fix
+# that preserves the "secret never written to a persistent path" property.
+if [[ -n "$AUTHORITY_KEY_JSON" ]]; then
+  AUTHORITY_KEYPAIR="$(mktemp -t ar-io-devnet-auth.XXXXXXXX.json)"
+  chmod 600 "$AUTHORITY_KEYPAIR"
+  printf '%s' "$AUTHORITY_KEY_JSON" > "$AUTHORITY_KEYPAIR"
+  trap 'rm -f "$AUTHORITY_KEYPAIR"' EXIT INT TERM HUP
+  unset AUTHORITY_KEY_JSON
+fi
+
 # solana_auth: run a solana CLI command with the upgrade authority signer
-# and the deploy cluster URL. In CI mode (AUTHORITY_KEY_JSON set), the
-# keypair is fed in via process substitution so its bytes are only ever
-# resident in shell + child-process memory and an anonymous pipe — they
-# never get written to the runner's filesystem. In local mode
-# (AUTHORITY_KEY_JSON unset), the file at AUTHORITY_KEYPAIR is used.
-#
+# and the deploy cluster URL. The keypair always comes from a file path now
+# (in CI, a tempfile populated above; locally, the operator-supplied file).
 # Both --keypair and --url are passed as global flags per call; this
-# script intentionally does NOT mutate ~/.config/solana/cli/config.yml,
-# so it leaves zero on-disk traces of either the key or the cluster.
+# script intentionally does NOT mutate ~/.config/solana/cli/config.yml, so
+# it leaves zero on-disk traces of the cluster choice.
 solana_auth() {
-  if [[ -n "$AUTHORITY_KEY_JSON" ]]; then
-    solana --keypair <(printf '%s' "$AUTHORITY_KEY_JSON") --url "$DEPLOY_CLUSTER" "$@"
-  else
-    solana --keypair "$AUTHORITY_KEYPAIR" --url "$DEPLOY_CLUSTER" "$@"
-  fi
+  solana --keypair "$AUTHORITY_KEYPAIR" --url "$DEPLOY_CLUSTER" "$@"
 }
 
-# Pubkey of the authority key, derived from whichever source we have.
+# Pubkey of the authority key.
 authority_pubkey() {
-  if [[ -n "$AUTHORITY_KEY_JSON" ]]; then
-    solana-keygen pubkey <(printf '%s' "$AUTHORITY_KEY_JSON")
-  else
-    solana-keygen pubkey "$AUTHORITY_KEYPAIR"
-  fi
+  solana-keygen pubkey "$AUTHORITY_KEYPAIR"
 }
 
 # ------------------------------------------------------------
@@ -139,23 +147,20 @@ step 1 "Load authority keypair and resolve program IDs from manifest"
 [[ -f "$PROGRAM_IDS_PATH" ]] || fail "$PROGRAM_IDS_PATH not found. CI cannot bootstrap a manifest — first deploys are a manual operator action."
 
 # Resolve the upgrade-authority key. CI mode (env): set AUTHORITY_KEY_JSON
-# to the raw JSON keypair contents — the script feeds it to solana via
-# process substitution and the bytes never touch the filesystem. Local
-# mode (file): set AUTHORITY_KEYPAIR to a path on disk.
-if [[ -n "$AUTHORITY_KEY_JSON" ]]; then
+# to the raw JSON keypair contents — the script materializes it to a
+# `chmod 600` tempfile (deleted on EXIT/INT/TERM/HUP) at the top of this
+# script and points AUTHORITY_KEYPAIR at it. Local mode (file): set
+# AUTHORITY_KEYPAIR to a path on disk; AUTHORITY_KEY_JSON is unused.
+if [[ -f "$AUTHORITY_KEYPAIR" ]]; then
   WALLET="$(authority_pubkey 2>/dev/null)" \
-    || fail "AUTHORITY_KEY_JSON is set but its contents are not a valid Solana keypair JSON array."
-  AUTHORITY_SOURCE="AUTHORITY_KEY_JSON env var (in-memory; not written to disk)"
-elif [[ -f "$AUTHORITY_KEYPAIR" ]]; then
-  WALLET="$(authority_pubkey 2>/dev/null)" \
-    || fail "$AUTHORITY_KEYPAIR exists but is not a valid Solana keypair JSON file."
-  AUTHORITY_SOURCE="$AUTHORITY_KEYPAIR (local file)"
+    || fail "$AUTHORITY_KEYPAIR is not a valid Solana keypair JSON file."
+  AUTHORITY_SOURCE="$AUTHORITY_KEYPAIR"
 else
   fail "No upgrade-authority key available.
 
 CI: set the AUTHORITY_KEY_JSON env var to the raw JSON keypair contents
-(from secrets.DEVNET_AUTHORITY_KEY_JSON). The script reads it via process
-substitution; the bytes never touch the runner's disk.
+(from secrets.DEVNET_AUTHORITY_KEY_JSON). The script materializes it to a
+chmod-600 tempfile at runtime and deletes it on script exit.
 
 Local: copy your existing devnet upgrade-authority keypair to:
 
@@ -233,9 +238,10 @@ step 4 "Deploy upgrades (signed by upgrade authority)"
 # Raw `solana program deploy --program-id <PUBKEY>` (not `anchor deploy`)
 # because we don't have program keypair files in CI. The pubkey comes from
 # the manifest; the upgrade authority signs (loaded by solana_auth from
-# AUTHORITY_KEY_JSON env via process substitution in CI, or from
-# AUTHORITY_KEYPAIR file locally). For an existing program, --program-id
-# accepts an address rather than a keypair. See `solana program deploy --help`.
+# AUTHORITY_KEYPAIR — either the operator's local file or the tempfile
+# materialized at script start from AUTHORITY_KEY_JSON in CI mode). For an
+# existing program, --program-id accepts an address rather than a keypair.
+# See `solana program deploy --help`.
 declare -A DEPLOYED_AT
 for prog in "${DEPLOY_ORDER[@]}"; do
   pid="${PROGRAM_ID_OF[$prog]}"
