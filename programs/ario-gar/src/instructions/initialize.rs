@@ -154,7 +154,14 @@ pub fn initialize_epochs(
     settings.enabled = false;
     settings.current_epoch_index = 0;
     settings.genesis_timestamp = clock.unix_timestamp;
-    settings.tenure_weight_duration = 180 * 86_400; // 180 days (matches Lua tenureWeightDurationMs)
+    // !!! DEVNET FAST-TEST VALUE — REVERT BEFORE MAINNET !!!
+    // Production target is `180 * 86_400` (180 days, matches Lua
+    // tenureWeightDurationMs). Shrunk to 1 hour so tenure weight ramps
+    // across a handful of 5-min epochs on devnet for end-to-end
+    // observer/cranker iteration. See docs/DEVNET_RUNBOOK.md → "Devnet
+    // vs mainnet epoch-settings deltas". Long-term fix is to surface
+    // this via `InitializeEpochParams` (separate ticket).
+    settings.tenure_weight_duration = 1 * 3600; // 1 hour (DEVNET ONLY)
     settings.max_tenure_weight = 4; // matches Lua maxTenureWeight
     settings.gateway_reward_ratio = GATEWAY_OPERATOR_REWARD_RATE;
     settings.observer_reward_ratio = OBSERVER_REWARD_RATE;

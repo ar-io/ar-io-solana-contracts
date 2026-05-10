@@ -40,6 +40,31 @@ pub fn set_epochs_enabled(ctx: Context<UpdateEpochSettings>, enabled: bool) -> R
     Ok(())
 }
 
+/// Close the EpochSettings PDA, refunding rent to the recorded authority.
+///
+/// Authority-only. Intended for fresh-init / authority-led recovery: closing
+/// + reinitializing is the only path to overwrite the immutable init params
+/// (`epoch_duration`, `prescribed_observer_count`, `prescribed_name_count`,
+/// `min_observer_stake`, `slash_rate`, `tenure_weight_duration`,
+/// `max_tenure_weight`) once they've been written by `initialize_epochs`.
+/// `initialize_epochs` uses `init` (not `init_if_needed`), so it cannot be
+/// called twice on the same PDA without a close in between.
+///
+/// Mid-cycle closure orphans existing Epoch PDAs and halts the cranker —
+/// the existing per-epoch PDAs remain on-chain but new `create_epoch` calls
+/// will fail until `initialize_epochs` runs again.
+///
+/// Deliberately NOT gated on `!enabled`: `set_epochs_enabled(false)` is a
+/// 7-day timelock (the `enabled` flag doesn't actually flip until `disable_at`
+/// elapses + the next `create_epoch` runs), which would force authority-led
+/// recovery to wait a week. The close is destructive regardless of timing,
+/// and the authority can already do anything else dangerous.
+pub fn close_epoch_settings(_ctx: Context<CloseEpochSettings>) -> Result<()> {
+    // Anchor's `close = authority` constraint on the Accounts struct
+    // does the lamport transfer + zero-out.
+    Ok(())
+}
+
 /// Create a new epoch (F23)
 /// This is permissionless - anyone can call when the previous epoch has ended
 pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
@@ -600,6 +625,21 @@ pub struct UpdateEpochSettings<'info> {
     )]
     pub epoch_settings: Account<'info, EpochSettings>,
 
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CloseEpochSettings<'info> {
+    #[account(
+        mut,
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+        close = authority,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    #[account(mut)]
     pub authority: Signer<'info>,
 }
 

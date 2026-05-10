@@ -1093,6 +1093,163 @@ async fn test_initialize_epochs() {
     assert_eq!(epoch_settings.current_epoch_index, 0);
 }
 
+/// Verify the close_epoch_settings ix:
+/// 1. Init → close → re-init roundtrip succeeds with new params.
+/// 2. Non-authority signer is rejected with `Unauthorized`.
+#[tokio::test]
+async fn test_close_epoch_settings() {
+    let mint = Keypair::new();
+    let dummy = Pubkey::new_unique();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    // Step 1: initial init
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InitializeEpochs {
+                epoch_settings: epoch_settings_key,
+                payer: upgrade_authority_keypair().pubkey(),
+                program_data: program_data_pda(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InitializeEpochs {
+                params: ario_gar::InitializeEpochParams {
+                    authority: ctx.payer.pubkey(),
+                    epoch_duration: 86_400,
+                    observer_count: 50,
+                    name_count: 50,
+                    min_observer_stake: 50_000_000_000,
+                    slash_rate: 1000,
+                },
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &upgrade_authority_keypair()],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Step 2: non-authority signer must be rejected
+    let bad_signer = Keypair::new();
+    // Fund bad_signer so they can pay tx fees
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: bad_signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseEpochSettings {}.data(),
+        }],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::Unauthorized);
+
+    // Step 3: authority signer closes successfully
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let close_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseEpochSettings {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(close_tx).await.unwrap();
+
+    // PDA must be gone (Anchor `close = authority` zeros + drains lamports).
+    let after_close = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap();
+    assert!(
+        after_close.is_none() || after_close.unwrap().lamports == 0,
+        "EpochSettings PDA should be closed"
+    );
+
+    // Step 4: re-init with new (fast-test) params lands fresh state
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let reinit_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InitializeEpochs {
+                epoch_settings: epoch_settings_key,
+                payer: upgrade_authority_keypair().pubkey(),
+                program_data: program_data_pda(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InitializeEpochs {
+                params: ario_gar::InitializeEpochParams {
+                    authority: ctx.payer.pubkey(),
+                    epoch_duration: 300,
+                    observer_count: 5,
+                    name_count: 10,
+                    min_observer_stake: 0,
+                    slash_rate: 0,
+                },
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &upgrade_authority_keypair()],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(reinit_tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let reinit = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(reinit.epoch_duration, 300);
+    assert_eq!(reinit.prescribed_observer_count, 5);
+    assert_eq!(reinit.prescribed_name_count, 10);
+    assert_eq!(reinit.min_observer_stake, 0);
+    assert_eq!(reinit.slash_rate, 0);
+    assert!(!reinit.enabled);
+}
+
 // =========================================
 // NEW INTEGRATION TESTS
 // =========================================

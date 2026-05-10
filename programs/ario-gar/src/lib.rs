@@ -257,6 +257,14 @@ pub mod ario_gar {
         instructions::epoch::set_epochs_enabled(ctx, enabled)
     }
 
+    /// Close the EpochSettings PDA (authority-only). The only path to
+    /// overwrite the immutable init params on a singleton PDA originally
+    /// created with `init` (not `init_if_needed`). After close, the
+    /// authority can call `initialize_epochs` again with new params.
+    pub fn close_epoch_settings(ctx: Context<CloseEpochSettings>) -> Result<()> {
+        instructions::epoch::close_epoch_settings(ctx)
+    }
+
     /// Create a new epoch (F23)
     /// This is permissionless - anyone can call when the previous epoch has ended
     pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
