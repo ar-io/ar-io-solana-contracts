@@ -58,7 +58,7 @@ pub const ED25519_PROGRAM_ID: Pubkey =
 /// All `claim_*_attested` instructions match the Ed25519Program ix
 /// signer against this constant via `verify::attested::verify_attested_signature`.
 pub const ATTESTOR_PUBKEY: Pubkey =
-    solana_program::pubkey!("AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m5tgebLHaRSZ9");
+    solana_program::pubkey!("CKgG3xMKEzd2gWEZTvyrukdZHYb4hwyeTsBMeh8w9mkW");
 
 /// Deterministic test value of `ATTESTOR_PUBKEY` (derived from Ed25519
 /// seed `[1u8; 32]`). Public knowledge — used by integration tests so
