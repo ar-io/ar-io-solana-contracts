@@ -1192,7 +1192,10 @@ async fn test_close_epoch_settings() {
         &[&ctx.payer],
         blockhash,
     );
-    ctx.banks_client.process_transaction(close_tx).await.unwrap();
+    ctx.banks_client
+        .process_transaction(close_tx)
+        .await
+        .unwrap();
 
     // PDA must be gone (Anchor `close = authority` zeros + drains lamports).
     let after_close = ctx
@@ -1233,7 +1236,10 @@ async fn test_close_epoch_settings() {
         &[&ctx.payer, &upgrade_authority_keypair()],
         blockhash,
     );
-    ctx.banks_client.process_transaction(reinit_tx).await.unwrap();
+    ctx.banks_client
+        .process_transaction(reinit_tx)
+        .await
+        .unwrap();
 
     let account = ctx
         .banks_client
