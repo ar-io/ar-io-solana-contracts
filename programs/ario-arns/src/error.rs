@@ -138,4 +138,13 @@ pub enum ArnsError {
 
     #[msg("Migration deadline has passed")]
     MigrationExpired,
+
+    // =========================================
+    // ADMIN SHRINK (devnet-shrunk recovery)
+    // =========================================
+    #[msg("Registry account is already at or below the target shrunk size")]
+    RegistryAlreadyShrunk,
+
+    #[msg("Shrinking would truncate populated registry slot data")]
+    ShrinkWouldLoseData,
 }

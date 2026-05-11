@@ -138,6 +138,63 @@ fn write_gateway_registry_header(registry: &AccountInfo, authority: Pubkey) -> R
     Ok(())
 }
 
+/// Recovery-only: shrink an over-sized `GatewayRegistry` PDA back to the
+/// current binary's expected size, refunding the rent diff to the
+/// authority.
+///
+/// The use case: a build-flag flip changes `GatewayRegistry::SIZE`
+/// (e.g. crossing from a production binary that allocated a ~168 KB
+/// registry to a `devnet-shrunk` binary that expects ~1.7 KB). The
+/// on-chain account is too big for the new binary's
+/// `AccountLoader::load`, which panics with a size mismatch. This ix uses
+/// `AccountInfo` (not `AccountLoader`) so it doesn't panic, and reallocs
+/// the account down to `8 + GatewayRegistry::SIZE` of the *current*
+/// binary, then transfers the freed rent lamports to the authority.
+///
+/// Authority-gated AND `migration_active`-gated. Inert after mainnet
+/// `finalize_migration`. Refuses to truncate populated slot data
+/// (`count <= MAX_GATEWAYS`).
+pub fn admin_shrink_gateway_registry(ctx: Context<AdminShrinkGatewayRegistry>) -> Result<()> {
+    let registry = &ctx.accounts.registry;
+    let target = 8 + GatewayRegistry::SIZE;
+
+    let current_len = registry.data_len();
+    require!(current_len > target, GarError::RegistryAlreadyShrunk);
+
+    // Belt-and-braces: don't truncate into populated slot data.
+    {
+        let data = registry.try_borrow_data()?;
+        let count = u32::from_le_bytes(
+            data[40..44]
+                .try_into()
+                .map_err(|_| GarError::InvalidAccountData)?,
+        ) as usize;
+        require!(
+            count <= GatewayRegistry::MAX_GATEWAYS,
+            GarError::ShrinkWouldLoseData
+        );
+    }
+
+    registry.realloc(target, false)?;
+
+    // Refund excess rent to authority. realloc preserves the head data and
+    // truncates the (unused) tail; the account's lamports are unchanged by
+    // realloc itself, so the surplus over the new rent minimum is free to
+    // transfer.
+    let new_minimum = Rent::get()?.minimum_balance(target);
+    let refund = registry.lamports().saturating_sub(new_minimum);
+    **registry.try_borrow_mut_lamports()? -= refund;
+    **ctx.accounts.authority.try_borrow_mut_lamports()? += refund;
+
+    msg!(
+        "GatewayRegistry shrunk: {} -> {} bytes, refunded {} lamports",
+        current_len,
+        target,
+        refund
+    );
+    Ok(())
+}
+
 pub fn initialize_epochs(
     ctx: Context<InitializeEpochs>,
     params: InitializeEpochParams,
@@ -234,6 +291,29 @@ pub struct CreateGatewayRegistry<'info> {
     pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminShrinkGatewayRegistry<'info> {
+    /// Authority gate via `has_one`, migration-window gate via
+    /// `migration_active`. Inert post `finalize_migration`.
+    #[account(
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
+        constraint = settings.migration_active @ crate::error::GarError::MigrationInactive,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    /// CHECK: deliberately `AccountInfo` rather than `AccountLoader` so the
+    /// ix works against an oversized account whose current bytes no longer
+    /// match the binary's `GatewayRegistry::SIZE`. PDA seed check ensures
+    /// we only touch the canonical registry.
+    #[account(mut, seeds = [REGISTRY_SEED], bump)]
+    pub registry: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
