@@ -240,6 +240,27 @@ sync_from_manifest() {
     echo "[build-sbf] patched $lib → declare_id!(\"$prog_id\")"
   done
 
+  # Patch the `ARIO_CORE_PROGRAM_ID` const in ario-gar's lib.rs so
+  # distribute_epoch's CPI target matches the deployed ario-core. We
+  # can't pull in ario_core::ID directly because the Cargo graph already
+  # has ario-core → ario-gar (cpi feature), and adding the reverse arc
+  # would be circular. The const lives in ario-gar source as a
+  # placeholder; this sed rewrites it per cluster.
+  local core_prog_id
+  core_prog_id="$(jq -r '.programs.ario_core // ""' "$manifest")"
+  local gar_lib="programs/ario-gar/src/lib.rs"
+  if [[ -n "$core_prog_id" && "$core_prog_id" != "null" && -f "$gar_lib" ]]; then
+    # Match only the ARIO_CORE_PROGRAM_ID const line; declare_id!() was
+    # already handled in the loop above against a different macro
+    # surface, no risk of double-matching. The const is kept on one
+    # line in source for this regex to work.
+    sed -i.bak -E \
+      "s|(ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!\(\")[^\"]+(\"\))|\1$core_prog_id\2|" \
+      "$gar_lib"
+    rm -f "${gar_lib}.bak"
+    echo "[build-sbf] patched $gar_lib → ARIO_CORE_PROGRAM_ID = \"$core_prog_id\""
+  fi
+
   # cargo-build-sbf 2.1.0 iterates ALL workspace members after the build to
   # copy .so files into target/deploy/, and fails if any member's .so is
   # absent (even one that was deliberately not built). Temporarily remove

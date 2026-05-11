@@ -71,6 +71,18 @@ pub mod ario_core {
         instructions::token::handler(ctx, amount)
     }
 
+    /// Release ARIO from the protocol treasury (signed by ArioConfig PDA)
+    /// to a constrained destination. Currently the only legitimate caller
+    /// is `ario-gar::distribute_epoch` via cross-program signed CPI;
+    /// authorization is enforced by the `seeds::program = ario_gar::ID`
+    /// constraint on the `gar_settings` account in `ReleaseTreasuryToRecipient`.
+    pub fn release_treasury_to_recipient(
+        ctx: Context<ReleaseTreasuryToRecipient>,
+        amount: u64,
+    ) -> Result<()> {
+        instructions::release_treasury::release_treasury_to_recipient(ctx, amount)
+    }
+
     // =========================================
     // VAULT OPERATIONS (F4-F9)
     // =========================================

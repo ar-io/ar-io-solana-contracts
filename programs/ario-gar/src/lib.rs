@@ -2,6 +2,26 @@ use anchor_lang::prelude::*;
 
 declare_id!("ARioGarProgramXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
 
+/// Program ID of `ario-core`. Used by `distribute_epoch` to verify the
+/// CPI target when releasing protocol-treasury rewards (treasury SPL
+/// authority lives on ario-core's `ArioConfig` PDA, so distribute_epoch
+/// CPIs into `ario_core::release_treasury_to_recipient` instead of
+/// signing the SPL transfer directly).
+///
+/// Patched at build time by `build-sbf.sh --sync-from-manifest` from
+/// `program-ids/<cluster>.json` so the const matches the deployed
+/// ario-core binary on whichever cluster the build targets. Production
+/// values are committed as the placeholder; CI / local builds rewrite
+/// in place. We can't `use ario_core::ID` directly because adding
+/// ario-core as a Cargo dep here would create a cyclic dependency with
+/// the existing `ario-core → ario-gar` cpi dep used by primary-name
+/// fund-from variants.
+///
+/// Format kept on one line (via `#[rustfmt::skip]`) so the sed-based
+/// sync regex in `build-sbf.sh` stays simple.
+#[rustfmt::skip]
+pub const ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("ARioCoreProgramXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+
 pub mod error;
 pub mod instructions;
 pub mod migration;
