@@ -350,6 +350,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ario-ant-escrow"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "ario-core",
+ "ario-test-utils",
+ "blake3",
+ "ed25519-dalek",
+ "indexmap",
+ "libsecp256k1",
+ "proc-macro-crate 3.2.0",
+ "serde",
+ "serde_json",
+ "solana-program",
+ "solana-program-test",
+ "solana-sdk",
+ "spl-token 7.0.0",
+ "tokio",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "ario-arns"
 version = "0.1.0"
 dependencies = [
