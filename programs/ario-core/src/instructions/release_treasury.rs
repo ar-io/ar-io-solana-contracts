@@ -11,9 +11,9 @@
 //! once per batch to move the per-epoch reward pool from treasury into
 //! GAR's stake token account. The constraints on this ix:
 //!
-//!   * Caller authentication via `seeds::program = ario_gar::ID` on the
-//!     `gar_settings` signer — only the canonical GAR program can produce
-//!     a `gar_settings` PDA signature.
+//!   * Caller authentication via `seeds::program = config.gar_program` on
+//!     the `gar_settings` signer — only the GAR program referenced by
+//!     `ArioConfig` can produce a `gar_settings` PDA signature.
 //!   * Destination locked to `gar_settings.stake_token_account` — even if
 //!     GAR is compromised or buggy, the funds can only land in GAR's
 //!     own stake-pool token account, not an arbitrary destination.
@@ -77,23 +77,30 @@ pub struct ReleaseTreasuryToRecipient<'info> {
     /// Cross-program signer proof. Three things must hold for this
     /// account to be accepted:
     ///   * `signer` — the call carries a signature for this account.
-    ///     Only `ario-gar` can produce one (via `invoke_signed` with
-    ///     `SETTINGS_SEED`); Solana's runtime enforces that PDA
+    ///     Only the GAR program can produce one (via `invoke_signed`
+    ///     with `SETTINGS_SEED`); Solana's runtime enforces that PDA
     ///     signatures can only originate from the program owning them.
-    ///   * `seeds = [b"gar_settings"]` + `seeds::program = ario_gar::ID`
+    ///   * `seeds = [b"gar_settings"]` + `seeds::program = config.gar_program`
     ///     — the account is the canonical gar_settings PDA derived
-    ///     from the trusted ario-gar program ID.
-    ///   * `Account<'info, GatewaySettings>` — Anchor type-deserializes,
-    ///     verifying the account is owned by ario-gar.
+    ///     from the GAR program ID stored in `ArioConfig`. Storing the
+    ///     program ID in config (vs. hardcoding `ario_gar::ID`) lets
+    ///     operators rotate the trusted GAR program post-deploy
+    ///     without an ario-core rebuild — same flexibility we have
+    ///     for `arns_program`. Operators are still trusted (they hold
+    ///     `authority`), so this isn't a security regression.
+    ///   * `Account<'info, GatewaySettings>` — Anchor type-deserializes
+    ///     and verifies the account is owned by ario-gar (the
+    ///     `#[account]` discriminator includes the declaring crate's
+    ///     ID).
     ///
-    /// Together these prove: the call originated from ario-gar's code,
-    /// not from a third party impersonating gar_settings as a regular
-    /// account.
+    /// Together these prove: the call originated from the GAR program
+    /// referenced by `config.gar_program`, not from a third party
+    /// impersonating gar_settings as a regular account.
     #[account(
         signer,
         seeds = [b"gar_settings"],
         bump = gar_settings.bump,
-        seeds::program = ario_gar::ID,
+        seeds::program = config.gar_program,
     )]
     pub gar_settings: Account<'info, ario_gar::state::GatewaySettings>,
 

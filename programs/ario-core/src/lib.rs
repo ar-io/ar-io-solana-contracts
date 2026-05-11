@@ -342,6 +342,20 @@ pub mod ario_core {
     ) -> Result<()> {
         instructions::admin::admin_repair_config::handler(ctx, new_mint, new_treasury)
     }
+
+    /// Migration ix for pre-`gar_program` ArioConfig deployments.
+    /// Grows the PDA by 32 bytes and writes `config.gar_program`.
+    /// Authority-gated, migration-window gated. Idempotent. Required
+    /// once on existing deployments before the first
+    /// `release_treasury_to_recipient` call after upgrading to a
+    /// binary that uses `config.gar_program` for cross-program signer
+    /// verification.
+    pub fn admin_set_gar_program(
+        ctx: Context<AdminSetGarProgram>,
+        new_gar_program: Pubkey,
+    ) -> Result<()> {
+        instructions::admin::admin_set_gar_program::handler(ctx, new_gar_program)
+    }
 }
 
 // =========================================
@@ -355,6 +369,10 @@ pub struct InitializeParams {
     pub arns_program: Pubkey,
     pub treasury: Pubkey,
     pub migration_authority: Pubkey,
+    /// GAR program ID — pinned at init so `release_treasury_to_recipient`
+    /// can verify the cross-program signer. Existing pre-`gar_program`
+    /// deployments populate via `admin_set_gar_program`.
+    pub gar_program: Pubkey,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]

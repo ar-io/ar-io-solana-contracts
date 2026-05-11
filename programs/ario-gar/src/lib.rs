@@ -97,22 +97,6 @@ pub mod ario_gar {
         instructions::initialize::initialize_epochs(ctx, params)
     }
 
-    /// Admin one-shot: transfer SPL `Owner` authority of `protocol_token_account`
-    /// from the GatewaySettings PDA to a target authority (typically
-    /// `ario-core`'s ArioConfig PDA, which signs SPL transfers in
-    /// `ario_core::import_balance`'s genesis-distribution branch).
-    ///
-    /// Mainnet creates the treasury under ArioConfig from the start; this
-    /// instruction is the migration path for already-deployed clusters.
-    /// See `instructions::initialize::release_treasury_authority` for the
-    /// motivation comment.
-    pub fn release_treasury_authority(
-        ctx: Context<ReleaseTreasuryAuthority>,
-        new_authority: Pubkey,
-    ) -> Result<()> {
-        instructions::initialize::release_treasury_authority(ctx, new_authority)
-    }
-
     /// Admin recovery — repair `GatewaySettings.mint` /
     /// `.stake_token_account` / `.protocol_token_account` for clusters
     /// where genesis was partially-initialized. See
