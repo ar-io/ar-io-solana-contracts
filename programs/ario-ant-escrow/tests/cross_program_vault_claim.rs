@@ -264,6 +264,7 @@ async fn initialize_ario_core(ctx: &mut ProgramTestContext, mint: &Pubkey) -> Pu
             arns_program: Pubkey::new_unique(),
             treasury: Pubkey::new_unique(),
             migration_authority: ctx.payer.pubkey(),
+            gar_program: solana_sdk::pubkey::Pubkey::default(),
         },
     };
     let tx = Transaction::new_signed_with_payer(
