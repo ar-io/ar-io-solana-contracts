@@ -271,6 +271,17 @@ pub mod ario_gar {
         instructions::epoch::set_epochs_enabled(ctx, enabled)
     }
 
+    /// Update `epoch_duration` post-init, re-anchoring `genesis_timestamp`
+    /// so the next-to-be-created epoch starts at `now`. Authority-only.
+    /// Existing already-created Epoch PDAs are unaffected — they age
+    /// out via the standard retention window.
+    pub fn admin_set_epoch_duration(
+        ctx: Context<UpdateEpochSettings>,
+        new_duration: i64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
+    }
+
     /// Close the EpochSettings PDA (authority-only). The only path to
     /// overwrite the immutable init params on a singleton PDA originally
     /// created with `init` (not `init_if_needed`). After close, the
@@ -821,6 +832,21 @@ pub struct AllowlistToggledEvent {
 pub struct EpochsToggledEvent {
     pub admin: Pubkey,
     pub enabled: bool,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_epoch_duration`. Records both the duration
+/// change AND the genesis re-anchor so indexers can recompute
+/// `wall_clock_epoch = (now - genesis_timestamp) / epoch_duration`
+/// without re-fetching `EpochSettings`.
+#[event]
+pub struct EpochDurationUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_duration: i64,
+    pub new_duration: i64,
+    pub old_genesis_timestamp: i64,
+    pub new_genesis_timestamp: i64,
+    pub current_epoch_index: u64,
     pub timestamp: i64,
 }
 
