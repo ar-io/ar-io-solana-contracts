@@ -292,4 +292,13 @@ pub enum GarError {
          (must be ['withdrawal', operator, withdrawal_counter.next_id + 1])"
     )]
     InvalidExcessWithdrawalPda,
+
+    // =========================================
+    // ADMIN SHRINK (devnet-shrunk recovery)
+    // =========================================
+    #[msg("Registry account is already at or below the target shrunk size")]
+    RegistryAlreadyShrunk,
+
+    #[msg("Shrinking would truncate populated registry slot data")]
+    ShrinkWouldLoseData,
 }
