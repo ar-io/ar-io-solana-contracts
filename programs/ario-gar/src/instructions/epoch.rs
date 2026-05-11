@@ -4,8 +4,8 @@ use anchor_spl::token::TokenAccount;
 use crate::error::GarError;
 use crate::state::*;
 use crate::{
-    EpochClosedEvent, EpochCreatedEvent, EpochPrescribedEvent, EpochWeightsTalliedEvent,
-    EpochsToggledEvent, RATE_SCALE,
+    EpochClosedEvent, EpochCreatedEvent, EpochDurationUpdatedEvent, EpochPrescribedEvent,
+    EpochWeightsTalliedEvent, EpochsToggledEvent, RATE_SCALE,
 };
 
 /// Enable/disable epoch processing.
@@ -36,6 +36,71 @@ pub fn set_epochs_enabled(ctx: Context<UpdateEpochSettings>, enabled: bool) -> R
         enabled,
         timestamp: now,
     });
+
+    Ok(())
+}
+
+/// Update `epoch_duration` post-init, re-anchoring `genesis_timestamp`
+/// so the next-to-be-created epoch starts at `now`.
+///
+/// Without the re-anchor, changing `epoch_duration` would push the next
+/// epoch's `start_timestamp = genesis + current_epoch_index * new_duration`
+/// either far into the future (longer duration) or far into the past
+/// (shorter duration), breaking `create_epoch`'s `clock >= start_timestamp`
+/// check or causing the cranker to chew through a backlog of imaginary
+/// stale epochs.
+///
+/// Re-anchor math: solve `epoch_start[current_epoch_index] == now` for
+/// `genesis_timestamp`, yielding
+/// `new_genesis = now - current_epoch_index * new_duration`.
+///
+/// Authority-only. Existing already-created Epoch PDAs are unaffected
+/// (their start/end timestamps were stamped at create time). They age
+/// into closability via the normal retention window as the cranker
+/// advances `current_epoch_index` past `idx + 7`.
+pub fn admin_set_epoch_duration(
+    ctx: Context<UpdateEpochSettings>,
+    new_duration: i64,
+) -> Result<()> {
+    require!(new_duration >= 60, GarError::InvalidParameter);
+
+    let clock = Clock::get()?;
+    let settings = &mut ctx.accounts.epoch_settings;
+
+    let old_duration = settings.epoch_duration;
+    let old_genesis = settings.genesis_timestamp;
+    let current_idx = settings.current_epoch_index as i64;
+
+    let new_genesis = clock
+        .unix_timestamp
+        .checked_sub(
+            current_idx
+                .checked_mul(new_duration)
+                .ok_or(GarError::ArithmeticOverflow)?,
+        )
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    settings.epoch_duration = new_duration;
+    settings.genesis_timestamp = new_genesis;
+
+    emit!(EpochDurationUpdatedEvent {
+        admin: ctx.accounts.authority.key(),
+        old_duration,
+        new_duration,
+        old_genesis_timestamp: old_genesis,
+        new_genesis_timestamp: new_genesis,
+        current_epoch_index: settings.current_epoch_index,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "epoch_duration {} → {} sec; genesis re-anchored {} → {} at idx={}",
+        old_duration,
+        new_duration,
+        old_genesis,
+        new_genesis,
+        settings.current_epoch_index
+    );
 
     Ok(())
 }
