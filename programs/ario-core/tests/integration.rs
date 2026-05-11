@@ -292,6 +292,7 @@ async fn test_initialize() {
             arns_program,
             treasury: Pubkey::new_unique(),
             migration_authority: ctx.payer.pubkey(),
+            gar_program: solana_sdk::pubkey::Pubkey::default(),
         },
     };
 
@@ -380,6 +381,7 @@ async fn test_create_vault() {
             arns_program,
             treasury: Pubkey::new_unique(),
             migration_authority: ctx.payer.pubkey(),
+            gar_program: solana_sdk::pubkey::Pubkey::default(),
         },
     };
     let tx = Transaction::new_signed_with_payer(
@@ -503,6 +505,7 @@ async fn test_create_vault_duration_too_short() {
                     arns_program: Pubkey::new_unique(),
                     treasury: Pubkey::new_unique(),
                     migration_authority: ctx.payer.pubkey(),
+                    gar_program: solana_sdk::pubkey::Pubkey::default(),
                 },
             }
             .data(),
@@ -596,6 +599,7 @@ async fn test_request_primary_name() {
                     arns_program: Pubkey::new_unique(),
                     treasury: protocol_token.pubkey(),
                     migration_authority: ctx.payer.pubkey(),
+                    gar_program: solana_sdk::pubkey::Pubkey::default(),
                 },
             }
             .data(),
@@ -768,6 +772,7 @@ async fn initialize_config(
                     arns_program,
                     treasury: *treasury,
                     migration_authority: ctx.payer.pubkey(),
+                    gar_program: solana_sdk::pubkey::Pubkey::default(),
                 },
             }
             .data(),
@@ -7180,6 +7185,7 @@ async fn test_initialize_rejects_non_upgrade_authority() {
                     arns_program: Pubkey::new_unique(),
                     treasury: Pubkey::new_unique(),
                     migration_authority: attacker.pubkey(),
+                    gar_program: solana_sdk::pubkey::Pubkey::default(),
                 },
             }
             .data(),
@@ -7244,6 +7250,7 @@ async fn test_create_vault_cu_consumption() {
                     arns_program: Pubkey::new_unique(),
                     treasury: Pubkey::new_unique(),
                     migration_authority: payer_pk,
+                    gar_program: solana_sdk::pubkey::Pubkey::default(),
                 },
             }
             .data(),
@@ -7343,6 +7350,7 @@ async fn test_init_if_needed_vault_counter_preserved() {
                     arns_program: Pubkey::new_unique(),
                     treasury: Pubkey::new_unique(),
                     migration_authority: payer_pk,
+                    gar_program: solana_sdk::pubkey::Pubkey::default(),
                 },
             }
             .data(),

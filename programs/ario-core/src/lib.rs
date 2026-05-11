@@ -71,6 +71,18 @@ pub mod ario_core {
         instructions::token::handler(ctx, amount)
     }
 
+    /// Release ARIO from the protocol treasury (signed by ArioConfig PDA)
+    /// to a constrained destination. Currently the only legitimate caller
+    /// is `ario-gar::distribute_epoch` via cross-program signed CPI;
+    /// authorization is enforced by the `seeds::program = ario_gar::ID`
+    /// constraint on the `gar_settings` account in `ReleaseTreasuryToRecipient`.
+    pub fn release_treasury_to_recipient(
+        ctx: Context<ReleaseTreasuryToRecipient>,
+        amount: u64,
+    ) -> Result<()> {
+        instructions::release_treasury::release_treasury_to_recipient(ctx, amount)
+    }
+
     // =========================================
     // VAULT OPERATIONS (F4-F9)
     // =========================================
@@ -330,6 +342,20 @@ pub mod ario_core {
     ) -> Result<()> {
         instructions::admin::admin_repair_config::handler(ctx, new_mint, new_treasury)
     }
+
+    /// Migration ix for pre-`gar_program` ArioConfig deployments.
+    /// Grows the PDA by 32 bytes and writes `config.gar_program`.
+    /// Authority-gated, migration-window gated. Idempotent. Required
+    /// once on existing deployments before the first
+    /// `release_treasury_to_recipient` call after upgrading to a
+    /// binary that uses `config.gar_program` for cross-program signer
+    /// verification.
+    pub fn admin_set_gar_program(
+        ctx: Context<AdminSetGarProgram>,
+        new_gar_program: Pubkey,
+    ) -> Result<()> {
+        instructions::admin::admin_set_gar_program::handler(ctx, new_gar_program)
+    }
 }
 
 // =========================================
@@ -343,6 +369,10 @@ pub struct InitializeParams {
     pub arns_program: Pubkey,
     pub treasury: Pubkey,
     pub migration_authority: Pubkey,
+    /// GAR program ID — pinned at init so `release_treasury_to_recipient`
+    /// can verify the cross-program signer. Existing pre-`gar_program`
+    /// deployments populate via `admin_set_gar_program`.
+    pub gar_program: Pubkey,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]

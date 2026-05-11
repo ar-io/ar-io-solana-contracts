@@ -8,8 +8,7 @@ use anchor_lang::solana_program::{
     system_instruction,
     sysvar::Sysvar,
 };
-use anchor_spl::token::spl_token::instruction::AuthorityType;
-use anchor_spl::token::{self, Mint, SetAuthority, Token, TokenAccount};
+use anchor_spl::token::{Mint, Token, TokenAccount};
 
 use crate::error::GarError;
 use crate::state::*;
@@ -345,84 +344,6 @@ pub struct InitializeEpochs<'info> {
     pub program_data: Account<'info, ProgramData>,
 
     pub system_program: Program<'info, System>,
-}
-
-/// One-shot admin: transfer SPL `Owner` authority of `protocol_token_account`
-/// from the current GatewaySettings PDA to a target authority (typically
-/// `ario-core`'s ArioConfig PDA).
-///
-/// Why this exists: at original deploy the protocol_token_account was created
-/// under the GatewaySettings PDA's authority (the natural choice for a
-/// fee-receipt account, since `ario-gar` is where stake/reward flows live).
-/// The genesis-distribution flow added in 2026-05 (`ario-core::import_balance`
-/// SPL transfer to pre-registered holders) needs ArioConfig PDA to sign
-/// transfers FROM the treasury — a different program entirely. Re-architecting
-/// to do cross-program-CPI'd treasury releases is heavier than just moving the
-/// SPL Owner authority once. Mainnet creates the treasury under ArioConfig
-/// from the start (see `migration/import/src/devnet-setup.ts`); this
-/// instruction is the migration path for already-deployed clusters.
-///
-/// Authority required: `settings.authority` (the original protocol deployer).
-/// `new_authority` is passed by the caller — typically the ArioConfig PDA
-/// computed from `[ario_config, ARIO_CORE_PROGRAM_ID]`. Caller is responsible
-/// for ensuring the destination is an actual signer (a PDA the new program
-/// can sign for); this handler doesn't validate program ownership of the
-/// target since the legitimate target is in a different program family.
-///
-/// Emits no event — one-shot infra change, indexers don't need it. Logs via
-/// `msg!` for tx-log auditability.
-pub fn release_treasury_authority(
-    ctx: Context<ReleaseTreasuryAuthority>,
-    new_authority: Pubkey,
-) -> Result<()> {
-    let cpi_accounts = SetAuthority {
-        account_or_mint: ctx.accounts.protocol_token_account.to_account_info(),
-        current_authority: ctx.accounts.settings.to_account_info(),
-    };
-    let bump = ctx.accounts.settings.bump;
-    let signer_seeds: &[&[&[u8]]] = &[&[SETTINGS_SEED, &[bump]]];
-    let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
-        cpi_accounts,
-        signer_seeds,
-    );
-    token::set_authority(cpi_ctx, AuthorityType::AccountOwner, Some(new_authority))?;
-
-    msg!(
-        "protocol_token_account authority transferred: {} -> {}",
-        ctx.accounts.settings.key(),
-        new_authority
-    );
-    Ok(())
-}
-
-/// Admin: transfer SPL `Owner` authority of the protocol token account away
-/// from the GatewaySettings PDA. See `release_treasury_authority` for
-/// motivation.
-#[derive(Accounts)]
-pub struct ReleaseTreasuryAuthority<'info> {
-    #[account(
-        seeds = [SETTINGS_SEED],
-        bump = settings.bump,
-        has_one = authority @ crate::error::GarError::Unauthorized,
-    )]
-    pub settings: Account<'info, GatewaySettings>,
-
-    pub authority: Signer<'info>,
-
-    /// Treasury account whose SPL `Owner` authority is being transferred.
-    /// Must currently be owned by the GatewaySettings PDA (i.e. its
-    /// `owner` field equals `settings.key()`); the SetAuthority CPI
-    /// would fail otherwise but we surface the mismatch as a typed
-    /// error first.
-    #[account(
-        mut,
-        constraint = protocol_token_account.owner == settings.key()
-            @ crate::error::GarError::InvalidOwner,
-    )]
-    pub protocol_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
 }
 
 /// Admin recovery — repair `GatewaySettings` mint / stake_token_account /

@@ -184,3 +184,55 @@ pub struct AdminRepairConfig<'info> {
 
     pub authority: Signer<'info>,
 }
+
+pub mod admin_set_gar_program {
+    use super::*;
+
+    /// Migration ix for pre-`gar_program` ArioConfig deployments.
+    /// Grows the ArioConfig PDA by 32 bytes (the size of the new
+    /// `gar_program` field, appended after `bump`) and writes the
+    /// supplied GAR program ID.
+    ///
+    /// Anchor's `realloc` constraint extends the account in place
+    /// before deserialize; `realloc::zero = true` zero-fills the new
+    /// tail bytes so `gar_program` deserializes as `Pubkey::default()`
+    /// and is then overwritten by the handler with the real value.
+    ///
+    /// Idempotent: on the second call the account is already at the
+    /// target size, Anchor's realloc is a no-op, and the handler just
+    /// rewrites `gar_program`. Authority-gated and migration-window
+    /// gated like the other admin recovery ixs.
+    pub fn handler(ctx: Context<AdminSetGarProgram>, new_gar_program: Pubkey) -> Result<()> {
+        let clock = Clock::get()?;
+        require!(
+            clock.unix_timestamp < MIGRATION_DEADLINE,
+            ArioError::MigrationExpired
+        );
+
+        let config = &mut ctx.accounts.config;
+        config.gar_program = new_gar_program;
+
+        msg!("ArioConfig.gar_program set: {}", new_gar_program);
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct AdminSetGarProgram<'info> {
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ ArioError::Unauthorized,
+        constraint = config.migration_active @ ArioError::MigrationInactive,
+        realloc = ArioConfig::SIZE,
+        realloc::payer = authority,
+        realloc::zero = true,
+    )]
+    pub config: Account<'info, ArioConfig>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}

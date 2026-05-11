@@ -51,6 +51,15 @@ pub struct ArioConfig {
     pub migration_authority: Pubkey,
     /// PDA bump
     pub bump: u8,
+    /// GAR program ID. Used by `release_treasury_to_recipient` to verify
+    /// the cross-program signer (`gar_settings`) was derived from the
+    /// canonical GAR program. Mirrors the `arns_program` storage
+    /// pattern. **Appended after `bump` for backward-compatibility:**
+    /// fresh deploys via `initialize` populate it directly; pre-existing
+    /// deployments populate via `admin_set_gar_program` (which reallocs
+    /// the account and writes the field). On a pre-realloc account this
+    /// field reads as `Pubkey::default()`.
+    pub gar_program: Pubkey,
 }
 
 impl ArioConfig {
@@ -68,7 +77,8 @@ impl ArioConfig {
         + 8   // primary_name_request_expiry
         + 1   // migration_active
         + 32  // migration_authority
-        + 1; // bump
+        + 1   // bump
+        + 32; // gar_program (appended for backward-compat realloc)
 
     /// Default minimum vault duration: 14 days (matches Lua MIN_TOKEN_LOCK_TIME)
     pub const DEFAULT_MIN_VAULT_DURATION: i64 = 14 * 86_400;
@@ -576,8 +586,9 @@ mod tests {
         // discriminator(8) + authority(32) + mint(32) + arns_program(32) + treasury(32)
         // + total_supply(8) + protocol_balance(8) + circulating_supply(8) + locked_supply(8)
         // + min_vault_duration(8) + max_vault_duration(8) + primary_name_request_expiry(8)
-        // + migration_active(1) + migration_authority(32) + bump(1) = 226
-        assert_eq!(ArioConfig::SIZE, 226);
+        // + migration_active(1) + migration_authority(32) + bump(1)
+        // + gar_program(32) = 258
+        assert_eq!(ArioConfig::SIZE, 258);
     }
 
     #[test]

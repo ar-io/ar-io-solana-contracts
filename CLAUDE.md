@@ -177,6 +177,47 @@ withdrawal vault, no lock period, no penalty. CPI depth = 2 (Solana max
 share is paid from stake via CPI; initiator share from buyer's wallet
 via direct SPL transfer.
 
+**Treasury release CPI** (ario-gar → ario-core → SPL Token). The
+`protocol_token_account` SPL `Owner` authority lives on the
+`ArioConfig` PDA (ario-core), permanently. Fresh deploys set this at
+`initialize` time; legacy deployments arrived at this state via
+`release_treasury_authority` (now removed) and stay there. **Only
+ario-core can sign SPL transfers FROM the treasury.**
+
+`ario-gar::distribute_epoch` therefore CPIs into
+`ario_core::release_treasury_to_recipient` instead of signing the SPL
+transfer directly. The CPI is **hand-rolled `invoke_signed`** (not
+Anchor's typed CPI) because adding `ario-core` as a Cargo dep on
+`ario-gar` would cycle with the existing `ario-core → ario-gar` cpi
+dep used by fund-from-stakes. The hand-roll uses
+`global:release_treasury_to_recipient` as the 8-byte discriminator and
+signs with `[SETTINGS_SEED, settings.bump]` so the inner ix's
+`gar_settings: signer` constraint is satisfied. ario-gar's source has
+`pub const ARIO_CORE_PROGRAM_ID` (single line, `#[rustfmt::skip]`'d;
+patched by `build-sbf.sh --sync-from-manifest` from
+`program-ids/<cluster>.json`) used as `address =` on the
+`ario_core_program` account to pin the CPI target.
+
+ario-core's `release_treasury_to_recipient` verifies the caller is the
+canonical ario-gar program via `seeds::program = config.gar_program`
+on `gar_settings` — the GAR program ID is stored in `ArioConfig`
+(mirrors the existing `arns_program` storage pattern). Fresh deploys
+set `gar_program` at `initialize` via `InitializeParams.gar_program`;
+legacy deployments populate it once via `admin_set_gar_program`
+(authority-gated, reallocs the PDA by 32 bytes to accommodate the
+appended field). The transfer destination is locked to
+`gar_settings.stake_token_account` so even a buggy or compromised
+ario-gar can only redirect treasury funds into GAR's own stake pool —
+never an arbitrary recipient. CPI depth = 3 (gar → core → spl_token),
+under Solana's 4-hop limit.
+
+`ArioConfig.gar_program` is appended after `bump` in the struct so a
+realloc on existing accounts only adds zero-filled trailing bytes
+without shifting any existing field offsets. Other field-ordering
+changes are NOT backward-compatible — see "ArioConfig" in the
+schema-evolution checklist in [`docs/DECISIONS.md`](docs/DECISIONS.md)
+before modifying.
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool
