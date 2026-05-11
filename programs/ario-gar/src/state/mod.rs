@@ -138,7 +138,17 @@ impl GatewaySlot {
 
 /// Global gateway registry for efficient enumeration
 /// PDA: ["gateway_registry"]
-/// NOTE: Uses zero-copy for performance with large gateway counts
+/// NOTE: Uses zero-copy for performance with large gateway counts.
+///
+/// **Capacity is build-time configurable.** Production builds use 3,000
+/// slots (~168 KB on-chain, ~1.17 SOL rent). Devnet/testnet smoke-test
+/// builds enable `--features devnet-shrunk` to compile with 30 slots
+/// (~1.7 KB, ~0.012 SOL rent), avoiding ~57 SOL of stranded rent across
+/// the registries when smoke-testing capacity isn't needed. The on-chain
+/// account size MUST match the binary's expectation (Anchor zero-copy
+/// requires exact size match); deploying a `devnet-shrunk` binary against
+/// an account allocated for production size will panic on every
+/// `AccountLoader::load()`, and vice versa.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct GatewayRegistry {
@@ -146,13 +156,20 @@ pub struct GatewayRegistry {
     pub authority: Pubkey,
     pub count: u32,
     pub _padding: [u8; 4],
+    #[cfg(not(feature = "devnet-shrunk"))]
     pub gateways: [GatewaySlot; 3000],
+    #[cfg(feature = "devnet-shrunk")]
+    pub gateways: [GatewaySlot; 30],
 }
 
 impl GatewayRegistry {
-    /// 32 (authority) + 4 (count) + 4 (_padding) + 56 (GatewaySlot) * 3000 = 168,040
-    pub const SIZE: usize = 32 + 4 + 4 + (56 * 3000);
+    /// 32 (authority) + 4 (count) + 4 (_padding) + 56 (GatewaySlot) * MAX_GATEWAYS.
+    /// Production: 32+4+4+(56*3000) = 168,040. Devnet-shrunk: 32+4+4+(56*30) = 1,720.
+    pub const SIZE: usize = 32 + 4 + 4 + (56 * Self::MAX_GATEWAYS);
+    #[cfg(not(feature = "devnet-shrunk"))]
     pub const MAX_GATEWAYS: usize = 3000;
+    #[cfg(feature = "devnet-shrunk")]
+    pub const MAX_GATEWAYS: usize = 30;
 }
 
 // =========================================
@@ -699,8 +716,11 @@ pub struct Epoch {
     /// (audit M8). Replaces a former `_padding1` byte — no layout change.
     pub observations_closed: u8,
 
-    // --- Failure tallies (u16 per gateway slot) ---
+    // --- Failure tallies (u16 per gateway slot — sized to GatewayRegistry::MAX_GATEWAYS) ---
+    #[cfg(not(feature = "devnet-shrunk"))]
     pub failure_counts: [u16; 3000],
+    #[cfg(feature = "devnet-shrunk")]
+    pub failure_counts: [u16; 30],
 
     // --- Embedded prescriptions ---
     /// Observer addresses (the observer_address from Gateway, used to verify signer)
@@ -716,8 +736,11 @@ pub struct Epoch {
 }
 
 impl Epoch {
-    // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
-    pub const SIZE: usize = 9400;
+    // 9*8 + 32 + 3*4 + 8*1 + MAX_GATEWAYS*2 + 50*32*2 + 2*32 + 7 + 5.
+    // Production (3000 slots): 9400. Devnet-shrunk (30 slots): 3460 +
+    // 4 bytes trailing repr(C) alignment pad = 3464; use mem::size_of
+    // to capture either layout exactly without manual arithmetic.
+    pub const SIZE: usize = core::mem::size_of::<Self>();
 
     pub fn total_composite_weight(&self) -> u128 {
         (self.total_composite_weight_hi as u128) << 64 | (self.total_composite_weight_lo as u128)
@@ -1155,8 +1178,17 @@ mod tests {
 
     #[test]
     fn epoch_size_correct() {
-        // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
-        assert_eq!(Epoch::SIZE, 9400);
+        #[cfg(not(feature = "devnet-shrunk"))]
+        {
+            // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
+            assert_eq!(Epoch::SIZE, 9400);
+        }
+        #[cfg(feature = "devnet-shrunk")]
+        {
+            // 9*8 + 32 + 3*4 + 8*1 + 30*2 + 50*32*2 + 2*32 + 7 + 5 = 3460,
+            // padded to next u64 boundary = 3464.
+            assert_eq!(Epoch::SIZE, 3464);
+        }
     }
 
     // =========================================
@@ -1530,7 +1562,10 @@ mod tests {
 
     #[test]
     fn gateway_registry_size_correct() {
+        #[cfg(not(feature = "devnet-shrunk"))]
         assert_eq!(GatewayRegistry::SIZE, 168_040);
+        #[cfg(feature = "devnet-shrunk")]
+        assert_eq!(GatewayRegistry::SIZE, 1_720);
     }
 
     // =========================================

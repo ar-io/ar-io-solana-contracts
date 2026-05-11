@@ -315,5 +315,17 @@ esac
 #   BUILD_NETWORK=devnet cargo build-sbf -- \
 #     --package ario-ant-escrow \
 #     --no-default-features --features network-devnet
-cargo build-sbf
+#
+# When BUILD_NETWORK=devnet we activate the `devnet-shrunk` cargo feature
+# on the two programs that hold zero-copy registries (ario-gar's
+# GatewayRegistry + Epoch.failure_counts; ario-arns's NameRegistry). This
+# shrinks the on-chain footprint from ~8 MB to ~10 KB total — saving ~57
+# SOL of rent on devnet — without forking the source. Mainnet builds
+# leave the feature off; the workspace default keeps production sizes.
+SBF_FEATURE_ARGS=()
+if [[ "$BUILD_NETWORK" == "devnet" ]]; then
+    SBF_FEATURE_ARGS+=(--features "ario-gar/devnet-shrunk,ario-arns/devnet-shrunk")
+    echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
+fi
+cargo build-sbf -- "${SBF_FEATURE_ARGS[@]}"
 ls -la target/deploy/*.so

@@ -16,6 +16,10 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
+# devnet-shrunk: compile-time shrink of zero-copy registries for smoke-test
+# clusters. GatewayRegistry: 3000→30 slots (~168 KB→~1.7 KB), Epoch.failure_counts
+# matches. Mainnet/testnet MUST NOT enable this feature. See state/mod.rs.
+devnet-shrunk = []
 default = []
 
 [dependencies]

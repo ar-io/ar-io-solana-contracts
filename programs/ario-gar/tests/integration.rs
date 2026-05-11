@@ -14870,8 +14870,8 @@ async fn test_join_network_registry_full() {
     let mut reg_data = vec![0u8; registry_size];
     let reg_disc = hash(b"account:GatewayRegistry");
     reg_data[..8].copy_from_slice(&reg_disc.to_bytes()[..8]);
-    // count at offset 40 = 3000 (MAX_GATEWAYS)
-    reg_data[40..44].copy_from_slice(&3000u32.to_le_bytes());
+    // count at offset 40 = MAX_GATEWAYS (3000 production / 30 devnet-shrunk)
+    reg_data[40..44].copy_from_slice(&(GatewayRegistry::MAX_GATEWAYS as u32).to_le_bytes());
 
     pt.add_account(
         registry_key,
