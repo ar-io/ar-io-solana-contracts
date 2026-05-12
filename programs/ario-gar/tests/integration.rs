@@ -5716,8 +5716,7 @@ async fn assert_global_stake_invariants(
         .await
         .unwrap()
         .unwrap();
-    let settings =
-        GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    let settings = GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
 
     let mut sum_operator = 0u64;
     let mut sum_delegated = 0u64;
@@ -5852,14 +5851,12 @@ async fn test_stake_conservation_global() {
     let (op2, op2_token) =
         create_funded_actor(&mut ctx, &setup, 10_000_000_000, 100_000_000_000).await;
     let stake2 = 25_000_000_000u64;
-    let gw2 =
-        join_gateway_with_operator(&mut ctx, &setup, &op2, &op2_token.pubkey(), stake2).await;
+    let gw2 = join_gateway_with_operator(&mut ctx, &setup, &op2, &op2_token.pubkey(), stake2).await;
 
     let (op3, op3_token) =
         create_funded_actor(&mut ctx, &setup, 10_000_000_000, 100_000_000_000).await;
     let stake3 = 20_000_000_000u64;
-    let gw3 =
-        join_gateway_with_operator(&mut ctx, &setup, &op3, &op3_token.pubkey(), stake3).await;
+    let gw3 = join_gateway_with_operator(&mut ctx, &setup, &op3, &op3_token.pubkey(), stake3).await;
 
     let gateway_keys = vec![gw1, gw2, gw3];
     let mut withdrawal_keys: Vec<Pubkey> = Vec::new();
@@ -5920,9 +5917,36 @@ async fn test_stake_conservation_global() {
     let del_amt_2 = 8_000_000_000u64;
     let del_amt_3 = 5_000_000_000u64;
 
-    do_delegate(&mut ctx, &setup, &op1_pk, &gw1, &del1, &del1_token.pubkey(), del_amt_1).await;
-    do_delegate(&mut ctx, &setup, &op2.pubkey(), &gw2, &del2, &del2_token.pubkey(), del_amt_2).await;
-    do_delegate(&mut ctx, &setup, &op1_pk, &gw1, &del3, &del3_token.pubkey(), del_amt_3).await;
+    do_delegate(
+        &mut ctx,
+        &setup,
+        &op1_pk,
+        &gw1,
+        &del1,
+        &del1_token.pubkey(),
+        del_amt_1,
+    )
+    .await;
+    do_delegate(
+        &mut ctx,
+        &setup,
+        &op2.pubkey(),
+        &gw2,
+        &del2,
+        &del2_token.pubkey(),
+        del_amt_2,
+    )
+    .await;
+    do_delegate(
+        &mut ctx,
+        &setup,
+        &op1_pk,
+        &gw1,
+        &del3,
+        &del3_token.pubkey(),
+        del_amt_3,
+    )
+    .await;
 
     assert_global_stake_invariants(
         &mut ctx,
@@ -6020,8 +6044,7 @@ async fn test_stake_conservation_global() {
         .await
         .unwrap()
         .unwrap();
-    let settings =
-        GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    let settings = GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
     assert_eq!(
         settings.total_staked,
         stake1 + stake2 - op2_decrease + stake3,
@@ -6232,7 +6255,10 @@ async fn test_stake_conservation_slash_path() {
     assert_eq!(protected.amount, Gateway::MIN_OPERATOR_STAKE);
     assert!(protected.is_protected);
     assert!(protected.is_exit_vault);
-    assert_eq!(excess.amount, stake_amount - 2 * Gateway::MIN_OPERATOR_STAKE);
+    assert_eq!(
+        excess.amount,
+        stake_amount - 2 * Gateway::MIN_OPERATOR_STAKE
+    );
     assert!(!excess.is_protected);
 
     let gw_after = Gateway::try_deserialize(
@@ -6246,7 +6272,10 @@ async fn test_stake_conservation_slash_path() {
             .as_slice(),
     )
     .unwrap();
-    assert_eq!(gw_after.operator_stake, 0, "operator_stake zeroed after slash");
+    assert_eq!(
+        gw_after.operator_stake, 0,
+        "operator_stake zeroed after slash"
+    );
     assert_eq!(
         gw_after.total_delegated_stake, del_amount,
         "delegations not affected by slash"
@@ -6346,8 +6375,7 @@ async fn test_stake_conservation_payment_paths() {
                 token_program: spl_token::id(),
             }
             .to_account_metas(None),
-            data: ario_gar::instruction::DeductOperatorStakeForPayment { amount: op_deduct }
-                .data(),
+            data: ario_gar::instruction::DeductOperatorStakeForPayment { amount: op_deduct }.data(),
         }],
         Some(&operator_pk),
         &[&ctx.payer],
@@ -6386,8 +6414,7 @@ async fn test_stake_conservation_payment_paths() {
                 token_program: spl_token::id(),
             }
             .to_account_metas(None),
-            data: ario_gar::instruction::DeductDelegationForPayment { amount: del_deduct }
-                .data(),
+            data: ario_gar::instruction::DeductDelegationForPayment { amount: del_deduct }.data(),
         }],
         Some(&del.pubkey()),
         &[&del],
