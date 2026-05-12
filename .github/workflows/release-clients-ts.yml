@@ -1,0 +1,167 @@
+name: Release clients/ts (npm)
+
+# Publish `@ar.io/solana-contracts` to npm.
+#
+# Triggered manually from the Actions tab. The `cluster` input controls
+# which size variant of the cfg-conditional zero-copy registry fields
+# (GatewayRegistry, NameRegistry, Epoch.failure_counts) ends up baked
+# into the published encoders:
+#
+#   - devnet  → small sizes (30 / 200 / 30), published with `@devnet` dist-tag
+#   - mainnet → production sizes (3000 / 200000 / 3000), published with `@latest`
+#
+# Version is taken from `clients/ts/package.json`. For devnet releases
+# we append `-devnet.<run-attempt>` automatically so each devnet publish
+# is uniquely versioned without bumping the base semver.
+#
+# Auth: npm OIDC Trusted Publishing (same model as `@ar.io/sdk`). No
+# NPM_TOKEN secret. Requires the package to be configured for trusted
+# publishing on npmjs.com — see clients/ts/README.md "First publish".
+
+permissions:
+  contents: read
+  id-token: write  # OIDC for npm Trusted Publishing — no NPM_TOKEN secret needed
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Target cluster (devnet | mainnet) — drives cfg-conditional registry sizes"
+        type: choice
+        options:
+          - devnet
+          - mainnet
+        required: true
+      version:
+        description: "Override version (e.g. 0.2.0). Leave empty to use clients/ts/package.json"
+        type: string
+        required: false
+      dry_run:
+        description: "Dry-run: run codegen + build + npm pack, skip publish"
+        type: boolean
+        default: false
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  NODE_VERSION: 20
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-clients-ts-${{ inputs.cluster }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & publish (${{ inputs.cluster }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
+
+      - name: Install Rust BPF toolchain
+        run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-${{ inputs.cluster }}
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor \
+            --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      # Anchor generates IDLs at `target/idl/<program>.json`. The IDL
+      # includes BOTH cfg variants of conditional fields regardless of
+      # active features (Anchor IDL gen quirk). The clients/ts codegen
+      # dedupes based on CLUSTER env var.
+      - name: Anchor build (produces IDLs)
+        run: anchor build
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@ar.io'
+
+      - name: Install + build typed-client
+        working-directory: clients/ts
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+        # `yarn install` runs the postinstall hook which invokes codegen
+        # with CLUSTER set. Then build:tsc emits `lib/`.
+        run: |
+          yarn install --frozen-lockfile --ignore-engines
+          yarn build:tsc
+
+      - name: Compute version
+        id: version
+        working-directory: clients/ts
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            target="${{ inputs.version }}"
+          else
+            target="$(node -p "require('./package.json').version")"
+          fi
+          # Devnet releases get a -devnet.<run> suffix so each publish is
+          # uniquely versioned. Mainnet uses the bare semver from package.json.
+          if [[ "${{ inputs.cluster }}" == "devnet" ]]; then
+            # Strip any existing prerelease suffix to avoid e.g. 0.1.0-devnet.5-devnet.6
+            base="${target%%-*}"
+            target="${base}-devnet.${{ github.run_number }}"
+          fi
+          echo "version=${target}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${target}"
+          npm version "${target}" --no-git-tag-version --allow-same-version
+
+      - name: Determine dist-tag
+        id: tag
+        run: |
+          if [[ "${{ inputs.cluster }}" == "mainnet" ]]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=devnet" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: npm pack (sanity check)
+        working-directory: clients/ts
+        run: |
+          npm pack
+          ls -la *.tgz
+
+      - name: Publish to npm (OIDC Trusted Publishing)
+        if: ${{ ! inputs.dry_run }}
+        working-directory: clients/ts
+        # No NPM_TOKEN required — npm CLI 9.5+ uses OIDC via the
+        # workflow's `id-token: write` permission, attesting both the
+        # publisher identity AND build provenance. Requires
+        # `@ar.io/solana-contracts` to have GitHub Actions configured
+        # as a Trusted Publisher on npmjs.com.
+        run: npm publish --access public --provenance --tag ${{ steps.tag.outputs.tag }}
+
+      - name: Summary
+        run: |
+          echo "### Released \`@ar.io/solana-contracts@${{ steps.version.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Cluster:** ${{ inputs.cluster }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Dist-tag:** \`${{ steps.tag.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Dry-run:** ${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Install:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "yarn add @ar.io/solana-contracts@${{ steps.tag.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

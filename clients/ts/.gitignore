@@ -1,0 +1,16 @@
+# Node
+node_modules/
+yarn-error.log
+*.tsbuildinfo
+
+# tsc output (built on publish)
+lib/
+
+# Codama-generated source (regenerated from IDLs at install / build time).
+# Hand-written files live at `src/index.ts` and `src/<program>.ts` — the
+# subdirectories below are the codegen output.
+src/core/
+src/gar/
+src/arns/
+src/ant/
+src/ant-escrow/
