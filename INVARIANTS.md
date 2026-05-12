@@ -31,25 +31,66 @@ below to compute the protocol's actual treasury position.
 
 ## Invariant 1 — Stake-pool conservation
 
-At every point between transactions, the SPL balance of
-`stake_token_account` is exactly the sum of the on-chain accounting
-fields that claim it:
+The SPL balance of `stake_token_account` is fully accounted for by the
+sum of on-chain accounting fields that claim it:
 
 ```
 stake_token_account.balance
-  = Σ Gateway.operator_stake             // active operator principal
-  + Σ Gateway.total_delegated_stake      // active delegation principal (aggregate)
-  + Σ Withdrawal.amount                  // pending exits, including exit vaults
+  = Σ Gateway.operator_stake               // settled operator principal
+  + Σ Gateway.total_delegated_stake        // settled delegation principal (aggregate)
+  + Σ Withdrawal.amount                    // pending exits, including exit vaults
+  + Σ pending_delegate_rewards             // unsettled rewards in the per-share accumulator
 ```
 
-The sums range over every `Gateway` PDA in `Joined` or `Leaving`
-status and every `Withdrawal` PDA the program owns.
+where the first three terms range over every `Gateway` PDA in `Joined`
+or `Leaving` status and every `Withdrawal` PDA the program owns, and
+the fourth term is the sum of unsettled delegate rewards computed from
+the per-share accumulator (see ["Pending delegate rewards term"](#pending-delegate-rewards-term)
+below).
+
+> **The first three terms alone are NOT enough.** Between the moment
+> `distribute_epoch` completes and each delegate's next settlement,
+> the SPL pool is **ahead** of the three settled-state sums by exactly
+> the unsettled delegate rewards — distribute_epoch transfers tokens
+> into the pool but intentionally leaves `total_delegated_stake`
+> unchanged (the per-share accumulator pattern is O(1) per epoch
+> regardless of delegate count). Off-chain readers that omit the
+> fourth term will false-alarm on any cluster where `distribute_epoch`
+> has run more recently than every delegate has settled — i.e.,
+> essentially every production cluster, every epoch. See
+> ["Stale-by-design"](#stale-by-design-delegate-rewards) for the
+> mechanics.
+
+### Pending delegate rewards term
+
+`pending_delegate_rewards` is not stored as a field. It is computed
+per-`Delegation` from the per-share accumulator:
+
+```
+pending(delegation) = ((gateway.cumulative_reward_per_token - delegation.reward_debt) * delegation.amount) / REWARD_PRECISION
+```
+
+with the same `u128` overflow-safe quotient/remainder split and
+`u64::MAX` saturating cap that [`settle_delegate_rewards`](programs/ario-gar/src/state/mod.rs#L444)
+applies on-chain. `REWARD_PRECISION = 10^18` (state/mod.rs:8). Sum
+across every `Delegation` PDA in the program.
+
+The AR.IO SDK's [`computeLiveDelegationBalance`](https://github.com/ar-io/ar-io-sdk/blob/solana/src/solana/delegation-math.ts)
+helper (TypeScript, `@ar.io/sdk@solana`) is a 1:1 port of the on-chain
+math and is what indexers / wallets / the network portal should use
+for both display and invariant verification.
 
 ### Why it holds
 
 Every code path that moves SPL tokens into or out of
 `stake_token_account` updates the corresponding accounting field in
-the same instruction, atomically. The full mapping:
+the same instruction, atomically. The only exception is
+`distribute_epoch`, which updates `Gateway.cumulative_reward_per_token`
+(accumulator pattern) rather than `Gateway.total_delegated_stake` for
+the delegate share — the fourth invariant term above captures those
+unsettled rewards.
+
+Full mapping:
 
 | Instruction                            | Token flow                                       | Accounting delta                                                                |
 | -------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------- |
@@ -59,7 +100,7 @@ the same instruction, atomically. The full mapping:
 | `delegate_stake`                       | delegator ATA → stake pool                       | `Gateway.total_delegated_stake ↑` ; `Delegation.amount ↑`                       |
 | `decrease_delegate_stake`              | (none)                                           | `Gateway.total_delegated_stake ↓` ; `Delegation.amount ↓` ; `Withdrawal.amount ↑` |
 | `claim_delegate_from_leaving_gateway`  | (none)                                           | `Gateway.total_delegated_stake ↓` ; `Delegation.amount → 0` ; `Withdrawal.amount ↑` |
-| `distribute_epoch`                     | treasury → stake pool                            | `Gateway.operator_stake ↑` (operator share) ; `Gateway.cumulative_reward_per_token ↑` (delegate share) |
+| `distribute_epoch`                     | treasury → stake pool                            | `Gateway.operator_stake ↑` (operator share). For the delegate share: `Gateway.cumulative_reward_per_token ↑` only — `total_delegated_stake` is intentionally NOT touched; the rewards live in the accumulator until each delegate settles (see [Stale-by-design](#stale-by-design-delegate-rewards)). |
 | `cancel_withdrawal`                    | (none)                                           | `Withdrawal` closed ; `Gateway.operator_stake ↑` or `Delegation.amount ↑` (+ `total_delegated_stake ↑`) |
 | `claim_withdrawal`                     | stake pool → owner ATA                           | `Withdrawal` closed                                                             |
 | `instant_withdrawal`                   | stake pool → owner ATA (payout) + treasury (fee) | `Withdrawal` closed                                                             |
@@ -195,17 +236,52 @@ instruction.
   This is correct behavior, not a bug.
 - Indexers, wallets, and dashboards that display delegate balances
   must compute `live_balance` from the accumulator + reward_debt,
-  not read the raw field.
-- Invariant 1 still holds at all times because every delegate's
-  pending rewards are tracked at the gateway level via the
-  accumulator. The unsettled rewards live in
-  `stake_token_account` (they were transferred there by
-  `distribute_epoch`) and are accounted for under
-  `Gateway.total_delegated_stake`, which `distribute_epoch`
-  increments alongside `cumulative_reward_per_token`.
+  not read the raw field. The AR.IO SDK does this automatically in
+  `getGatewayDelegates` / `getDelegations` / `getAllDelegates` since
+  `@ar.io/sdk@solana` >= 4.0.0-solana.6.
 - Operators don't have this problem — `distribute_epoch` writes
   directly into `Gateway.operator_stake`, so a snapshot of that
   field is always the live operator balance.
+
+### Invariant 1 violation window
+
+Between `distribute_epoch` completing and each delegate's next
+settlement (via any delegation IX or via permissionless
+`compound_delegation_rewards`), the three settled-state terms in
+Invariant 1 (`Σ operator_stake + Σ total_delegated_stake +
+Σ Withdrawal.amount`) are **strictly less than** the SPL pool
+balance — by exactly the unsettled delegate-reward amount.
+
+What happens during `distribute_epoch`
+([`distribution.rs:35-337`](programs/ario-gar/src/instructions/distribution.rs)):
+
+1. SPL transfer: `protocol_token_account → stake_token_account` for
+   the full batch reward (operator + delegate shares combined,
+   line 285-299).
+2. `Gateway.operator_stake ↑` (line 222) and `settings.total_staked ↑`
+   (line 330-334) — operator share.
+3. `Gateway.cumulative_reward_per_token ↑` (line 240-243) — delegate
+   share goes into the accumulator.
+4. `Gateway.total_delegated_stake` and `settings.total_delegated` are
+   **not** touched.
+
+The fourth term in Invariant 1 (`Σ pending_delegate_rewards`)
+captures exactly this gap; it is what restores the equation.
+
+In practice every production cluster is in this window almost
+continuously — `distribute_epoch` runs every epoch, dormant
+delegations may never settle for weeks. The fourth term is therefore
+mandatory for any off-chain health check; omitting it produces a
+false-positive after every epoch.
+
+`Σ pending_delegate_rewards == 0` only when the accumulator has not
+advanced since every delegation last settled, which is fleeting in
+production.
+
+The supply-counter shadow ([Invariant 2](#invariant-2--supply-counter-shadow))
+is unaffected — `settings.total_delegated` is equally stale as
+`Σ Gateway.total_delegated_stake`, so both sides agree. Only the
+SPL-pool-vs-accounting equation depends on the fourth term.
 
 ## Known limits
 
@@ -261,26 +337,70 @@ The shared helpers `assert_global_stake_invariants` and
 `create_funded_actor` (defined near the first invariant test) are
 reusable for any future scenario test.
 
+> **Coverage caveat.** None of these tests call `distribute_epoch`,
+> so none exercise the [Invariant 1 violation window](#invariant-1-violation-window) directly. The helper
+> `assert_global_stake_invariants` checks the three settled-state
+> terms only and is sufficient for the scenarios it's run against
+> (join / delegate / decrease / slash / payment — all of which leave
+> `sumPendingRewards == 0`). Extending the helper and adding a
+> `test_stake_conservation_distribute_window` test that exercises a
+> full epoch cycle (create → tally → prescribe → save_observations
+> → distribute → assert with the fourth term) is the obvious
+> follow-up; it's left as future work because the epoch-cycle setup
+> in integration tests is substantial.
+
 ### Off-chain monitoring
 
 A periodic health-check job that sums on-chain state and compares it
-to the pool balance is the canonical operational tool. Pseudocode:
+to the pool balance is the canonical operational tool. The fourth
+invariant term is mandatory — omitting it produces false positives
+after every `distribute_epoch` (see [Invariant 1 violation window](#invariant-1-violation-window)).
 
 ```typescript
+import { computeLiveDelegationBalance, REWARD_PRECISION } from '@ar.io/sdk/solana';
+
 const settings    = await fetchGatewaySettings(rpc);
-const gateways    = await fetchAllGateways(rpc);
+const gateways    = await fetchAllGateways(rpc);            // includes cumulative_reward_per_token
+const delegations = await fetchAllDelegations(rpc);          // includes reward_debt
 const withdrawals = await fetchAllWithdrawals(rpc);
-const poolBalance = (await rpc.getTokenAccountBalance(settings.stake_token_account)).value.amount;
+const poolBalance = BigInt(
+  (await rpc.getTokenAccountBalance(settings.stake_token_account)).value.amount,
+);
 
-const sumOperator  = gateways.reduce((s, g) => s + g.operator_stake, 0n);
-const sumDelegated = gateways.reduce((s, g) => s + g.total_delegated_stake, 0n);
-const sumWithdrawn = withdrawals.reduce((s, w) => s + w.amount, 0n);
+const gatewayByAddr = new Map(gateways.map((g) => [g.address, g]));
 
-assert(BigInt(poolBalance) === sumOperator + sumDelegated + sumWithdrawn);                  // Invariant 1
-assert(sumOperator  === settings.total_staked);                                              // Invariant 2 (split)
-assert(sumDelegated === settings.total_delegated);
-assert(sumWithdrawn === settings.total_withdrawn);
+const sumOperator  = gateways.reduce((s, g) => s + BigInt(g.operator_stake), 0n);
+const sumDelegated = gateways.reduce((s, g) => s + BigInt(g.total_delegated_stake), 0n);
+const sumWithdrawn = withdrawals.reduce((s, w) => s + BigInt(w.amount), 0n);
+
+// Fourth term: unsettled delegate rewards, computed from each delegation's
+// reward_debt vs its gateway's cumulative_reward_per_token. The on-chain
+// `settle_delegate_rewards` does exactly this when a delegate next interacts.
+const sumPendingRewards = delegations.reduce((s, d) => {
+  const gw = gatewayByAddr.get(d.gateway);
+  if (!gw) return s;
+  const live = computeLiveDelegationBalance({
+    delegatedStake: d.amount,
+    rewardDebt: d.reward_debt,
+    cumulativeRewardPerToken: gw.cumulative_reward_per_token,
+  });
+  return s + BigInt(live - d.amount); // pending = live - settled
+}, 0n);
+
+// Invariant 1 — stake-pool conservation with all four terms.
+assert(poolBalance === sumOperator + sumDelegated + sumWithdrawn + sumPendingRewards);
+
+// Invariant 2 — supply-counter shadow (independent of distribute_epoch staleness;
+// both sides are equally stale, so they always agree).
+assert(sumOperator  === BigInt(settings.total_staked));
+assert(sumDelegated === BigInt(settings.total_delegated));
+assert(sumWithdrawn === BigInt(settings.total_withdrawn));
 ```
 
 Run this against every cluster (devnet, mainnet) on a schedule.
 Drift indicates a real bug and should page.
+
+**Sanity tip:** if Invariant 2 holds but Invariant 1 fails by a small
+positive amount, you're almost certainly missing the
+`sumPendingRewards` term. Compute it (or use the SDK's
+`computeLiveDelegationBalance`) and re-check.
