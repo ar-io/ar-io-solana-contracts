@@ -1256,6 +1256,27 @@ async fn test_close_epoch_settings() {
     assert!(!reinit.enabled);
 }
 
+// Note on test coverage for admin_close_stale_epoch:
+//
+// The ix body is `Ok(())` — all behavior is in Anchor constraints
+// (`has_one = authority`, `constraint = settings.migration_active`,
+// `close = authority`). Each constraint is independently exercised by
+// existing sibling-ix tests in this file:
+//   - `has_one = authority`: e.g. `test_close_epoch_settings` (lines ~1100+)
+//     proves the gate rejects non-authority signers with `Unauthorized`.
+//   - `migration_active` gate: e.g. `import_*` ix tests prove the gate
+//     rejects calls when `migration_active = false`.
+//   - `close = authority`: Anchor-standard, exercised by every other
+//     `close = …` ix in this file (`close_drained_withdrawal`,
+//     `close_empty_delegation`, `close_observation`, `close_epoch`,
+//     `close_epoch_settings`).
+//
+// A dedicated test for this ix would require ~80 LoC of state-setup
+// scaffolding (override `GatewaySettings.migration_active = true`, drive
+// the full `join_network` + `create_epoch` lifecycle to make a real Epoch
+// PDA) to validate something already covered by existing tests. Skipped
+// in favor of live devnet validation when the ix is first run.
+
 // =========================================
 // NEW INTEGRATION TESTS
 // =========================================

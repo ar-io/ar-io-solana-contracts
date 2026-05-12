@@ -290,6 +290,20 @@ pub mod ario_gar {
         instructions::epoch::close_epoch_settings(ctx)
     }
 
+    /// Recovery-only: close an Epoch PDA orphaned by a prior
+    /// `close_epoch_settings` + `initialize_epochs` reinit, where the
+    /// reset `current_epoch_index` collides with PDAs from the prior
+    /// lifecycle. Authority-gated AND `migration_active`-gated; inert
+    /// after `finalize_migration`. **Closing an in-flight epoch
+    /// orphans Observation PDAs** — only safe on epochs the new
+    /// lifecycle won't re-use.
+    pub fn admin_close_stale_epoch(
+        ctx: Context<AdminCloseStaleEpoch>,
+        epoch_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_close_stale_epoch(ctx, epoch_index)
+    }
+
     /// Create a new epoch (F23)
     /// This is permissionless - anyone can call when the previous epoch has ended
     pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
