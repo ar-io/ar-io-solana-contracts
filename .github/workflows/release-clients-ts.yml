@@ -13,9 +13,14 @@ name: Release clients/ts (npm)
 # Version is taken from `clients/ts/package.json`. For devnet releases
 # we append `-devnet.<run-attempt>` automatically so each devnet publish
 # is uniquely versioned without bumping the base semver.
+#
+# Auth: npm OIDC Trusted Publishing (same model as `@ar.io/sdk`). No
+# NPM_TOKEN secret. Requires the package to be configured for trusted
+# publishing on npmjs.com — see clients/ts/README.md "First publish".
 
 permissions:
   contents: read
+  id-token: write  # OIDC for npm Trusted Publishing — no NPM_TOKEN secret needed
 
 on:
   workflow_dispatch:
@@ -138,12 +143,15 @@ jobs:
           npm pack
           ls -la *.tgz
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC Trusted Publishing)
         if: ${{ ! inputs.dry_run }}
         working-directory: clients/ts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --tag ${{ steps.tag.outputs.tag }}
+        # No NPM_TOKEN required — npm CLI 9.5+ uses OIDC via the
+        # workflow's `id-token: write` permission, attesting both the
+        # publisher identity AND build provenance. Requires
+        # `@ar.io/solana-contracts` to have GitHub Actions configured
+        # as a Trusted Publisher on npmjs.com.
+        run: npm publish --access public --provenance --tag ${{ steps.tag.outputs.tag }}
 
       - name: Summary
         run: |

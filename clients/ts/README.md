@@ -106,6 +106,47 @@ yarn install              # postinstall regenerates src/<program>/
 yarn build:tsc            # compiles to lib/
 ```
 
+`CLUSTER=mainnet yarn codegen` picks the production-sized variant of the
+cfg-conditional zero-copy registries (see "Cluster coupling" above).
+Default is `devnet`.
+
+## Publishing
+
+CI workflow `.github/workflows/release-clients-ts.yml` is
+[workflow_dispatch]-triggered with `cluster` (devnet | mainnet),
+optional `version` override, and optional `dry_run`.
+
+Auth uses **npm OIDC Trusted Publishing** — same model as `@ar.io/sdk`.
+No `NPM_TOKEN` secret in CI. The workflow declares `id-token: write`;
+npm CLI ≥9.5 negotiates the OIDC handshake with npmjs.com and attests
+both publisher identity AND build provenance.
+
+### First publish (chicken-and-egg)
+
+Trusted publishers are configured **per package** on npm, so the
+package must exist before the trusted-publisher rule can be added.
+One-time bootstrap:
+
+1. Publish `0.1.0-devnet.0` manually from a local checkout with
+   `npm publish --access public --tag devnet` (using your personal
+   npm credentials).
+2. On npmjs.com: navigate to `@ar.io/solana-contracts` → **Settings**
+   → **Trusted Publishers** → **Add Trusted Publisher**:
+   - Publisher: GitHub Actions
+   - Organization: `ar-io`
+   - Repository: `ar-io-solana-contracts`
+   - Workflow filename: `release-clients-ts.yml`
+   - Environment: *(leave blank)*
+3. Subsequent releases (devnet rebuilds, mainnet promotion, version
+   bumps) all run through CI — no token, no manual step.
+
+### Dist-tags
+
+| Tag | Cluster | Use for |
+|---|---|---|
+| `@latest` | mainnet | `yarn add @ar.io/solana-contracts` |
+| `@devnet` | devnet | `yarn add @ar.io/solana-contracts@devnet` |
+
 ## License
 
 [AGPL-3.0-or-later](./LICENSE).
