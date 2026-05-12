@@ -125,38 +125,20 @@ both publisher identity AND build provenance.
 
 Trusted publishers are configured **per package** on npm, so the
 package must exist before the trusted-publisher rule can be added.
-The workflow supports both auth modes — use `NPM_TOKEN` for the
-bootstrap, then strip it once OIDC is configured.
+One-time bootstrap:
 
-**Bootstrap (entirely mobile-friendly — no shell required):**
-
-1. **Generate an npm token** on npmjs.com → Account → **Access Tokens**
-   → **Generate New Token** → **Granular Access Token**:
-   - Name: `ar-io-solana-contracts CI bootstrap`
-   - Expiration: 7 days (intentionally short; this is a throwaway)
-   - Packages and scopes: `@ar.io/*` ("Read and write" permission)
-2. **Add as GitHub secret:**
-   `ar-io/ar-io-solana-contracts` → Settings → Secrets and variables
-   → Actions → New repository secret → name `NPM_TOKEN`, paste the
-   value.
-3. **Trigger the release workflow:** Actions tab → "Release clients/ts (npm)"
-   → Run workflow → `cluster=devnet`, leave version blank,
-   `dry_run=false`. Wait for the run to finish (~5 min). It will
-   publish `@ar.io/solana-contracts@0.1.0-devnet.<run>` to npm.
-4. **Configure trusted publisher** on npmjs.com:
-   `@ar.io/solana-contracts` page → **Settings** → **Trusted Publishers**
-   → **Add Trusted Publisher**:
+1. Publish `0.1.0-devnet.0` manually from a local checkout with
+   `npm publish --access public --tag devnet` (using your personal
+   npm credentials).
+2. On npmjs.com: navigate to `@ar.io/solana-contracts` → **Settings**
+   → **Trusted Publishers** → **Add Trusted Publisher**:
    - Publisher: GitHub Actions
    - Organization: `ar-io`
    - Repository: `ar-io-solana-contracts`
    - Workflow filename: `release-clients-ts.yml`
    - Environment: *(leave blank)*
-5. **Remove the NPM_TOKEN secret** from GitHub (let it expire
-   naturally, or delete now — it's no longer used).
-
-From this point on the workflow uses OIDC (`id-token: write` +
-`npm publish --provenance`) — no token in CI, signed provenance
-attestations on every release.
+3. Subsequent releases (devnet rebuilds, mainnet promotion, version
+   bumps) all run through CI — no token, no manual step.
 
 ### Dist-tags
 
