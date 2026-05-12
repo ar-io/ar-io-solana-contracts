@@ -49,6 +49,15 @@ const REPO_ROOT = resolve(CLIENT_ROOT, '..', '..');
 const ANCHOR_IDL_DIR = resolve(REPO_ROOT, 'target/idl');
 const OUT_ROOT = resolve(CLIENT_ROOT, 'src');
 
+// Target cluster — drives cfg-conditional field dedup. See
+// `dedupeCfgConditionalFields` for the size-pick logic.
+const CLUSTER = (process.env.CLUSTER ?? 'devnet').toLowerCase();
+if (CLUSTER !== 'devnet' && CLUSTER !== 'mainnet') {
+  console.error(`[codegen] CLUSTER must be 'devnet' or 'mainnet'; got '${CLUSTER}'`);
+  process.exit(1);
+}
+console.log(`[codegen] CLUSTER=${CLUSTER}`);
+
 const PROGRAMS = [
   { idl: 'ario_core', out: 'core' },
   { idl: 'ario_gar', out: 'gar' },
@@ -121,18 +130,18 @@ console.log(`[codegen] ${PROGRAMS.length} programs ✓`);
  * `{ name: "names", type: [NameEntry; 200] }` — Codama renders both,
  * tsc rejects with `TS2300: Duplicate identifier`.
  *
- * We deduplicate by name within each struct type, keeping the SMALLER
- * variant (the `devnet-shrunk` size). This matches:
- *   1. The currently-deployed devnet binaries (built with
- *      `--features devnet-shrunk` per `build-sbf.sh`)
- *   2. The published `@ar.io/sdk@solana` client (idls/ vendored with the
- *      shrunk variant)
+ * We deduplicate by name within each struct type, picking the variant
+ * appropriate for the target cluster:
+ *   - `CLUSTER=devnet` (default): keep the SMALLER variant. Matches
+ *     `build-sbf.sh BUILD_NETWORK=devnet` which compiles the .so with
+ *     `--features devnet-shrunk`.
+ *   - `CLUSTER=mainnet`: keep the LARGER variant. Matches the default
+ *     workspace features (no `devnet-shrunk`), used for production deploys.
  *
- * A future mainnet-targeted typed-client release will swap to the
- * production sizes — likely via a major version bump or a separate
- * cluster-suffixed package.
+ * The CI release workflow sets `CLUSTER` from the workflow input.
  */
 function dedupeCfgConditionalFields(idl) {
+  const preferSmaller = CLUSTER !== 'mainnet';
   const dedupe = (type) => {
     if (!type || !type.fields || !Array.isArray(type.fields)) return;
     const seen = new Map(); // name -> { idx, size }
@@ -142,15 +151,17 @@ function dedupeCfgConditionalFields(idl) {
       const prev = seen.get(field.name);
       if (prev === undefined) {
         seen.set(field.name, { idx, size });
-      } else {
-        // Keep whichever has the smaller fixed-array size. If sizes are
-        // equal (or non-fixed-array), keep the FIRST occurrence.
-        if (size != null && prev.size != null && size < prev.size) {
+      } else if (size != null && prev.size != null && size !== prev.size) {
+        const keepCurrent = preferSmaller ? size < prev.size : size > prev.size;
+        if (keepCurrent) {
           toDrop.add(prev.idx);
           seen.set(field.name, { idx, size });
         } else {
           toDrop.add(idx);
         }
+      } else {
+        // Sizes equal or non-fixed-array — keep the FIRST occurrence.
+        toDrop.add(idx);
       }
     });
     if (toDrop.size > 0) {
