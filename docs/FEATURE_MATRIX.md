@@ -20,7 +20,7 @@ This document maps every feature from the current AO Lua contract to its Solana 
 
 | ID | Feature | Lua Source | Solana Program | Instruction(s) | Status |
 |----|---------|------------|----------------|-----------------|--------|
-| F1 | Token Transfer | `token.lua`, `balances.lua` | ario-core | `transfer` | [R] |
+| F1 | Token Transfer | `token.lua`, `balances.lua` | (none — standard SPL) | Standard SPL Token `transferChecked`. The custom `ario-core::transfer` ix is **deprecated in-place** (kept for IDL stability; SDK no longer calls it). See `docs/REMOVE_CUSTOM_TRANSFER_PLAN.md`. | [R] |
 | F2 | Balance Query | `balances.lua` | ario-core | SPL Token `getBalance` | [R] |
 | F3 | Total Supply Tracking | `balances.lua` | ario-core | `initialize` (config tracks supply components) | [R] |
 

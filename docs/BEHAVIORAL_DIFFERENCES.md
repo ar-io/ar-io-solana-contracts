@@ -544,8 +544,8 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | | |
 |---|---|
 | **Lua Behavior** | `balances.transfer`: `assert(from ~= recipient, "Cannot transfer to self")` — checks address equality. |
-| **Solana Behavior** | `transfer`: `require!(from_token_account.key() != to_token_account.key(), ArioError::SelfTransfer)` — checks token account equality, not wallet equality. Two different token accounts owned by the same wallet can transfer between each other. |
-| **Rationale** | SPL Token operates on token accounts, not wallets. A user may have multiple token accounts for the same mint. Preventing same-account transfers avoids no-op transactions. |
+| **Solana Behavior** | The custom `ario-core::transfer` ix is **deprecated** (see `docs/REMOVE_CUSTOM_TRANSFER_PLAN.md`); the SDK now builds standard SPL `transferChecked`, which has **no self-transfer guard** — a no-op same-ATA transfer succeeds. The deprecated ix retained `require!(from_token_account.key() != to_token_account.key(), ArioError::SelfTransfer)` for any straggler caller — checks token-account equality, not wallet equality. |
+| **Rationale** | SPL Token operates on token accounts, not wallets — a user may have multiple ATAs for the same mint. The original guard was defensive against AO-style address aliasing that doesn't exist on Solana. Standard SPL transfers are well-understood and don't need our wrapper; relying on them removes the ATA pre-existence bug class entirely (wallets auto-create ATAs for standard SPL transfers). |
 
 ### BD-086: Epoch Rewards — Leaving Gateways Get Zero
 
