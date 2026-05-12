@@ -344,7 +344,7 @@ esac
 # SOL of rent on devnet — without forking the source. Mainnet builds
 # leave the feature off; the workspace default keeps production sizes.
 SBF_FEATURE_ARGS=()
-if [[ "$BUILD_NETWORK" == "devnet" ]]; then
+if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
     SBF_FEATURE_ARGS+=(--features devnet-shrunk)
     echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
 fi
