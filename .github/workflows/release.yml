@@ -49,6 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      semver: ${{ steps.ver.outputs.semver }}
     permissions:
       contents: write
       pull-requests: write
@@ -110,19 +111,26 @@ jobs:
           # Fall back to nearest semver ancestor via git-describe (--match keeps
           # non-semver release tags like devnet-YYYYMMDD-… out of the search).
           # Last resort: SHA+timestamp.
-          semver=$(git describe --tags --exact-match --match "v[0-9]*" 2>/dev/null || true)
-          if [[ -n "$semver" ]]; then
-            version="${{ inputs.cluster }}-${semver}"
+          semver_tag=$(git describe --tags --exact-match --match "v[0-9]*" 2>/dev/null || true)
+          if [[ -n "$semver_tag" ]]; then
+            version="${{ inputs.cluster }}-${semver_tag}"
+            semver="${semver_tag#v}"
           else
             described=$(git describe --tags --always --match "v[0-9]*" 2>/dev/null || true)
             if [[ -n "$described" ]] && echo "$described" | grep -qE "^v[0-9]"; then
               version="${{ inputs.cluster }}-${described}"
+              # Strip leading "v" and any trailing "-<offset>-g<sha>" so the
+              # downstream typed-client publish gets clean semver.
+              base="${described#v}"
+              semver="${base%-*-g*}"
             else
               short_sha=$(git rev-parse --short HEAD)
               version="${{ inputs.cluster }}-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+              semver=""
             fi
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "semver=${semver}" >> "$GITHUB_OUTPUT"
 
       - name: Package release bundle
         env:
@@ -163,3 +171,21 @@ jobs:
             --target "${target_branch}" \
             --prerelease \
             "release/ar-io-solana-contracts-${VERSION}.tar.gz"
+
+  # Publish the matching typed-client to npm whenever a contract
+  # release ships. Devnet contract releases publish to the @devnet
+  # dist-tag (with -devnet.<run> suffix); mainnet → @latest. The
+  # `version` input carries the contract semver (extracted from the
+  # release-plz tag, if any) so the npm package version reads
+  # `0.3.0-devnet.42` for contract `devnet-v0.3.0`.
+  publish-typed-client:
+    needs: release
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-clients-ts.yml
+    with:
+      cluster: ${{ inputs.cluster }}
+      version: ${{ needs.release.outputs.semver }}
+      dry_run: false
+    secrets: inherit

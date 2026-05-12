@@ -40,6 +40,22 @@ on:
         description: "Dry-run: run codegen + build + npm pack, skip publish"
         type: boolean
         default: false
+  # Reusable from release.yml so a contract release also publishes
+  # the matching typed-client release. release.yml passes its computed
+  # semver (e.g. `0.3.0` extracted from a `devnet-v0.3.0` git tag) via
+  # `version`; the publish step suffixes `-devnet.<run>` for devnet
+  # releases so the npm version aligns with the contract release.
+  workflow_call:
+    inputs:
+      cluster:
+        type: string
+        required: true
+      version:
+        type: string
+        required: false
+      dry_run:
+        type: boolean
+        default: false
 
 env:
   ANCHOR_VERSION: 0.31.1
