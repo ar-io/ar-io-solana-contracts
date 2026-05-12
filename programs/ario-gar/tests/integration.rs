@@ -6040,6 +6040,406 @@ async fn test_stake_conservation_global() {
 }
 
 #[tokio::test]
+async fn test_stake_conservation_slash_path() {
+    // Property test for INVARIANTS.md #1/#2/#3 across the prune_gateway slash flow.
+    //
+    // Scenario:
+    //   1. Gateway joins with 50k ARIO operator stake (well above the 20k min).
+    //   2. Delegator delegates 5k ARIO to that gateway.
+    //   3. failed_consecutive is injected at 30 (== max_consecutive_failures from
+    //      pre_create_epoch_settings) to make the gateway eligible for pruning.
+    //   4. prune_gateway is called. Per gateway.rs:
+    //        - slash_amount = min(MIN_OPERATOR_STAKE, operator_stake) = 20k
+    //        - post_slash    = 50k - 20k = 30k
+    //        - protected     = min(20k, 30k) = 20k        (Withdrawal #0)
+    //        - excess        = 30k - 20k = 10k            (Withdrawal #1)
+    //        - slash transferred stake → protocol treasury
+    //
+    // Asserts:
+    //   * Invariant 1: stake_token_account.balance equals Σ operator_stake +
+    //     Σ total_delegated_stake + Σ Withdrawal.amount after the slash.
+    //   * Invariant 2: GatewaySettings supply counters track per-entity sums.
+    //   * Invariant 3 / treasury inflow: protocol_token_account grew by exactly
+    //     MIN_OPERATOR_STAKE.
+    //   * Delegations are untouched by the slash.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Join with 50k ARIO (well above 20k min so post_slash > min, exercising both vaults).
+    let operator_pk = ctx.payer.pubkey();
+    let stake_amount = 50_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // Delegator with 5k delegation
+    let (del, del_token) =
+        create_funded_actor(&mut ctx, &setup, 5_000_000_000, 50_000_000_000).await;
+    let del_amount = 5_000_000_000u64;
+    let (del_delegation, _) = delegation_pda(&operator_pk, &del.pubkey());
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: del_delegation,
+                delegator_token_account: del_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: del.pubkey(),
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake { amount: del_amount }.data(),
+        }],
+        Some(&del.pubkey()),
+        &[&del],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let gateway_keys = vec![gateway_key];
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &[],
+        "after join + delegate",
+    )
+    .await;
+
+    // Snapshot treasury before the slash
+    let treasury_before = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+
+    // Inject failed_consecutive = 30 to make the gateway eligible for pruning.
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    gw.stats.failed_consecutive = 30;
+    let mut new_data = Vec::new();
+    gw.try_serialize(&mut new_data).unwrap();
+    let original_len = gw_account.data.len();
+    new_data.resize(original_len, 0);
+    ctx.set_account(
+        &gateway_key,
+        &solana_sdk::account::Account {
+            lamports: gw_account.lamports,
+            data: new_data,
+            owner: gw_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Call prune_gateway. Operator gets exit_id=0 (protected vault) and id=1 (excess vault).
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (op_wd_counter, _) = withdrawal_counter_pda(&operator_pk);
+    let (protected_vault, _) = withdrawal_pda(&operator_pk, 0);
+    let (excess_vault, _) = withdrawal_pda(&operator_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::PruneGateway {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_key,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: op_wd_counter,
+                withdrawal: protected_vault,
+                excess_withdrawal: Some(excess_vault),
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: operator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::PruneGateway {}.data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Invariant 1 + 2 still hold after slash.
+    let withdrawal_keys = vec![protected_vault, excess_vault];
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &withdrawal_keys,
+        "after prune_gateway slash",
+    )
+    .await;
+
+    // Invariant 3 / treasury inflow: protocol_token_account grew by exactly slash_amount.
+    let treasury_after = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    assert_eq!(
+        treasury_after - treasury_before,
+        Gateway::MIN_OPERATOR_STAKE,
+        "treasury did not receive slash_amount (= MIN_OPERATOR_STAKE)"
+    );
+
+    // Slash math: protected = 20k, excess = 10k, delegation intact at 5k.
+    let protected = Withdrawal::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(protected_vault)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    let excess = Withdrawal::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(excess_vault)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(protected.amount, Gateway::MIN_OPERATOR_STAKE);
+    assert!(protected.is_protected);
+    assert!(protected.is_exit_vault);
+    assert_eq!(excess.amount, stake_amount - 2 * Gateway::MIN_OPERATOR_STAKE);
+    assert!(!excess.is_protected);
+
+    let gw_after = Gateway::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(gw_after.operator_stake, 0, "operator_stake zeroed after slash");
+    assert_eq!(
+        gw_after.total_delegated_stake, del_amount,
+        "delegations not affected by slash"
+    );
+    assert!(matches!(gw_after.status, GatewayStatus::Leaving));
+}
+
+#[tokio::test]
+async fn test_stake_conservation_payment_paths() {
+    // Property test for INVARIANTS.md across the cross-flow payment paths
+    // (deduct_operator_stake_for_payment, deduct_delegation_for_payment).
+    // These instructions move tokens stake_token_account → protocol_token_account
+    // while decrementing the corresponding accounting field; they're designed
+    // to be CPI'd from ario-arns for ArNS purchases funded from stake.
+    //
+    // Asserts:
+    //   * Invariant 1 holds after each deduct (pool balance still matches
+    //     the per-entity sums even though tokens left the pool).
+    //   * Invariant 2 supply counters track in lockstep with per-entity state.
+    //   * Treasury (protocol_token_account) gains exactly the deducted amount.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let stake_amount = 30_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // Delegator with 8k delegation
+    let (del, del_token) =
+        create_funded_actor(&mut ctx, &setup, 5_000_000_000, 50_000_000_000).await;
+    let del_amount = 8_000_000_000u64;
+    let (del_delegation, _) = delegation_pda(&operator_pk, &del.pubkey());
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: del_delegation,
+                delegator_token_account: del_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: del.pubkey(),
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake { amount: del_amount }.data(),
+        }],
+        Some(&del.pubkey()),
+        &[&del],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let gateway_keys = vec![gateway_key];
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &[],
+        "after join + delegate",
+    )
+    .await;
+
+    // ---- Operator deducts from their own stake to pay the protocol ------
+    let treasury_t0 = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    let op_deduct = 5_000_000_000u64;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DeductOperatorStakeForPayment {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                operator: operator_pk,
+                token_program: spl_token::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DeductOperatorStakeForPayment { amount: op_deduct }
+                .data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &[],
+        "after deduct_operator_stake_for_payment",
+    )
+    .await;
+    let treasury_t1 = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    assert_eq!(
+        treasury_t1 - treasury_t0,
+        op_deduct,
+        "treasury did not receive operator-stake deduction"
+    );
+
+    // ---- Delegator deducts from their own delegation --------------------
+    let del_deduct = 2_000_000_000u64;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DeductDelegationForPayment {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: del_delegation,
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                delegator: del.pubkey(),
+                token_program: spl_token::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DeductDelegationForPayment { amount: del_deduct }
+                .data(),
+        }],
+        Some(&del.pubkey()),
+        &[&del],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &[],
+        "after deduct_delegation_for_payment",
+    )
+    .await;
+    let treasury_t2 = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    assert_eq!(
+        treasury_t2 - treasury_t1,
+        del_deduct,
+        "treasury did not receive delegation deduction"
+    );
+
+    // Final balance check: operator and delegation accounting reflect both deductions.
+    let gw_final = Gateway::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(gw_final.operator_stake, stake_amount - op_deduct);
+    assert_eq!(gw_final.total_delegated_stake, del_amount - del_deduct);
+
+    let del_final = Delegation::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(del_delegation)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(del_final.amount, del_amount - del_deduct);
+}
+
+#[tokio::test]
 async fn test_epoch_reward_budget_not_exceeded() {
     // Verify that reward distribution never transfers more than epoch.total_eligible_rewards
     // from the protocol token account.

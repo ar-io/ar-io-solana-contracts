@@ -244,20 +244,22 @@ slashed; their positions flow through
 
 ## Verifying the invariants
 
-### Property test
+### Property tests
 
-[`programs/ario-gar/tests/integration.rs::test_stake_conservation_global`](programs/ario-gar/tests/integration.rs)
-exercises Invariants 1 and 2 across a multi-gateway / multi-delegate
-scenario with mixed operations (joins, delegations, decreases,
-withdrawals, reward distribution). The existing
-`test_stake_conservation_across_operations` is a narrower
-single-gateway version of the same check. Future paths worth adding
-as their own focused tests:
+The invariants are asserted by four tests in
+[`programs/ario-gar/tests/integration.rs`](programs/ario-gar/tests/integration.rs)
+(grep for `test_stake_conservation_`):
 
-- Slash flow via `prune_gateway` after triggering enough failed
-  observations.
-- Cross-program payment via `deduct_*_for_payment` invoked through
-  `ario-arns`.
+| Test                                       | Coverage                                                                                       |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `test_stake_conservation_across_operations`| Single gateway: join → decrease → invariant after each. The original regression check.         |
+| `test_stake_conservation_global`           | 3 gateways + 3 delegations + decreases. Asserts Invariants 1 and 2 at every checkpoint.        |
+| `test_stake_conservation_slash_path`       | `prune_gateway` slash: verifies stake-pool conservation across the slash + Invariant 3 (treasury inflow equals `MIN_OPERATOR_STAKE`) + delegations untouched. |
+| `test_stake_conservation_payment_paths`    | `deduct_operator_stake_for_payment` and `deduct_delegation_for_payment`: stake → treasury cross-flow preserves both invariants and treasury inflow matches the deduction amount. |
+
+The shared helpers `assert_global_stake_invariants` and
+`create_funded_actor` (defined near the first invariant test) are
+reusable for any future scenario test.
 
 ### Off-chain monitoring
 
