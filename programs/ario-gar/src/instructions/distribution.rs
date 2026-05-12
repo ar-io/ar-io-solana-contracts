@@ -235,6 +235,22 @@ pub fn distribute_epoch<'info>(
             // either invariant, the epoch fails loudly with
             // ArithmeticOverflow instead of silently zeroing delegate
             // accruals for the batch.
+            //
+            // NOTE: We intentionally do NOT update `p.gateway.total_delegated_stake`
+            // or `settings.total_delegated` here. Doing so per-delegate would be
+            // O(delegates) per epoch and blow the compute budget; doing so only
+            // at the gateway aggregate would silently change the accumulator's
+            // denominator semantics for the next epoch (rewards would start
+            // compounding into the principal). Instead, the per-share accumulator
+            // (`cumulative_reward_per_token`) is what tracks unsettled delegate
+            // rewards; each `Delegation.amount` is updated lazily on the next
+            // delegate interaction or via permissionless `compound_delegation_rewards`.
+            //
+            // Consequence: between this point and each delegate's next settlement,
+            // `stake_token_account.balance > Σ operator_stake + Σ total_delegated_stake
+            // + Σ Withdrawal.amount` by exactly the unsettled-rewards amount.
+            // See INVARIANTS.md §"Invariant 1 violation window" for the off-chain
+            // health-check formula.
             if delegate_pool > 0 && p.gateway.total_delegated_stake > 0 {
                 let increment = (delegate_pool as u128)
                     .checked_mul(REWARD_PRECISION)
