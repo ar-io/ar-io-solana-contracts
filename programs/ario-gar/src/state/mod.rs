@@ -78,6 +78,19 @@ pub struct GatewaySettings {
     pub arns_program_id: Pubkey,
     /// Aggregate supply counters — updated atomically at every staking mutation site.
     /// Enables the SDK to return the full AoTokenSupplyData breakdown (parity with Lua).
+    ///
+    /// **Invariant (supply-counter shadow):** these counters must always equal
+    /// the per-entity sums computed across every `Gateway` and `Withdrawal` PDA:
+    ///
+    /// ```text
+    /// total_staked     == Σ Gateway.operator_stake
+    /// total_delegated  == Σ Gateway.total_delegated_stake
+    /// total_withdrawn  == Σ Withdrawal.amount
+    /// ```
+    ///
+    /// Any drift indicates a missed-update bug in some instruction. See
+    /// `INVARIANTS.md` (Invariant 2) for the full health-check formula and the
+    /// global property test in `programs/ario-gar/tests/integration.rs`.
     pub total_staked: u64,
     pub total_delegated: u64,
     pub total_withdrawn: u64,
@@ -428,9 +441,27 @@ impl RegistryIndex {
 pub struct Delegation {
     pub gateway: Pubkey,
     pub delegator: Pubkey,
+    /// Last-settled delegate principal. **Stale-by-design between epochs.**
+    ///
+    /// `distribute_epoch` does NOT increment this field per delegate — instead it
+    /// advances `Gateway.cumulative_reward_per_token`. The live balance is:
+    ///
+    /// ```text
+    /// live = amount + ((gateway.cumulative_reward_per_token - reward_debt) * amount) / REWARD_PRECISION
+    /// ```
+    ///
+    /// Use [`settle_delegate_rewards`] to realize pending rewards into this field
+    /// (called automatically on every delegation interaction, and exposed as the
+    /// permissionless `compound_delegation_rewards` instruction).
+    ///
+    /// Indexers, wallets, and dashboards must compute the live value from the
+    /// accumulator; reading `amount` directly under-reports earnings. See
+    /// `INVARIANTS.md` ("Stale-by-design: delegate rewards").
     pub amount: u64,
     pub start_timestamp: i64,
-    /// Snapshot of gateway.cumulative_reward_per_token at last settlement
+    /// Snapshot of `gateway.cumulative_reward_per_token` at the last call to
+    /// [`settle_delegate_rewards`]. The difference between this and the
+    /// gateway's current accumulator is what's owed to the delegate.
     pub reward_debt: u128,
     pub bump: u8,
 }

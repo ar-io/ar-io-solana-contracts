@@ -5691,6 +5691,354 @@ async fn test_stake_conservation_across_operations() {
     );
 }
 
+/// Read the program-tracked stake state and assert both invariants documented in
+/// `INVARIANTS.md`:
+///
+/// 1. `stake_token_account.balance == Σ Gateway.operator_stake + Σ Gateway.total_delegated_stake + Σ Withdrawal.amount`
+/// 2. `GatewaySettings.{total_staked, total_delegated, total_withdrawn}` equals the per-entity sums.
+///
+/// `gateway_keys` lists every Gateway PDA in the test. `withdrawal_keys` lists
+/// every Withdrawal PDA that has been created so far; closed/uninitialized
+/// entries are skipped silently. `label` is included in assertion messages to
+/// identify which checkpoint failed.
+async fn assert_global_stake_invariants(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_keys: &[Pubkey],
+    withdrawal_keys: &[Pubkey],
+    label: &str,
+) {
+    let pool_balance = get_token_balance(ctx, &setup.stake_token.pubkey()).await;
+
+    let settings_acc = ctx
+        .banks_client
+        .get_account(setup.settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings =
+        GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+
+    let mut sum_operator = 0u64;
+    let mut sum_delegated = 0u64;
+    for gw_key in gateway_keys {
+        let gw_acc = ctx
+            .banks_client
+            .get_account(*gw_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let gw = Gateway::try_deserialize(&mut gw_acc.data.as_slice()).unwrap();
+        sum_operator += gw.operator_stake;
+        sum_delegated += gw.total_delegated_stake;
+    }
+
+    let mut sum_withdrawn = 0u64;
+    for wd_key in withdrawal_keys {
+        let Some(wd_acc) = ctx.banks_client.get_account(*wd_key).await.unwrap() else {
+            continue;
+        };
+        if wd_acc.data.len() < 8 {
+            continue;
+        }
+        if let Ok(wd) = Withdrawal::try_deserialize(&mut wd_acc.data.as_slice()) {
+            sum_withdrawn += wd.amount;
+        }
+    }
+
+    // Invariant 1 — stake pool conservation
+    assert_eq!(
+        pool_balance,
+        sum_operator + sum_delegated + sum_withdrawn,
+        "[{label}] Invariant 1 violated: stake_token_account.balance ({pool_balance}) != \
+         Σ operator_stake ({sum_operator}) + Σ total_delegated_stake ({sum_delegated}) + \
+         Σ Withdrawal.amount ({sum_withdrawn})"
+    );
+
+    // Invariant 2 — supply-counter shadow
+    assert_eq!(
+        settings.total_staked, sum_operator,
+        "[{label}] Invariant 2 violated: settings.total_staked ({}) != Σ operator_stake ({sum_operator})",
+        settings.total_staked
+    );
+    assert_eq!(
+        settings.total_delegated, sum_delegated,
+        "[{label}] Invariant 2 violated: settings.total_delegated ({}) != Σ total_delegated_stake ({sum_delegated})",
+        settings.total_delegated
+    );
+    assert_eq!(
+        settings.total_withdrawn, sum_withdrawn,
+        "[{label}] Invariant 2 violated: settings.total_withdrawn ({}) != Σ Withdrawal.amount ({sum_withdrawn})",
+        settings.total_withdrawn
+    );
+}
+
+/// Create and fund a new actor (SOL for fees/rent + a token ATA with `mint_amount` ARIO).
+async fn create_funded_actor(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    sol_lamports: u64,
+    mint_amount: u64,
+) -> (Keypair, Keypair) {
+    let actor = Keypair::new();
+    let actor_token = Keypair::new();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &actor.pubkey(),
+            sol_lamports,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    create_token_account(ctx, &actor_token, &setup.mint.pubkey(), &actor.pubkey()).await;
+    mint_tokens(
+        ctx,
+        &setup.mint.pubkey(),
+        &actor_token.pubkey(),
+        &setup.mint_authority,
+        mint_amount,
+    )
+    .await;
+
+    (actor, actor_token)
+}
+
+#[tokio::test]
+async fn test_stake_conservation_global() {
+    // Multi-gateway / multi-delegator property test for INVARIANTS.md (#1 and #2).
+    //
+    // Scenario:
+    //   1. Three gateways join with different stakes.
+    //   2. Three delegators delegate to a mix of gateways (one gateway has 2
+    //      delegators, exercising aggregation under total_delegated_stake).
+    //   3. One operator decreases their stake (creates a Withdrawal PDA;
+    //      tokens stay in the pool).
+    //   4. One delegator decreases their delegation (second Withdrawal PDA).
+    //
+    // After each step we assert both invariants hold globally across all
+    // gateways and withdrawals, and that the GatewaySettings supply counters
+    // match the per-entity sums.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // ---- Step 1: three gateways join -------------------------------------
+    let op1_pk = ctx.payer.pubkey();
+    let stake1 = 30_000_000_000u64;
+    let gw1 = join_gateway(&mut ctx, &setup, stake1).await;
+
+    let (op2, op2_token) =
+        create_funded_actor(&mut ctx, &setup, 10_000_000_000, 100_000_000_000).await;
+    let stake2 = 25_000_000_000u64;
+    let gw2 =
+        join_gateway_with_operator(&mut ctx, &setup, &op2, &op2_token.pubkey(), stake2).await;
+
+    let (op3, op3_token) =
+        create_funded_actor(&mut ctx, &setup, 10_000_000_000, 100_000_000_000).await;
+    let stake3 = 20_000_000_000u64;
+    let gw3 =
+        join_gateway_with_operator(&mut ctx, &setup, &op3, &op3_token.pubkey(), stake3).await;
+
+    let gateway_keys = vec![gw1, gw2, gw3];
+    let mut withdrawal_keys: Vec<Pubkey> = Vec::new();
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &withdrawal_keys,
+        "after 3 gateways join",
+    )
+    .await;
+
+    // ---- Step 2: three delegations ---------------------------------------
+    // del1 → gw1, del2 → gw2, del3 → gw1 (two delegators on gw1)
+    let (del1, del1_token) =
+        create_funded_actor(&mut ctx, &setup, 5_000_000_000, 50_000_000_000).await;
+    let (del2, del2_token) =
+        create_funded_actor(&mut ctx, &setup, 5_000_000_000, 50_000_000_000).await;
+    let (del3, del3_token) =
+        create_funded_actor(&mut ctx, &setup, 5_000_000_000, 50_000_000_000).await;
+
+    async fn do_delegate(
+        ctx: &mut ProgramTestContext,
+        setup: &GarSetup,
+        gateway_operator: &Pubkey,
+        gateway_key: &Pubkey,
+        delegator: &Keypair,
+        delegator_token: &Pubkey,
+        amount: u64,
+    ) {
+        let delegator_pk = delegator.pubkey();
+        let (delegation_key, _) = delegation_pda(gateway_operator, &delegator_pk);
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DelegateStake {
+                    settings: setup.settings_key,
+                    gateway: *gateway_key,
+                    delegation: delegation_key,
+                    delegator_token_account: *delegator_token,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    delegator: delegator_pk,
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DelegateStake { amount }.data(),
+            }],
+            Some(&delegator_pk),
+            &[delegator],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    let del_amt_1 = 10_000_000_000u64;
+    let del_amt_2 = 8_000_000_000u64;
+    let del_amt_3 = 5_000_000_000u64;
+
+    do_delegate(&mut ctx, &setup, &op1_pk, &gw1, &del1, &del1_token.pubkey(), del_amt_1).await;
+    do_delegate(&mut ctx, &setup, &op2.pubkey(), &gw2, &del2, &del2_token.pubkey(), del_amt_2).await;
+    do_delegate(&mut ctx, &setup, &op1_pk, &gw1, &del3, &del3_token.pubkey(), del_amt_3).await;
+
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &withdrawal_keys,
+        "after 3 delegations",
+    )
+    .await;
+
+    // ---- Step 3: op2 decreases their operator stake ----------------------
+    let op2_decrease = 5_000_000_000u64;
+    let (op2_wd_counter, _) = withdrawal_counter_pda(&op2.pubkey());
+    let (op2_wd_0, _) = withdrawal_pda(&op2.pubkey(), 0);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DecreaseOperatorStake {
+                settings: setup.settings_key,
+                gateway: gw2,
+                withdrawal_counter: op2_wd_counter,
+                withdrawal: op2_wd_0,
+                operator: op2.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DecreaseOperatorStake {
+                amount: op2_decrease,
+            }
+            .data(),
+        }],
+        Some(&op2.pubkey()),
+        &[&op2],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    withdrawal_keys.push(op2_wd_0);
+
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &withdrawal_keys,
+        "after op2 decrease_operator_stake",
+    )
+    .await;
+
+    // ---- Step 4: del3 decreases their delegation -------------------------
+    let del3_decrease = 2_000_000_000u64;
+    let (del3_delegation, _) = delegation_pda(&op1_pk, &del3.pubkey());
+    let (del3_wd_counter, _) = withdrawal_counter_pda(&del3.pubkey());
+    let (del3_wd_0, _) = withdrawal_pda(&del3.pubkey(), 0);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DecreaseDelegateStake {
+                settings: setup.settings_key,
+                gateway: gw1,
+                delegation: del3_delegation,
+                withdrawal_counter: del3_wd_counter,
+                withdrawal: del3_wd_0,
+                delegator: del3.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DecreaseDelegateStake {
+                amount: del3_decrease,
+            }
+            .data(),
+        }],
+        Some(&del3.pubkey()),
+        &[&del3],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    withdrawal_keys.push(del3_wd_0);
+
+    assert_global_stake_invariants(
+        &mut ctx,
+        &setup,
+        &gateway_keys,
+        &withdrawal_keys,
+        "after del3 decrease_delegate_stake",
+    )
+    .await;
+
+    // Sanity: expected supply-counter totals at the end
+    let settings_acc = ctx
+        .banks_client
+        .get_account(setup.settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings =
+        GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    assert_eq!(
+        settings.total_staked,
+        stake1 + stake2 - op2_decrease + stake3,
+        "final total_staked mismatch"
+    );
+    assert_eq!(
+        settings.total_delegated,
+        del_amt_1 + del_amt_2 + del_amt_3 - del3_decrease,
+        "final total_delegated mismatch"
+    );
+    assert_eq!(
+        settings.total_withdrawn,
+        op2_decrease + del3_decrease,
+        "final total_withdrawn mismatch"
+    );
+}
+
 #[tokio::test]
 async fn test_epoch_reward_budget_not_exceeded() {
     // Verify that reward distribution never transfers more than epoch.total_eligible_rewards
