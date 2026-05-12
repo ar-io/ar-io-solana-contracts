@@ -143,15 +143,24 @@ jobs:
           npm pack
           ls -la *.tgz
 
-      - name: Publish to npm (OIDC Trusted Publishing)
+      - name: Publish to npm
         if: ${{ ! inputs.dry_run }}
         working-directory: clients/ts
-        # No NPM_TOKEN required — npm CLI 9.5+ uses OIDC via the
-        # workflow's `id-token: write` permission, attesting both the
-        # publisher identity AND build provenance. Requires
-        # `@ar.io/solana-contracts` to have GitHub Actions configured
-        # as a Trusted Publisher on npmjs.com.
-        run: npm publish --access public --provenance --tag ${{ steps.tag.outputs.tag }}
+        env:
+          # Dual-mode auth. If NPM_TOKEN secret is set, npm CLI uses it
+          # (token-based auth — needed for the FIRST publish since the
+          # package must exist before a Trusted Publisher rule can be
+          # added on npmjs.com). Once Trusted Publishing is configured
+          # the secret can be removed; the workflow's `id-token: write`
+          # permission lets npm CLI 9.5+ negotiate OIDC instead.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -n "$NODE_AUTH_TOKEN" ]]; then
+            echo "::notice::Publishing with NPM_TOKEN (token-based auth). Remove the secret once Trusted Publishing is configured to switch to OIDC."
+          else
+            echo "::notice::Publishing via OIDC Trusted Publishing (no token)."
+          fi
+          npm publish --access public --provenance --tag ${{ steps.tag.outputs.tag }}
 
       - name: Summary
         run: |
