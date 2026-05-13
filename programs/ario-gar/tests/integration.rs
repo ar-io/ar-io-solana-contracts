@@ -1068,6 +1068,8 @@ async fn test_initialize_epochs() {
                     name_count: 10,
                     min_observer_stake: 10_000_000_000,
                     slash_rate: 1000,
+                    tenure_weight_duration: 180 * 86_400,
+                    max_tenure_weight: 4,
                 },
             }
             .data(),
@@ -1091,6 +1093,125 @@ async fn test_initialize_epochs() {
     assert_eq!(epoch_settings.prescribed_name_count, 10);
     assert!(!epoch_settings.enabled);
     assert_eq!(epoch_settings.current_epoch_index, 0);
+    // Tenure-ramp params are caller-supplied — confirm they round-trip
+    // intact (regression guard against the earlier hardcoded `3600` /
+    // `4` defaults that leaked from devnet into a mainnet-bound build).
+    assert_eq!(epoch_settings.tenure_weight_duration, 180 * 86_400);
+    assert_eq!(epoch_settings.max_tenure_weight, 4);
+}
+
+/// `initialize_epochs` must reject zero / negative tenure-ramp params.
+/// Zero `tenure_weight_duration` would divide-by-zero in
+/// `GatewayWeights::compute`; zero `max_tenure_weight` would peg every
+/// gateway's tenure_weight to 0 and silently disable observer / reward
+/// flows. Caller is the upgrade authority — these are operator-typo
+/// guards, not adversarial defenses.
+async fn send_initialize_epochs(
+    ctx: &mut solana_program_test::ProgramTestContext,
+    epoch_settings_key: Pubkey,
+    params: ario_gar::InitializeEpochParams,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let blockhash = ctx.banks_client.get_latest_blockhash().await?;
+    let upgrade_auth = upgrade_authority_keypair();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InitializeEpochs {
+                epoch_settings: epoch_settings_key,
+                payer: upgrade_auth.pubkey(),
+                program_data: program_data_pda(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InitializeEpochs { params }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &upgrade_auth],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_initialize_epochs_rejects_zero_tenure_params() {
+    let mint = Keypair::new();
+    let dummy = Pubkey::new_unique();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    let base = ario_gar::InitializeEpochParams {
+        authority: ctx.payer.pubkey(),
+        epoch_duration: 86_400,
+        observer_count: 5,
+        name_count: 10,
+        min_observer_stake: 10_000_000_000,
+        slash_rate: 1000,
+        tenure_weight_duration: 180 * 86_400,
+        max_tenure_weight: 4,
+    };
+
+    // Zero tenure_weight_duration → reject.
+    let err = send_initialize_epochs(
+        &mut ctx,
+        epoch_settings_key,
+        ario_gar::InitializeEpochParams {
+            tenure_weight_duration: 0,
+            ..base.clone()
+        },
+    )
+    .await
+    .expect_err("init must reject tenure_weight_duration=0");
+    assert!(
+        format!("{err:?}").contains("Custom"),
+        "expected on-chain Custom error, got: {err:?}",
+    );
+
+    // Negative tenure_weight_duration → reject.
+    let err = send_initialize_epochs(
+        &mut ctx,
+        epoch_settings_key,
+        ario_gar::InitializeEpochParams {
+            tenure_weight_duration: -1,
+            ..base.clone()
+        },
+    )
+    .await
+    .expect_err("init must reject tenure_weight_duration<0");
+    assert!(
+        format!("{err:?}").contains("Custom"),
+        "expected on-chain Custom error, got: {err:?}",
+    );
+
+    // Zero max_tenure_weight → reject.
+    let err = send_initialize_epochs(
+        &mut ctx,
+        epoch_settings_key,
+        ario_gar::InitializeEpochParams {
+            max_tenure_weight: 0,
+            ..base.clone()
+        },
+    )
+    .await
+    .expect_err("init must reject max_tenure_weight=0");
+    assert!(
+        format!("{err:?}").contains("Custom"),
+        "expected on-chain Custom error, got: {err:?}",
+    );
+
+    // Sanity: original valid params still succeed (no account-already-in-use
+    // leakage from rejected calls — Anchor `init` constraint must still
+    // see EpochSettings as un-initialized after every revert).
+    send_initialize_epochs(&mut ctx, epoch_settings_key, base)
+        .await
+        .expect("init with valid params must succeed after prior rejections");
 }
 
 /// Verify the close_epoch_settings ix:
@@ -1132,6 +1253,8 @@ async fn test_close_epoch_settings() {
                     name_count: 50,
                     min_observer_stake: 50_000_000_000,
                     slash_rate: 1000,
+                    tenure_weight_duration: 180 * 86_400,
+                    max_tenure_weight: 4,
                 },
             }
             .data(),
@@ -1228,6 +1351,8 @@ async fn test_close_epoch_settings() {
                     name_count: 10,
                     min_observer_stake: 0,
                     slash_rate: 0,
+                    tenure_weight_duration: 180 * 86_400,
+                    max_tenure_weight: 4,
                 },
             }
             .data(),
@@ -9031,6 +9156,8 @@ async fn test_set_epochs_enabled() {
                     name_count: 2,
                     min_observer_stake: 10_000_000_000,
                     slash_rate: 0,
+                    tenure_weight_duration: 180 * 86_400,
+                    max_tenure_weight: 4,
                 },
             }
             .data(),

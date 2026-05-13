@@ -1,10 +1,20 @@
 # Epoch Settings Reinit + Fast-Test Devnet — Implementation Plan
 
-**Status:** queued. **Target:** devnet (`ario-gar` program ID
+**Status:** partially done. **Target:** devnet (`ario-gar` program ID
 `AF8QAEaR4hzsqeUDwEdeTXMYtdyFegTENBdnJro6WVLR`). **Driver:** observer/cranker
 iteration is impractical with production-realistic defaults (1-day epochs,
 180-day tenure ramp). Reduce to 5-min epochs / 1-hour tenure ramp for
 end-to-end testing.
+
+**Update — tenure-weight params are now caller-supplied:**
+`InitializeEpochParams` exposes `tenure_weight_duration` (i64) and
+`max_tenure_weight` (u64). The previous "source-level edit" footnote is
+obsolete; devnet ops pass `1 * 3600 / 4` and mainnet ops pass
+`180 * 86_400 / 4`. See the "Param targets" table below. Operators with
+already-initialized `EpochSettings` PDAs that carry the old hardcoded
+`3600` still need `close_epoch_settings` + `initialize_epochs` (with
+explicit params) to overwrite on-chain state — the code change alone
+does not rewrite existing accounts.
 
 ## Why "close + reinit"
 
@@ -38,15 +48,11 @@ the only invariant — no permanent admin-mutation surface.
 | `name_count` / `prescribed_name_count`         | `10`         | `50`           |
 | `min_observer_stake`                           | `0`          | `50_000_000_000` (50k ARIO) |
 | `slash_rate`                                   | leave as-is  | —              |
+| `tenure_weight_duration`                       | `1 * 3600`   | `180 * 86_400` |
+| `max_tenure_weight`                            | `4`          | `4`            |
 
-Source-level edit (NOT in `InitializeEpochParams`):
-
-- `programs/ario-gar/src/instructions/initialize.rs:157`:
-  `settings.tenure_weight_duration = 180 * 86_400` → `1 * 3600` (1 hour).
-- `:158` (`max_tenure_weight = 4`) — leave alone.
-
-Long-term: parameterize `tenure_weight_duration` via
-`InitializeEpochParams` as a separate ticket. Don't block on it.
+All of the above are now caller-supplied via `InitializeEpochParams`;
+no source-level edit required. The reinit flow below stays the same.
 
 ## Implementation
 
@@ -147,9 +153,9 @@ Picks up the new ix automatically — no hand edits to generated clients.
 
 - `docs/DEVNET_RUNBOOK.md` (or wherever the mainnet/devnet matrix is
   documented in this repo — confirm during implementation) — new "Devnet
-  vs mainnet epoch-settings deltas" subsection. Includes the 5-row table
-  + a callout on `tenure_weight_duration` being a source-level edit (not
-  in `InitializeEpochParams`).
+  vs mainnet epoch-settings deltas" subsection. Includes the 7-row
+  table above. `tenure_weight_duration` / `max_tenure_weight` are
+  caller-supplied via `InitializeEpochParams` (no source-level edit).
 
 ## Devnet ops sequence (post-merge)
 

@@ -198,6 +198,18 @@ pub fn initialize_epochs(
     ctx: Context<InitializeEpochs>,
     params: InitializeEpochParams,
 ) -> Result<()> {
+    // Both tenure-ramp params must be positive: zero `tenure_weight_duration`
+    // would divide-by-zero in `GatewayWeights::compute`, and zero
+    // `max_tenure_weight` would peg every gateway's tenure_weight to 0 and
+    // therefore wipe composite_weight (silently disabling reward / observer
+    // selection). Caller is the migration authority — these checks catch
+    // operator typos, not adversarial input.
+    require!(
+        params.tenure_weight_duration > 0,
+        GarError::InvalidParameter
+    );
+    require!(params.max_tenure_weight > 0, GarError::InvalidParameter);
+
     let clock = Clock::get()?;
     let settings = &mut ctx.accounts.epoch_settings;
 
@@ -210,15 +222,15 @@ pub fn initialize_epochs(
     settings.enabled = false;
     settings.current_epoch_index = 0;
     settings.genesis_timestamp = clock.unix_timestamp;
-    // !!! DEVNET FAST-TEST VALUE — REVERT BEFORE MAINNET !!!
-    // Production target is `180 * 86_400` (180 days, matches Lua
-    // tenureWeightDurationMs). Shrunk to 1 hour so tenure weight ramps
-    // across a handful of 5-min epochs on devnet for end-to-end
-    // observer/cranker iteration. See docs/DEVNET_RUNBOOK.md → "Devnet
-    // vs mainnet epoch-settings deltas". Long-term fix is to surface
-    // this via `InitializeEpochParams` (separate ticket).
-    settings.tenure_weight_duration = 3600; // 1 hour (DEVNET ONLY)
-    settings.max_tenure_weight = 4; // matches Lua maxTenureWeight
+    // Tenure-ramp denominator + ceiling are now caller-supplied so devnet
+    // can pass a short value (e.g. 3600 = 1 hour) for fast iteration while
+    // mainnet uses the Lua/production constant (`180 * 86_400` = 180 days,
+    // `max_tenure_weight = 4`). The earlier hardcoded `3600` was a devnet
+    // fast-test default that leaked into a mainnet-bound build and
+    // inflated tenure_weight for newly-joined gateways, distorting
+    // weighted-observer selection probability.
+    settings.tenure_weight_duration = params.tenure_weight_duration;
+    settings.max_tenure_weight = params.max_tenure_weight;
     settings.gateway_reward_ratio = GATEWAY_OPERATOR_REWARD_RATE;
     settings.observer_reward_ratio = OBSERVER_REWARD_RATE;
     settings.missed_observation_penalty_rate = MISSED_OBSERVATION_PENALTY;
