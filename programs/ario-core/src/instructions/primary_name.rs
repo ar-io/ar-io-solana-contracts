@@ -194,17 +194,32 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
     Ok(u64::from_le_bytes(df_bytes))
 }
 
-/// Read the record owner from an AntRecord PDA in the ANT program named
-/// by the asset's `ANT Program` attribute (or `ario_ant::ID` fallback).
+/// Read the record owner from an AntRecord PDA in the canonical ARIO-ANT
+/// program (`ario_ant::ID`).
 ///
-/// `ant_program` selects which program owns the AntRecord PDA — derived
-/// from the asset's Metaplex Core Attributes plugin in callers, with a
-/// canonical fallback. Hard-coding `ario_ant::ID` here would defeat the
-/// asset-side pluggability (ADR-016 / BD-100) — the AntRecord PDA lives
-/// in whichever program manages the asset's per-mint state.
+/// SECURITY: `ant_program` MUST equal `ario_ant::ID` — the helper rejects
+/// anything else. The earlier version of this helper trusted whatever
+/// program id the caller passed, which let an attacker deploy their own
+/// Solana program, create a PDA at `[b"ant_record", ant_mint,
+/// undername_hash]` under it, write byte-compatible `AntRecord` data with
+/// `owner = attacker`, and pass that program as `ant_program`. Both the
+/// `account.owner == ant_program` check and the
+/// `find_program_address(seeds, ant_program)` PDA derivation ran under
+/// the attacker's program and trivially passed — the helper then
+/// returned `attacker` as the record owner, granting unilateral control
+/// over `request_and_set_primary_name`, `approve_primary_name`, and
+/// `remove_primary_name_for_base_name`.
 ///
-/// Returns Some(owner) if the record exists and has a delegated owner,
-/// None otherwise.
+/// ADR-016 (pluggable ANT program) is the long-term intent; routing
+/// there must consult the asset's Metaplex Core `ANT Program`
+/// Attributes-plugin trait as the trusted source. That migration is
+/// tracked as a follow-up — until then this helper hard-pins to the
+/// canonical program. All tests in this repo and all observed clients
+/// pass `ario_ant::ID`, so the canonical-only constraint is operationally
+/// transparent today.
+///
+/// Returns `Some(owner)` if the record exists and has a delegated owner,
+/// `None` otherwise.
 ///
 /// Borsh layout (mirrors `ario_ant::state::AntRecord` — keep in sync with
 /// `programs/ario-ant/src/state.rs`):
@@ -233,6 +248,13 @@ fn read_ant_record_owner(
     undername: &str,
     ant_program: &Pubkey,
 ) -> Result<Option<Pubkey>> {
+    // SECURITY: pin to the canonical ARIO-ANT program. See helper
+    // doc-comment above for the spoofing attack this closes.
+    require!(
+        *ant_program == ario_ant::ID,
+        ArioError::InvalidAccountState
+    );
+
     require!(
         ant_record_info.owner == ant_program,
         ArioError::InvalidAccountState
@@ -468,11 +490,14 @@ pub mod request_and_set_primary_name {
                 .map_err(|_| ArioError::InvalidAccountState)?
         };
 
-        // ADR-016 reshape: ario-core is MPL-agnostic. Authorization is
-        // "caller is the AntRecord.owner for this name" via PDA-seed-pinned
-        // lookup at remaining_accounts[2]. The undername part of the name
-        // selects which AntRecord to check (full base names use the "@"
-        // sentinel which the canonical ario-ant creates at mint time).
+        // Authorization is "caller is the AntRecord.owner for this name".
+        // `read_ant_record_owner` enforces `ant_program_id == ario_ant::ID`
+        // (canonical lockdown — see helper doc-comment for the program-id
+        // spoof attack this defends against). The undername part of the
+        // name selects which AntRecord to check (full base names use the
+        // "@" sentinel which the canonical ario-ant creates at mint time).
+        // ADR-016 pluggability via the asset's `ANT Program` attribute is
+        // tracked as a follow-up that must add MPL Core asset parsing.
         require!(remaining.len() > 2, ArioError::UndernameRecordOwnerRequired);
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let initiator_key = ctx.accounts.initiator.key();
@@ -611,13 +636,16 @@ pub mod approve_primary_name {
                 .map_err(|_| ArioError::InvalidAccountState)?
         };
 
-        // ADR-016 reshape: ario-core is MPL-agnostic. Authorization is
-        // "approver is the AntRecord.owner for this name" via PDA-seed-pinned
-        // lookup at remaining_accounts[1]. The undername part of the name
-        // selects which AntRecord (the canonical ario-ant uses "@" for base
-        // names). `ant_program_id` is supplied by the caller, but the PDA
-        // seed check pins (program_id, ant_mint, undername) — lying about it
-        // fails the seed match.
+        // Authorization is "approver is the AntRecord.owner for this name".
+        // `read_ant_record_owner` enforces `ant_program_id == ario_ant::ID`
+        // (canonical lockdown). The earlier doc here claimed "the PDA seed
+        // check pins (program_id, ant_mint, undername) — lying about it
+        // fails the seed match", which is wrong: `find_program_address`
+        // derives a fresh PDA under whatever program the caller supplies,
+        // so the seed check trivially passes against an attacker-deployed
+        // program. The canonical lockdown closes that loop. The undername
+        // part of the name selects which AntRecord (the canonical ario-ant
+        // uses "@" for base names).
         require!(remaining.len() > 1, ArioError::UndernameRecordOwnerRequired);
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let approver_key = ctx.accounts.name_owner.key();
@@ -788,11 +816,14 @@ pub mod remove_primary_name_for_base_name {
                 .map_err(|_| ArioError::InvalidAccountState)?
         };
 
-        // ADR-016 reshape: ario-core is MPL-agnostic. The base-name owner is
-        // the AntRecord.owner for the BASE name's "@" undername (the canonical
-        // ario-ant creates this record at mint time). PDA seeds pin
-        // (program_id, ant_mint, "@") so a caller lying about
-        // `ant_program_id` fails the seed check at remaining_accounts[1].
+        // The base-name owner is the AntRecord.owner for the BASE name's
+        // "@" undername (the canonical ario-ant creates this record at
+        // mint time). `read_ant_record_owner` enforces
+        // `ant_program_id == ario_ant::ID` (canonical lockdown — earlier
+        // logic incorrectly claimed PDA seeds pinned the program id; in
+        // fact `find_program_address` runs under whatever program the
+        // caller supplies, so an attacker-deployed program would still
+        // satisfy the seed check).
         require!(remaining.len() > 1, ArioError::UndernameRecordOwnerRequired);
         let caller_key = ctx.accounts.name_owner.key();
         let record_owner = read_ant_record_owner(&remaining[1], &ant, "@", &ant_program_id)?;
