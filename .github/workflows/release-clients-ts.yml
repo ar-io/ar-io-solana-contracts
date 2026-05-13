@@ -89,16 +89,24 @@ jobs:
           shared-key: ar-io-contracts-bpf-${{ inputs.cluster }}
 
       - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        # `SOLANA_VERSION` comes from the workflow-level `env:` block (a
+        # static literal), but we still consume it via `$SOLANA_VERSION`
+        # rather than `${{ env.SOLANA_VERSION }}` to keep one uniform rule:
+        # `${{ … }}` never appears inside a `run:` script. Any future
+        # auditor (human or automated) can then look for that pattern as
+        # a single failure mode.
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          set -euo pipefail
+          sh -c "$(curl -sSfL "https://release.anza.xyz/${SOLANA_VERSION}/install")"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
       - name: Install Anchor ${{ env.ANCHOR_VERSION }}
         run: |
+          set -euo pipefail
           cargo install --git https://github.com/coral-xyz/anchor \
-            --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
-          avm install ${{ env.ANCHOR_VERSION }}
-          avm use ${{ env.ANCHOR_VERSION }}
+            --tag "v${ANCHOR_VERSION}" avm --locked --force
+          avm install "${ANCHOR_VERSION}"
+          avm use "${ANCHOR_VERSION}"
 
       # Anchor generates IDLs at `target/idl/<program>.json`. The IDL
       # includes BOTH cfg variants of conditional fields regardless of
@@ -127,27 +135,76 @@ jobs:
       - name: Compute version
         id: version
         working-directory: clients/ts
+        # SECURITY: every value sourced from `inputs.*` or `github.*` is
+        # passed through `env:` and consumed via shell variables, never
+        # interpolated directly with `${{ … }}` inside this `run:` block.
+        # Direct interpolation lets a workflow_dispatch caller (or a
+        # workflow_call invoker) supply shell metacharacters that GitHub
+        # expression expansion substitutes BEFORE bash parses the script,
+        # which executes arbitrary commands in the same job that holds
+        # `id-token: write` for npm Trusted Publishing.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CLUSTER: ${{ inputs.cluster }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          if [[ -n "${{ inputs.version }}" ]]; then
-            target="${{ inputs.version }}"
+          set -euo pipefail
+          # Strict semver allowlist (subset of semver.org tolerant enough for
+          # npm: MAJOR.MINOR.PATCH with optional `-<prerelease>` and
+          # `+<build>` identifiers, each segment alphanumeric / `.` / `-`).
+          # Anything containing `$`, backticks, `;`, spaces, etc. is rejected.
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          # `cluster` is `choice` for workflow_dispatch but `string` for
+          # workflow_call — validate here so a malicious calling workflow
+          # can't slip through.
+          if [[ "$INPUT_CLUSTER" != "devnet" && "$INPUT_CLUSTER" != "mainnet" ]]; then
+            echo "::error::Invalid cluster: '$INPUT_CLUSTER' (must be 'devnet' or 'mainnet')"
+            exit 1
+          fi
+          if [[ -n "$INPUT_VERSION" ]]; then
+            if [[ ! "$INPUT_VERSION" =~ $SEMVER_RE ]]; then
+              echo "::error::Invalid version: '$INPUT_VERSION' (must match SemVer 2.0)"
+              exit 1
+            fi
+            target="$INPUT_VERSION"
           else
             target="$(node -p "require('./package.json').version")"
           fi
+          # `github.run_number` is a non-negative integer string supplied by
+          # the runner, but harden anyway in case the upstream contract
+          # changes.
+          if [[ ! "$RUN_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid run number: '$RUN_NUMBER'"
+            exit 1
+          fi
           # Devnet releases get a -devnet.<run> suffix so each publish is
           # uniquely versioned. Mainnet uses the bare semver from package.json.
-          if [[ "${{ inputs.cluster }}" == "devnet" ]]; then
+          if [[ "$INPUT_CLUSTER" == "devnet" ]]; then
             # Strip any existing prerelease suffix to avoid e.g. 0.1.0-devnet.5-devnet.6
             base="${target%%-*}"
-            target="${base}-devnet.${{ github.run_number }}"
+            target="${base}-devnet.${RUN_NUMBER}"
           fi
-          echo "version=${target}" >> "$GITHUB_OUTPUT"
-          echo "Computed version: ${target}"
-          npm version "${target}" --no-git-tag-version --allow-same-version
+          # Final sanity check: even the derived devnet-suffixed value must
+          # still be valid semver. Belt-and-braces against future edits to
+          # the suffix logic.
+          if [[ ! "$target" =~ $SEMVER_RE ]]; then
+            echo "::error::Computed version is not valid SemVer: '$target'"
+            exit 1
+          fi
+          echo "version=$target" >> "$GITHUB_OUTPUT"
+          echo "Computed version: $target"
+          npm version "$target" --no-git-tag-version --allow-same-version
 
       - name: Determine dist-tag
         id: tag
+        # `INPUT_CLUSTER` was validated upstream in the Compute version step,
+        # but env-var hygiene is preserved here so a future re-order of
+        # steps can't silently re-introduce a script-injection sink.
+        env:
+          INPUT_CLUSTER: ${{ inputs.cluster }}
         run: |
-          if [[ "${{ inputs.cluster }}" == "mainnet" ]]; then
+          set -euo pipefail
+          if [[ "$INPUT_CLUSTER" == "mainnet" ]]; then
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           else
             echo "tag=devnet" >> "$GITHUB_OUTPUT"
@@ -167,17 +224,37 @@ jobs:
         # publisher identity AND build provenance. Requires
         # `@ar.io/solana-contracts` to have GitHub Actions configured
         # as a Trusted Publisher on npmjs.com.
-        run: npm publish --access public --provenance --tag ${{ steps.tag.outputs.tag }}
+        env:
+          DIST_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # `DIST_TAG` is set by the previous step from validated cluster
+          # input, so it's already one of `latest` | `devnet`. Validate
+          # again as belt-and-braces — `npm publish --tag <x>` happily
+          # accepts arbitrary strings, so even a future-step mistake
+          # shouldn't let a devnet build poison the mainnet tag.
+          if [[ "$DIST_TAG" != "latest" && "$DIST_TAG" != "devnet" ]]; then
+            echo "::error::Invalid dist-tag: '$DIST_TAG'"
+            exit 1
+          fi
+          npm publish --access public --provenance --tag "$DIST_TAG"
 
       - name: Summary
+        env:
+          PUBLISHED_VERSION: ${{ steps.version.outputs.version }}
+          DIST_TAG: ${{ steps.tag.outputs.tag }}
+          INPUT_CLUSTER: ${{ inputs.cluster }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          echo "### Released \`@ar.io/solana-contracts@${{ steps.version.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Cluster:** ${{ inputs.cluster }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Dist-tag:** \`${{ steps.tag.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Dry-run:** ${{ inputs.dry_run }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Install:" >> "$GITHUB_STEP_SUMMARY"
-          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
-          echo "yarn add @ar.io/solana-contracts@${{ steps.tag.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Released \`@ar.io/solana-contracts@${PUBLISHED_VERSION}\`"
+            echo ""
+            echo "- **Cluster:** ${INPUT_CLUSTER}"
+            echo "- **Dist-tag:** \`${DIST_TAG}\`"
+            echo "- **Dry-run:** ${INPUT_DRY_RUN}"
+            echo ""
+            echo "Install:"
+            echo '```bash'
+            echo "yarn add @ar.io/solana-contracts@${DIST_TAG}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
