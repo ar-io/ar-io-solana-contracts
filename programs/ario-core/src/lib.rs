@@ -151,13 +151,16 @@ pub mod ario_core {
     /// M2: Request AND set a primary name in one tx (auto-approve for ANT
     /// holders of the matching AntRecord).
     ///
-    /// ADR-016 reshape (per Atticus's review): ario-core is MPL-agnostic.
-    /// The caller passes `ant_program_id` so ario-core knows which program's
-    /// AntRecord PDA to look at; the PDA's seed derivation pins
-    /// (program_id, ant_mint, undername) so a caller lying about
-    /// `ant_program_id` fails the seed check. Authorization is "caller is
-    /// the AntRecord.owner for this name" rather than "caller is the
-    /// MPL Core asset's NFT holder."
+    /// Authorization: caller is the `AntRecord.owner` for the requested
+    /// name's undername (or `@` for base names). The AntRecord PDA is
+    /// resolved under `ant_program_id`, which `read_ant_record_owner`
+    /// requires to equal `ario_ant::ID` (canonical lockdown — pluggable
+    /// ANT programs per ADR-016 are deferred until the asset's
+    /// `ANT Program` Attributes-plugin trait can be consulted on-chain).
+    /// Earlier docs claimed PDA-seed derivation alone pinned the program
+    /// id; that's wrong — `find_program_address` derives a PDA under
+    /// whatever program the caller supplies, so without the canonical
+    /// check an attacker-deployed program would satisfy the seed match.
     pub fn request_and_set_primary_name(
         ctx: Context<RequestAndSetPrimaryName>,
         name: String,
@@ -206,7 +209,9 @@ pub mod ario_core {
     ///     ([0] ArnsRecord, [1] DemandFactor, [2] AntRecord)
     ///   [validation_account_count..):  funding-source PDAs
     ///
-    /// ADR-016 reshape: takes `ant_program_id` instead of reading the asset.
+    /// `ant_program_id` must equal `ario_ant::ID` (canonical lockdown) —
+    /// see `request_and_set_primary_name` for the full rationale and the
+    /// ADR-016 pluggable-program follow-up.
     pub fn request_and_set_primary_name_from_funding_plan<'info>(
         ctx: Context<'_, '_, 'info, 'info, RequestAndSetPrimaryNameFromFundingPlan<'info>>,
         name: String,
@@ -229,10 +234,10 @@ pub mod ario_core {
 
     /// Approve a primary name request (F43)
     ///
-    /// ADR-016 reshape: caller must be the AntRecord.owner for the requested
-    /// name. `ant_program_id` selects which program's AntRecord PDA to look
-    /// up — see request_and_set_primary_name for the same authorization
-    /// rationale.
+    /// Authorization: `name_owner` must be the AntRecord.owner for the
+    /// requested name. `ant_program_id` must equal `ario_ant::ID`
+    /// (canonical lockdown) — see `request_and_set_primary_name` for the
+    /// full rationale and the ADR-016 pluggable-program follow-up.
     pub fn approve_primary_name(
         ctx: Context<ApprovePrimaryName>,
         reverse_lookup_hash: [u8; 32],
@@ -264,8 +269,9 @@ pub mod ario_core {
     /// The base name owner can revoke any primary name that uses their ArNS domain.
     /// E.g., owner of "arweave" can revoke "alice_arweave" primary name.
     ///
-    /// ADR-016 reshape: caller must be the AntRecord.owner for the BASE
-    /// name's @ undername. `ant_program_id` selects which program manages it.
+    /// Authorization: caller must be the AntRecord.owner for the BASE
+    /// name's @ undername. `ant_program_id` must equal `ario_ant::ID`
+    /// (canonical lockdown) — see `request_and_set_primary_name`.
     pub fn remove_primary_name_for_base_name(
         ctx: Context<RemovePrimaryNameForBaseName>,
         reverse_lookup_hash: [u8; 32],
