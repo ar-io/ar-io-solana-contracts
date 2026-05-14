@@ -29,9 +29,12 @@ tooling around them.
 ├── test-utils/        # shared event-log parser used by every program's tests
 ├── localnet/          # Surfpool feature-gate policy (sourced by start-localnet.sh)
 ├── program-ids/       # per-cluster program ID + mint manifests (committed)
+├── clients/ts/        # @ar.io/solana-contracts — Codama-generated TS client,
+│                      #   published in lockstep with contract releases
 ├── scripts/           # deploy / release / package tooling
 ├── docs/              # ADRs, behavioral diff, escrow specs (see "Reference Material")
-└── .github/workflows/ # build-test, release-devnet, release-mainnet, codeql
+└── .github/workflows/ # build-test, release, release-clients-ts, upgrade-devnet,
+                       #   upgrade-mainnet, release-plz, docker-builder, codeql
 ```
 
 Sister repositories — code that *depends on* this one but isn't in
@@ -177,6 +180,47 @@ withdrawal vault, no lock period, no penalty. CPI depth = 2 (Solana max
 share is paid from stake via CPI; initiator share from buyer's wallet
 via direct SPL transfer.
 
+**Treasury release CPI** (ario-gar → ario-core → SPL Token). The
+`protocol_token_account` SPL `Owner` authority lives on the
+`ArioConfig` PDA (ario-core), permanently. Fresh deploys set this at
+`initialize` time; legacy deployments arrived at this state via
+`release_treasury_authority` (now removed) and stay there. **Only
+ario-core can sign SPL transfers FROM the treasury.**
+
+`ario-gar::distribute_epoch` therefore CPIs into
+`ario_core::release_treasury_to_recipient` instead of signing the SPL
+transfer directly. The CPI is **hand-rolled `invoke_signed`** (not
+Anchor's typed CPI) because adding `ario-core` as a Cargo dep on
+`ario-gar` would cycle with the existing `ario-core → ario-gar` cpi
+dep used by fund-from-stakes. The hand-roll uses
+`global:release_treasury_to_recipient` as the 8-byte discriminator and
+signs with `[SETTINGS_SEED, settings.bump]` so the inner ix's
+`gar_settings: signer` constraint is satisfied. ario-gar's source has
+`pub const ARIO_CORE_PROGRAM_ID` (single line, `#[rustfmt::skip]`'d;
+patched by `build-sbf.sh --sync-from-manifest` from
+`program-ids/<cluster>.json`) used as `address =` on the
+`ario_core_program` account to pin the CPI target.
+
+ario-core's `release_treasury_to_recipient` verifies the caller is the
+canonical ario-gar program via `seeds::program = config.gar_program`
+on `gar_settings` — the GAR program ID is stored in `ArioConfig`
+(mirrors the existing `arns_program` storage pattern). Fresh deploys
+set `gar_program` at `initialize` via `InitializeParams.gar_program`;
+legacy deployments populate it once via `admin_set_gar_program`
+(authority-gated, reallocs the PDA by 32 bytes to accommodate the
+appended field). The transfer destination is locked to
+`gar_settings.stake_token_account` so even a buggy or compromised
+ario-gar can only redirect treasury funds into GAR's own stake pool —
+never an arbitrary recipient. CPI depth = 3 (gar → core → spl_token),
+under Solana's 4-hop limit.
+
+`ArioConfig.gar_program` is appended after `bump` in the struct so a
+realloc on existing accounts only adds zero-filled trailing bytes
+without shifting any existing field offsets. Other field-ordering
+changes are NOT backward-compatible — see "ArioConfig" in the
+schema-evolution checklist in [`docs/DECISIONS.md`](docs/DECISIONS.md)
+before modifying.
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool
@@ -191,7 +235,7 @@ cd ar-io-solana-contracts
 
 # 1. Toolchain (one-time — see "Toolchain" below).
 sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.0/install)"
-cargo install --git https://github.com/coral-xyz/anchor avm
+cargo install --git https://github.com/coral-xyz/anchor --tag v0.31.1 avm --locked
 avm install 0.31.1 && avm use 0.31.1
 
 # 2. Build (also generates target/idl/*.json).
@@ -201,10 +245,31 @@ anchor build
 cargo test --workspace
 ```
 
-After IDL changes (`anchor build` mutating an `ario_*` IDL), downstream
-SDK consumers need to re-run their `yarn codegen` step against the new
-JSON. The IDL ABI stability check (`scripts/idl-event-snapshot.mjs`)
-catches breaking event changes; Anchor IDLs are otherwise additive-safe.
+After IDL changes (`anchor build` mutating an `ario_*` IDL), the in-tree
+typed client at [`clients/ts/`](clients/ts/) (`@ar.io/solana-contracts`,
+Codama-generated for per-program subpaths, plus hand-written
+`./canonical/*` helpers for things the IDL can't express) must be
+regenerated:
+
+```bash
+cd clients/ts && yarn codegen && yarn build:tsc
+```
+
+The npm package publishes from `.github/workflows/release-clients-ts.yml`,
+coupled to contract releases — bump the contract, the client republishes.
+Downstream SDK consumers (`ar-io-sdk`, etc.) then update their dep on
+`@ar.io/solana-contracts`. The IDL ABI stability check
+(`scripts/idl-event-snapshot.mjs`) catches breaking event changes; Anchor
+IDLs are otherwise additive-safe.
+
+Hand-written modules under `clients/ts/src/canonical/` ride alongside
+the codegen output but aren't touched by `yarn clean` (which only wipes
+per-program codegen dirs). Cross-language byte parity is asserted by
+`clients/ts/test/canonical.cross.test.ts`, which builds the Rust
+`cargo run --example canonical -p ario-ant-escrow` binary and
+byte-compares against the TS implementation across six test vectors
+(ANT + token/vault claims). Skips gracefully when cargo isn't on PATH
+so plain `yarn test` works without the Rust toolchain.
 
 ### Contracts (Rust/Anchor)
 
@@ -220,10 +285,17 @@ cargo test                                      # all tests
 cargo test -p ario-core                         # one program
 cargo test -p ario-gar test_join_network        # specific test
 
-# ario-arns CPIs into Metaplex Core (UpdatePluginV1 trait sync) and needs
-# mpl_core.so staged + BPF_OUT_DIR set:
+# Tests that CPI into Metaplex Core (UpdatePluginV1 trait sync) need
+# mpl_core.so staged + BPF_OUT_DIR set + the program's own .so present:
+#   ario-arns      — all integration tests
+#   ario-ant       — clear_attributes + sync_attributes only
+#   ario-ant-escrow — integration + event-coverage tests
+cargo build-sbf --manifest-path programs/ario-arns/Cargo.toml   # or ario-ant / -ant-escrow
 cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
 BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-arns
+# Same recipe for ario-ant's MPL-Core-CPI tests:
+BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-ant \
+  --test clear_attributes --test sync_attributes
 
 # Devnet deploy (idempotent — re-runs upgrade against the same program IDs)
 bash scripts/devnet-deploy.sh
@@ -237,14 +309,34 @@ bash scripts/start-localnet.sh
 `SURFPOOL_SKIP_MAINNET_INACTIVE_DISABLES=1`,
 `SURFPOOL_ENABLE_ALL_SVM_FEATURES=1`.
 
-**`BPF_OUT_DIR` pitfall:** Set it ONLY for `ario-arns` (and the
-`ario-ant-escrow` event-coverage tests). For
-`ario-core` / `ario-gar` / `ario-ant`, leave it unset — otherwise
-`solana-program-test` loads stale prebuilt `.so` files from
-`target/deploy/` instead of the just-compiled native processor, and
-recently-added instructions fail with `InstructionFallbackNotFound
-(101)`. Fix: `unset BPF_OUT_DIR` or delete the stale
-`target/deploy/<program>.so` first.
+**`BPF_OUT_DIR` rules.** The rule isn't per-program — it's per-test-file,
+governed by whether the test CPIs into Metaplex Core:
+
+* **Tests that CPI Metaplex Core** need `BPF_OUT_DIR` set, the staged
+  `mpl_core.so` in that directory, AND the program's own freshly-built
+  `.so` in that same directory (else `solana-program-test` 2.1 panics
+  with `Program file data not available for <program>` — its
+  "prefer BPF" mode is global to the `ProgramTest` instance and applies
+  to programs registered via `ProgramTest::new(...)` even when a native
+  processor is supplied). Suites in this category:
+  * `ario-arns` integration tests
+  * `ario-ant` `clear_attributes.rs` and `sync_attributes.rs`
+  * `ario-ant-escrow` integration + event-coverage tests
+  Recipe: `cargo build-sbf --manifest-path programs/<crate>/Cargo.toml`
+  then run `cargo test` with `BPF_OUT_DIR` set.
+
+* **All other tests** (everything in `ario-core`, `ario-gar`,
+  `ario-test-utils`, and the non-MPL `ario-ant` suites:
+  `integration.rs`, `events.rs`, `transfer_event.rs`) use the native
+  processor and **must** be run with `BPF_OUT_DIR` unset. Otherwise
+  solana-program-test loads a stale `target/deploy/<program>.so` and
+  recently-added instructions fail with `InstructionFallbackNotFound
+  (101)`. Fix: `unset BPF_OUT_DIR` or delete the stale `.so`.
+
+This is also why CI's `build-test.yml` runs only
+`cargo test -p ario-core -p ario-gar -p ario-test-utils` — the
+MPL-CPI-dependent suites need the BPF toolchain available, which CI's
+host-only job doesn't install.
 
 **`declare_id!()` drift:** `cargo build-sbf` / `anchor build` embed the
 `declare_id!("...")` literal into the `.so`. Deployments use
@@ -327,8 +419,7 @@ it's stored to skip the on-chain `find_program_address` search on
 subsequent loads — passing it via `seeds = [...], bump = self.bump`
 saves ~1.5k CU per access. Comments may reference the seed pattern in
 [`docs/COMPUTE_AND_LIMITS.md`](docs/COMPUTE_AND_LIMITS.md) rather than
-repeating it. See `.cursor/rules/pda-bump-comments.mdc` for canonical
-examples; applies to `#[account]` structs in `state.rs` /
+repeating it. Applies to `#[account]` structs in `state.rs` /
 `state/mod.rs`, account-context structs in `instructions/*.rs`, and any
 `init` / `realloc` site that captures a bump into state.
 
@@ -403,6 +494,27 @@ The IDLs at `target/idl/<program>.json` (regenerated by `anchor build`)
 plus the `program-ids/` manifests are the authoritative source of truth
 for instruction ABIs and on-chain addresses.
 
+### Optional: Solana Dev Skill
+
+The [`solana-foundation/solana-dev-skill`](https://github.com/solana-foundation/solana-dev-skill)
+Claude Code skill packages current (Jan 2026) Solana ecosystem
+references — security vulnerability patterns, Anchor / Pinocchio guides,
+LiteSVM / Mollusk / Surfpool testing notes, version compatibility, common
+errors. When installed it activates automatically on relevant prompts
+(security review, toolchain issues, testing patterns, etc.). Install
+user-level once:
+
+```bash
+git clone https://github.com/solana-foundation/solana-dev-skill /tmp/sds && \
+  /tmp/sds/install.sh && rm -rf /tmp/sds   # installs to ~/.claude/skills/solana-dev/
+```
+
+The skill is **not vendored into this repo** — it's a per-developer
+opt-in. Project-specific conventions in this CLAUDE.md still take
+precedence over generic skill guidance when they conflict (e.g. our
+PDA bump-doc-comment rule, our event ABI policy, our `BPF_OUT_DIR`
+pitfall).
+
 ### External source we're porting from
 
 Clone these as siblings when porting Lua semantics to Rust — every BD-NNN
@@ -436,8 +548,8 @@ entry in `BEHAVIORAL_DIFFERENCES.md` cites them by file/line:
   `Cargo.toml` (see "Build & Test Commands" → `idl-build` notes).
 * **New PDA layouts:** update
   [`docs/COMPUTE_AND_LIMITS.md`](docs/COMPUTE_AND_LIMITS.md) (seed
-  pattern + size) and add the bump-doc-comment per
-  `.cursor/rules/pda-bump-comments.mdc`.
+  pattern + size) and add the bump-doc-comment per the **PDA `bump` doc
+  comments** rule in "Code Conventions" above.
 * **Archiving superseded docs:** move into
   [`docs/archive/`](docs/archive/) with a banner pointing at the
   successor. Don't delete — external trackers link to specific files

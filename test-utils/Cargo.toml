@@ -13,3 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 anchor-lang = { workspace = true }
 base64 = "0.22"
+
+[lints]
+workspace = true

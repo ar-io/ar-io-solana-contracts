@@ -1,0 +1,191 @@
+name: Release
+
+# Build BPF binaries, generate IDLs, package the release bundle, and
+# publish a GitHub release.  Triggered manually from the Actions tab.
+#
+# Also runs the release-plz-release step, which creates the semver git
+# tag (e.g. v0.2.0) if a Release PR was merged since the last tag.
+# release-plz-update (opening the Release PR) runs in release-plz.yml.
+#
+# Version precedence:
+#   1. Exact semver tag on HEAD  → e.g. devnet-v0.2.0
+#   2. git describe (tag+offset) → e.g. devnet-v0.2.0-3-gabc1234
+#   3. Fallback                  → devnet-YYYYMMDD-HHMMSS-sha
+
+concurrency:
+  group: release-${{ inputs.cluster }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Target cluster (devnet | mainnet)"
+        type: choice
+        options:
+          - devnet
+          - mainnet
+        required: true
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    uses: ./.github/workflows/build-test.yml
+    secrets: inherit
+
+  release:
+    name: Build & release (${{ inputs.cluster }})
+    needs: lint-test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      semver: ${{ steps.ver.outputs.semver }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
+
+      # Create the semver tag (e.g. v0.2.0) if a Release PR was merged
+      # since the last tag.  No-ops if nothing to release.
+      - name: Tag release (release-plz-release)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-plz-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust BPF toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-${{ inputs.cluster }}
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor \
+            --tag v${{ env.ANCHOR_VERSION }} avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Build BPF binaries
+        env:
+          PROGRAM_IDS_PATH: program-ids/${{ inputs.cluster }}.json
+          BUILD_NETWORK: ${{ inputs.cluster }}
+        run: BUILD_NETWORK=${{ inputs.cluster }} bash build-sbf.sh --sync-from-manifest
+
+      - name: Build IDLs (anchor build)
+        run: anchor build
+
+      - name: IDL event ABI stability check
+        run: node scripts/idl-event-snapshot.mjs
+
+      - name: Compute version
+        id: ver
+        run: |
+          # Prefer an exact semver tag on HEAD (release-plz just created one).
+          # Fall back to nearest semver ancestor via git-describe (--match keeps
+          # non-semver release tags like devnet-YYYYMMDD-… out of the search).
+          # Last resort: SHA+timestamp.
+          semver_tag=$(git describe --tags --exact-match --match "v[0-9]*" 2>/dev/null || true)
+          if [[ -n "$semver_tag" ]]; then
+            version="${{ inputs.cluster }}-${semver_tag}"
+            semver="${semver_tag#v}"
+          else
+            described=$(git describe --tags --always --match "v[0-9]*" 2>/dev/null || true)
+            if [[ -n "$described" ]] && echo "$described" | grep -qE "^v[0-9]"; then
+              version="${{ inputs.cluster }}-${described}"
+              # Strip leading "v" and any trailing "-<offset>-g<sha>" so the
+              # downstream typed-client publish gets clean semver.
+              base="${described#v}"
+              semver="${base%-*-g*}"
+            else
+              short_sha=$(git rev-parse --short HEAD)
+              version="${{ inputs.cluster }}-$(date -u +%Y%m%d-%H%M%S)-${short_sha}"
+              semver=""
+            fi
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "semver=${semver}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release bundle
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          CLUSTER: ${{ inputs.cluster }}
+        run: bash scripts/package-release.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-io-solana-contracts-${{ steps.ver.outputs.version }}
+          path: release/ar-io-solana-contracts-${{ steps.ver.outputs.version }}.tar.gz
+          retention-days: 90
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          CLUSTER: ${{ inputs.cluster }}
+        run: |
+          target_branch=$([[ "$CLUSTER" == "mainnet" ]] && echo "main" || echo "develop")
+          gh release create "$VERSION" \
+            --title "${{ inputs.cluster }} release $VERSION" \
+            --notes "Binary release (no on-chain upgrade).
+
+            **Cluster:** ${{ inputs.cluster }}
+            **Commit:** ${{ github.sha }}
+
+            ## Bundle contents
+            - \`idl/\` — Anchor 0.31 IDLs
+            - \`so/\` — compiled BPF binaries
+            - \`program-ids.json\` — program ID manifest
+            - \`VERSION\` — version, cluster, git SHA, build timestamp
+            - \`SHA256SUMS\` — checksums
+
+            To run a cluster upgrade from this build use the
+            upgrade-${{ inputs.cluster }} workflow." \
+            --target "${target_branch}" \
+            --prerelease \
+            "release/ar-io-solana-contracts-${VERSION}.tar.gz"
+
+  # Publish the matching typed-client to npm whenever a contract
+  # release ships. Devnet contract releases publish to the @devnet
+  # dist-tag (with -devnet.<run> suffix); mainnet → @latest. The
+  # `version` input carries the contract semver (extracted from the
+  # release-plz tag, if any) so the npm package version reads
+  # `0.3.0-devnet.42` for contract `devnet-v0.3.0`.
+  publish-typed-client:
+    needs: release
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-clients-ts.yml
+    with:
+      cluster: ${{ inputs.cluster }}
+      version: ${{ needs.release.outputs.semver }}
+      dry_run: false
+    secrets: inherit

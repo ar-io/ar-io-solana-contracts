@@ -1,0 +1,67 @@
+name: Release PLZ
+
+# Automates semver versioning via conventional commits.
+#
+# Two phases (both triggered by pushes to develop/main):
+#
+#   1. Update — inspects commits since the last tag, determines the
+#      semver bump (patch / minor / major), opens or refreshes a
+#      "Release PR" that bumps Cargo.toml versions + CHANGELOG.md.
+#      Merging that PR is the human approval step.
+#
+#   2. Release — runs after the Release PR merges; creates the git tag
+#      (e.g. v0.2.0).  Does NOT publish to crates.io or create a GitHub
+#      Release — that's handled by the release.yml workflow which
+#      operators trigger manually to build BPF binaries and package
+#      artifacts.
+#
+# Conventional commit format (enforced by the pre-push hook):
+#   feat: ...        → minor bump
+#   fix: / perf: ... → patch bump
+#   BREAKING CHANGE  → major bump
+#
+# Required secret: RELEASE_PLZ_TOKEN
+#   A GitHub PAT (fine-grained or classic) with:
+#     - Contents: write   (push commits / tags to the repo)
+#     - Pull requests: write  (open / update the Release PR)
+#   The built-in GITHUB_TOKEN cannot open PRs that trigger other
+#   workflows (Actions limitation), so a PAT is needed.
+#   Name the secret RELEASE_PLZ_TOKEN in the repo settings.
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false   # never cancel mid-tag
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-plz:
+    name: Release PLZ
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90.0"
+
+      # Only the PR-creation half of release-plz.  The tagging + build
+      # half (release-plz-release) runs inside release.yml when an
+      # operator calls it via workflow_call after the PR is merged.
+      - name: Open / refresh Release PR
+        uses: release-plz/action@v0.5
+        with:
+          command: release-plz-update
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

@@ -446,8 +446,16 @@ impl ReservedName {
 
 /// Global name registry for efficient enumeration
 /// PDA: ["name_registry"]
-/// NOTE: Uses zero-copy for performance with large name counts
-/// This enables the epoch system to prescribe names without an off-chain indexer
+/// NOTE: Uses zero-copy for performance with large name counts.
+/// This enables the epoch system to prescribe names without an off-chain indexer.
+///
+/// **Capacity is build-time configurable.** Production builds use 200,000
+/// slots (~8 MB on-chain, ~57 SOL rent). Devnet/testnet smoke-test builds
+/// enable `--features devnet-shrunk` to compile with 200 slots (~8 KB,
+/// ~0.06 SOL rent). Anchor zero-copy requires the on-chain account size
+/// to match the binary's struct size exactly — deploying a mismatched
+/// pair will panic on every `AccountLoader::load()`. See the matching
+/// note on `GatewayRegistry`.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct NameRegistry {
@@ -456,12 +464,18 @@ pub struct NameRegistry {
     pub _padding: [u8; 4],
     /// Array of name hashes (SHA256) for registered active names
     /// Names are added when purchased and removed when expired/released
+    #[cfg(not(feature = "devnet-shrunk"))]
     pub names: [NameEntry; 200_000],
+    #[cfg(feature = "devnet-shrunk")]
+    pub names: [NameEntry; 200],
 }
 
 impl NameRegistry {
-    pub const SIZE: usize = 32 + 4 + 4 + (NameEntry::SIZE * 200_000);
+    pub const SIZE: usize = 32 + 4 + 4 + (NameEntry::SIZE * Self::MAX_NAMES);
+    #[cfg(not(feature = "devnet-shrunk"))]
     pub const MAX_NAMES: usize = 200_000;
+    #[cfg(feature = "devnet-shrunk")]
+    pub const MAX_NAMES: usize = 200;
 }
 
 /// Entry in the name registry for enumeration

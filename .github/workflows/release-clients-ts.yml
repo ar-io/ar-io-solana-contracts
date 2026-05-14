@@ -1,0 +1,260 @@
+name: Release clients/ts (npm)
+
+# Publish `@ar.io/solana-contracts` to npm.
+#
+# Triggered manually from the Actions tab. The `cluster` input controls
+# which size variant of the cfg-conditional zero-copy registry fields
+# (GatewayRegistry, NameRegistry, Epoch.failure_counts) ends up baked
+# into the published encoders:
+#
+#   - devnet  → small sizes (30 / 200 / 30), published with `@devnet` dist-tag
+#   - mainnet → production sizes (3000 / 200000 / 3000), published with `@latest`
+#
+# Version is taken from `clients/ts/package.json`. For devnet releases
+# we append `-devnet.<run-attempt>` automatically so each devnet publish
+# is uniquely versioned without bumping the base semver.
+#
+# Auth: npm OIDC Trusted Publishing (same model as `@ar.io/sdk`). No
+# NPM_TOKEN secret. Requires the package to be configured for trusted
+# publishing on npmjs.com — see clients/ts/README.md "First publish".
+
+permissions:
+  contents: read
+  id-token: write  # OIDC for npm Trusted Publishing — no NPM_TOKEN secret needed
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "Target cluster (devnet | mainnet) — drives cfg-conditional registry sizes"
+        type: choice
+        options:
+          - devnet
+          - mainnet
+        required: true
+      version:
+        description: "Override version (e.g. 0.2.0). Leave empty to use clients/ts/package.json"
+        type: string
+        required: false
+      dry_run:
+        description: "Dry-run: run codegen + build + npm pack, skip publish"
+        type: boolean
+        default: false
+  # Reusable from release.yml so a contract release also publishes
+  # the matching typed-client release. release.yml passes its computed
+  # semver (e.g. `0.3.0` extracted from a `devnet-v0.3.0` git tag) via
+  # `version`; the publish step suffixes `-devnet.<run>` for devnet
+  # releases so the npm version aligns with the contract release.
+  workflow_call:
+    inputs:
+      cluster:
+        type: string
+        required: true
+      version:
+        type: string
+        required: false
+      dry_run:
+        type: boolean
+        default: false
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.0
+  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  NODE_VERSION: 20
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-clients-ts-${{ inputs.cluster }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & publish (${{ inputs.cluster }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
+
+      - name: Install Rust BPF toolchain
+        run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-${{ inputs.cluster }}
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        # `SOLANA_VERSION` comes from the workflow-level `env:` block (a
+        # static literal), but we still consume it via `$SOLANA_VERSION`
+        # rather than `${{ env.SOLANA_VERSION }}` to keep one uniform rule:
+        # `${{ … }}` never appears inside a `run:` script. Any future
+        # auditor (human or automated) can then look for that pattern as
+        # a single failure mode.
+        run: |
+          set -euo pipefail
+          sh -c "$(curl -sSfL "https://release.anza.xyz/${SOLANA_VERSION}/install")"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          set -euo pipefail
+          cargo install --git https://github.com/coral-xyz/anchor \
+            --tag "v${ANCHOR_VERSION}" avm --locked --force
+          avm install "${ANCHOR_VERSION}"
+          avm use "${ANCHOR_VERSION}"
+
+      # Anchor generates IDLs at `target/idl/<program>.json`. The IDL
+      # includes BOTH cfg variants of conditional fields regardless of
+      # active features (Anchor IDL gen quirk). The clients/ts codegen
+      # dedupes based on CLUSTER env var.
+      - name: Anchor build (produces IDLs)
+        run: anchor build
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@ar.io'
+
+      - name: Install + build typed-client
+        working-directory: clients/ts
+        env:
+          CLUSTER: ${{ inputs.cluster }}
+        # `yarn install` runs the postinstall hook which invokes codegen
+        # with CLUSTER set. Then build:tsc emits `lib/`.
+        run: |
+          yarn install --frozen-lockfile --ignore-engines
+          yarn build:tsc
+
+      - name: Compute version
+        id: version
+        working-directory: clients/ts
+        # SECURITY: every value sourced from `inputs.*` or `github.*` is
+        # passed through `env:` and consumed via shell variables, never
+        # interpolated directly with `${{ … }}` inside this `run:` block.
+        # Direct interpolation lets a workflow_dispatch caller (or a
+        # workflow_call invoker) supply shell metacharacters that GitHub
+        # expression expansion substitutes BEFORE bash parses the script,
+        # which executes arbitrary commands in the same job that holds
+        # `id-token: write` for npm Trusted Publishing.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_CLUSTER: ${{ inputs.cluster }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          # Strict semver allowlist (subset of semver.org tolerant enough for
+          # npm: MAJOR.MINOR.PATCH with optional `-<prerelease>` and
+          # `+<build>` identifiers, each segment alphanumeric / `.` / `-`).
+          # Anything containing `$`, backticks, `;`, spaces, etc. is rejected.
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          # `cluster` is `choice` for workflow_dispatch but `string` for
+          # workflow_call — validate here so a malicious calling workflow
+          # can't slip through.
+          if [[ "$INPUT_CLUSTER" != "devnet" && "$INPUT_CLUSTER" != "mainnet" ]]; then
+            echo "::error::Invalid cluster: '$INPUT_CLUSTER' (must be 'devnet' or 'mainnet')"
+            exit 1
+          fi
+          if [[ -n "$INPUT_VERSION" ]]; then
+            if [[ ! "$INPUT_VERSION" =~ $SEMVER_RE ]]; then
+              echo "::error::Invalid version: '$INPUT_VERSION' (must match SemVer 2.0)"
+              exit 1
+            fi
+            target="$INPUT_VERSION"
+          else
+            target="$(node -p "require('./package.json').version")"
+          fi
+          # `github.run_number` is a non-negative integer string supplied by
+          # the runner, but harden anyway in case the upstream contract
+          # changes.
+          if [[ ! "$RUN_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid run number: '$RUN_NUMBER'"
+            exit 1
+          fi
+          # Devnet releases get a -devnet.<run> suffix so each publish is
+          # uniquely versioned. Mainnet uses the bare semver from package.json.
+          if [[ "$INPUT_CLUSTER" == "devnet" ]]; then
+            # Strip any existing prerelease suffix to avoid e.g. 0.1.0-devnet.5-devnet.6
+            base="${target%%-*}"
+            target="${base}-devnet.${RUN_NUMBER}"
+          fi
+          # Final sanity check: even the derived devnet-suffixed value must
+          # still be valid semver. Belt-and-braces against future edits to
+          # the suffix logic.
+          if [[ ! "$target" =~ $SEMVER_RE ]]; then
+            echo "::error::Computed version is not valid SemVer: '$target'"
+            exit 1
+          fi
+          echo "version=$target" >> "$GITHUB_OUTPUT"
+          echo "Computed version: $target"
+          npm version "$target" --no-git-tag-version --allow-same-version
+
+      - name: Determine dist-tag
+        id: tag
+        # `INPUT_CLUSTER` was validated upstream in the Compute version step,
+        # but env-var hygiene is preserved here so a future re-order of
+        # steps can't silently re-introduce a script-injection sink.
+        env:
+          INPUT_CLUSTER: ${{ inputs.cluster }}
+        run: |
+          set -euo pipefail
+          if [[ "$INPUT_CLUSTER" == "mainnet" ]]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=devnet" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: npm pack (sanity check)
+        working-directory: clients/ts
+        run: |
+          npm pack
+          ls -la *.tgz
+
+      - name: Publish to npm (OIDC Trusted Publishing)
+        if: ${{ ! inputs.dry_run }}
+        working-directory: clients/ts
+        # No NPM_TOKEN required — npm CLI 9.5+ uses OIDC via the
+        # workflow's `id-token: write` permission, attesting both the
+        # publisher identity AND build provenance. Requires
+        # `@ar.io/solana-contracts` to have GitHub Actions configured
+        # as a Trusted Publisher on npmjs.com.
+        env:
+          DIST_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # `DIST_TAG` is set by the previous step from validated cluster
+          # input, so it's already one of `latest` | `devnet`. Validate
+          # again as belt-and-braces — `npm publish --tag <x>` happily
+          # accepts arbitrary strings, so even a future-step mistake
+          # shouldn't let a devnet build poison the mainnet tag.
+          if [[ "$DIST_TAG" != "latest" && "$DIST_TAG" != "devnet" ]]; then
+            echo "::error::Invalid dist-tag: '$DIST_TAG'"
+            exit 1
+          fi
+          npm publish --access public --provenance --tag "$DIST_TAG"
+
+      - name: Summary
+        env:
+          PUBLISHED_VERSION: ${{ steps.version.outputs.version }}
+          DIST_TAG: ${{ steps.tag.outputs.tag }}
+          INPUT_CLUSTER: ${{ inputs.cluster }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "### Released \`@ar.io/solana-contracts@${PUBLISHED_VERSION}\`"
+            echo ""
+            echo "- **Cluster:** ${INPUT_CLUSTER}"
+            echo "- **Dist-tag:** \`${DIST_TAG}\`"
+            echo "- **Dry-run:** ${INPUT_DRY_RUN}"
+            echo ""
+            echo "Install:"
+            echo '```bash'
+            echo "yarn add @ar.io/solana-contracts@${DIST_TAG}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -239,6 +239,40 @@ sync_from_manifest() {
     rm -f "${lib}.bak"
     echo "[build-sbf] patched $lib → declare_id!(\"$prog_id\")"
   done
+
+  # Patch the `ARIO_CORE_PROGRAM_ID` const in ario-gar's lib.rs so
+  # distribute_epoch's CPI target matches the deployed ario-core. We
+  # can't pull in ario_core::ID directly because the Cargo graph already
+  # has ario-core → ario-gar (cpi feature), and adding the reverse arc
+  # would be circular. The const lives in ario-gar source as a
+  # placeholder; this sed rewrites it per cluster.
+  local core_prog_id
+  core_prog_id="$(jq -r '.programs.ario_core // ""' "$manifest")"
+  local gar_lib="programs/ario-gar/src/lib.rs"
+  if [[ -n "$core_prog_id" && "$core_prog_id" != "null" && -f "$gar_lib" ]]; then
+    # Match only the ARIO_CORE_PROGRAM_ID const line; declare_id!() was
+    # already handled in the loop above against a different macro
+    # surface, no risk of double-matching. The const is kept on one
+    # line in source for this regex to work.
+    sed -i.bak -E \
+      "s|(ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!\(\")[^\"]+(\"\))|\1$core_prog_id\2|" \
+      "$gar_lib"
+    rm -f "${gar_lib}.bak"
+    echo "[build-sbf] patched $gar_lib → ARIO_CORE_PROGRAM_ID = \"$core_prog_id\""
+  fi
+
+  # cargo-build-sbf 2.1.0 iterates ALL workspace members after the build to
+  # copy .so files into target/deploy/, and fails if any member's .so is
+  # absent (even one that was deliberately not built). Temporarily remove
+  # ario-ant-escrow from the workspace so it is invisible to that copy step.
+  # restore_keys() (registered in the EXIT trap) restores Cargo.toml.
+  local cargo_backup
+  cargo_backup="$SYNC_BACKUP_DIR/Cargo_toml"
+  cp Cargo.toml "$cargo_backup"
+  echo "Cargo.toml" > "$cargo_backup.path"
+  sed -i.bak '/"programs\/ario-ant-escrow"/d' Cargo.toml
+  rm -f Cargo.toml.bak
+  echo "[build-sbf] patched Cargo.toml — excluded ario-ant-escrow from workspace (restored on EXIT)"
 }
 
 case "$MODE" in
@@ -292,37 +326,27 @@ EOF
     ;;
 esac
 
-# Belt-and-suspenders for F-4: also run the shell guardrail. The
-# const-eval check inside `state.rs` already refuses to compile a
-# real-network build that has the test ATTESTOR_PUBKEY, but a
-# misconfigured BUILD_NETWORK or feature override could in principle
-# slip past it. Failing fast here avoids a confusing compile error.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/scripts/check-attestor-pubkey.sh" --strict
-
-# `ario-ant-escrow` defaults to `unsafe-allow-test-attestor-pubkey` for
-# non-SBF dev convenience (`cargo test` Just Works with the test seed).
-# Real-network SBF builds MUST opt out — F-4 compile-time guard refuses
-# a real-network build that still has the test ATTESTOR_PUBKEY unless
-# the unsafe feature is set. We never set it for SBF.
+# Plain workspace build — no -p flags needed.  cargo-build-sbf 2.1.0
+# copies every workspace member's .so at the end of the build, so we
+# must not leave ario-ant-escrow in the workspace when it isn't being
+# compiled.  sync_from_manifest() removes it from Cargo.toml and the
+# EXIT trap restores it.
 #
-# Default network is mainnet; override with `BUILD_NETWORK=devnet`.
-build_network="${BUILD_NETWORK:-mainnet}"
-case "${build_network}" in
-  mainnet) escrow_features="network-mainnet" ;;
-  devnet)  escrow_features="network-devnet"  ;;
-  *)
-    echo "[build-sbf] BUILD_NETWORK must be 'mainnet' or 'devnet', got '${build_network}'" >&2
-    exit 1
-    ;;
-esac
-
-# `cargo build-sbf` doesn't expose a per-package feature override directly,
-# but the workspace Cargo.toml already lists ario-ant-escrow as a member
-# and feature flags propagate down. Use `--no-default-features --features`
-# scoped to the escrow crate.
-cargo build-sbf -- --package ario-ant-escrow --no-default-features --features "${escrow_features}"
-# Then build the rest of the workspace with default features.
-cargo build-sbf -- \
-  --package ario-core --package ario-gar --package ario-arns --package ario-ant
+# To build escrow separately (requires real ATTESTOR_PUBKEY in state.rs):
+#   BUILD_NETWORK=devnet cargo build-sbf -- \
+#     --package ario-ant-escrow \
+#     --no-default-features --features network-devnet
+#
+# When BUILD_NETWORK=devnet we activate the `devnet-shrunk` cargo feature
+# on the two programs that hold zero-copy registries (ario-gar's
+# GatewayRegistry + Epoch.failure_counts; ario-arns's NameRegistry). This
+# shrinks the on-chain footprint from ~8 MB to ~10 KB total — saving ~57
+# SOL of rent on devnet — without forking the source. Mainnet builds
+# leave the feature off; the workspace default keeps production sizes.
+SBF_FEATURE_ARGS=()
+if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
+    SBF_FEATURE_ARGS+=(--features devnet-shrunk)
+    echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
+fi
+cargo build-sbf -- "${SBF_FEATURE_ARGS[@]}"
 ls -la target/deploy/*.so

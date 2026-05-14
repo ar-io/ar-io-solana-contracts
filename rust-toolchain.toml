@@ -1,0 +1,8 @@
+# Host toolchain for fmt, clippy, cargo test, and avm.
+# cargo-build-sbf uses its own bundled toolchain (rustc 1.79) regardless
+# of this file — only host-side commands pick it up.
+#
+# Keep in sync with RUST_TOOLCHAIN_HOST in .github/workflows/build-test.yml.
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]

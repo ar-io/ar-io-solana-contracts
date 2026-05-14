@@ -4,8 +4,8 @@ use anchor_spl::token::TokenAccount;
 use crate::error::GarError;
 use crate::state::*;
 use crate::{
-    EpochClosedEvent, EpochCreatedEvent, EpochPrescribedEvent, EpochWeightsTalliedEvent,
-    EpochsToggledEvent, RATE_SCALE,
+    EpochClosedEvent, EpochCreatedEvent, EpochDurationUpdatedEvent, EpochPrescribedEvent,
+    EpochWeightsTalliedEvent, EpochsToggledEvent, RATE_SCALE,
 };
 
 /// Enable/disable epoch processing.
@@ -37,6 +37,127 @@ pub fn set_epochs_enabled(ctx: Context<UpdateEpochSettings>, enabled: bool) -> R
         timestamp: now,
     });
 
+    Ok(())
+}
+
+/// Update `epoch_duration` post-init, re-anchoring `genesis_timestamp`
+/// so the next-to-be-created epoch starts at `now`.
+///
+/// Without the re-anchor, changing `epoch_duration` would push the next
+/// epoch's `start_timestamp = genesis + current_epoch_index * new_duration`
+/// either far into the future (longer duration) or far into the past
+/// (shorter duration), breaking `create_epoch`'s `clock >= start_timestamp`
+/// check or causing the cranker to chew through a backlog of imaginary
+/// stale epochs.
+///
+/// Re-anchor math: solve `epoch_start[current_epoch_index] == now` for
+/// `genesis_timestamp`, yielding
+/// `new_genesis = now - current_epoch_index * new_duration`.
+///
+/// Authority-only. Existing already-created Epoch PDAs are unaffected
+/// (their start/end timestamps were stamped at create time). They age
+/// into closability via the normal retention window as the cranker
+/// advances `current_epoch_index` past `idx + 7`.
+pub fn admin_set_epoch_duration(
+    ctx: Context<UpdateEpochSettings>,
+    new_duration: i64,
+) -> Result<()> {
+    require!(new_duration >= 60, GarError::InvalidParameter);
+
+    let clock = Clock::get()?;
+    let settings = &mut ctx.accounts.epoch_settings;
+
+    let old_duration = settings.epoch_duration;
+    let old_genesis = settings.genesis_timestamp;
+    let current_idx = settings.current_epoch_index as i64;
+
+    let new_genesis = clock
+        .unix_timestamp
+        .checked_sub(
+            current_idx
+                .checked_mul(new_duration)
+                .ok_or(GarError::ArithmeticOverflow)?,
+        )
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    settings.epoch_duration = new_duration;
+    settings.genesis_timestamp = new_genesis;
+
+    emit!(EpochDurationUpdatedEvent {
+        admin: ctx.accounts.authority.key(),
+        old_duration,
+        new_duration,
+        old_genesis_timestamp: old_genesis,
+        new_genesis_timestamp: new_genesis,
+        current_epoch_index: settings.current_epoch_index,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "epoch_duration {} → {} sec; genesis re-anchored {} → {} at idx={}",
+        old_duration,
+        new_duration,
+        old_genesis,
+        new_genesis,
+        settings.current_epoch_index
+    );
+
+    Ok(())
+}
+
+/// Close the EpochSettings PDA, refunding rent to the recorded authority.
+///
+/// Authority-only. Intended for fresh-init / authority-led recovery: closing
+/// + reinitializing is the only path to overwrite the immutable init params
+/// (`epoch_duration`, `prescribed_observer_count`, `prescribed_name_count`,
+/// `min_observer_stake`, `slash_rate`, `tenure_weight_duration`,
+/// `max_tenure_weight`) once they've been written by `initialize_epochs`.
+/// `initialize_epochs` uses `init` (not `init_if_needed`), so it cannot be
+/// called twice on the same PDA without a close in between.
+///
+/// Mid-cycle closure orphans existing Epoch PDAs and halts the cranker —
+/// the existing per-epoch PDAs remain on-chain but new `create_epoch` calls
+/// will fail until `initialize_epochs` runs again.
+///
+/// Deliberately NOT gated on `!enabled`: `set_epochs_enabled(false)` is a
+/// 7-day timelock (the `enabled` flag doesn't actually flip until `disable_at`
+/// elapses + the next `create_epoch` runs), which would force authority-led
+/// recovery to wait a week. The close is destructive regardless of timing,
+/// and the authority can already do anything else dangerous.
+pub fn close_epoch_settings(_ctx: Context<CloseEpochSettings>) -> Result<()> {
+    // Anchor's `close = authority` constraint on the Accounts struct
+    // does the lamport transfer + zero-out.
+    Ok(())
+}
+
+/// Recovery-only: close an Epoch PDA without the normal distribute /
+/// retention / observation-closed gates that `close_epoch` enforces.
+///
+/// The use case: after a `close_epoch_settings` + `initialize_epochs`
+/// reinit, `EpochSettings.current_epoch_index` resets to 0. If the
+/// cluster previously cycled through Epochs 0..N before reinit, those
+/// PDAs still exist on chain at seeds `[EPOCH_SEED, i.to_le_bytes()]`,
+/// and the next `create_epoch` collides with the orphaned PDA at the
+/// same address. Permissionless `close_epoch` cannot clean these up
+/// because the orphans never finished `distribute_rewards` and don't
+/// satisfy the retention gate.
+///
+/// **Closing an in-flight epoch (one with submitted-but-unclosed
+/// Observations) orphans those Observation PDAs**, breaking
+/// `close_observation`'s parent-reference invariant and leaving their
+/// rent stranded. Only run this on epochs that are genuinely orphaned —
+/// i.e., after a reinit, against indices that the new lifecycle won't
+/// re-use.
+///
+/// Authority-gated AND `migration_active`-gated: after mainnet
+/// `finalize_migration` flips `GatewaySettings.migration_active` to
+/// false, this ix becomes inert. By design, it is migration-window
+/// recovery infrastructure only.
+pub fn admin_close_stale_epoch(
+    _ctx: Context<AdminCloseStaleEpoch>,
+    _epoch_index: u64,
+) -> Result<()> {
+    // Anchor's `close = authority` on the Epoch account does the rest.
     Ok(())
 }
 
@@ -337,10 +458,8 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                 cumulative += slot.composite_weight as u128;
                 if cumulative > random_value && slot.composite_weight > 0 {
                     // Check if already selected
-                    let already = epoch.prescribed_observer_gateways[..selected_count]
-                        .iter()
-                        .any(|p| *p == slot.address);
-                    if !already {
+                    if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
+                    {
                         epoch.prescribed_observer_gateways[selected_count] = slot.address;
                         epoch.prescribed_observers[selected_count] = slot.address;
                         selected_count += 1;
@@ -360,10 +479,8 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                     if slot.composite_weight == 0 {
                         continue;
                     }
-                    let already = epoch.prescribed_observer_gateways[..selected_count]
-                        .iter()
-                        .any(|p| *p == slot.address);
-                    if !already {
+                    if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
+                    {
                         epoch.prescribed_observer_gateways[selected_count] = slot.address;
                         epoch.prescribed_observers[selected_count] = slot.address;
                         selected_count += 1;
@@ -481,10 +598,8 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                         if let Some(name_hash_bytes) =
                             read_name_entry(&name_data, names_offset, idx)
                         {
-                            let already = epoch.prescribed_names[..names_selected]
-                                .iter()
-                                .any(|n| *n == name_hash_bytes);
-                            if !already {
+                            if !epoch.prescribed_names[..names_selected].contains(&name_hash_bytes)
+                            {
                                 epoch.prescribed_names[names_selected] = name_hash_bytes;
                                 names_selected += 1;
                                 break;
@@ -606,6 +721,54 @@ pub struct UpdateEpochSettings<'info> {
     )]
     pub epoch_settings: Account<'info, EpochSettings>,
 
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CloseEpochSettings<'info> {
+    #[account(
+        mut,
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+        close = authority,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct AdminCloseStaleEpoch<'info> {
+    /// Authority gate via `has_one` (matches `EpochSettings.authority`)
+    /// + `migration_active` gate via `GatewaySettings`. After mainnet
+    /// `finalize_migration` flips `migration_active` to false, this ix
+    /// becomes inert.
+    #[account(
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        constraint = settings.migration_active @ GarError::MigrationInactive,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    #[account(
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    #[account(
+        mut,
+        seeds = [EPOCH_SEED, &epoch_index.to_le_bytes()],
+        bump,
+        close = authority,
+    )]
+    pub epoch: AccountLoader<'info, Epoch>,
+
+    #[account(mut)]
     pub authority: Signer<'info>,
 }
 

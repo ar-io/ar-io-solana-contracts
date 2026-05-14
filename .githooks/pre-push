@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Pre-push: mirror the fast half of CI (build-test.yml fmt-clippy job).
+# Install once: bash scripts/install-git-hooks.sh
+#
+# Skip (emergency pushes):  AR_IO_SKIP_PREPUSH=1 git push
+#
+# For full CI parity (slow: anchor build + tests + IDL snapshot), run
+# locally before a big merge or use the GitHub Actions workflow.
+
+set -euo pipefail
+
+if [[ "${AR_IO_SKIP_PREPUSH:-0}" == "1" ]]; then
+	echo "AR_IO_SKIP_PREPUSH=1 — skipping pre-push checks"
+	exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+echo "=== pre-push: cargo fmt (check) ==="
+cargo fmt --all -- --check
+
+echo "=== pre-push: cargo clippy (host, -D warnings) ==="
+cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+echo "=== pre-push OK ==="

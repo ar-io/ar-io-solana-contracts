@@ -16,6 +16,9 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
+# No-op: defined so workspace-wide --features devnet-shrunk works
+# (only ario-gar + ario-arns actually gate on this).
+devnet-shrunk = []
 default = []
 
 [dependencies]
@@ -41,3 +44,6 @@ tokio.workspace = true
 ario-ant = { path = "../ario-ant", features = ["no-entrypoint"] }
 ario-gar = { path = "../ario-gar", features = ["cpi"] }
 ario-test-utils = { path = "../../test-utils" }
+
+[lints]
+workspace = true

@@ -152,6 +152,52 @@ fn write_name_registry_header(reg: &AccountInfo, authority: Pubkey) -> Result<()
     Ok(())
 }
 
+/// Recovery-only: shrink an over-sized `NameRegistry` PDA back to the
+/// current binary's expected size, refunding the rent diff to the
+/// authority. Mirrors `ario_gar::admin_shrink_gateway_registry` — see
+/// that ix's doc comment for the full rationale (build-flag flip
+/// crosses `NameRegistry::SIZE`, causes `AccountLoader::load` to panic;
+/// this ix uses `AccountInfo` so it doesn't trip the size check).
+///
+/// Authority-gated AND `migration_active`-gated. Inert after mainnet
+/// `finalize_migration`. Refuses to truncate populated slot data
+/// (`count <= MAX_NAMES`).
+pub fn admin_shrink_name_registry(ctx: Context<AdminShrinkNameRegistry>) -> Result<()> {
+    let name_registry = &ctx.accounts.name_registry;
+    let target = 8 + NameRegistry::SIZE;
+
+    let current_len = name_registry.data_len();
+    require!(current_len > target, ArnsError::RegistryAlreadyShrunk);
+
+    {
+        let data = name_registry.try_borrow_data()?;
+        let count = u32::from_le_bytes(
+            data[40..44]
+                .try_into()
+                .map_err(|_| ArnsError::InvalidAccountData)?,
+        ) as usize;
+        require!(
+            count <= NameRegistry::MAX_NAMES,
+            ArnsError::ShrinkWouldLoseData
+        );
+    }
+
+    name_registry.realloc(target, false)?;
+
+    let new_minimum = Rent::get()?.minimum_balance(target);
+    let refund = name_registry.lamports().saturating_sub(new_minimum);
+    **name_registry.try_borrow_mut_lamports()? -= refund;
+    **ctx.accounts.authority.try_borrow_mut_lamports()? += refund;
+
+    msg!(
+        "NameRegistry shrunk: {} -> {} bytes, refunded {} lamports",
+        current_len,
+        target,
+        refund
+    );
+    Ok(())
+}
+
 #[derive(Accounts)]
 pub struct InitializeArns<'info> {
     #[account(
@@ -211,4 +257,27 @@ pub struct CreateNameRegistry<'info> {
     pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AdminShrinkNameRegistry<'info> {
+    /// Authority gate via `has_one`, migration-window gate via
+    /// `migration_active`. Inert post `finalize_migration`.
+    #[account(
+        seeds = [ARNS_CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ crate::error::ArnsError::Unauthorized,
+        constraint = config.migration_active @ crate::error::ArnsError::MigrationInactive,
+    )]
+    pub config: Account<'info, ArnsConfig>,
+
+    /// CHECK: deliberately `AccountInfo` rather than `AccountLoader` so the
+    /// ix works against an oversized account whose current bytes no longer
+    /// match the binary's `NameRegistry::SIZE`. PDA seed check ensures we
+    /// only touch the canonical registry.
+    #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
+    pub name_registry: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
 }

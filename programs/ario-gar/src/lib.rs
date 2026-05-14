@@ -2,6 +2,26 @@ use anchor_lang::prelude::*;
 
 declare_id!("ARioGarProgramXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
 
+/// Program ID of `ario-core`. Used by `distribute_epoch` to verify the
+/// CPI target when releasing protocol-treasury rewards (treasury SPL
+/// authority lives on ario-core's `ArioConfig` PDA, so distribute_epoch
+/// CPIs into `ario_core::release_treasury_to_recipient` instead of
+/// signing the SPL transfer directly).
+///
+/// Patched at build time by `build-sbf.sh --sync-from-manifest` from
+/// `program-ids/<cluster>.json` so the const matches the deployed
+/// ario-core binary on whichever cluster the build targets. Production
+/// values are committed as the placeholder; CI / local builds rewrite
+/// in place. We can't `use ario_core::ID` directly because adding
+/// ario-core as a Cargo dep here would create a cyclic dependency with
+/// the existing `ario-core → ario-gar` cpi dep used by primary-name
+/// fund-from variants.
+///
+/// Format kept on one line (via `#[rustfmt::skip]`) so the sed-based
+/// sync regex in `build-sbf.sh` stays simple.
+#[rustfmt::skip]
+pub const ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("ARioCoreProgramXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+
 pub mod error;
 pub mod instructions;
 pub mod migration;
@@ -59,28 +79,22 @@ pub mod ario_gar {
         instructions::initialize::create_gateway_registry(ctx)
     }
 
+    /// Recovery-only: shrink an over-sized GatewayRegistry back to the
+    /// current binary's expected size and refund rent to authority.
+    /// Used when switching build modes (e.g. production → devnet-shrunk)
+    /// would otherwise leave the on-chain account too large for
+    /// `AccountLoader::load`. Authority + `migration_active` gated;
+    /// inert after `finalize_migration`.
+    pub fn admin_shrink_gateway_registry(ctx: Context<AdminShrinkGatewayRegistry>) -> Result<()> {
+        instructions::initialize::admin_shrink_gateway_registry(ctx)
+    }
+
     /// Initialize epoch settings
     pub fn initialize_epochs(
         ctx: Context<InitializeEpochs>,
         params: InitializeEpochParams,
     ) -> Result<()> {
         instructions::initialize::initialize_epochs(ctx, params)
-    }
-
-    /// Admin one-shot: transfer SPL `Owner` authority of `protocol_token_account`
-    /// from the GatewaySettings PDA to a target authority (typically
-    /// `ario-core`'s ArioConfig PDA, which signs SPL transfers in
-    /// `ario_core::import_balance`'s genesis-distribution branch).
-    ///
-    /// Mainnet creates the treasury under ArioConfig from the start; this
-    /// instruction is the migration path for already-deployed clusters.
-    /// See `instructions::initialize::release_treasury_authority` for the
-    /// motivation comment.
-    pub fn release_treasury_authority(
-        ctx: Context<ReleaseTreasuryAuthority>,
-        new_authority: Pubkey,
-    ) -> Result<()> {
-        instructions::initialize::release_treasury_authority(ctx, new_authority)
     }
 
     /// Admin recovery — repair `GatewaySettings.mint` /
@@ -255,6 +269,39 @@ pub mod ario_gar {
     /// Enable/disable epoch processing
     pub fn set_epochs_enabled(ctx: Context<UpdateEpochSettings>, enabled: bool) -> Result<()> {
         instructions::epoch::set_epochs_enabled(ctx, enabled)
+    }
+
+    /// Update `epoch_duration` post-init, re-anchoring `genesis_timestamp`
+    /// so the next-to-be-created epoch starts at `now`. Authority-only.
+    /// Existing already-created Epoch PDAs are unaffected — they age
+    /// out via the standard retention window.
+    pub fn admin_set_epoch_duration(
+        ctx: Context<UpdateEpochSettings>,
+        new_duration: i64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
+    }
+
+    /// Close the EpochSettings PDA (authority-only). The only path to
+    /// overwrite the immutable init params on a singleton PDA originally
+    /// created with `init` (not `init_if_needed`). After close, the
+    /// authority can call `initialize_epochs` again with new params.
+    pub fn close_epoch_settings(ctx: Context<CloseEpochSettings>) -> Result<()> {
+        instructions::epoch::close_epoch_settings(ctx)
+    }
+
+    /// Recovery-only: close an Epoch PDA orphaned by a prior
+    /// `close_epoch_settings` + `initialize_epochs` reinit, where the
+    /// reset `current_epoch_index` collides with PDAs from the prior
+    /// lifecycle. Authority-gated AND `migration_active`-gated; inert
+    /// after `finalize_migration`. **Closing an in-flight epoch
+    /// orphans Observation PDAs** — only safe on epochs the new
+    /// lifecycle won't re-use.
+    pub fn admin_close_stale_epoch(
+        ctx: Context<AdminCloseStaleEpoch>,
+        epoch_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_close_stale_epoch(ctx, epoch_index)
     }
 
     /// Create a new epoch (F23)
@@ -530,6 +577,20 @@ pub struct InitializeEpochParams {
     pub name_count: u8,
     pub min_observer_stake: u64,
     pub slash_rate: u16,
+    /// Denominator (seconds) for the per-gateway tenure-weight ramp:
+    /// `tenure_weight = min(time_running / tenure_weight_duration,
+    /// max_tenure_weight)`. Lua / mainnet value is `180 * 86_400`
+    /// (180 days). Devnet bootstraps often pass `3600` (1 hour) to
+    /// surface a full tenure ramp inside a handful of short epochs.
+    /// MUST be > 0 — see ADR / DECISIONS for the security history
+    /// behind making this a caller-supplied param (the previous
+    /// unconditional 1-hour default leaked into a production-bound
+    /// build and inflated weighted-observer-selection probabilities
+    /// for newly-joined gateways).
+    pub tenure_weight_duration: i64,
+    /// Ceiling for the tenure-weight ramp above. Lua / mainnet value
+    /// is `4`. MUST be > 0.
+    pub max_tenure_weight: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -799,6 +860,21 @@ pub struct AllowlistToggledEvent {
 pub struct EpochsToggledEvent {
     pub admin: Pubkey,
     pub enabled: bool,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_epoch_duration`. Records both the duration
+/// change AND the genesis re-anchor so indexers can recompute
+/// `wall_clock_epoch = (now - genesis_timestamp) / epoch_duration`
+/// without re-fetching `EpochSettings`.
+#[event]
+pub struct EpochDurationUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_duration: i64,
+    pub new_duration: i64,
+    pub old_genesis_timestamp: i64,
+    pub new_genesis_timestamp: i64,
+    pub current_epoch_index: u64,
     pub timestamp: i64,
 }
 

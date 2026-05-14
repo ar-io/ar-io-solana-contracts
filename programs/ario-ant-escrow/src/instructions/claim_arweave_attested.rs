@@ -39,9 +39,11 @@ use crate::{
     error::EscrowError,
     mpl_core_cpi::{set_update_authority_signed_by_pda, transfer_asset_signed_by_pda},
     state::{
-        assert_mpl_core_asset_v1, EscrowAnt, ESCROW_ANT_SEED, MPL_CORE_PROGRAM_ID, PROTOCOL_ARWEAVE,
+        assert_mpl_core_asset_v1, EscrowAnt, ASSET_TYPE_ANT, ESCROW_ANT_SEED, MPL_CORE_PROGRAM_ID,
+        PROTOCOL_ARWEAVE,
     },
     verify::attested::verify_attested_signature,
+    EscrowClaimedEvent,
 };
 
 pub fn handler(ctx: Context<ClaimAntArweaveAttested>, message_nonce: [u8; 32]) -> Result<()> {
@@ -112,6 +114,17 @@ pub fn handler(ctx: Context<ClaimAntArweaveAttested>, message_nonce: [u8; 32]) -
         &ctx.accounts.mpl_core_program,
         signer_seeds,
     )?;
+
+    let clock = Clock::get()?;
+    emit!(EscrowClaimedEvent {
+        escrow: ctx.accounts.escrow.key(),
+        claimer: ctx.accounts.claimant.key(),
+        asset_id: ant_mint_key,
+        asset_type: ASSET_TYPE_ANT,
+        amount: 0,
+        claim_protocol: PROTOCOL_ARWEAVE,
+        timestamp: clock.unix_timestamp,
+    });
 
     msg!(
         "ant-escrow: claimed (arweave-attested) mint={} claimant={}",

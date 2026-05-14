@@ -184,3 +184,109 @@ pub struct AdminRepairConfig<'info> {
 
     pub authority: Signer<'info>,
 }
+
+pub mod admin_set_gar_program {
+    use super::*;
+    use anchor_lang::system_program;
+    use anchor_lang::Discriminator;
+
+    /// Migration ix for pre-`gar_program` ArioConfig deployments.
+    /// Grows the ArioConfig PDA by 32 bytes (the size of the new
+    /// `gar_program` field, appended after `bump`) and writes the
+    /// supplied GAR program ID.
+    ///
+    /// `config` is an `UncheckedAccount` (not `Account<ArioConfig>`)
+    /// because Anchor's account-load runs *before* `realloc` and
+    /// would fail with `AccountDidNotDeserialize` on the pre-realloc
+    /// 226-byte account (the new 258-byte struct hits EOF reading the
+    /// appended `gar_program` field). Validation is therefore done
+    /// manually: owner, discriminator, PDA derivation, stored
+    /// authority, and `migration_active` flag.
+    ///
+    /// Idempotent: if the account is already at the target size,
+    /// realloc is skipped and the handler just rewrites `gar_program`.
+    pub fn handler(ctx: Context<AdminSetGarProgram>, new_gar_program: Pubkey) -> Result<()> {
+        let clock = Clock::get()?;
+        require!(
+            clock.unix_timestamp < MIGRATION_DEADLINE,
+            ArioError::MigrationExpired
+        );
+
+        let config_ai = &ctx.accounts.config;
+        let authority = &ctx.accounts.authority;
+        let system_program_ai = &ctx.accounts.system_program;
+
+        require_keys_eq!(*config_ai.owner, crate::ID, ArioError::Unauthorized);
+
+        let current_size = config_ai.data_len();
+        require!(current_size >= 226, ArioError::Unauthorized);
+
+        {
+            let data = config_ai.try_borrow_data()?;
+            require!(
+                &data[..8] == ArioConfig::DISCRIMINATOR,
+                ArioError::Unauthorized
+            );
+
+            // Stored authority is the first field after the discriminator.
+            let stored_authority =
+                Pubkey::try_from(&data[8..40]).map_err(|_| error!(ArioError::Unauthorized))?;
+            require_keys_eq!(stored_authority, authority.key(), ArioError::Unauthorized);
+
+            // `migration_active` lives at payload offset 184 (= data offset 192).
+            // Layout: authority(32)+mint(32)+arns_program(32)+treasury(32)
+            //   + 4*u64(32) + 3*i64(24) = 184 bytes before this field.
+            require!(data[192] == 1, ArioError::MigrationInactive);
+        }
+
+        let target_size = ArioConfig::SIZE;
+        if current_size < target_size {
+            let rent = Rent::get()?;
+            let required = rent.minimum_balance(target_size);
+            let cur_lamports = config_ai.lamports();
+            if required > cur_lamports {
+                let diff = required - cur_lamports;
+                let cpi_accounts = system_program::Transfer {
+                    from: authority.to_account_info(),
+                    to: config_ai.to_account_info(),
+                };
+                let cpi_ctx = CpiContext::new(system_program_ai.to_account_info(), cpi_accounts);
+                system_program::transfer(cpi_ctx, diff)?;
+            }
+            config_ai.realloc(target_size, false)?;
+            let mut data = config_ai.try_borrow_mut_data()?;
+            for byte in &mut data[current_size..target_size] {
+                *byte = 0;
+            }
+        }
+
+        {
+            let mut data = config_ai.try_borrow_mut_data()?;
+            let offset = target_size - 32;
+            data[offset..offset + 32].copy_from_slice(&new_gar_program.to_bytes());
+        }
+
+        msg!("ArioConfig.gar_program set: {}", new_gar_program);
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct AdminSetGarProgram<'info> {
+    /// CHECK: manually validated in handler — owner, discriminator,
+    /// stored authority, and migration_active are all checked before
+    /// any mutation. Cannot use `Account<'info, ArioConfig>` because
+    /// Anchor account-load runs before `realloc` and would reject the
+    /// pre-realloc 226-byte layout.
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump,
+    )]
+    pub config: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}

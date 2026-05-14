@@ -1,0 +1,81 @@
+{
+  "name": "@ar.io/solana-contracts",
+  "version": "0.2.0",
+  "description": "TypeScript client for the AR.IO Solana programs (ario-core, ario-gar, ario-arns, ario-ant, ario-ant-escrow). Codama-generated per-program clients plus hand-written helpers for things the IDL doesn't expose (e.g. the ANT-escrow canonical-message builders signed off-chain by the attestor and reconstructed on-chain for Ed25519 verification).",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/ar-io/ar-io-solana-contracts/tree/develop/clients/ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ar-io/ar-io-solana-contracts.git",
+    "directory": "clients/ts"
+  },
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js"
+    },
+    "./core": {
+      "types": "./lib/core/index.d.ts",
+      "import": "./lib/core/index.js"
+    },
+    "./gar": {
+      "types": "./lib/gar/index.d.ts",
+      "import": "./lib/gar/index.js"
+    },
+    "./arns": {
+      "types": "./lib/arns/index.d.ts",
+      "import": "./lib/arns/index.js"
+    },
+    "./ant": {
+      "types": "./lib/ant/index.d.ts",
+      "import": "./lib/ant/index.js"
+    },
+    "./ant-escrow": {
+      "types": "./lib/ant-escrow/index.d.ts",
+      "import": "./lib/ant-escrow/index.js"
+    },
+    "./canonical": {
+      "types": "./lib/canonical/index.d.ts",
+      "import": "./lib/canonical/index.js"
+    },
+    "./canonical/ant-escrow": {
+      "types": "./lib/canonical/ant-escrow.d.ts",
+      "import": "./lib/canonical/ant-escrow.js"
+    }
+  },
+  "files": [
+    "lib/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "codegen": "node scripts/codegen.mjs",
+    "build:tsc": "tsc -p tsconfig.json",
+    "build": "yarn codegen && yarn build:tsc",
+    "postinstall": "node scripts/postinstall.mjs",
+    "clean": "rm -rf lib src/core src/gar src/arns src/ant src/ant-escrow",
+    "prepublishOnly": "yarn clean && yarn build",
+    "test": "node --test --import tsx test/canonical.cross.test.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.5.0",
+    "bs58": "^6.0.0"
+  },
+  "peerDependencies": {
+    "@solana/kit": ">=6 <7"
+  },
+  "devDependencies": {
+    "@codama/nodes-from-anchor": "^1.4.1",
+    "@codama/renderers-js": "^2.1.0",
+    "@solana/kit": "^6.8.0",
+    "@types/node": "^20.0.0",
+    "codama": "^1.6.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.3.0"
+  },
+  "packageManager": "yarn@1.22.22"
+}

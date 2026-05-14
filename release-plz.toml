@@ -1,0 +1,53 @@
+[workspace]
+# Not published to crates.io — these are on-chain programs, not library crates.
+publish = false
+
+# We create GitHub Releases ourselves in release.yml (builds BPF binaries,
+# packages IDLs + .so + program-ids manifest). release-plz only creates the
+# semver tag and updates CHANGELOG.md.
+git_release_enable = false
+
+# Keep CHANGELOG.md up to date from conventional commits.
+changelog_update = true
+
+# Conventional commit types that trigger a release PR.
+# feat → minor bump, fix/perf → patch bump, BREAKING CHANGE → major bump.
+# release_always = false (default) means a PR is only opened when there
+# are commits that produce a changelog entry.
+
+# Tag format: v0.2.0 (no package-name prefix — all programs ship together).
+git_tag_name = "v{{ version }}"
+
+# Per-package overrides — all programs share version.workspace = true so
+# they all bump together. Disable individual package GH releases.
+[[package]]
+name = "ario-core"
+publish = false
+git_release_enable = false
+
+[[package]]
+name = "ario-gar"
+publish = false
+git_release_enable = false
+
+[[package]]
+name = "ario-arns"
+publish = false
+git_release_enable = false
+
+[[package]]
+name = "ario-ant"
+publish = false
+git_release_enable = false
+
+[[package]]
+name = "ario-ant-escrow"
+publish = false
+git_release_enable = false
+
+[[package]]
+name = "ario-test-utils"
+publish = false
+git_release_enable = false
+# test-utils is internal scaffolding; exclude it from the release PR changelog.
+release = false

@@ -8,8 +8,7 @@ use anchor_lang::solana_program::{
     system_instruction,
     sysvar::Sysvar,
 };
-use anchor_spl::token::spl_token::instruction::AuthorityType;
-use anchor_spl::token::{self, Mint, SetAuthority, Token, TokenAccount};
+use anchor_spl::token::{Mint, Token, TokenAccount};
 
 use crate::error::GarError;
 use crate::state::*;
@@ -58,7 +57,7 @@ pub fn create_gateway_registry(ctx: Context<CreateGatewayRegistry>) -> Result<()
     let system = ctx.accounts.system_program.to_account_info();
     let auth_pk = ctx.accounts.settings.authority;
 
-    let current_len = registry.data_len() as usize;
+    let current_len = registry.data_len();
 
     if current_len == TARGET {
         let data = registry.try_borrow_data()?;
@@ -138,10 +137,79 @@ fn write_gateway_registry_header(registry: &AccountInfo, authority: Pubkey) -> R
     Ok(())
 }
 
+/// Recovery-only: shrink an over-sized `GatewayRegistry` PDA back to the
+/// current binary's expected size, refunding the rent diff to the
+/// authority.
+///
+/// The use case: a build-flag flip changes `GatewayRegistry::SIZE`
+/// (e.g. crossing from a production binary that allocated a ~168 KB
+/// registry to a `devnet-shrunk` binary that expects ~1.7 KB). The
+/// on-chain account is too big for the new binary's
+/// `AccountLoader::load`, which panics with a size mismatch. This ix uses
+/// `AccountInfo` (not `AccountLoader`) so it doesn't panic, and reallocs
+/// the account down to `8 + GatewayRegistry::SIZE` of the *current*
+/// binary, then transfers the freed rent lamports to the authority.
+///
+/// Authority-gated AND `migration_active`-gated. Inert after mainnet
+/// `finalize_migration`. Refuses to truncate populated slot data
+/// (`count <= MAX_GATEWAYS`).
+pub fn admin_shrink_gateway_registry(ctx: Context<AdminShrinkGatewayRegistry>) -> Result<()> {
+    let registry = &ctx.accounts.registry;
+    let target = 8 + GatewayRegistry::SIZE;
+
+    let current_len = registry.data_len();
+    require!(current_len > target, GarError::RegistryAlreadyShrunk);
+
+    // Belt-and-braces: don't truncate into populated slot data.
+    {
+        let data = registry.try_borrow_data()?;
+        let count = u32::from_le_bytes(
+            data[40..44]
+                .try_into()
+                .map_err(|_| GarError::InvalidAccountData)?,
+        ) as usize;
+        require!(
+            count <= GatewayRegistry::MAX_GATEWAYS,
+            GarError::ShrinkWouldLoseData
+        );
+    }
+
+    registry.realloc(target, false)?;
+
+    // Refund excess rent to authority. realloc preserves the head data and
+    // truncates the (unused) tail; the account's lamports are unchanged by
+    // realloc itself, so the surplus over the new rent minimum is free to
+    // transfer.
+    let new_minimum = Rent::get()?.minimum_balance(target);
+    let refund = registry.lamports().saturating_sub(new_minimum);
+    **registry.try_borrow_mut_lamports()? -= refund;
+    **ctx.accounts.authority.try_borrow_mut_lamports()? += refund;
+
+    msg!(
+        "GatewayRegistry shrunk: {} -> {} bytes, refunded {} lamports",
+        current_len,
+        target,
+        refund
+    );
+    Ok(())
+}
+
 pub fn initialize_epochs(
     ctx: Context<InitializeEpochs>,
     params: InitializeEpochParams,
 ) -> Result<()> {
+    // Both tenure-ramp params must be positive: zero `tenure_weight_duration`
+    // would divide-by-zero in `GatewayWeights::compute`, and zero
+    // `max_tenure_weight` would peg every gateway's tenure_weight to 0 and
+    // therefore wipe composite_weight (silently disabling reward / observer
+    // selection). Caller is the migration authority — these checks catch
+    // operator typos, not adversarial input.
+    require!(
+        params.tenure_weight_duration > 0,
+        GarError::InvalidParameter
+    );
+    require!(params.max_tenure_weight > 0, GarError::InvalidParameter);
+
     let clock = Clock::get()?;
     let settings = &mut ctx.accounts.epoch_settings;
 
@@ -154,8 +222,15 @@ pub fn initialize_epochs(
     settings.enabled = false;
     settings.current_epoch_index = 0;
     settings.genesis_timestamp = clock.unix_timestamp;
-    settings.tenure_weight_duration = 180 * 86_400; // 180 days (matches Lua tenureWeightDurationMs)
-    settings.max_tenure_weight = 4; // matches Lua maxTenureWeight
+    // Tenure-ramp denominator + ceiling are now caller-supplied so devnet
+    // can pass a short value (e.g. 3600 = 1 hour) for fast iteration while
+    // mainnet uses the Lua/production constant (`180 * 86_400` = 180 days,
+    // `max_tenure_weight = 4`). The earlier hardcoded `3600` was a devnet
+    // fast-test default that leaked into a mainnet-bound build and
+    // inflated tenure_weight for newly-joined gateways, distorting
+    // weighted-observer selection probability.
+    settings.tenure_weight_duration = params.tenure_weight_duration;
+    settings.max_tenure_weight = params.max_tenure_weight;
     settings.gateway_reward_ratio = GATEWAY_OPERATOR_REWARD_RATE;
     settings.observer_reward_ratio = OBSERVER_REWARD_RATE;
     settings.missed_observation_penalty_rate = MISSED_OBSERVATION_PENALTY;
@@ -230,6 +305,29 @@ pub struct CreateGatewayRegistry<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AdminShrinkGatewayRegistry<'info> {
+    /// Authority gate via `has_one`, migration-window gate via
+    /// `migration_active`. Inert post `finalize_migration`.
+    #[account(
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
+        constraint = settings.migration_active @ crate::error::GarError::MigrationInactive,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    /// CHECK: deliberately `AccountInfo` rather than `AccountLoader` so the
+    /// ix works against an oversized account whose current bytes no longer
+    /// match the binary's `GatewayRegistry::SIZE`. PDA seed check ensures
+    /// we only touch the canonical registry.
+    #[account(mut, seeds = [REGISTRY_SEED], bump)]
+    pub registry: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeEpochs<'info> {
     #[account(
         init,
@@ -258,84 +356,6 @@ pub struct InitializeEpochs<'info> {
     pub program_data: Account<'info, ProgramData>,
 
     pub system_program: Program<'info, System>,
-}
-
-/// One-shot admin: transfer SPL `Owner` authority of `protocol_token_account`
-/// from the current GatewaySettings PDA to a target authority (typically
-/// `ario-core`'s ArioConfig PDA).
-///
-/// Why this exists: at original deploy the protocol_token_account was created
-/// under the GatewaySettings PDA's authority (the natural choice for a
-/// fee-receipt account, since `ario-gar` is where stake/reward flows live).
-/// The genesis-distribution flow added in 2026-05 (`ario-core::import_balance`
-/// SPL transfer to pre-registered holders) needs ArioConfig PDA to sign
-/// transfers FROM the treasury — a different program entirely. Re-architecting
-/// to do cross-program-CPI'd treasury releases is heavier than just moving the
-/// SPL Owner authority once. Mainnet creates the treasury under ArioConfig
-/// from the start (see `migration/import/src/devnet-setup.ts`); this
-/// instruction is the migration path for already-deployed clusters.
-///
-/// Authority required: `settings.authority` (the original protocol deployer).
-/// `new_authority` is passed by the caller — typically the ArioConfig PDA
-/// computed from `[ario_config, ARIO_CORE_PROGRAM_ID]`. Caller is responsible
-/// for ensuring the destination is an actual signer (a PDA the new program
-/// can sign for); this handler doesn't validate program ownership of the
-/// target since the legitimate target is in a different program family.
-///
-/// Emits no event — one-shot infra change, indexers don't need it. Logs via
-/// `msg!` for tx-log auditability.
-pub fn release_treasury_authority(
-    ctx: Context<ReleaseTreasuryAuthority>,
-    new_authority: Pubkey,
-) -> Result<()> {
-    let cpi_accounts = SetAuthority {
-        account_or_mint: ctx.accounts.protocol_token_account.to_account_info(),
-        current_authority: ctx.accounts.settings.to_account_info(),
-    };
-    let bump = ctx.accounts.settings.bump;
-    let signer_seeds: &[&[&[u8]]] = &[&[SETTINGS_SEED, &[bump]]];
-    let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
-        cpi_accounts,
-        signer_seeds,
-    );
-    token::set_authority(cpi_ctx, AuthorityType::AccountOwner, Some(new_authority))?;
-
-    msg!(
-        "protocol_token_account authority transferred: {} -> {}",
-        ctx.accounts.settings.key(),
-        new_authority
-    );
-    Ok(())
-}
-
-/// Admin: transfer SPL `Owner` authority of the protocol token account away
-/// from the GatewaySettings PDA. See `release_treasury_authority` for
-/// motivation.
-#[derive(Accounts)]
-pub struct ReleaseTreasuryAuthority<'info> {
-    #[account(
-        seeds = [SETTINGS_SEED],
-        bump = settings.bump,
-        has_one = authority @ crate::error::GarError::Unauthorized,
-    )]
-    pub settings: Account<'info, GatewaySettings>,
-
-    pub authority: Signer<'info>,
-
-    /// Treasury account whose SPL `Owner` authority is being transferred.
-    /// Must currently be owned by the GatewaySettings PDA (i.e. its
-    /// `owner` field equals `settings.key()`); the SetAuthority CPI
-    /// would fail otherwise but we surface the mismatch as a typed
-    /// error first.
-    #[account(
-        mut,
-        constraint = protocol_token_account.owner == settings.key()
-            @ crate::error::GarError::InvalidOwner,
-    )]
-    pub protocol_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
 }
 
 /// Admin recovery — repair `GatewaySettings` mint / stake_token_account /

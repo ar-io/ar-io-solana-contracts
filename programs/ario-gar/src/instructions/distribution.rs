@@ -1,9 +1,13 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer as SplTransfer};
+use anchor_lang::solana_program::{
+    instruction::{AccountMeta, Instruction},
+    program::invoke_signed,
+};
+use anchor_spl::token::{Token, TokenAccount};
 
 use crate::error::GarError;
 use crate::state::*;
-use crate::{EpochDistributedEvent, RATE_SCALE};
+use crate::{EpochDistributedEvent, ARIO_CORE_PROGRAM_ID, RATE_SCALE};
 
 /// Per-gateway intermediate computed during distribute_epoch's first pass.
 /// Holds the deserialized Gateway + the scalar per-gateway computations so
@@ -231,6 +235,22 @@ pub fn distribute_epoch<'info>(
             // either invariant, the epoch fails loudly with
             // ArithmeticOverflow instead of silently zeroing delegate
             // accruals for the batch.
+            //
+            // NOTE: We intentionally do NOT update `p.gateway.total_delegated_stake`
+            // or `settings.total_delegated` here. Doing so per-delegate would be
+            // O(delegates) per epoch and blow the compute budget; doing so only
+            // at the gateway aggregate would silently change the accumulator's
+            // denominator semantics for the next epoch (rewards would start
+            // compounding into the principal). Instead, the per-share accumulator
+            // (`cumulative_reward_per_token`) is what tracks unsettled delegate
+            // rewards; each `Delegation.amount` is updated lazily on the next
+            // delegate interaction or via permissionless `compound_delegation_rewards`.
+            //
+            // Consequence: between this point and each delegate's next settlement,
+            // `stake_token_account.balance > Σ operator_stake + Σ total_delegated_stake
+            // + Σ Withdrawal.amount` by exactly the unsettled-rewards amount.
+            // See INVARIANTS.md §"Invariant 1 violation window" for the off-chain
+            // health-check formula.
             if delegate_pool > 0 && p.gateway.total_delegated_stake > 0 {
                 let increment = (delegate_pool as u128)
                     .checked_mul(REWARD_PRECISION)
@@ -279,24 +299,60 @@ pub fn distribute_epoch<'info>(
 
     // ----------------------------------------------------------------------
     // Single SPL transfer for the (possibly capped) batch total. The
-    // in-memory accounting above already used `transfer_amount`, so the
-    // protocol token account and the gateways' stake credits stay in sync.
+    // protocol-treasury SPL authority lives on `ario-core`'s ArioConfig
+    // PDA (set during migration bootstrap via
+    // `ario_gar::release_treasury_authority`), so we CPI into
+    // `ario_core::release_treasury_to_recipient` instead of signing the
+    // SPL transfer directly. The hand-rolled `invoke_signed` (vs Anchor
+    // CPI) avoids a circular Cargo dep with the existing
+    // `ario-core → ario-gar` cpi dep used by primary-name fund-from
+    // variants.
+    //
+    // ario-core verifies on its side:
+    //   - source == ArioConfig.treasury (pinned)
+    //   - destination == gar_settings.stake_token_account (limits the
+    //     blast radius even if this CPI were spoofed)
+    //   - `gar_settings` is a real signer derived from ario-gar's
+    //     program ID (only ario-gar code can produce this signature)
     // ----------------------------------------------------------------------
     if transfer_amount > 0 {
         let settings_bump = ctx.accounts.settings.bump;
         let signer_seeds: &[&[&[u8]]] = &[&[SETTINGS_SEED, &[settings_bump]]];
 
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.protocol_token_account.to_account_info(),
-            to: ctx.accounts.stake_token_account.to_account_info(),
-            authority: ctx.accounts.settings.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer_seeds,
+        // Anchor instruction discriminator for global:release_treasury_to_recipient.
+        // Hard-coded as a manual CPI; ario-gar can't depend on ario-core
+        // crate (would cycle with ario-core → ario-gar cpi dep).
+        let mut data: Vec<u8> = Vec::with_capacity(8 + 8);
+        data.extend_from_slice(
+            &anchor_lang::solana_program::hash::hash(b"global:release_treasury_to_recipient")
+                .to_bytes()[..8],
         );
-        token::transfer(cpi_ctx, transfer_amount)?;
+        data.extend_from_slice(&transfer_amount.to_le_bytes());
+
+        let cpi_ix = Instruction {
+            program_id: ARIO_CORE_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(ctx.accounts.ario_config.key(), false),
+                AccountMeta::new(ctx.accounts.protocol_token_account.key(), false),
+                AccountMeta::new(ctx.accounts.stake_token_account.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.settings.key(), true),
+                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+            ],
+            data,
+        };
+
+        invoke_signed(
+            &cpi_ix,
+            &[
+                ctx.accounts.ario_config.to_account_info(),
+                ctx.accounts.protocol_token_account.to_account_info(),
+                ctx.accounts.stake_token_account.to_account_info(),
+                ctx.accounts.settings.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.ario_core_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
     }
 
     if transfer_amount < batch_total_reward {
@@ -362,7 +418,8 @@ pub struct DistributeEpoch<'info> {
     )]
     pub registry: AccountLoader<'info, GatewayRegistry>,
 
-    /// GAR settings PDA — used as signer for protocol token transfers
+    /// GAR settings PDA — signs the CPI into `ario_core::release_treasury_to_recipient`
+    /// (the SPL transfer itself is signed inside ario-core by ArioConfig).
     #[account(
         mut,
         seeds = [SETTINGS_SEED],
@@ -370,7 +427,11 @@ pub struct DistributeEpoch<'info> {
     )]
     pub settings: Account<'info, GatewaySettings>,
 
-    /// Protocol token account (source of reward tokens, authority = settings PDA)
+    /// Protocol token account (source of reward tokens). Owned by
+    /// ario-core's ArioConfig PDA; ario-core signs the SPL transfer.
+    /// We constrain only the address (matches the settings-pinned value)
+    /// — the SPL-level owner mismatch with `settings` here is intentional
+    /// since ario-core now holds treasury authority.
     #[account(
         mut,
         constraint = protocol_token_account.mint == settings.mint,
@@ -385,6 +446,28 @@ pub struct DistributeEpoch<'info> {
         constraint = stake_token_account.key() == settings.stake_token_account @ GarError::InvalidParameter,
     )]
     pub stake_token_account: Account<'info, TokenAccount>,
+
+    /// ario-core's `ArioConfig` PDA. ario-core's
+    /// `release_treasury_to_recipient` ix verifies this is the canonical
+    /// config PDA (via its own `seeds = [CONFIG_SEED]` constraint).
+    /// We pass it through as `AccountInfo` here to avoid importing
+    /// ario-core types (would create a Cargo dep cycle).
+    ///
+    /// CHECK: derivation verified by `seeds::program = ARIO_CORE_PROGRAM_ID`.
+    #[account(
+        seeds = [b"ario_config"],
+        bump,
+        seeds::program = ARIO_CORE_PROGRAM_ID,
+    )]
+    pub ario_config: AccountInfo<'info>,
+
+    /// CHECK: address-pinned to the canonical ario-core program ID, which
+    /// is patched at build time by `build-sbf.sh --sync-from-manifest`
+    /// from `program-ids/<cluster>.json`. The constraint guarantees the
+    /// downstream `invoke_signed` target can't be substituted by the
+    /// caller.
+    #[account(address = ARIO_CORE_PROGRAM_ID)]
+    pub ario_core_program: AccountInfo<'info>,
 
     pub payer: Signer<'info>,
 
