@@ -218,8 +218,20 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
 /// pass `ario_ant::ID`, so the canonical-only constraint is operationally
 /// transparent today.
 ///
-/// Returns `Some(owner)` if the record exists and has a delegated owner,
-/// `None` otherwise.
+/// Returns the **effective owner** of an `AntRecord`:
+///   * `owner` field if `Some(_)` (explicit delegate),
+///   * `last_reconciled_owner` otherwise (canonical NFT-owner snapshot
+///     written at spawn and refreshed on every owner-reconciling ix in
+///     `ario_ant`).
+///
+/// Why fall back: `ario_ant` initializes new records with `owner = None`
+/// (the spawn flow doesn't set a delegate — the NFT holder is the
+/// implicit owner). ario-core is MPL-agnostic per ADR-016 and can't
+/// read the NFT owner directly, so it relies on `last_reconciled_owner`
+/// as the canonical snapshot. Authorization through this helper stays
+/// stale-after-NFT-transfer until someone in `ario_ant` (set_record,
+/// transfer_record, reconcile) refreshes it — same staleness window
+/// every other ARIO-core/ARIO-ant interaction already has.
 ///
 /// Borsh layout (mirrors `ario_ant::state::AntRecord` — keep in sync with
 /// `programs/ario-ant/src/state.rs`):
@@ -231,23 +243,29 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
 ///   4     ttl_seconds: u32
 ///   1+[4] priority: Option<u32> (0x00 = None, 0x01 + u32 = Some)
 ///   1+[32] owner: Option<Pubkey> (0x00 = None, 0x01 + 32 bytes = Some)
-///   32    last_reconciled_owner — not read here
+///   32    last_reconciled_owner: Pubkey
 ///   1     bump — not read here
 ///
 /// The layout-pin test `test_ant_record_layout_parse_pin` exercises this
-/// parser end-to-end. If `AntRecord` field order changes before `owner`,
-/// that test fails — refresh this helper and its comment.
+/// parser end-to-end. If `AntRecord` field order changes before
+/// `last_reconciled_owner` (inclusive), that test fails — refresh this
+/// helper and its comment.
 ///
 /// Conformance: third-party ANT programs MUST keep AntRecord's prefix
 /// (mint, undername, target, target_protocol, ttl_seconds, priority,
-/// owner) byte-compatible with the canonical `ario_ant`. Anything else
-/// makes them invisible to ario-core's BD-097 path.
+/// owner, last_reconciled_owner) byte-compatible with the canonical
+/// `ario_ant`. Anything else makes them invisible to ario-core's BD-097
+/// path. The `last_reconciled_owner` requirement is new in this fix;
+/// previously the conformance contract stopped at `owner` but the helper
+/// required `record.owner == Some(signer)` — which blocked every
+/// canonical spawn-then-setPrimaryName flow because spawns leave
+/// `owner = None`.
 fn read_ant_record_owner(
     ant_record_info: &AccountInfo,
     ant_mint: &Pubkey,
     undername: &str,
     ant_program: &Pubkey,
-) -> Result<Option<Pubkey>> {
+) -> Result<Pubkey> {
     // SECURITY: pin to the canonical ARIO-ANT program. See helper
     // doc-comment above for the spoofing attack this closes.
     require!(*ant_program == ario_ant::ID, ArioError::InvalidAccountState);
@@ -337,8 +355,8 @@ fn read_ant_record_owner(
 
     // owner: Option<Pubkey>
     require!(data.len() > offset, ArioError::InvalidAccountState);
-    if data[offset] == 0 {
-        Ok(None)
+    let (explicit_owner, owner_size) = if data[offset] == 0 {
+        (None, 1usize)
     } else {
         let owner_end = offset
             .checked_add(1)
@@ -347,8 +365,24 @@ fn read_ant_record_owner(
         require!(data.len() >= owner_end, ArioError::InvalidAccountState);
         let owner = Pubkey::try_from(&data[offset + 1..offset + 33])
             .map_err(|_| error!(ArioError::InvalidAccountState))?;
-        Ok(Some(owner))
-    }
+        (Some(owner), 33usize)
+    };
+    offset = offset
+        .checked_add(owner_size)
+        .ok_or(ArioError::InvalidAccountState)?;
+
+    // last_reconciled_owner: Pubkey — used as the implicit owner fallback
+    // when `owner` is `None` (canonical at-spawn state). Set by every
+    // owner-reconciling ix in `ario_ant`; stale only until the next such
+    // ix runs against this record after an NFT transfer.
+    let lro_end = offset
+        .checked_add(32)
+        .ok_or(ArioError::InvalidAccountState)?;
+    require!(data.len() >= lro_end, ArioError::InvalidAccountState);
+    let last_reconciled_owner = Pubkey::try_from(&data[offset..lro_end])
+        .map_err(|_| error!(ArioError::InvalidAccountState))?;
+
+    Ok(explicit_owner.unwrap_or(last_reconciled_owner))
 }
 
 pub mod request_primary_name {
@@ -499,7 +533,7 @@ pub mod request_and_set_primary_name {
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let initiator_key = ctx.accounts.initiator.key();
         let record_owner = read_ant_record_owner(&remaining[2], &ant, undername, &ant_program_id)?;
-        require!(record_owner == Some(initiator_key), ArioError::NotAntHolder);
+        require!(record_owner == initiator_key, ArioError::NotAntHolder);
 
         // Read demand factor from remaining_accounts[1] (mandatory)
         require!(remaining.len() > 1, ArioError::InvalidParameter);
@@ -647,7 +681,7 @@ pub mod approve_primary_name {
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let approver_key = ctx.accounts.name_owner.key();
         let record_owner = read_ant_record_owner(&remaining[1], &ant, undername, &ant_program_id)?;
-        require!(record_owner == Some(approver_key), ArioError::NotAntHolder);
+        require!(record_owner == approver_key, ArioError::NotAntHolder);
 
         // CORE-008: If user already has a primary name set to a DIFFERENT name,
         // they must call remove_primary_name first to close the old PrimaryNameReverse.
@@ -824,7 +858,7 @@ pub mod remove_primary_name_for_base_name {
         require!(remaining.len() > 1, ArioError::UndernameRecordOwnerRequired);
         let caller_key = ctx.accounts.name_owner.key();
         let record_owner = read_ant_record_owner(&remaining[1], &ant, "@", &ant_program_id)?;
-        require!(record_owner == Some(caller_key), ArioError::NotAntHolder);
+        require!(record_owner == caller_key, ArioError::NotAntHolder);
 
         // Base-name override path: caller != owner (the base-name holder
         // is revoking someone else's primary name). Same event shape as
@@ -1419,7 +1453,7 @@ pub mod request_and_set_primary_name_from_funding_plan {
         let initiator_key = ctx.accounts.initiator.key();
         let record_owner =
             read_ant_record_owner(&validation_accounts[2], &ant, undername, &ant_program_id)?;
-        require!(record_owner == Some(initiator_key), ArioError::NotAntHolder);
+        require!(record_owner == initiator_key, ArioError::NotAntHolder);
 
         let demand_factor = read_demand_factor(&validation_accounts[1], &config.arns_program)?;
 
