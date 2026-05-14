@@ -250,10 +250,7 @@ fn read_ant_record_owner(
 ) -> Result<Option<Pubkey>> {
     // SECURITY: pin to the canonical ARIO-ANT program. See helper
     // doc-comment above for the spoofing attack this closes.
-    require!(
-        *ant_program == ario_ant::ID,
-        ArioError::InvalidAccountState
-    );
+    require!(*ant_program == ario_ant::ID, ArioError::InvalidAccountState);
 
     require!(
         ant_record_info.owner == ant_program,

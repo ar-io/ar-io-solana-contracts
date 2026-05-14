@@ -4665,7 +4665,11 @@ async fn test_request_and_set_primary_name_rejects_non_canonical_ant_program() {
     // `owner = attacker (payer_pk)`.
     let undername_hash = solana_sdk::hash::hash(b"@");
     let (fake_ant_record_pda, _) = Pubkey::find_program_address(
-        &[b"ant_record", ant_mint_key.as_ref(), undername_hash.as_ref()],
+        &[
+            b"ant_record",
+            ant_mint_key.as_ref(),
+            undername_hash.as_ref(),
+        ],
         &evil_program_id,
     );
     let fake_data = build_ant_record_data(&ant_mint_key, "@", Some(payer_pk));
