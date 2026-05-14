@@ -16,6 +16,12 @@ workspace = true
 [features]
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 no-entrypoint = []
+# No-op: defined so workspace-wide `--features devnet-shrunk` builds (used
+# by the localnet harness and devnet deploys that include escrow) don't
+# fail with "none of the selected packages contains these features".
+# Escrow has no zero-copy registries, so there's nothing to shrink — the
+# flag just needs to be syntactically accepted here.
+devnet-shrunk = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]

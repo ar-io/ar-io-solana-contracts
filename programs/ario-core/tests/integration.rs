@@ -843,6 +843,27 @@ fn build_ant_record_data(
     undername: &str,
     owner: Option<solana_sdk::pubkey::Pubkey>,
 ) -> Vec<u8> {
+    // Default last_reconciled_owner to all-zero so existing tests that don't
+    // care about the fallback path keep working (any real signer mismatches
+    // Pubkey::default(), so NotAntHolder still fires for owner=None).
+    build_ant_record_data_with_lro(
+        mint,
+        undername,
+        owner,
+        solana_sdk::pubkey::Pubkey::default(),
+    )
+}
+
+/// Variant of `build_ant_record_data` that lets tests pin
+/// `last_reconciled_owner`. Used to exercise the
+/// `owner=None → last_reconciled_owner` fallback path that `ario_core`
+/// uses to authorize spawned-but-not-yet-delegated records.
+fn build_ant_record_data_with_lro(
+    mint: &solana_sdk::pubkey::Pubkey,
+    undername: &str,
+    owner: Option<solana_sdk::pubkey::Pubkey>,
+    last_reconciled_owner: solana_sdk::pubkey::Pubkey,
+) -> Vec<u8> {
     let mut data = Vec::new();
     let disc = solana_sdk::hash::hash(b"account:AntRecord");
     data.extend_from_slice(&disc.to_bytes()[..8]);
@@ -863,7 +884,7 @@ fn build_ant_record_data(
         }
         None => data.push(0),
     }
-    data.extend_from_slice(&[0u8; 32]); // last_reconciled_owner
+    data.extend_from_slice(last_reconciled_owner.as_ref()); // last_reconciled_owner
     data.push(255); // bump
     data
 }
@@ -882,8 +903,29 @@ async fn install_ant_record(
     undername: &str,
     owner: Option<solana_sdk::pubkey::Pubkey>,
 ) -> solana_sdk::pubkey::Pubkey {
+    install_ant_record_with_lro(
+        ctx,
+        mint,
+        undername,
+        owner,
+        solana_sdk::pubkey::Pubkey::default(),
+    )
+    .await
+}
+
+/// Variant of `install_ant_record` that pins `last_reconciled_owner`.
+/// Use for tests that exercise the `owner=None → last_reconciled_owner`
+/// fallback in `ario_core::read_ant_record_owner` (canonical
+/// just-spawned ANT state).
+async fn install_ant_record_with_lro(
+    ctx: &mut ProgramTestContext,
+    mint: &solana_sdk::pubkey::Pubkey,
+    undername: &str,
+    owner: Option<solana_sdk::pubkey::Pubkey>,
+    last_reconciled_owner: solana_sdk::pubkey::Pubkey,
+) -> solana_sdk::pubkey::Pubkey {
     let pda = ant_record_pda(mint, undername);
-    let data = build_ant_record_data(mint, undername, owner);
+    let data = build_ant_record_data_with_lro(mint, undername, owner, last_reconciled_owner);
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let account = solana_sdk::account::Account {
         lamports: rent.minimum_balance(data.len()),
@@ -8211,9 +8253,85 @@ async fn test_undername_without_record_owner_rejected() {
         blockhash,
     );
     let result = ctx.banks_client.process_transaction(tx).await;
-    // ADR-016 reshape: AntRecord with owner=None means "no delegated
-    // owner" — handler returns NotAntHolder because None != Some(caller).
+    // owner=None + last_reconciled_owner=Pubkey::default() (helper default
+    // for tests that aren't exercising the fallback path). The effective
+    // owner resolves to Pubkey::default(), which doesn't match the
+    // caller, so the handler returns NotAntHolder.
     assert_anchor_error!(result, ArioError::NotAntHolder);
+}
+
+// -----------------------------------------------------------------
+// 6b. owner=None + last_reconciled_owner=caller must succeed.
+//     Canonical post-spawn state: `ario_ant::init_ant` writes
+//     `record.owner = None` and `record.last_reconciled_owner =
+//     <NFT holder>`. Before this was wired through, every fresh
+//     spawn-then-setPrimaryName flow failed with NotAntHolder.
+// -----------------------------------------------------------------
+#[tokio::test]
+async fn test_undername_owner_none_last_reconciled_caller_succeeds() {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = undername_test_setup(&mut ctx).await;
+    let payer_pk = ctx.payer.pubkey();
+
+    let base_name = "spawnedbase";
+    let undername = "myblog";
+    let full = format!("{}_{}", undername, base_name);
+
+    // Caller (payer) holds the NFT. Spawn-state AntRecord: owner=None,
+    // last_reconciled_owner=payer.
+    let ant_asset_key = install_ant_asset(&mut ctx, &payer_pk).await;
+    let arns_pda = install_arns_record(
+        &mut ctx,
+        &setup.arns_program_id,
+        base_name,
+        &Pubkey::new_unique(),
+        &ant_asset_key,
+    )
+    .await;
+    let demand_factor_pda = install_demand_factor(&mut ctx, &setup.arns_program_id).await;
+    let ant_record_pda =
+        install_ant_record_with_lro(&mut ctx, &ant_asset_key, undername, None, payer_pk).await;
+
+    let (primary_name_key, reverse_key) = primary_name_pdas(&payer_pk, &full);
+    let metas = build_request_and_set_metas(
+        &setup.config_key,
+        &primary_name_key,
+        &reverse_key,
+        &setup.initiator_token,
+        &setup.protocol_token,
+        &payer_pk,
+        &[arns_pda, demand_factor_pda, ant_record_pda],
+    );
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: metas,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: full.clone(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(&full),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let pn_account = ctx
+        .banks_client
+        .get_account(primary_name_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let pn = PrimaryName::try_deserialize(&mut pn_account.data.as_slice()).unwrap();
+    assert_eq!(pn.owner, payer_pk);
+    assert_eq!(pn.name, full);
 }
 
 // -----------------------------------------------------------------
