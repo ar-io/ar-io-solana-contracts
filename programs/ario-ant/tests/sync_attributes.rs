@@ -6,11 +6,18 @@
 //! and the post-update on-chain attribute layout.
 //!
 //! REQUIRES:
-//!   1. `cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/`
-//!   2. `BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-ant
+//!   1. `cargo build-sbf --manifest-path programs/ario-ant/Cargo.toml`
+//!      (or `anchor build`) so `target/deploy/ario_ant.so` is fresh.
+//!      `solana-program-test` 2.1 with `BPF_OUT_DIR` set treats every
+//!      program registered via `ProgramTest::new(...)` as "prefer BPF"
+//!      and panics with `Program file data not available for ario_ant`
+//!      if the .so is missing — even when a native processor is
+//!      supplied.
+//!   2. `cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/`
+//!   3. `BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-ant
 //!      --test sync_attributes`
 //!
-//! Without those, `add_program("mpl_core", ...)` falls back to a
+//! Without step 2, `add_program("mpl_core", ...)` falls back to a
 //! stale/empty .so and the inner CPI returns AccountNotExecutable.
 
 use anchor_lang::{InstructionData, ToAccountMetas};

@@ -274,10 +274,17 @@ cargo test                                      # all tests
 cargo test -p ario-core                         # one program
 cargo test -p ario-gar test_join_network        # specific test
 
-# ario-arns CPIs into Metaplex Core (UpdatePluginV1 trait sync) and needs
-# mpl_core.so staged + BPF_OUT_DIR set:
+# Tests that CPI into Metaplex Core (UpdatePluginV1 trait sync) need
+# mpl_core.so staged + BPF_OUT_DIR set + the program's own .so present:
+#   ario-arns      — all integration tests
+#   ario-ant       — clear_attributes + sync_attributes only
+#   ario-ant-escrow — integration + event-coverage tests
+cargo build-sbf --manifest-path programs/ario-arns/Cargo.toml   # or ario-ant / -ant-escrow
 cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
 BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-arns
+# Same recipe for ario-ant's MPL-Core-CPI tests:
+BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-ant \
+  --test clear_attributes --test sync_attributes
 
 # Devnet deploy (idempotent — re-runs upgrade against the same program IDs)
 bash scripts/devnet-deploy.sh
@@ -291,14 +298,34 @@ bash scripts/start-localnet.sh
 `SURFPOOL_SKIP_MAINNET_INACTIVE_DISABLES=1`,
 `SURFPOOL_ENABLE_ALL_SVM_FEATURES=1`.
 
-**`BPF_OUT_DIR` pitfall:** Set it ONLY for `ario-arns` (and the
-`ario-ant-escrow` event-coverage tests). For
-`ario-core` / `ario-gar` / `ario-ant`, leave it unset — otherwise
-`solana-program-test` loads stale prebuilt `.so` files from
-`target/deploy/` instead of the just-compiled native processor, and
-recently-added instructions fail with `InstructionFallbackNotFound
-(101)`. Fix: `unset BPF_OUT_DIR` or delete the stale
-`target/deploy/<program>.so` first.
+**`BPF_OUT_DIR` rules.** The rule isn't per-program — it's per-test-file,
+governed by whether the test CPIs into Metaplex Core:
+
+* **Tests that CPI Metaplex Core** need `BPF_OUT_DIR` set, the staged
+  `mpl_core.so` in that directory, AND the program's own freshly-built
+  `.so` in that same directory (else `solana-program-test` 2.1 panics
+  with `Program file data not available for <program>` — its
+  "prefer BPF" mode is global to the `ProgramTest` instance and applies
+  to programs registered via `ProgramTest::new(...)` even when a native
+  processor is supplied). Suites in this category:
+  * `ario-arns` integration tests
+  * `ario-ant` `clear_attributes.rs` and `sync_attributes.rs`
+  * `ario-ant-escrow` integration + event-coverage tests
+  Recipe: `cargo build-sbf --manifest-path programs/<crate>/Cargo.toml`
+  then run `cargo test` with `BPF_OUT_DIR` set.
+
+* **All other tests** (everything in `ario-core`, `ario-gar`,
+  `ario-test-utils`, and the non-MPL `ario-ant` suites:
+  `integration.rs`, `events.rs`, `transfer_event.rs`) use the native
+  processor and **must** be run with `BPF_OUT_DIR` unset. Otherwise
+  solana-program-test loads a stale `target/deploy/<program>.so` and
+  recently-added instructions fail with `InstructionFallbackNotFound
+  (101)`. Fix: `unset BPF_OUT_DIR` or delete the stale `.so`.
+
+This is also why CI's `build-test.yml` runs only
+`cargo test -p ario-core -p ario-gar -p ario-test-utils` — the
+MPL-CPI-dependent suites need the BPF toolchain available, which CI's
+host-only job doesn't install.
 
 **`declare_id!()` drift:** `cargo build-sbf` / `anchor build` embed the
 `declare_id!("...")` literal into the `.so`. Deployments use
