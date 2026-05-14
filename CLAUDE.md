@@ -247,7 +247,9 @@ cargo test --workspace
 
 After IDL changes (`anchor build` mutating an `ario_*` IDL), the in-tree
 typed client at [`clients/ts/`](clients/ts/) (`@ar.io/solana-contracts`,
-Codama-generated, `@solana/kit`-based) must be regenerated:
+Codama-generated for per-program subpaths, plus hand-written
+`./canonical/*` helpers for things the IDL can't express) must be
+regenerated:
 
 ```bash
 cd clients/ts && yarn codegen && yarn build:tsc
@@ -259,6 +261,15 @@ Downstream SDK consumers (`ar-io-sdk`, etc.) then update their dep on
 `@ar.io/solana-contracts`. The IDL ABI stability check
 (`scripts/idl-event-snapshot.mjs`) catches breaking event changes; Anchor
 IDLs are otherwise additive-safe.
+
+Hand-written modules under `clients/ts/src/canonical/` ride alongside
+the codegen output but aren't touched by `yarn clean` (which only wipes
+per-program codegen dirs). Cross-language byte parity is asserted by
+`clients/ts/test/canonical.cross.test.ts`, which builds the Rust
+`cargo run --example canonical -p ario-ant-escrow` binary and
+byte-compares against the TS implementation across six test vectors
+(ANT + token/vault claims). Skips gracefully when cargo isn't on PATH
+so plain `yarn test` works without the Rust toolchain.
 
 ### Contracts (Rust/Anchor)
 
