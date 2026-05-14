@@ -577,6 +577,20 @@ pub struct InitializeEpochParams {
     pub name_count: u8,
     pub min_observer_stake: u64,
     pub slash_rate: u16,
+    /// Denominator (seconds) for the per-gateway tenure-weight ramp:
+    /// `tenure_weight = min(time_running / tenure_weight_duration,
+    /// max_tenure_weight)`. Lua / mainnet value is `180 * 86_400`
+    /// (180 days). Devnet bootstraps often pass `3600` (1 hour) to
+    /// surface a full tenure ramp inside a handful of short epochs.
+    /// MUST be > 0 — see ADR / DECISIONS for the security history
+    /// behind making this a caller-supplied param (the previous
+    /// unconditional 1-hour default leaked into a production-bound
+    /// build and inflated weighted-observer-selection probabilities
+    /// for newly-joined gateways).
+    pub tenure_weight_duration: i64,
+    /// Ceiling for the tenure-weight ramp above. Lua / mainnet value
+    /// is `4`. MUST be > 0.
+    pub max_tenure_weight: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
