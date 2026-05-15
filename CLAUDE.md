@@ -302,12 +302,29 @@ bash scripts/devnet-deploy.sh
 
 # Local validator
 bash scripts/start-localnet.sh
+
+# CU regression tracking (run on event-emission / instruction-path PRs)
+bash scripts/cu-baseline.sh                     # capture baseline
+bash scripts/cu-baseline.sh --diff              # show deltas vs baseline
+
+# Optional: install the pre-push hook (cargo fmt --check + clippy -D warnings)
+bash scripts/install-git-hooks.sh
+# Bypass in an emergency: AR_IO_SKIP_PREPUSH=1 git push
 ```
 
 `scripts/start-localnet.sh` env toggles: `SKIP_BUILD=1` (use existing
 `target/deploy/*.so`), `SURFPOOL_PORT=<n>`,
 `SURFPOOL_SKIP_MAINNET_INACTIVE_DISABLES=1`,
 `SURFPOOL_ENABLE_ALL_SVM_FEATURES=1`.
+
+**`BUILD_NETWORK` env var** selects the cluster identity baked into
+`ario-ant-escrow` at compile time — specifically the canonical-message
+string the off-chain attestor signs over. The mainnet release workflow
+sets `BUILD_NETWORK=mainnet` so attestor-signed claims are bound to
+mainnet. Default is `devnet`. When manually building escrow `.so`
+artifacts for mainnet (e.g. reproducing a buffer), set
+`BUILD_NETWORK=mainnet` or the resulting binary will reject mainnet
+attestor signatures.
 
 **`BPF_OUT_DIR` rules.** The rule isn't per-program — it's per-test-file,
 governed by whether the test CPIs into Metaplex Core:
@@ -369,6 +386,14 @@ program-to-program cpi deps need a parallel entry.
   (`blake3`, `proc-macro-crate`, `indexmap`, `unicode-segmentation`,
   with explicit per-program versions) so `cargo-build-sbf` (Cargo
   **1.79** / rustc **1.79**) can resolve the dep graph.
+* **Edition-2024 trap:** transitive deps whose `Cargo.toml` declares
+  `edition = "2024"` will not parse under cargo-build-sbf's bundled
+  Cargo 1.79 and break the BPF build with a manifest-parse error.
+  `Cargo.lock` pins `time` and `time-macros` to pre-edition2024
+  versions for this reason. When bumping or adding deps, run
+  `./build-sbf.sh` (or `anchor build`) — if it fails on a manifest,
+  inspect the new transitive's `edition`; the fix is usually a `[patch]`
+  or pinning the offender down a minor version.
 * Rust edition 2021. Key deps: `anchor-lang` (with `init-if-needed`),
   `anchor-spl`, `bytemuck` (zero-copy), `solana-program-test`.
 * License: AGPL-3.0-or-later.
