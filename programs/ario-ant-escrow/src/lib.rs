@@ -94,7 +94,7 @@ pub mod ario_ant_escrow {
     /// one; we use sysvar instruction-introspection to confirm the
     /// signing pubkey matches `ATTESTOR_PUBKEY` and the signed bytes
     /// match the canonical claim message reconstructed from escrow
-    /// state. See `migration/attestor/README.md` and the module-level
+    /// state. See the `ar-io/ar-io-solana-attestor` repo and the module-level
     /// docs in `instructions/claim_arweave_attested.rs`.
     pub fn claim_ant_arweave_attested(
         ctx: Context<ClaimAntArweaveAttested>,

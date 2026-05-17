@@ -9,7 +9,7 @@
 //!
 //! Mirrors `claim_tokens_arweave` exactly aside from the verification
 //! step. See `instructions/claim_arweave_attested.rs` for design
-//! rationale and `migration/attestor/README.md` for the service.
+//! rationale and the `ar-io/ar-io-solana-attestor` repo for the service.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, CloseAccount, Token, TokenAccount, Transfer as SplTransfer};
