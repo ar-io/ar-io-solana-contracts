@@ -1153,7 +1153,7 @@ re-signed Ed25519 attestation over the SAME canonical message bytes:
 
 1. User signs canonical message with their Arweave wallet (RSA-PSS-4096).
 2. User POSTs `{rsa_modulus, rsa_signature, claim_params}` to the
-   attestor (`migration/attestor/`).
+   attestor ([`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor); extracted 2026-05-16 from `solana-ar-io/migration/attestor/`).
 3. Attestor verifies the RSA-PSS signature via `node:crypto`
    (OpenSSL-backed, hardware-accelerated, ~5ms per request), then
    signs the SAME canonical message bytes with Ed25519.
@@ -1228,7 +1228,7 @@ window" does not materially expand the trust surface.
 
 Recovery: program upgrade swapping `ATTESTOR_PUBKEY` invalidates the
 compromised key for all future claims. The runbook is in
-`migration/attestor/README.md` § "Key rotation" — measured at ~30
+[`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)`/README.md` § "Key rotation" — measured at ~30
 minutes end-to-end.
 
 ### Consequences
@@ -1267,7 +1267,7 @@ minutes end-to-end.
   `claim_tokens_arweave_attested`, `claim_vault_arweave_attested`.
 - New on-chain helper module: `contracts/programs/ario-ant-escrow/src/verify/attested.rs`
   (Ed25519Program ix introspection, ~190 LOC).
-- New off-chain service: `migration/attestor/` (~1.4 KLOC TS + tests).
+- New off-chain service: [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor) (~1.4 KLOC TS + tests; extracted 2026-05-16 from `solana-ar-io/migration/attestor/`).
 - New SDK surface: `EscrowAttestorClient`, `buildEd25519SigverifyIx`,
   6 new methods on `ANTEscrow` / `TokenEscrow` (3 high-level + 3
   ix-builder pairs).

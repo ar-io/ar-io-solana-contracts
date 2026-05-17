@@ -73,7 +73,7 @@ unicode-segmentation.workspace = true
 solana-program.workspace = true
 ario-core = { path = "../ario-core", features = ["cpi"] }
 # Arweave production claim path is the off-chain attestor service
-# (`migration/attestor/`) — RSA-PSS verified off-chain, re-signed
+# (`ar-io/ar-io-solana-attestor`) — RSA-PSS verified off-chain, re-signed
 # with Ed25519, verified on-chain via the always-enabled native
 # Ed25519 sigverify program (~720 CU). The earlier on-chain RSA-PSS
 # verifier was removed because it referenced the feature-gated

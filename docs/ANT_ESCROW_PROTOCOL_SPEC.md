@@ -19,7 +19,7 @@
 
 ## 1. Overview
 
-The `ario-ant-escrow` program is a Solana program that holds Metaplex Core ANT (Arweave Name Token) NFTs, ARIO tokens, and time-locked vaults in trustless custody and releases them when presented with a valid cryptographic signature from a designated Arweave (RSA-PSS-4096) or Ethereum (ECDSA secp256k1) key. Ethereum signatures verify fully on-chain via the always-enabled `secp256k1_recover` syscall. Arweave signatures take a hybrid path: a single-purpose off-chain attestor service (`migration/attestor/`) verifies the RSA-PSS signature and re-signs the canonical claim message with Ed25519; the on-chain program verifies the cheap Ed25519 signature via Solana's native sigverify program + sysvar instruction-introspection. The attestor's Ed25519 public key is compiled into the program; rotation requires a `BPFLoaderUpgradeable` upgrade. Escrows persist indefinitely until claimed, cancelled by the depositor, or redirected to a new recipient. See ADR-017 for the architecture rationale.
+The `ario-ant-escrow` program is a Solana program that holds Metaplex Core ANT (Arweave Name Token) NFTs, ARIO tokens, and time-locked vaults in trustless custody and releases them when presented with a valid cryptographic signature from a designated Arweave (RSA-PSS-4096) or Ethereum (ECDSA secp256k1) key. Ethereum signatures verify fully on-chain via the always-enabled `secp256k1_recover` syscall. Arweave signatures take a hybrid path: a single-purpose off-chain attestor service ([`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)) verifies the RSA-PSS signature and re-signs the canonical claim message with Ed25519; the on-chain program verifies the cheap Ed25519 signature via Solana's native sigverify program + sysvar instruction-introspection. The attestor's Ed25519 public key is compiled into the program; rotation requires a `BPFLoaderUpgradeable` upgrade. Escrows persist indefinitely until claimed, cancelled by the depositor, or redirected to a new recipient. See ADR-017 for the architecture rationale.
 
 ---
 
@@ -161,7 +161,7 @@ Standard Arweave wallets (Wander, ArConnect) expose `wallet.signMessage(bytes)` 
 
 The Solana runtime already cryptographically verified the Ed25519 signature when it executed the Ed25519Program ix; on-chain we only confirm WHAT was verified. Total cost: ~75-80K CU per claim (vs 200K+ for the equivalent on-chain RSA-PSS, which was removed because `sol_big_mod_exp` is feature-gated and disabled on every public Solana cluster).
 
-See `docs/DECISIONS.md` ADR-017 for the architecture rationale and `migration/attestor/README.md` for the off-chain service contract.
+See `docs/DECISIONS.md` ADR-017 for the architecture rationale and [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)`/README.md` for the off-chain service contract.
 
 ### 3.2 Ethereum (ECDSA secp256k1 + EIP-191)
 
@@ -1029,7 +1029,7 @@ into the program at deploy time and ships with a deterministic test
 value (`AKnL4NN...`) derived from the public seed `[1u8; 32]` so
 integration tests work without external setup. **This MUST be
 replaced before deploying to any cluster that holds real value** —
-see `migration/attestor/README.md` § "Initial deploy" for the runbook
+see [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)`/README.md` § "Initial deploy" for the runbook
 and `contracts/scripts/check-attestor-pubkey.sh --strict` for the
 automated guardrail wired into `devnet-deploy.sh`.
 
