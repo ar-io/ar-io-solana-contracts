@@ -14,6 +14,12 @@ External audit still recommended before mainnet.
 > off-chain attestor service. The on-chain RSA-PSS verifier no longer
 > exists, so the historical "verify/arweave.rs" code-path concerns are
 > N/A — only the attestor's `node:crypto` RSA-PSS verifier remains.
+>
+> **Repo location update (2026-05-16):** the off-chain attestor service
+> was extracted from `solana-ar-io/ar-io-solana-attestor/` into its own
+> repo: [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor).
+> All `ar-io-solana-attestor/<path>` references below resolve to
+> `ar-io-solana-attestor/<path>` in the new repo. Findings unchanged.
 
 ---
 
@@ -29,7 +35,7 @@ on-chain Ed25519 introspection rejects.
 
 Touched: `programs/ario-ant-escrow/src/canonical.rs` (new
 `derive_recipient_id_b64url`), all 6 claim ix handlers,
-`migration/attestor/src/canonical.ts`, `sdk/src/solana/canonical-message.ts`,
+`ar-io-solana-attestor/src/canonical.ts`, `sdk/src/solana/canonical-message.ts`,
 `migration/solana-escrow-app/src/services/escrow-client.ts`. New regression
 test `test_claim_ant_arweave_attested_rejects_wrong_modulus_in_canonical`
 asserts the F-1 attack is rejected on-chain. Cross-tests (Rust ↔ TS)
@@ -42,7 +48,7 @@ regenerated.
 - `claim_ant_arweave_attested` (`programs/ario-ant-escrow/src/instructions/claim_arweave_attested.rs`)
 - `claim_tokens_arweave_attested` (`.../claim_tokens_arweave_attested.rs`)
 - `claim_vault_arweave_attested` (`.../claim_vault_arweave_attested.rs`)
-- `migration/attestor/src/app.ts` `POST /attest`
+- `ar-io-solana-attestor/src/app.ts` `POST /attest`
 - All SDK + frontend code that builds the attested-claim canonical and posts to the attestor
 
 ### What is supposed to happen
@@ -109,8 +115,8 @@ The Arweave address of an RSA wallet is `base64url(sha256(modulus))`, determinis
 
 Touched code:
 - `programs/ario-ant-escrow/src/canonical.rs` — append the `arweave_addr` line to both `build_ant_escrow_claim_message` and `build_escrow_claim_message`. Compute `sha256` on-chain (~3K CU).
-- `migration/attestor/src/canonical.ts` — mirror.
-- `migration/attestor/src/app.ts` — pass the modulus into the canonical builders.
+- `ar-io-solana-attestor/src/canonical.ts` — mirror.
+- `ar-io-solana-attestor/src/app.ts` — pass the modulus into the canonical builders.
 - `sdk/src/solana/canonical-message.ts` — mirror (TS used for cross-tests; not used directly by attested-claim path but stays in sync).
 - All cross-tests must be regenerated.
 
@@ -126,9 +132,9 @@ Cost: +512 bytes tx data, ~+1K CU for memcmp. Tx still fits. Doesn't change the 
 
 ## ✅ HIGH — F-2: Attestor service has no auth and per-IP rate limit only
 
-**Status: PARTIALLY FIXED in code; OPS HARDENING DOCUMENTED in `migration/attestor/README.md`.**
+**Status: PARTIALLY FIXED in code; OPS HARDENING DOCUMENTED in `ar-io-solana-attestor/README.md`.**
 
-Code changes (`migration/attestor/src/app.ts`):
+Code changes (`ar-io-solana-attestor/src/app.ts`):
 - System-wide concurrent RSA-PSS verify cap (`MAX_CONCURRENT_VERIFIES`,
   default 10). Excess requests fast-reject 503 `BUSY` so upstream load
   balancers shed early instead of letting CPU saturate.
@@ -150,7 +156,7 @@ Operational hardening that remains REQUIRED for any real-value deploy
 
 ### Where
 
-`migration/attestor/src/app.ts:27-34`. Default 30 req/min/IP.
+`ar-io-solana-attestor/src/app.ts:27-34`. Default 30 req/min/IP.
 
 ### Why it matters
 
@@ -174,7 +180,7 @@ These are operational hardening, not code changes. They go into the attestor REA
 ## ✅ MEDIUM — F-3: Attestor `decodeHex` accepts negative numbers in mid-string
 
 **Status: FIXED in commit `1611c13`.** Strict `/^[0-9a-fA-F]*$/` pre-check
-added to `decodeHex` in `migration/attestor/src/app.ts`.
+added to `decodeHex` in `ar-io-solana-attestor/src/app.ts`.
 
 ---
 
@@ -182,7 +188,7 @@ added to `decodeHex` in `migration/attestor/src/app.ts`.
 
 ### Where
 
-`migration/attestor/src/app.ts:283-292`.
+`ar-io-solana-attestor/src/app.ts:283-292`.
 
 ```ts
 function decodeHex(s: string): Uint8Array {

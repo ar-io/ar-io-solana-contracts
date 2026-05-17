@@ -42,9 +42,16 @@ scope here:
 
 * [`ar-io/solana-ar-io`](https://github.com/ar-io/solana-ar-io) — AO →
   Solana migration tooling (snapshot exporter, import orchestrator,
-  claim/escrow web apps, attestor service, downstream node forks).
-  When CLAUDE.md notes mention `migration/`, `sdk/`, `cranker/`,
-  `comms/` etc. — that's where they live.
+  claim/escrow web apps, downstream node forks). When CLAUDE.md notes
+  mention `migration/`, `sdk/`, `cranker/`, `comms/` etc. — that's where
+  they live.
+* [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)
+  — Off-chain attestor service (extracted from
+  `solana-ar-io/migration/attestor/`). Verifies Arweave RSA-PSS-4096
+  sigs and re-signs the canonical claim message with Ed25519 for the
+  on-chain `ario-ant-escrow` program — ADR-017. Comments in this repo
+  that reference `migration/attestor/` predate the extraction; the
+  service now lives in this dedicated repo.
 * [`ar-io/ar-io-sdk`](https://github.com/ar-io/ar-io-sdk) — TypeScript
   SDK that consumes the IDLs published from this repo.
 * [`ar-io/ar-io-cranker`](https://github.com/ar-io/ar-io-cranker) —

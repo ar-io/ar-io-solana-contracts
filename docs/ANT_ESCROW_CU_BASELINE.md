@@ -39,7 +39,7 @@ variants (`claim_*_arweave`) were removed in commit 4ce73e4 because they
 referenced the feature-gated `sol_big_mod_exp` syscall which prevented
 the BPF loader from accepting the .so on devnet/mainnet. See ADR-017
 (`docs/DECISIONS.md`) for the architecture rationale and
-`migration/attestor/README.md` for the off-chain service.
+[`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor) for the off-chain service.
 
 ## Estimate vs measured gap
 

@@ -20,7 +20,7 @@
 # this with `--strict` before any `solana program deploy` step.
 #
 # Replacement runbook (when this fails):
-#   1. cd migration/attestor && yarn keygen
+#   1. Clone ar-io/ar-io-solana-attestor, then `yarn install && yarn keygen`
 #      → records ATTESTOR_SECRET_BASE58 in your secret manager
 #      → prints ATTESTOR_PUBKEY_BASE58 to stdout
 #   2. Replace `pub const ATTESTOR_PUBKEY: Pubkey = ...` in
@@ -66,12 +66,12 @@ if grep -A 2 'pub const ATTESTOR_PUBKEY' "${STATE_RS}" | grep -q "${TEST_VALUE}"
   any cluster that holds real value would let anyone forge attestations.
 
   Replace before deploying:
-    1. cd migration/attestor && yarn keygen
+    1. Clone ar-io/ar-io-solana-attestor, then yarn install && yarn keygen
     2. Paste the printed ATTESTOR_PUBKEY_BASE58 into state.rs
     3. Rebuild and re-run this script
     4. Store the secret in your secret manager (KMS / Vault / etc.)
 
-  See migration/attestor/README.md § "Key rotation" for the full runbook.
+  See the ar-io/ar-io-solana-attestor repo's README § "Key rotation" for the full runbook.
 ========================================================================
 EOF
     exit 1

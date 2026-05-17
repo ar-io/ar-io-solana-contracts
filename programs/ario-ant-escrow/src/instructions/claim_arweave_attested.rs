@@ -11,7 +11,7 @@
 //! the day the syscall is enabled.
 //!
 //! For practical use, AR.IO operates an off-chain attestor service
-//! (`migration/attestor/`) that:
+//! (`ar-io/ar-io-solana-attestor`) that:
 //!   1. Receives the user's RSA-PSS-signed canonical claim message
 //!   2. Verifies the RSA-PSS sig via `node:crypto` (~5ms)
 //!   3. Re-signs the SAME canonical message bytes with Ed25519
@@ -29,8 +29,8 @@
 //! to detect stale-nonce errors with a clean error code; the canonical
 //! message body is never client-supplied.
 //!
-//! See `migration/attestor/README.md` for the off-chain side and
-//! `src/verify/attested.rs` for the introspection helper.
+//! See the `ar-io/ar-io-solana-attestor` repo for the off-chain side
+//! and `src/verify/attested.rs` for the introspection helper.
 
 use anchor_lang::prelude::*;
 

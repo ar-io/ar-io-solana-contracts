@@ -440,7 +440,8 @@ in CI.)
 
 | Repo | What it contains |
 |------|------------------|
-| [`ar-io/solana-ar-io`](https://github.com/ar-io/solana-ar-io) | AO → Solana migration tooling: snapshot exporter, import orchestrator, claim/escrow web apps, attestor service, localnet harness, downstream node forks |
+| [`ar-io/solana-ar-io`](https://github.com/ar-io/solana-ar-io) | AO → Solana migration tooling: snapshot exporter, import orchestrator, claim/escrow web apps, localnet harness, downstream node forks |
+| [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor) | Off-chain attestor service (extracted from `solana-ar-io/migration/attestor/`). Verifies Arweave RSA-PSS-4096 sigs and re-signs the canonical claim message with Ed25519 for the on-chain `ario-ant-escrow` program — ADR-017 |
 | [`ar-io/ar-io-sdk`](https://github.com/ar-io/ar-io-sdk) | TypeScript SDK with dual AO + Solana backends; consumes the IDLs published from this repo |
 | [`ar-io/ar-io-cranker`](https://github.com/ar-io/ar-io-cranker) | Standalone epoch cranker (also embedded in ar-io-observer) |
 
