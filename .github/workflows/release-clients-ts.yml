@@ -62,7 +62,14 @@ env:
   SOLANA_VERSION: v2.1.0
   RUST_TOOLCHAIN: 1.79.0
   RUST_TOOLCHAIN_HOST: 1.90.0
-  NODE_VERSION: 20
+  # Node 24 ships with npm 11.x. npm Trusted Publishing AUTHENTICATION
+  # (as distinct from provenance signing) requires npm 11.5+ — npm 10.x
+  # can sign provenance via OIDC but still expects an NPM_TOKEN for the
+  # actual publish PUT, which we don't have. Symptom on Node 20 was a
+  # successful sigstore provenance signature followed immediately by
+  # `npm error 404 Not Found - PUT https://registry.npmjs.org/<pkg>`.
+  # Sibling `@ar.io/sdk` uses Node v24 for the same reason.
+  NODE_VERSION: 24
   CARGO_TERM_COLOR: always
 
 concurrency:
