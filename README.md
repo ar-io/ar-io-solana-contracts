@@ -83,8 +83,12 @@ edge exists.
     └── workflows/
         ├── build-test.yml
         ├── codeql.yml
-        ├── release-devnet.yml
-        └── release-mainnet.yml
+        ├── docker-builder.yml
+        ├── release.yml
+        ├── release-clients-ts.yml
+        ├── release-plz.yml
+        ├── upgrade-devnet.yml
+        └── upgrade-mainnet.yml
 ```
 
 ---
@@ -164,23 +168,23 @@ bash scripts/install-git-hooks.sh
 ```
 feature branch ─PR─▶ develop ─PR─▶ main
                        │              │
-                       │              └─▶ release-mainnet workflow
+                       │              └─▶ upgrade-mainnet workflow
                        │                  → buffer staging, multisig hand-off
                        │
-                       └─▶ release-devnet workflow
+                       └─▶ upgrade-devnet workflow
                            → live devnet upgrade + tarball release
 ```
 
 * Open PRs against `develop`. CI runs `build-test.yml` (lint, build,
   full test suite, IDL ABI stability check, escrow fuzz smoke) before
   the PR is mergeable.
-* Merging to `develop` triggers `release-devnet.yml`: full build, deploy
+* Merging to `develop` triggers `upgrade-devnet.yml`: full build, deploy
   to devnet, refresh `program-ids/devnet.json` (auto-committed back to
   `develop`), and publish a versioned release tarball with IDLs + .so +
   keypairs so downstream clients can update or run their own Surfpool.
 * Cutting a mainnet release happens by opening a `develop → main` PR.
   Required reviewers / branch protection on `main` are the human gate.
-  Merging triggers `release-mainnet.yml`: build with mainnet feature
+  Merging triggers `upgrade-mainnet.yml`: build with mainnet feature
   flags, stage upgrade buffers, transfer buffer authority to the
   Squads V4 multisig, attach a buffer manifest to a draft GitHub
   release. The multisig signers vote and execute the upgrade
@@ -247,7 +251,7 @@ holds is the upgrade authority keypair. Program keypairs live in the
 original deployer's offline custody and are only needed for first
 deploys (a manual operator action — see below).
 
-`release-devnet.yml` does the following:
+`upgrade-devnet.yml` does the following:
 
 1. Reuses the `build-test.yml` job (full lint + build + test).
 2. Passes `secrets.DEVNET_AUTHORITY_KEY_JSON` straight into the deploy
@@ -345,7 +349,7 @@ land on devnet (today: only `ario_ant_escrow`):
 
 ### Mainnet — gated, on every merge to `main`
 
-`release-mainnet.yml`:
+`upgrade-mainnet.yml`:
 
 1. Reuses `build-test.yml`.
 2. Builds with `BUILD_NETWORK=mainnet` (selects the correct
