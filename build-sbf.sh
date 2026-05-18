@@ -261,30 +261,28 @@ sync_from_manifest() {
     echo "[build-sbf] patched $gar_lib → ARIO_CORE_PROGRAM_ID = \"$core_prog_id\""
   fi
 
-  # cargo-build-sbf 2.1.0 iterates ALL workspace members after the build to
-  # copy .so files into target/deploy/, and fails if any member's .so is
-  # absent (even one that was deliberately not built). Temporarily remove
-  # ario-ant-escrow from the workspace `members` array AND add it to
-  # `workspace.exclude` so cargo doesn't error out when our follow-up
-  # `cargo build-sbf --manifest-path programs/ario-ant-escrow/Cargo.toml`
-  # step encounters an "orphan" package inside the workspace tree. Without
-  # the exclude, cargo errors with "current package believes it's in a
-  # workspace when it's not". restore_keys() (EXIT trap) restores Cargo.toml.
-  local cargo_backup
-  cargo_backup="$SYNC_BACKUP_DIR/Cargo_toml"
-  cp Cargo.toml "$cargo_backup"
-  echo "Cargo.toml" > "$cargo_backup.path"
-  # Step 1: drop escrow from `members = [...]`.
-  sed -i.bak '/"programs\/ario-ant-escrow"/d' Cargo.toml
-  # Step 2: insert `exclude = [...]` before the resolver line so cargo
-  # knows escrow is intentionally NOT a member. The placement before
-  # `resolver = "2"` keeps it inside the `[workspace]` table.
-  if ! grep -q '^exclude = ' Cargo.toml; then
-    sed -i.bak '/^resolver = "2"/i\
-exclude = ["programs/ario-ant-escrow"]' Cargo.toml
-  fi
-  rm -f Cargo.toml.bak
-  echo "[build-sbf] patched Cargo.toml — moved ario-ant-escrow from members to exclude (restored on EXIT)"
+  # Note: previous revisions of this function patched Cargo.toml to remove
+  # ario-ant-escrow from the workspace `members` array (PR #6) and later
+  # also add it to `workspace.exclude` (PR #45). That approach was meant
+  # to work around `cargo build-sbf` 2.1.0's "copy every workspace
+  # member's .so" pass failing when escrow's .so didn't exist — escrow
+  # has a `compile_error!` requiring exactly one of `network-mainnet` /
+  # `network-devnet` features, and the default workspace build didn't
+  # supply either. The exclude approach broke escrow's
+  # `xxx.workspace = true` inheritance (`error inheriting edition from
+  # workspace root manifest`), forcing a separate `cargo build-sbf
+  # --manifest-path` step which then failed on the same inheritance.
+  #
+  # We now solve this at the build invocation: passing
+  # `--no-default-features --features network-${BUILD_NETWORK:-devnet}`
+  # to the workspace build (see end of script) satisfies escrow's
+  # compile_error!, produces escrow.so as part of the normal workspace
+  # build, and keeps workspace-inheritance intact. The other four crates
+  # have `default = []` so `--no-default-features` is a no-op for them.
+  # Escrow's `unsafe-allow-test-attestor-pubkey` default also gets turned
+  # off, which is correct — the F-4 const-eval guard then fires
+  # appropriately on real-network builds.
+  :
 }
 
 case "$MODE" in
@@ -338,59 +336,32 @@ EOF
     ;;
 esac
 
-# Plain workspace build — no -p flags needed.  cargo-build-sbf 2.1.0
-# copies every workspace member's .so at the end of the build, so we
-# must not leave ario-ant-escrow in the workspace when it isn't being
-# compiled.  sync_from_manifest() removes it from Cargo.toml and the
-# EXIT trap restores it.
+# Workspace build — one invocation produces all 5 .so files in target/deploy/.
 #
-# To build escrow separately (requires real ATTESTOR_PUBKEY in state.rs):
-#   BUILD_NETWORK=devnet cargo build-sbf -- \
-#     --package ario-ant-escrow \
-#     --no-default-features --features network-devnet
+# `--no-default-features` is necessary because ario-ant-escrow's defaults
+# (`["network-mainnet", "unsafe-allow-test-attestor-pubkey"]`) would
+# trigger its `compile_error!` (mutual exclusivity with whatever
+# `--features network-<cluster>` we add). It's a no-op for the other 4
+# crates (they all declare `default = []`). Disabling
+# `unsafe-allow-test-attestor-pubkey` also re-enables the F-4 const-eval
+# guard in state.rs — desirable for any real-network build.
 #
-# When BUILD_NETWORK=devnet we activate the `devnet-shrunk` cargo feature
-# on the two programs that hold zero-copy registries (ario-gar's
-# GatewayRegistry + Epoch.failure_counts; ario-arns's NameRegistry). This
-# shrinks the on-chain footprint from ~8 MB to ~10 KB total — saving ~57
-# SOL of rent on devnet — without forking the source. Mainnet builds
-# leave the feature off; the workspace default keeps production sizes.
-SBF_FEATURE_ARGS=()
+# `--features network-${BUILD_NETWORK:-devnet}` satisfies escrow's
+# `compile_error!` requiring exactly one of network-mainnet /
+# network-devnet to be enabled. The feature is only declared on escrow,
+# so it activates there only; the other crates ignore it.
+#
+# `--features devnet-shrunk` (BUILD_NETWORK=devnet only) shrinks the
+# zero-copy registry account sizes on ario-gar + ario-arns to fit on
+# devnet. Mainnet builds leave it off so production sizes are baked in.
+# It's declared as a no-op feature on every workspace member (PR #18) so
+# the workspace-level `--features` flag finds it without erroring.
+SBF_FEATURE_ARGS=(--no-default-features --features "network-${BUILD_NETWORK:-devnet}")
 if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
     SBF_FEATURE_ARGS+=(--features devnet-shrunk)
     echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
 fi
+echo "[build-sbf] cargo build-sbf -- ${SBF_FEATURE_ARGS[*]}"
 cargo build-sbf -- "${SBF_FEATURE_ARGS[@]}"
-
-# Second pass: build ario-ant-escrow IF the active manifest assigns it a real
-# program ID. It is excluded from the workspace in sync_from_manifest() above
-# (cargo-build-sbf 2.1.0 chokes on the network feature requirement during the
-# generic workspace build), so when escrow IS expected to deploy we need a
-# separate invocation with the cluster-specific feature set.
-#
-# `--package ario-ant-escrow` is fine here even though the package is no
-# longer a workspace member: cargo finds the manifest via the explicit path
-# we pass in. We disable defaults (turns off `unsafe-allow-test-attestor-pubkey`)
-# and enable exactly one of `network-mainnet` / `network-devnet`, matching
-# what `lib.rs`'s compile_error! guards demand.
-escrow_manifest_id=""
-if command -v jq >/dev/null 2>&1 && [[ -f "${PROGRAM_IDS_PATH:-program-ids/devnet.json}" ]]; then
-    escrow_manifest_id="$(jq -r '.programs.ario_ant_escrow // ""' "${PROGRAM_IDS_PATH:-program-ids/devnet.json}")"
-    [[ "$escrow_manifest_id" == "null" ]] && escrow_manifest_id=""
-fi
-if [[ -n "$escrow_manifest_id" ]]; then
-    escrow_network_feature="network-${BUILD_NETWORK:-devnet}"
-    echo
-    echo "[build-sbf] manifest has ario_ant_escrow=$escrow_manifest_id"
-    echo "[build-sbf] building ario-ant-escrow separately with --no-default-features --features $escrow_network_feature"
-    cargo build-sbf \
-        --manifest-path programs/ario-ant-escrow/Cargo.toml \
-        -- \
-        --no-default-features \
-        --features "$escrow_network_feature"
-else
-    echo
-    echo "[build-sbf] ario_ant_escrow manifest entry is null — skipping separate escrow build (first deploy must happen offline)"
-fi
 
 ls -la target/deploy/*.so
