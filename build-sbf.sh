@@ -349,4 +349,36 @@ if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
     echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
 fi
 cargo build-sbf -- "${SBF_FEATURE_ARGS[@]}"
+
+# Second pass: build ario-ant-escrow IF the active manifest assigns it a real
+# program ID. It is excluded from the workspace in sync_from_manifest() above
+# (cargo-build-sbf 2.1.0 chokes on the network feature requirement during the
+# generic workspace build), so when escrow IS expected to deploy we need a
+# separate invocation with the cluster-specific feature set.
+#
+# `--package ario-ant-escrow` is fine here even though the package is no
+# longer a workspace member: cargo finds the manifest via the explicit path
+# we pass in. We disable defaults (turns off `unsafe-allow-test-attestor-pubkey`)
+# and enable exactly one of `network-mainnet` / `network-devnet`, matching
+# what `lib.rs`'s compile_error! guards demand.
+escrow_manifest_id=""
+if command -v jq >/dev/null 2>&1 && [[ -f "${PROGRAM_IDS_PATH:-program-ids/devnet.json}" ]]; then
+    escrow_manifest_id="$(jq -r '.programs.ario_ant_escrow // ""' "${PROGRAM_IDS_PATH:-program-ids/devnet.json}")"
+    [[ "$escrow_manifest_id" == "null" ]] && escrow_manifest_id=""
+fi
+if [[ -n "$escrow_manifest_id" ]]; then
+    escrow_network_feature="network-${BUILD_NETWORK:-devnet}"
+    echo
+    echo "[build-sbf] manifest has ario_ant_escrow=$escrow_manifest_id"
+    echo "[build-sbf] building ario-ant-escrow separately with --no-default-features --features $escrow_network_feature"
+    cargo build-sbf \
+        --manifest-path programs/ario-ant-escrow/Cargo.toml \
+        -- \
+        --no-default-features \
+        --features "$escrow_network_feature"
+else
+    echo
+    echo "[build-sbf] ario_ant_escrow manifest entry is null — skipping separate escrow build (first deploy must happen offline)"
+fi
+
 ls -la target/deploy/*.so
