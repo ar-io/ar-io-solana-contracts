@@ -38,13 +38,14 @@ pub const ED25519_PROGRAM_ID: Pubkey =
 /// Ed25519 public key of the AR.IO attestor service.
 ///
 /// Compiled into the program — rotation requires a `BPFLoaderUpgradeable`
-/// upgrade swapping this constant. See
-/// `migration/attestor/README.md` § "Key rotation" for the runbook.
+/// upgrade swapping this constant. See the
+/// `ar-io/ar-io-solana-attestor` repo's `README.md` § "Key rotation"
+/// for the runbook.
 ///
 /// The current value is the **deterministic test pubkey** derived from
 /// Ed25519 secret seed `[1u8; 32]` — known to integration tests and to
 /// nobody else. Before any devnet/mainnet deploy:
-///   1. Run `yarn keygen` in `migration/attestor/`.
+///   1. Clone `ar-io/ar-io-solana-attestor`, then run `yarn keygen`.
 ///   2. Replace this constant with the printed `ATTESTOR_PUBKEY_BASE58`.
 ///   3. Provision the corresponding `ATTESTOR_SECRET_BASE58` to the
 ///      running service's secret manager.
@@ -111,7 +112,7 @@ const _: () = {
             "REFUSING TO BUILD: ATTESTOR_PUBKEY in src/state.rs still has the deterministic test \
              value (derived from public seed [1u8; 32]). Anyone reading this code can mint valid \
              attestations. Replace it with the real attestor pubkey before building for any real \
-             network. See migration/attestor/README.md § \"Initial deploy\"."
+             network. See the ar-io/ar-io-solana-attestor repo § \"Initial deploy\"."
         );
     }
 };

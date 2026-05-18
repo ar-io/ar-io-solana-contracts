@@ -11,8 +11,10 @@
 
 18 on-chain instructions in a single Anchor program that provides
 trustless custody for three asset types, plus a single-purpose
-off-chain Node.js service (`migration/attestor/`) that re-signs Arweave
-RSA-PSS signatures with Ed25519 for cheap on-chain verification.
+off-chain Node.js service ([`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor),
+extracted 2026-05-16 from `solana-ar-io/ar-io-solana-attestor/`) that
+re-signs Arweave RSA-PSS signatures with Ed25519 for cheap on-chain
+verification.
 
 | Asset | Deposit | Claim | Cancel | Update |
 |-------|---------|-------|--------|--------|
@@ -46,7 +48,7 @@ the off-chain attestor service.
 - **Token + vault escrow** (`ESCROW_CLAIM_HEADER`): `ar.io escrow claim v2\nnetwork:...\ntype:...\nasset:...\namount:...\nclaimant:...\nnonce:...`
 - Reconstructed entirely on-chain from account state — never client-supplied
 - The off-chain attestor service uses byte-identical canonical builders
-  (`migration/attestor/src/canonical.ts` ↔ `contracts/programs/ario-ant-escrow/src/canonical.rs`)
+  (`ar-io-solana-attestor/src/canonical.ts` ↔ `contracts/programs/ario-ant-escrow/src/canonical.rs`)
   pinned by a cross-toolchain test that re-runs every CI build.
 
 ### Vault claim pattern
@@ -104,11 +106,11 @@ contracts/programs/ario-ant-escrow/src/
 
 > The earlier `verify/arweave.rs` + `instructions/claim_*_arweave.rs`
 > on-chain RSA-PSS verifier was removed in commit 4ce73e4. Production
-> Arweave claims use the off-chain attestor (`migration/attestor/`).
+> Arweave claims use the off-chain attestor (`ar-io-solana-attestor/`).
 
 ### Off-chain attestor service
 ```
-migration/attestor/
+ar-io-solana-attestor/
 ├── src/
 │   ├── app.ts                  — Express handlers; /health and /attest
 │   ├── index.ts                — entry point + listen
@@ -166,15 +168,15 @@ contracts/programs/ario-ant-escrow/fuzz/fuzz_targets/
    for arbitrary (escrow, claimant) pairs. The on-chain program enforces
    only that `pubkey == ATTESTOR_PUBKEY` and `message == reconstructed
    canonical from escrow state`. Auditors should evaluate:
-   - Attestor verifier correctness (`migration/attestor/src/verify-rsa-pss.ts`):
+   - Attestor verifier correctness (`ar-io-solana-attestor/src/verify-rsa-pss.ts`):
      does it reject all PKCS#1 v1.5 sigs, mismatched salt lengths, modulus
      length errors? It uses `RSA_PKCS1_PSS_PADDING` only.
    - Canonical builder byte-equivalence: any drift between TS and Rust
      enables signature confusion. Pinned by the cross-test in
-     `migration/attestor/src/canonical.cross.test.ts`.
+     `ar-io-solana-attestor/src/canonical.cross.test.ts`.
    - Container hardening: non-root user, read-only fs, no inbound network
      except the configured PORT, secret never logged.
-   - Key rotation runbook (`migration/attestor/README.md` § Key rotation):
+   - Key rotation runbook (`ar-io-solana-attestor/README.md` § Key rotation):
      swap requires program upgrade — verify the procedure is documented
      and rehearsable.
 
@@ -199,7 +201,7 @@ contracts/programs/ario-ant-escrow/fuzz/fuzz_targets/
 4. **Canonical message reconstruction** — Cross-language byte-equivalence
    between Rust and TypeScript. Two surfaces: SDK
    (`sdk/src/solana/canonical-message.ts`) AND attestor service
-   (`migration/attestor/src/canonical.ts`). Any drift enables signature
+   (`ar-io-solana-attestor/src/canonical.ts`). Any drift enables signature
    confusion. Both pinned by cross-tests against the Rust binary. Note
    the `recipient: <43-char base64url(sha256(recipient_pubkey))>` line
    added by the F-1 fix — that's the binding that prevents the attestor
@@ -273,5 +275,5 @@ cargo +nightly fuzz run verify_personal_sign -- -max_total_time=86400
 - `docs/DECISIONS.md` ADR-017 — Off-chain attestor decision (covers all
   alternatives investigated, CU comparison, why Ed25519 over privileged
   authority)
-- `migration/attestor/README.md` — Attestor service deploy + ops + key
+- `ar-io-solana-attestor/README.md` — Attestor service deploy + ops + key
   rotation runbook

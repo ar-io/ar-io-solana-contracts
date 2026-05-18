@@ -386,7 +386,7 @@ vault), including all MPL Core CPIs and SPL transfers.
 The attestor's Ed25519 secret can mint valid attestations. Compromise
 allows draining all Arweave-recipient escrows. Recovery: program
 upgrade swapping `ATTESTOR_PUBKEY` (~30 minute runbook in
-`migration/attestor/README.md` § "Key rotation"). The trust assumption
+[`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)`/README.md` § "Key rotation"). The trust assumption
 is bounded by the migration window's existing AR.IO-operated trust
 model — see ADR-017 for the full analysis.
 
@@ -397,7 +397,7 @@ that did the RSA-PSS verification on-chain via `sol_big_mod_exp`.
 Removed in commit 4ce73e4 — the syscall is feature-gated and disabled
 on every public Solana cluster, so any `.so` referencing it failed to
 load on devnet/mainnet. The full RFC 8017 §9.1.2 algorithm spec is
-preserved in `migration/attestor/src/verify-rsa-pss.ts` (which
+preserved in [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)`/src/verify-rsa-pss.ts` (which
 delegates to Node's hardware-accelerated `node:crypto.verify` rather
 than re-implementing the modexp by hand).
 

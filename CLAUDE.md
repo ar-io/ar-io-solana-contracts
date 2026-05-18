@@ -42,9 +42,16 @@ scope here:
 
 * [`ar-io/solana-ar-io`](https://github.com/ar-io/solana-ar-io) — AO →
   Solana migration tooling (snapshot exporter, import orchestrator,
-  claim/escrow web apps, attestor service, downstream node forks).
-  When CLAUDE.md notes mention `migration/`, `sdk/`, `cranker/`,
-  `comms/` etc. — that's where they live.
+  claim/escrow web apps, downstream node forks). When CLAUDE.md notes
+  mention `migration/`, `sdk/`, `cranker/`, `comms/` etc. — that's where
+  they live.
+* [`ar-io/ar-io-solana-attestor`](https://github.com/ar-io/ar-io-solana-attestor)
+  — Off-chain attestor service (extracted from
+  `solana-ar-io/migration/attestor/`). Verifies Arweave RSA-PSS-4096
+  sigs and re-signs the canonical claim message with Ed25519 for the
+  on-chain `ario-ant-escrow` program — ADR-017. Comments in this repo
+  that reference `migration/attestor/` predate the extraction; the
+  service now lives in this dedicated repo.
 * [`ar-io/ar-io-sdk`](https://github.com/ar-io/ar-io-sdk) — TypeScript
   SDK that consumes the IDLs published from this repo.
 * [`ar-io/ar-io-cranker`](https://github.com/ar-io/ar-io-cranker) —
@@ -302,12 +309,29 @@ bash scripts/devnet-deploy.sh
 
 # Local validator
 bash scripts/start-localnet.sh
+
+# CU regression tracking (run on event-emission / instruction-path PRs)
+bash scripts/cu-baseline.sh                     # capture baseline
+bash scripts/cu-baseline.sh --diff              # show deltas vs baseline
+
+# Optional: install the pre-push hook (cargo fmt --check + clippy -D warnings)
+bash scripts/install-git-hooks.sh
+# Bypass in an emergency: AR_IO_SKIP_PREPUSH=1 git push
 ```
 
 `scripts/start-localnet.sh` env toggles: `SKIP_BUILD=1` (use existing
 `target/deploy/*.so`), `SURFPOOL_PORT=<n>`,
 `SURFPOOL_SKIP_MAINNET_INACTIVE_DISABLES=1`,
 `SURFPOOL_ENABLE_ALL_SVM_FEATURES=1`.
+
+**`BUILD_NETWORK` env var** selects the cluster identity baked into
+`ario-ant-escrow` at compile time — specifically the canonical-message
+string the off-chain attestor signs over. The mainnet release workflow
+sets `BUILD_NETWORK=mainnet` so attestor-signed claims are bound to
+mainnet. Default is `devnet`. When manually building escrow `.so`
+artifacts for mainnet (e.g. reproducing a buffer), set
+`BUILD_NETWORK=mainnet` or the resulting binary will reject mainnet
+attestor signatures.
 
 **`BPF_OUT_DIR` rules.** The rule isn't per-program — it's per-test-file,
 governed by whether the test CPIs into Metaplex Core:
@@ -369,6 +393,14 @@ program-to-program cpi deps need a parallel entry.
   (`blake3`, `proc-macro-crate`, `indexmap`, `unicode-segmentation`,
   with explicit per-program versions) so `cargo-build-sbf` (Cargo
   **1.79** / rustc **1.79**) can resolve the dep graph.
+* **Edition-2024 trap:** transitive deps whose `Cargo.toml` declares
+  `edition = "2024"` will not parse under cargo-build-sbf's bundled
+  Cargo 1.79 and break the BPF build with a manifest-parse error.
+  `Cargo.lock` pins `time` and `time-macros` to pre-edition2024
+  versions for this reason. When bumping or adding deps, run
+  `./build-sbf.sh` (or `anchor build`) — if it fails on a manifest,
+  inspect the new transitive's `edition`; the fix is usually a `[patch]`
+  or pinning the offender down a minor version.
 * Rust edition 2021. Key deps: `anchor-lang` (with `init-if-needed`),
   `anchor-spl`, `bytemuck` (zero-copy), `solana-program-test`.
 * License: AGPL-3.0-or-later.
