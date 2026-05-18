@@ -20,6 +20,12 @@ cpi = ["no-entrypoint"]
 # clusters. GatewayRegistry: 3000→30 slots (~168 KB→~1.7 KB), Epoch.failure_counts
 # matches. Mainnet/testnet MUST NOT enable this feature. See state/mod.rs.
 devnet-shrunk = []
+# No-op: defined so workspace-wide --features network-mainnet /
+# network-devnet works during build-sbf.sh's BPF build (only
+# ario-ant-escrow actually gates on these to bake the cluster
+# identifier into its canonical claim message).
+network-mainnet = []
+network-devnet = []
 default = []
 
 [dependencies]
