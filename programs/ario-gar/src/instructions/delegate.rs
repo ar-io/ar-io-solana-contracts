@@ -6,7 +6,7 @@ use crate::error::GarError;
 use crate::state::*;
 use crate::{
     DelegationClosedEvent, DelegationDecreasedEvent, DelegationEvent, RedelegationEvent,
-    RewardsCompoundedEvent, RATE_SCALE, WITHDRAWAL_LOCK_PERIOD,
+    RewardsCompoundedEvent, RATE_SCALE,
 };
 
 pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
@@ -234,9 +234,14 @@ pub fn claim_delegate_from_leaving_gateway(
     withdrawal.gateway = gateway.operator;
     withdrawal.amount = amount;
     withdrawal.created_at = clock.unix_timestamp;
+    // Consistency fix: read from `settings.withdrawal_period` so the
+    // `admin_set_withdrawal_period` lever applies to this path too.
+    // Previously hardcoded to `WITHDRAWAL_LOCK_PERIOD` (the const), which
+    // had the same default value but couldn't be overridden for testing /
+    // ops. Mirrors the source `withdraw_delegation` handler (line 158).
     withdrawal.available_at = clock
         .unix_timestamp
-        .checked_add(WITHDRAWAL_LOCK_PERIOD)
+        .checked_add(ctx.accounts.settings.withdrawal_period)
         .ok_or(GarError::ArithmeticOverflow)?;
     withdrawal.is_delegate = true;
     withdrawal.is_exit_vault = false;

@@ -147,15 +147,27 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
 }
 
 /// Leave the AR.IO network (F11)
-/// Sets gateway to Leaving status with a 90-day leave period.
-/// Operator stake becomes withdrawable after leave period.
+/// Sets gateway to Leaving status. Stake splits into two vaults with
+/// DIFFERENT lock periods, mirroring `gar.lua::leaveNetwork`:
+///   - Protected exit vault (min portion): `GATEWAY_LEAVE_PERIOD` (90 days).
+///     Uses `leaveLengthMs` in Lua via `createGatewayExitVault`.
+///   - Excess vault (above-min portion): `settings.withdrawal_period`
+///     (30 days default). Uses `withdrawLengthMs` in Lua via
+///     `createGatewayWithdrawVault`.
 /// Delegates are notified to withdraw (handled via separate delegate withdrawal txs).
-/// Matches Lua: gateway.status = "leaving", leaveLengthMs = 90 days
 pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
-    let available_at = now
+    // Protected exit vault gets the 90-day leave-network lock.
+    let protected_available_at = now
         .checked_add(GATEWAY_LEAVE_PERIOD)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    // Excess vault gets the shorter regular-withdrawal lock — same as if
+    // the operator had used `withdraw_operator_stake` while staying joined.
+    // Reading from settings (not the `WITHDRAWAL_LOCK_PERIOD` const) so the
+    // `admin_set_withdrawal_period` lever applies here too.
+    let excess_available_at = now
+        .checked_add(ctx.accounts.settings.withdrawal_period)
         .ok_or(GarError::ArithmeticOverflow)?;
     let gateway = &mut ctx.accounts.gateway;
 
@@ -201,7 +213,7 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
         exit.amount = protected_amount;
         exit.created_at = now;
         exit.available_at = if protected_amount > 0 {
-            available_at
+            protected_available_at
         } else {
             now
         };
@@ -282,7 +294,7 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
             gateway: gateway.operator,
             amount: excess_amount,
             created_at: now,
-            available_at,
+            available_at: excess_available_at,
             is_delegate: false,
             is_exit_vault: true,
             is_protected: false,

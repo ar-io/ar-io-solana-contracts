@@ -671,6 +671,49 @@
       ]
     },
     {
+      "name": "EpochDurationUpdatedEvent",
+      "discriminator": [
+        172,
+        139,
+        180,
+        188,
+        190,
+        137,
+        51,
+        136
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "old_duration",
+          "type": "i64"
+        },
+        {
+          "name": "new_duration",
+          "type": "i64"
+        },
+        {
+          "name": "old_genesis_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "new_genesis_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "current_epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "EpochPrescribedEvent",
       "discriminator": [
         238,
@@ -1382,6 +1425,37 @@
         {
           "name": "residue",
           "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "WithdrawalPeriodUpdatedEvent",
+      "discriminator": [
+        89,
+        88,
+        177,
+        10,
+        14,
+        21,
+        146,
+        54
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "old_period_seconds",
+          "type": "i64"
+        },
+        {
+          "name": "new_period_seconds",
+          "type": "i64"
         },
         {
           "name": "timestamp",
