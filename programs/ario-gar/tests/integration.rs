@@ -559,6 +559,134 @@ async fn test_gar_settings_initialized() {
     assert_eq!(settings.protocol_token_account, protocol_token.pubkey());
 }
 
+/// Verify `admin_set_withdrawal_period`:
+///   1. Authority signer succeeds; `settings.withdrawal_period` updates.
+///   2. Non-authority signer rejected with `Unauthorized`.
+///   3. `new_period_seconds < 60` rejected with `InvalidParameter` (matches
+///      the same bound on `admin_set_epoch_duration`).
+#[tokio::test]
+async fn test_admin_set_withdrawal_period() {
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar(
+        // payer is the authority for the GAR settings PDA in this fixture.
+        // We don't have `ctx.payer.pubkey()` yet (ProgramTest hasn't started),
+        // but ProgramTest's default payer is deterministic. Pre-set the
+        // authority to a placeholder we'll then replace below.
+        &Pubkey::new_unique(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    // Re-write the GatewaySettings PDA's `authority` field to `ctx.payer`
+    // so we can sign as authority. (Anchor processes the `has_one =
+    // authority` constraint at ix execution time, against on-chain state.)
+    let (settings_key, _) = settings_pda();
+    let mut settings_account = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    // authority is the first field after the 8-byte discriminator.
+    settings_account.data[8..40].copy_from_slice(ctx.payer.pubkey().as_ref());
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::AccountSharedData::from(settings_account),
+    );
+
+    // Step 1: authority signer succeeds, period updates from default to 120s.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: 120,
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings = GatewaySettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(settings.withdrawal_period, 120);
+
+    // Step 2: non-authority signer rejected.
+    let bad_signer = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: settings_key,
+                authority: bad_signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: 60,
+            }
+            .data(),
+        }],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::Unauthorized);
+
+    // Step 3: new_period_seconds < 60 rejected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let too_short_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: 30,
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let too_short_result = ctx.banks_client.process_transaction(too_short_tx).await;
+    assert_anchor_error!(too_short_result, GarError::InvalidParameter);
+}
+
 #[tokio::test]
 async fn test_join_network() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();

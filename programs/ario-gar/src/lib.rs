@@ -117,6 +117,27 @@ pub mod ario_gar {
         )
     }
 
+    /// Override `GatewaySettings.withdrawal_period` — the lock duration
+    /// applied to every NEW operator-stake or delegate withdrawal vault.
+    /// Mirrors `admin_set_epoch_duration`'s pattern for epoch tuning.
+    ///
+    /// Existing withdrawal vaults are unaffected (their unlock timestamps
+    /// were stamped at create time). Only withdrawals initiated AFTER this
+    /// call use the new period. Authority-only. Minimum 60 seconds.
+    ///
+    /// Primary use case is devnet testing: the production default
+    /// (`WITHDRAWAL_LOCK_PERIOD` = 30 days) is impractical for end-to-end
+    /// claim-withdrawal validation on a real cluster. Secondary use case
+    /// is emergency tuning by the multisig without a code upgrade. See
+    /// `instructions::initialize::admin_set_withdrawal_period` for the
+    /// full motivation comment.
+    pub fn admin_set_withdrawal_period(
+        ctx: Context<AdminSetWithdrawalPeriod>,
+        new_period_seconds: i64,
+    ) -> Result<()> {
+        instructions::initialize::admin_set_withdrawal_period(ctx, new_period_seconds)
+    }
+
     // =========================================
     // GATEWAY LIFECYCLE (F10-F12)
     // =========================================
@@ -875,6 +896,19 @@ pub struct EpochDurationUpdatedEvent {
     pub old_genesis_timestamp: i64,
     pub new_genesis_timestamp: i64,
     pub current_epoch_index: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_withdrawal_period`. Indexers tracking the
+/// withdrawal-claim eligibility window need this to recompute
+/// `unlock_timestamp = vault.created_at + settings.withdrawal_period` for
+/// any NEW withdrawal vault created after the timestamp here. Existing
+/// vaults retain their stamped `unlock_timestamp` and are unaffected.
+#[event]
+pub struct WithdrawalPeriodUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_period_seconds: i64,
+    pub new_period_seconds: i64,
     pub timestamp: i64,
 }
 

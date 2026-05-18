@@ -406,3 +406,72 @@ pub struct AdminRepairSettings<'info> {
 
     pub authority: Signer<'info>,
 }
+
+/// Authority-gated override of `GatewaySettings.withdrawal_period` (the lock
+/// duration applied to every NEW withdrawal vault created by
+/// `withdraw_operator_stake` / `withdraw_delegation`). Mirrors
+/// `admin_set_epoch_duration`'s pattern for `EpochSettings.epoch_duration`.
+///
+/// Primary use cases:
+///   1. **Devnet testing.** The default (`WITHDRAWAL_LOCK_PERIOD` = 30 days)
+///      is impractical for end-to-end claim-withdrawal validation on a real
+///      cluster. Operators can drop the period to seconds for a test run.
+///   2. **Mainnet emergency.** If a security incident requires shortening
+///      the unstake window (or lengthening it to delay an in-flight exit),
+///      the multisig has a direct lever instead of needing a code upgrade.
+///
+/// **Existing withdrawal vaults are unaffected.** Their unlock timestamps
+/// were stamped at creation time (`unlock_timestamp = created_at +
+/// settings.withdrawal_period`) and are checked against `Clock::unix_timestamp`
+/// at `claim_withdrawal`. Only withdrawals initiated AFTER this update use
+/// the new period.
+///
+/// Authority-only. NOT migration-gated (unlike `admin_repair_settings`) so
+/// the lever remains available after `finalize_migration`. Min bound of 60
+/// seconds matches `admin_set_epoch_duration` to prevent accidental
+/// withdrawal-front-running by setting to 0.
+pub fn admin_set_withdrawal_period(
+    ctx: Context<AdminSetWithdrawalPeriod>,
+    new_period_seconds: i64,
+) -> Result<()> {
+    require!(
+        new_period_seconds >= 60,
+        crate::error::GarError::InvalidParameter
+    );
+
+    let settings = &mut ctx.accounts.settings;
+    let old_period = settings.withdrawal_period;
+    settings.withdrawal_period = new_period_seconds;
+
+    let clock = Clock::get()?;
+    emit!(crate::WithdrawalPeriodUpdatedEvent {
+        admin: ctx.accounts.authority.key(),
+        old_period_seconds: old_period,
+        new_period_seconds,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "GatewaySettings.withdrawal_period {} → {} seconds (admin override)",
+        old_period,
+        new_period_seconds
+    );
+
+    Ok(())
+}
+
+/// Context for `admin_set_withdrawal_period`. Authority gate matches
+/// `admin_repair_settings`; no `migration_active` constraint so the lever
+/// remains available post-migration for ops / emergency tuning.
+#[derive(Accounts)]
+pub struct AdminSetWithdrawalPeriod<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    pub authority: Signer<'info>,
+}
