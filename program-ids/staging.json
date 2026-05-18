@@ -1,0 +1,24 @@
+{
+  "cluster": "https://api.devnet.solana.com",
+  "deployer": "2J8x7uqw5XtzqkVoPWJkWJR7fGH8HFqABcSK9iUKHxBF",
+  "deployed_at": {
+    "ario_core": null,
+    "ario_gar": null,
+    "ario_arns": null,
+    "ario_ant": null,
+    "ario_ant_escrow": null
+  },
+  "programs": {
+    "ario_core": "4QDDbsU6GJ3FLLW9HFdfyt6roeVm855PFHCuMyB4fEsW",
+    "ario_gar": "Bt7Q4UdcMwZmi5QoD5VCEgVk1XCif7mkftoCk76m6Lou",
+    "ario_arns": "2saz1GMynPgjctHE5aTXcZe26xNxHpJeoFVYdqUH9Yj8",
+    "ario_ant": "GS6nhMuBkCQwjJPWYfRDntGiyXANYehoKaVk25KHbnWa",
+    "ario_ant_escrow": "GBTCZzzV97HFzCMiFRs6BYgptLK9fuUmZGrWoYEUFwih"
+  },
+  "mints": {
+    "ario": null
+  },
+  "external": {
+    "mpl_core": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+  }
+}

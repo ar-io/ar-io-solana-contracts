@@ -24,10 +24,11 @@ on:
   workflow_dispatch:
     inputs:
       cluster:
-        description: "Target cluster (devnet | mainnet)"
+        description: "Target cluster (devnet | staging | mainnet). 'staging' runs on Solana devnet at separate program IDs (program-ids/staging.json) and serves as the mainnet dress-rehearsal env with full-size registries."
         type: choice
         options:
           - devnet
+          - staging
           - mainnet
         required: true
 
