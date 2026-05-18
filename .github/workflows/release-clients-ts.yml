@@ -26,10 +26,11 @@ on:
   workflow_dispatch:
     inputs:
       cluster:
-        description: "Target cluster (devnet | mainnet) — drives cfg-conditional registry sizes"
+        description: "Target cluster (devnet | staging | mainnet) — drives cfg-conditional registry sizes. 'staging' uses production sizes (mainnet dress-rehearsal on Solana devnet)."
         type: choice
         options:
           - devnet
+          - staging
           - mainnet
         required: true
       version:
@@ -164,8 +165,8 @@ jobs:
           # `cluster` is `choice` for workflow_dispatch but `string` for
           # workflow_call — validate here so a malicious calling workflow
           # can't slip through.
-          if [[ "$INPUT_CLUSTER" != "devnet" && "$INPUT_CLUSTER" != "mainnet" ]]; then
-            echo "::error::Invalid cluster: '$INPUT_CLUSTER' (must be 'devnet' or 'mainnet')"
+          if [[ "$INPUT_CLUSTER" != "devnet" && "$INPUT_CLUSTER" != "staging" && "$INPUT_CLUSTER" != "mainnet" ]]; then
+            echo "::error::Invalid cluster: '$INPUT_CLUSTER' (must be 'devnet', 'staging', or 'mainnet')"
             exit 1
           fi
           if [[ -n "$INPUT_VERSION" ]]; then
@@ -211,11 +212,18 @@ jobs:
           INPUT_CLUSTER: ${{ inputs.cluster }}
         run: |
           set -euo pipefail
-          if [[ "$INPUT_CLUSTER" == "mainnet" ]]; then
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=devnet" >> "$GITHUB_OUTPUT"
-          fi
+          case "$INPUT_CLUSTER" in
+            mainnet) echo "tag=latest"  >> "$GITHUB_OUTPUT" ;;
+            staging) echo "tag=staging" >> "$GITHUB_OUTPUT" ;;
+            devnet)  echo "tag=devnet"  >> "$GITHUB_OUTPUT" ;;
+            *)
+              # Unreachable: cluster was already validated in the Compute
+              # version step. Defensive default just in case a future
+              # re-order moves this step ahead of validation.
+              echo "::error::Determine dist-tag: unexpected cluster '$INPUT_CLUSTER'"
+              exit 1
+              ;;
+          esac
 
       - name: npm pack (sanity check)
         working-directory: clients/ts
