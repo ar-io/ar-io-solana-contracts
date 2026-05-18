@@ -264,15 +264,27 @@ sync_from_manifest() {
   # cargo-build-sbf 2.1.0 iterates ALL workspace members after the build to
   # copy .so files into target/deploy/, and fails if any member's .so is
   # absent (even one that was deliberately not built). Temporarily remove
-  # ario-ant-escrow from the workspace so it is invisible to that copy step.
-  # restore_keys() (registered in the EXIT trap) restores Cargo.toml.
+  # ario-ant-escrow from the workspace `members` array AND add it to
+  # `workspace.exclude` so cargo doesn't error out when our follow-up
+  # `cargo build-sbf --manifest-path programs/ario-ant-escrow/Cargo.toml`
+  # step encounters an "orphan" package inside the workspace tree. Without
+  # the exclude, cargo errors with "current package believes it's in a
+  # workspace when it's not". restore_keys() (EXIT trap) restores Cargo.toml.
   local cargo_backup
   cargo_backup="$SYNC_BACKUP_DIR/Cargo_toml"
   cp Cargo.toml "$cargo_backup"
   echo "Cargo.toml" > "$cargo_backup.path"
+  # Step 1: drop escrow from `members = [...]`.
   sed -i.bak '/"programs\/ario-ant-escrow"/d' Cargo.toml
+  # Step 2: insert `exclude = [...]` before the resolver line so cargo
+  # knows escrow is intentionally NOT a member. The placement before
+  # `resolver = "2"` keeps it inside the `[workspace]` table.
+  if ! grep -q '^exclude = ' Cargo.toml; then
+    sed -i.bak '/^resolver = "2"/i\
+exclude = ["programs/ario-ant-escrow"]' Cargo.toml
+  fi
   rm -f Cargo.toml.bak
-  echo "[build-sbf] patched Cargo.toml — excluded ario-ant-escrow from workspace (restored on EXIT)"
+  echo "[build-sbf] patched Cargo.toml — moved ario-ant-escrow from members to exclude (restored on EXIT)"
 }
 
 case "$MODE" in
