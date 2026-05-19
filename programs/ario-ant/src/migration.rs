@@ -108,6 +108,16 @@ fn require_trailing_zero_padding(data: &[u8], i: usize) -> Result<()> {
     Ok(())
 }
 
+/// Skip the three-byte `SchemaVersion { major, minor, patch }` field.
+fn skip_schema_version(data: &[u8], i: &mut usize) -> Result<()> {
+    require!(
+        data.len() >= *i + SCHEMA_VERSION_SIZE,
+        AntError::InvalidAccountData
+    );
+    *i += SCHEMA_VERSION_SIZE;
+    Ok(())
+}
+
 fn validate_ant_config_borsh_payload(data: &[u8]) -> Result<()> {
     let mut i = 8usize;
     skip_pubkey(data, &mut i)?;
@@ -118,7 +128,7 @@ fn validate_ant_config_borsh_payload(data: &[u8]) -> Result<()> {
     skip_vec_string(data, &mut i)?;
     skip_pubkey(data, &mut i)?;
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -127,7 +137,7 @@ fn validate_ant_controllers_borsh_payload(data: &[u8]) -> Result<()> {
     skip_pubkey(data, &mut i)?;
     skip_vec_pubkey(data, &mut i)?;
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -142,7 +152,7 @@ fn validate_ant_record_borsh_payload(data: &[u8]) -> Result<()> {
     skip_option_pubkey(data, &mut i)?; // owner
     skip_pubkey(data, &mut i)?; // last_reconciled_owner
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -157,7 +167,7 @@ fn validate_ant_record_metadata_borsh_payload(data: &[u8]) -> Result<()> {
     skip_option_string(data, &mut i)?; // record_description
     skip_option_vec_string(data, &mut i)?; // record_keywords
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 

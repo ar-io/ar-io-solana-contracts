@@ -678,10 +678,12 @@ async fn send_migrate_ant(
     payer: &Keypair,
 ) -> std::result::Result<(), BanksClientError> {
     let (config_key, _) = config_pda(asset);
+    let (controllers_key, _) = controllers_pda(asset);
 
-    let accounts = ario_ant::accounts::MigrateAnt {
+    let accounts = ario_ant::accounts::AntMigration {
         asset: *asset,
         ant_config: config_key,
+        ant_controllers: controllers_key,
         payer: payer.pubkey(),
         system_program: system_program::ID,
     };
@@ -1693,9 +1695,13 @@ async fn test_record_owner_reconciliation() {
 }
 
 // 22. Migrate ANT version — already at latest version should fail
-//     Because initialize sets version = ANT_CONFIG_VERSION (1), calling migrate_ant
-//     on a freshly initialized ANT should immediately fail with AlreadyLatestVersion.
-//     We also test the success path by pre-creating an AntConfig with version 0.
+//     Because initialize sets version = ANT_CONFIG_VERSION (1.0.0), calling
+//     migrate_ant on a freshly initialized ANT should immediately fail with
+//     AlreadyLatestVersion.  We also test that an account at an unknown old
+//     version (0.0.0) returns UnknownSchemaVersion (no production migration
+//     path exists below 1.0.0).  Multi-step migration success is covered by
+//     the dedicated `migration_e2e` integration test suite compiled with
+//     `--features migration-test`.
 #[tokio::test]
 async fn test_migrate_ant_version() {
     let owner = Keypair::new();
@@ -1722,8 +1728,9 @@ async fn test_migrate_ant_version() {
     let result = send_migrate_ant(&mut ctx, &asset.pubkey(), &owner).await;
     assert_anchor_error!(result, AntError::AlreadyLatestVersion);
 
-    // Now test the success path: pre-create a second ANT with version=0 by manually
-    // writing account data to simulate an ANT from before schema versioning.
+    // Now test with an account whose version is below any known migration arm.
+    // Construct an asset and a pre-existing AntConfig at version 0.0.0 +
+    // a minimal AntControllers so the transaction can reach the handler.
     let asset2 = Keypair::new();
     let asset2_data = create_fake_asset_data(&owner.pubkey());
     let rent = ctx.banks_client.get_rent().await.unwrap();
@@ -1739,7 +1746,9 @@ async fn test_migrate_ant_version() {
         .into(),
     );
 
-    // Build a version-0 AntConfig and write it directly as a pre-existing account
+    // Build a version-0.0.0 AntConfig directly using try_serialize, then
+    // overwrite the version bytes so Anchor's discriminator stays valid but
+    // the stored SchemaVersion reads as 0.0.0 (below the current 1.0.0).
     let (config2_key, config2_bump) = config_pda(&asset2.pubkey());
     let v0_config = AntConfig {
         mint: asset2.pubkey(),
@@ -1750,7 +1759,7 @@ async fn test_migrate_ant_version() {
         keywords: vec![],
         last_known_owner: owner.pubkey(),
         bump: config2_bump,
-        version: 0, // <-- old version, needs migration
+        version: SchemaVersion::new(0, 0, 0),
     };
     let mut v0_data = Vec::new();
     v0_config.try_serialize(&mut v0_data).unwrap();
@@ -1768,39 +1777,42 @@ async fn test_migrate_ant_version() {
         .into(),
     );
 
-    // Verify version is 0
-    let config2 = fetch_config(&mut ctx, &asset2.pubkey()).await;
-    assert_eq!(config2.version, 0, "Pre-created ANT should have version 0");
+    // Also create a minimal AntControllers for asset2 so AntMigration can load it.
+    let (controllers2_key, controllers2_bump) = controllers_pda(&asset2.pubkey());
+    let v0_controllers = AntControllers {
+        mint: asset2.pubkey(),
+        controllers: vec![],
+        bump: controllers2_bump,
+        version: SchemaVersion::new(1, 0, 0),
+    };
+    let mut ctrl_data = Vec::new();
+    v0_controllers.try_serialize(&mut ctrl_data).unwrap();
+    ctrl_data.resize(AntControllers::SIZE, 0);
 
-    // Migrate the v0 ANT — should succeed
-    send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner)
-        .await
-        .unwrap();
-
-    // Verify version is now at latest
-    let config2 = fetch_config(&mut ctx, &asset2.pubkey()).await;
-    assert_eq!(config2.version, ANT_CONFIG_VERSION);
-    // Verify other fields survived the migration intact
-    assert_eq!(config2.name, "Old ANT");
-    assert_eq!(config2.ticker, "OLD");
-    assert_eq!(config2.mint, asset2.pubkey());
-
-    // Verify calling migrate again fails. We use a separate payer (funded user) since
-    // migrate_ant is permissionless — anyone can call it.
-    let another_payer = Keypair::new();
     ctx.set_account(
-        &another_payer.pubkey(),
+        &controllers2_key,
         &solana_sdk::account::Account {
-            lamports: 10_000_000_000,
-            data: vec![],
-            owner: solana_sdk::system_program::ID,
+            lamports: rent.minimum_balance(AntControllers::SIZE),
+            data: ctrl_data,
+            owner: ario_ant::ID,
             executable: false,
             rent_epoch: 0,
         }
         .into(),
     );
-    let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &another_payer).await;
-    assert_anchor_error!(result, AntError::AlreadyLatestVersion);
+
+    // Verify version is 0.0.0
+    let config2 = fetch_config(&mut ctx, &asset2.pubkey()).await;
+    assert_eq!(
+        config2.version,
+        SchemaVersion::new(0, 0, 0),
+        "Pre-created ANT should have version 0.0.0"
+    );
+
+    // Migrate attempt on a 0.0.0 account — the dispatch function has no arm
+    // for that version, so it returns UnknownSchemaVersion.
+    let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner).await;
+    assert_anchor_error!(result, AntError::UnknownSchemaVersion);
 }
 
 // =========================================

@@ -24,6 +24,10 @@ cpi = ["no-entrypoint"]
 # No-op: defined so workspace-wide --features devnet-shrunk works
 # (only ario-gar + ario-arns actually gate on this).
 devnet-shrunk = []
+# Activates 4-schema migration test fields (field_1/field_2/field_3 on
+# AntConfig) and the corresponding migration arms so migration_e2e tests
+# can exercise a real multi-step upgrade path without polluting production.
+migration-test = []
 # No-op: defined so workspace-wide --features network-mainnet /
 # network-devnet works during build-sbf.sh's BPF build (only
 # ario-ant-escrow actually gates on these to bake the cluster

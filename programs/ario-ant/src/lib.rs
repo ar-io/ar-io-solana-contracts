@@ -6,6 +6,7 @@ pub mod acl;
 pub mod error;
 pub mod migration;
 pub mod mpl_core_cpi;
+pub mod schema_migration;
 pub mod state;
 
 pub use acl::*;
@@ -673,29 +674,89 @@ pub mod ario_ant {
     // ANT MIGRATION (per-ANT schema upgrade)
     // =========================================
 
-    /// Migrate an ANT's on-chain state to the latest schema version.
-    /// Permissionless: anyone can pay to migrate any ANT — this only
-    /// upgrades the data layout and never changes user data.
-    /// Uses realloc to handle account size changes between versions.
-    pub fn migrate_ant(ctx: Context<MigrateAnt>) -> Result<()> {
+    /// Migrate an ANT's `AntConfig` and `AntControllers` to the latest schema
+    /// versions. Permissionless — anyone can pay the realloc rent. The
+    /// `schema_migration` dispatch functions step through every intermediate
+    /// version in order, so a single call handles any version gap.
+    ///
+    /// Per-undername `AntRecord` and `AntRecordMetadata` accounts have their
+    /// own instructions (`migrate_ant_record`, `migrate_ant_record_metadata`)
+    /// because their cardinality is unbounded and cannot fit in a single tx.
+    pub fn migrate_ant(ctx: Context<AntMigration>) -> Result<()> {
+        let asset_key = ctx.accounts.asset.key();
+
         let config = &mut ctx.accounts.ant_config;
         require!(
             config.version < ANT_CONFIG_VERSION,
             AntError::AlreadyLatestVersion
         );
-
-        // Future: perform migration steps based on config.version
-        // match config.version {
-        //     0 => migrate_v0_to_v1(config, ...),
-        //     1 => migrate_v1_to_v2(config, ...),
-        //     _ => {}
-        // }
-
-        config.version = ANT_CONFIG_VERSION;
+        schema_migration::migrate_config_version(config)?;
         msg!(
-            "ANT {} migrated to version {}",
+            "ANT {} config migrated to {}.{}.{}",
+            asset_key,
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+
+        let controllers = &mut ctx.accounts.ant_controllers;
+        if controllers.version < ANT_CONTROLLERS_VERSION {
+            schema_migration::migrate_controllers_version(controllers)?;
+            msg!(
+                "ANT {} controllers migrated to {}.{}.{}",
+                asset_key,
+                controllers.version.major,
+                controllers.version.minor,
+                controllers.version.patch,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Migrate a single `AntRecord` PDA to the latest schema version.
+    /// Permissionless — anyone can pay. Call once per undername that needs
+    /// migrating; callers can derive which records exist via `getProgramAccounts`
+    /// filtered on `ANT_RECORD_SEED`.
+    pub fn migrate_ant_record(ctx: Context<AntMigrationRecord>, undername: String) -> Result<()> {
+        let record = &mut ctx.accounts.record;
+        require!(
+            record.version < ANT_RECORD_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_record_version(record)?;
+        msg!(
+            "ANT {} record '{}' migrated to {}.{}.{}",
             ctx.accounts.asset.key(),
-            ANT_CONFIG_VERSION,
+            undername,
+            record.version.major,
+            record.version.minor,
+            record.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a single `AntRecordMetadata` PDA to the latest schema version.
+    /// Permissionless — anyone can pay. Only needed for records that have an
+    /// existing metadata PDA; the `undername` is the same one passed to
+    /// `migrate_ant_record`.
+    pub fn migrate_ant_record_metadata(
+        ctx: Context<AntMigrationRecordMetadata>,
+        undername: String,
+    ) -> Result<()> {
+        let metadata = &mut ctx.accounts.record_metadata;
+        require!(
+            metadata.version < ANT_RECORD_METADATA_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_record_metadata_version(metadata)?;
+        msg!(
+            "ANT {} record metadata '{}' migrated to {}.{}.{}",
+            ctx.accounts.asset.key(),
+            undername,
+            metadata.version.major,
+            metadata.version.minor,
+            metadata.version.patch,
         );
         Ok(())
     }
@@ -1691,7 +1752,7 @@ pub struct ManageMetadata<'info> {
 }
 
 #[derive(Accounts)]
-pub struct MigrateAnt<'info> {
+pub struct AntMigration<'info> {
     /// CHECK: Metaplex Core asset
     #[account(
         constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
@@ -1708,7 +1769,68 @@ pub struct MigrateAnt<'info> {
     )]
     pub ant_config: Account<'info, AntConfig>,
 
+    #[account(
+        mut,
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
+        bump = ant_controllers.bump,
+        realloc = AntControllers::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub ant_controllers: Account<'info, AntControllers>,
+
     /// Anyone can pay to migrate any ANT (permissionless)
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AntMigrationRecord<'info> {
+    /// CHECK: Metaplex Core asset — validates the record belongs to a real ANT.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_SEED, asset.key().as_ref(), &hash_undername(&record.undername)],
+        bump = record.bump,
+        realloc = AntRecord::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub record: Account<'info, AntRecord>,
+
+    /// Anyone can pay to migrate any ANT record (permissionless)
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct AntMigrationRecordMetadata<'info> {
+    /// CHECK: Metaplex Core asset — validates the metadata belongs to a real ANT.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_META_SEED, asset.key().as_ref(), &hash_undername(&undername)],
+        bump = record_metadata.bump,
+        realloc = AntRecordMetadata::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub record_metadata: Account<'info, AntRecordMetadata>,
+
+    /// Anyone can pay to migrate any ANT record metadata (permissionless)
     #[account(mut)]
     pub payer: Signer<'info>,
 
