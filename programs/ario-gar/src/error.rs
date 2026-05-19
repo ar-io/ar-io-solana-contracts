@@ -119,6 +119,12 @@ pub enum GarError {
     #[msg("Epochs not enabled")]
     EpochsNotEnabled,
 
+    #[msg("Epochs are already enabled — cannot mutate counter while cranker is live")]
+    EpochsAlreadyEnabled,
+
+    #[msg("Epoch counter has already advanced past zero — admin_set_current_epoch_index is one-shot")]
+    EpochCounterAlreadyAdvanced,
+
     #[msg("Epoch not started yet")]
     EpochNotStarted,
 

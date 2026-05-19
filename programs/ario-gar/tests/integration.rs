@@ -1530,6 +1530,183 @@ async fn test_close_epoch_settings() {
 // PDA) to validate something already covered by existing tests. Skipped
 // in favor of live devnet validation when the ix is first run.
 
+/// Verify `admin_set_current_epoch_index`:
+///   1. Authority signer with non-zero `new_index` succeeds — settings
+///      updates AND `genesis_timestamp` re-anchors to make the new
+///      index's epoch_start ≈ now.
+///   2. `new_index = 0` rejected with `InvalidParameter` (no point;
+///      0 is the default).
+///   3. Non-authority signer rejected with `Unauthorized`.
+///   4. One-shot: re-calling after a successful set rejects with
+///      `EpochCounterAlreadyAdvanced`.
+#[tokio::test]
+async fn test_admin_set_current_epoch_index() {
+    let mint = Keypair::new();
+    let dummy = Pubkey::new_unique();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    // initialize_epochs: starts with current_epoch_index=0, enabled=false.
+    let epoch_duration: i64 = 86_400;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InitializeEpochs {
+                epoch_settings: epoch_settings_key,
+                payer: upgrade_authority_keypair().pubkey(),
+                program_data: program_data_pda(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InitializeEpochs {
+                params: ario_gar::InitializeEpochParams {
+                    authority: ctx.payer.pubkey(),
+                    epoch_duration,
+                    observer_count: 50,
+                    name_count: 50,
+                    min_observer_stake: 50_000_000_000,
+                    slash_rate: 1000,
+                    tenure_weight_duration: 180 * 86_400,
+                    max_tenure_weight: 4,
+                },
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &upgrade_authority_keypair()],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Step 1: new_index = 0 rejected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let zero_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 0 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let zero_result = ctx.banks_client.process_transaction(zero_tx).await;
+    assert_anchor_error!(zero_result, GarError::InvalidParameter);
+
+    // Step 2: non-authority signer rejected.
+    let bad_signer = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: bad_signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 406 }.data(),
+        }],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::Unauthorized);
+
+    // Step 3: authority + valid new_index succeeds.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ok_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 406 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(ok_tx).await.unwrap();
+
+    // Verify the state update.
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(settings.current_epoch_index, 406);
+    // Re-anchor invariant: epoch_start for index=406 ≈ now (i.e.
+    // `now - new_genesis ≈ new_index * epoch_duration`).
+    let clock_sysvar = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::sysvar::clock::Clock>()
+        .await
+        .unwrap();
+    let now = clock_sysvar.unix_timestamp;
+    let elapsed = now - settings.genesis_timestamp;
+    let expected_elapsed = 406i64 * epoch_duration;
+    // Allow a small slack for the slot/clock advance between the tx and
+    // this query (program-test slots advance every few ms).
+    assert!(
+        (elapsed - expected_elapsed).abs() < 60,
+        "expected genesis re-anchor to ~{}s ago (406 * {}), got {}s",
+        expected_elapsed,
+        epoch_duration,
+        elapsed
+    );
+
+    // Step 4: one-shot — calling again is rejected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let twice_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 500 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let twice_result = ctx.banks_client.process_transaction(twice_tx).await;
+    assert_anchor_error!(twice_result, GarError::EpochCounterAlreadyAdvanced);
+}
+
 // =========================================
 // NEW INTEGRATION TESTS
 // =========================================
