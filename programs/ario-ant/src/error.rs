@@ -109,6 +109,9 @@ pub enum AntError {
     #[msg("ANT is already at the latest version")]
     AlreadyLatestVersion,
 
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
+
     #[msg("Migration deadline has passed")]
     MigrationExpired,
 
