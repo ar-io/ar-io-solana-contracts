@@ -361,7 +361,18 @@ if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
     SBF_FEATURE_ARGS+=(--features devnet-shrunk)
     echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
 fi
-echo "[build-sbf] cargo build-sbf -- ${SBF_FEATURE_ARGS[*]}"
-cargo build-sbf -- "${SBF_FEATURE_ARGS[@]}"
+# Use `anchor build` (not `cargo build-sbf`) so we get IDLs alongside
+# the .so files. anchor build wraps cargo-build-sbf internally + adds
+# IDL extraction via the `idl-build` cargo feature, and its
+# `address` field in target/idl/*.json picks up the
+# already-patched declare_id!() values (essential — the package-release.sh
+# step bundles those IDLs for downstream SDK consumers).
+#
+# anchor build forwards args after `--` to cargo build-sbf; our feature
+# combo (--no-default-features --features network-...,devnet-shrunk)
+# passes through unchanged, in addition to anchor's own
+# `--features idl-build`. Cargo unions multiple --features flags.
+echo "[build-sbf] anchor build -- ${SBF_FEATURE_ARGS[*]}"
+anchor build -- "${SBF_FEATURE_ARGS[@]}"
 
-ls -la target/deploy/*.so
+ls -la target/deploy/*.so target/idl/*.json 2>/dev/null || ls -la target/deploy/*.so
