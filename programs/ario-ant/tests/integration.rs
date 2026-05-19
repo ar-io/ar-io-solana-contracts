@@ -680,7 +680,7 @@ async fn send_migrate_ant(
     let (config_key, _) = config_pda(asset);
     let (controllers_key, _) = controllers_pda(asset);
 
-    let accounts = ario_ant::accounts::MigrateAnt {
+    let accounts = ario_ant::accounts::AntMigration {
         asset: *asset,
         ant_config: config_key,
         ant_controllers: controllers_key,
@@ -1777,7 +1777,7 @@ async fn test_migrate_ant_version() {
         .into(),
     );
 
-    // Also create a minimal AntControllers for asset2 so MigrateAnt can load it.
+    // Also create a minimal AntControllers for asset2 so AntMigration can load it.
     let (controllers2_key, controllers2_bump) = controllers_pda(&asset2.pubkey());
     let v0_controllers = AntControllers {
         mint: asset2.pubkey(),

@@ -682,7 +682,7 @@ pub mod ario_ant {
     /// Per-undername `AntRecord` and `AntRecordMetadata` accounts have their
     /// own instructions (`migrate_ant_record`, `migrate_ant_record_metadata`)
     /// because their cardinality is unbounded and cannot fit in a single tx.
-    pub fn migrate_ant(ctx: Context<MigrateAnt>) -> Result<()> {
+    pub fn migrate_ant(ctx: Context<AntMigration>) -> Result<()> {
         let asset_key = ctx.accounts.asset.key();
 
         let config = &mut ctx.accounts.ant_config;
@@ -718,7 +718,7 @@ pub mod ario_ant {
     /// Permissionless — anyone can pay. Call once per undername that needs
     /// migrating; callers can derive which records exist via `getProgramAccounts`
     /// filtered on `ANT_RECORD_SEED`.
-    pub fn migrate_ant_record(ctx: Context<MigrateAntRecord>, undername: String) -> Result<()> {
+    pub fn migrate_ant_record(ctx: Context<AntMigrationRecord>, undername: String) -> Result<()> {
         let record = &mut ctx.accounts.record;
         require!(
             record.version < ANT_RECORD_VERSION,
@@ -741,7 +741,7 @@ pub mod ario_ant {
     /// existing metadata PDA; the `undername` is the same one passed to
     /// `migrate_ant_record`.
     pub fn migrate_ant_record_metadata(
-        ctx: Context<MigrateAntRecordMetadata>,
+        ctx: Context<AntMigrationRecordMetadata>,
         undername: String,
     ) -> Result<()> {
         let metadata = &mut ctx.accounts.record_metadata;
@@ -1752,7 +1752,7 @@ pub struct ManageMetadata<'info> {
 }
 
 #[derive(Accounts)]
-pub struct MigrateAnt<'info> {
+pub struct AntMigration<'info> {
     /// CHECK: Metaplex Core asset
     #[account(
         constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
@@ -1787,7 +1787,7 @@ pub struct MigrateAnt<'info> {
 }
 
 #[derive(Accounts)]
-pub struct MigrateAntRecord<'info> {
+pub struct AntMigrationRecord<'info> {
     /// CHECK: Metaplex Core asset — validates the record belongs to a real ANT.
     #[account(
         constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
@@ -1813,7 +1813,7 @@ pub struct MigrateAntRecord<'info> {
 
 #[derive(Accounts)]
 #[instruction(undername: String)]
-pub struct MigrateAntRecordMetadata<'info> {
+pub struct AntMigrationRecordMetadata<'info> {
     /// CHECK: Metaplex Core asset — validates the metadata belongs to a real ANT.
     #[account(
         constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
