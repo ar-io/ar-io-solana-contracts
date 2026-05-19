@@ -109,12 +109,12 @@ fn require_trailing_zero_padding(data: &[u8], i: usize) -> Result<()> {
 }
 
 /// Skip the three-byte `SchemaVersion { major, minor, patch }` field.
-/// `SchemaVersion` serializes as three consecutive `u8` bytes in field-declaration
-/// order (major, minor, patch) — matching Borsh's struct layout rule.
 fn skip_schema_version(data: &[u8], i: &mut usize) -> Result<()> {
-    read_u8(data, i)?; // major
-    read_u8(data, i)?; // minor
-    read_u8(data, i)?; // patch
+    require!(
+        data.len() >= *i + SCHEMA_VERSION_SIZE,
+        AntError::InvalidAccountData
+    );
+    *i += SCHEMA_VERSION_SIZE;
     Ok(())
 }
 
