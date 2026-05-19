@@ -609,6 +609,45 @@
       ]
     },
     {
+      "name": "EpochCounterAdvancedEvent",
+      "discriminator": [
+        167,
+        6,
+        32,
+        31,
+        110,
+        2,
+        89,
+        19
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_index",
+          "type": "u64"
+        },
+        {
+          "name": "old_genesis_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "new_genesis_timestamp",
+          "type": "i64"
+        },
+        {
+          "name": "epoch_duration",
+          "type": "i64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "EpochCreatedEvent",
       "discriminator": [
         69,

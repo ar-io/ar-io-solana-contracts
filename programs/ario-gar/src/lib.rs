@@ -303,6 +303,24 @@ pub mod ario_gar {
         instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
     }
 
+    /// Authority-gated one-shot to set `current_epoch_index` to a non-zero
+    /// starting value (and re-anchor `genesis_timestamp` so the first
+    /// `create_epoch` fires immediately for that index). Use case:
+    /// AO → Solana cutover where Solana should pick up at AO's last
+    /// epoch + 1 for indexer / dashboard / reward-decay continuity.
+    ///
+    /// Pre-conditions: `enabled == false` AND
+    /// `current_epoch_index == 0`. After the cranker advances the
+    /// counter (or epochs are enabled), the lever is permanently
+    /// locked. See `instructions::epoch::admin_set_current_epoch_index`
+    /// for the full rationale.
+    pub fn admin_set_current_epoch_index(
+        ctx: Context<UpdateEpochSettings>,
+        new_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_current_epoch_index(ctx, new_index)
+    }
+
     /// Close the EpochSettings PDA (authority-only). The only path to
     /// overwrite the immutable init params on a singleton PDA originally
     /// created with `init` (not `init_if_needed`). After close, the
@@ -896,6 +914,23 @@ pub struct EpochDurationUpdatedEvent {
     pub old_genesis_timestamp: i64,
     pub new_genesis_timestamp: i64,
     pub current_epoch_index: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_current_epoch_index`. The one-shot AO →
+/// Solana cutover lever. Indexers tracking the epoch counter need
+/// this to know Solana didn't actually run epochs 0..(new_index-1) —
+/// the counter jumped. Without this event, an indexer scanning
+/// `EpochCreatedEvent`s would see epoch numbers start at `new_index`
+/// out of nowhere and might log warnings or treat earlier indices as
+/// "missing." This event explicitly records the discontinuity.
+#[event]
+pub struct EpochCounterAdvancedEvent {
+    pub admin: Pubkey,
+    pub new_index: u64,
+    pub old_genesis_timestamp: i64,
+    pub new_genesis_timestamp: i64,
+    pub epoch_duration: i64,
     pub timestamp: i64,
 }
 
