@@ -654,6 +654,12 @@ mod tests {
             last_known_owner: owner,
             bump: 0,
             version: ANT_CONFIG_VERSION,
+            #[cfg(feature = "migration-test")]
+            field_1: 0,
+            #[cfg(feature = "migration-test")]
+            field_2: 0,
+            #[cfg(feature = "migration-test")]
+            field_3: false,
         }
     }
 
@@ -1498,6 +1504,12 @@ mod tests {
             last_known_owner: owner,
             bump: 0,
             version: ANT_CONFIG_VERSION,
+            #[cfg(feature = "migration-test")]
+            field_1: 0,
+            #[cfg(feature = "migration-test")]
+            field_2: 0,
+            #[cfg(feature = "migration-test")]
+            field_3: false,
         };
         assert_eq!(config.name, "My Cool ANT");
         assert_eq!(config.ticker, "COOL");
