@@ -2,11 +2,11 @@
   "cluster": "https://api.devnet.solana.com",
   "deployer": "FkkABY7WLYpET8jKdbknCArYab44M88TkjmJmut8TcRF",
   "deployed_at": {
-    "ario_core": "2026-05-06T17:34:58Z",
-    "ario_gar": "2026-05-08T00:39:43Z",
-    "ario_arns": "2026-05-06T03:35:10Z",
-    "ario_ant": "2026-05-06T03:36:19Z",
-    "ario_ant_escrow": "2026-05-17T00:00:00Z"
+    "ario_core": "2026-05-19T00:56:00Z",
+    "ario_gar": "2026-05-19T00:56:31Z",
+    "ario_arns": "2026-05-19T00:56:47Z",
+    "ario_ant": "2026-05-19T00:56:14Z",
+    "ario_ant_escrow": "2026-05-19T00:56:58Z"
   },
   "programs": {
     "ario_core": "83CQLP848zzCgnZ4LTq87g6hvxTooNLX7YXXkUUGv5ig",
