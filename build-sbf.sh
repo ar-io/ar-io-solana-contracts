@@ -261,18 +261,28 @@ sync_from_manifest() {
     echo "[build-sbf] patched $gar_lib → ARIO_CORE_PROGRAM_ID = \"$core_prog_id\""
   fi
 
-  # cargo-build-sbf 2.1.0 iterates ALL workspace members after the build to
-  # copy .so files into target/deploy/, and fails if any member's .so is
-  # absent (even one that was deliberately not built). Temporarily remove
-  # ario-ant-escrow from the workspace so it is invisible to that copy step.
-  # restore_keys() (registered in the EXIT trap) restores Cargo.toml.
-  local cargo_backup
-  cargo_backup="$SYNC_BACKUP_DIR/Cargo_toml"
-  cp Cargo.toml "$cargo_backup"
-  echo "Cargo.toml" > "$cargo_backup.path"
-  sed -i.bak '/"programs\/ario-ant-escrow"/d' Cargo.toml
-  rm -f Cargo.toml.bak
-  echo "[build-sbf] patched Cargo.toml — excluded ario-ant-escrow from workspace (restored on EXIT)"
+  # Note: previous revisions of this function patched Cargo.toml to remove
+  # ario-ant-escrow from the workspace `members` array (PR #6) and later
+  # also add it to `workspace.exclude` (PR #45). That approach was meant
+  # to work around `cargo build-sbf` 2.1.0's "copy every workspace
+  # member's .so" pass failing when escrow's .so didn't exist — escrow
+  # has a `compile_error!` requiring exactly one of `network-mainnet` /
+  # `network-devnet` features, and the default workspace build didn't
+  # supply either. The exclude approach broke escrow's
+  # `xxx.workspace = true` inheritance (`error inheriting edition from
+  # workspace root manifest`), forcing a separate `cargo build-sbf
+  # --manifest-path` step which then failed on the same inheritance.
+  #
+  # We now solve this at the build invocation: passing
+  # `--no-default-features --features network-${BUILD_NETWORK:-devnet}`
+  # to the workspace build (see end of script) satisfies escrow's
+  # compile_error!, produces escrow.so as part of the normal workspace
+  # build, and keeps workspace-inheritance intact. The other four crates
+  # have `default = []` so `--no-default-features` is a no-op for them.
+  # Escrow's `unsafe-allow-test-attestor-pubkey` default also gets turned
+  # off, which is correct — the F-4 const-eval guard then fires
+  # appropriately on real-network builds.
+  :
 }
 
 case "$MODE" in
@@ -326,27 +336,43 @@ EOF
     ;;
 esac
 
-# Plain workspace build — no -p flags needed.  cargo-build-sbf 2.1.0
-# copies every workspace member's .so at the end of the build, so we
-# must not leave ario-ant-escrow in the workspace when it isn't being
-# compiled.  sync_from_manifest() removes it from Cargo.toml and the
-# EXIT trap restores it.
+# Workspace build — one invocation produces all 5 .so files in target/deploy/.
 #
-# To build escrow separately (requires real ATTESTOR_PUBKEY in state.rs):
-#   BUILD_NETWORK=devnet cargo build-sbf -- \
-#     --package ario-ant-escrow \
-#     --no-default-features --features network-devnet
+# `--no-default-features` is necessary because ario-ant-escrow's defaults
+# (`["network-mainnet", "unsafe-allow-test-attestor-pubkey"]`) would
+# trigger its `compile_error!` (mutual exclusivity with whatever
+# `--features network-<cluster>` we add). It's a no-op for the other 4
+# crates (they all declare `default = []`). Disabling
+# `unsafe-allow-test-attestor-pubkey` also re-enables the F-4 const-eval
+# guard in state.rs — desirable for any real-network build.
 #
-# When BUILD_NETWORK=devnet we activate the `devnet-shrunk` cargo feature
-# on the two programs that hold zero-copy registries (ario-gar's
-# GatewayRegistry + Epoch.failure_counts; ario-arns's NameRegistry). This
-# shrinks the on-chain footprint from ~8 MB to ~10 KB total — saving ~57
-# SOL of rent on devnet — without forking the source. Mainnet builds
-# leave the feature off; the workspace default keeps production sizes.
-SBF_FEATURE_ARGS=()
+# `--features network-${BUILD_NETWORK:-devnet}` satisfies escrow's
+# `compile_error!` requiring exactly one of network-mainnet /
+# network-devnet to be enabled. The feature is only declared on escrow,
+# so it activates there only; the other crates ignore it.
+#
+# `--features devnet-shrunk` (BUILD_NETWORK=devnet only) shrinks the
+# zero-copy registry account sizes on ario-gar + ario-arns to fit on
+# devnet. Mainnet builds leave it off so production sizes are baked in.
+# It's declared as a no-op feature on every workspace member (PR #18) so
+# the workspace-level `--features` flag finds it without erroring.
+SBF_FEATURE_ARGS=(--no-default-features --features "network-${BUILD_NETWORK:-devnet}")
 if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
     SBF_FEATURE_ARGS+=(--features devnet-shrunk)
     echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
 fi
-cargo build-sbf -- "${SBF_FEATURE_ARGS[@]}"
-ls -la target/deploy/*.so
+# Use `anchor build` (not `cargo build-sbf`) so we get IDLs alongside
+# the .so files. anchor build wraps cargo-build-sbf internally + adds
+# IDL extraction via the `idl-build` cargo feature, and its
+# `address` field in target/idl/*.json picks up the
+# already-patched declare_id!() values (essential — the package-release.sh
+# step bundles those IDLs for downstream SDK consumers).
+#
+# anchor build forwards args after `--` to cargo build-sbf; our feature
+# combo (--no-default-features --features network-...,devnet-shrunk)
+# passes through unchanged, in addition to anchor's own
+# `--features idl-build`. Cargo unions multiple --features flags.
+echo "[build-sbf] anchor build -- ${SBF_FEATURE_ARGS[*]}"
+anchor build -- "${SBF_FEATURE_ARGS[@]}"
+
+ls -la target/deploy/*.so target/idl/*.json 2>/dev/null || ls -la target/deploy/*.so

@@ -105,6 +105,84 @@ pub fn admin_set_epoch_duration(
     Ok(())
 }
 
+/// Authority-gated one-shot to set `EpochSettings.current_epoch_index` to
+/// a non-zero starting value, AND re-anchor `genesis_timestamp` so the
+/// first `create_epoch` call fires immediately for that index.
+///
+/// Use case — AO → Solana cutover. AO's epoch counter doesn't carry
+/// over by default (`initialize_epochs` always sets `current_epoch_index
+/// = 0`). For epoch-number continuity with AO at cutover, the operator
+/// calls this immediately after `initialize_epochs` and before
+/// `set_epochs_enabled(true)`.
+///
+/// Example: AO closed at epoch 405. Solana operator calls
+///   admin_set_current_epoch_index(406)
+/// which sets:
+///   current_epoch_index = 406
+///   genesis_timestamp   = now - 406 * epoch_duration
+///     (so wall-clock-derived `epoch_start` for index 406 ≈ now,
+///     letting the cranker create_epoch immediately rather than
+///     having to grind through 406 no-op create_epoch calls.)
+///
+/// Reward-decay constants (`REWARD_DECAY_START_EPOCH = 365`,
+/// `REWARD_DECAY_LAST_EPOCH = 547`) are authored against AO's epoch
+/// numbering — this ix preserves the decay schedule continuity.
+///
+/// One-shot by design:
+///   - Pre-condition: `current_epoch_index == 0` (never run after the
+///     counter has advanced; protects against mid-operation jumps).
+///   - Pre-condition: `enabled == false` (no cranker racing this).
+/// After the cutover, the counter advances only via `create_epoch`.
+pub fn admin_set_current_epoch_index(
+    ctx: Context<UpdateEpochSettings>,
+    new_index: u64,
+) -> Result<()> {
+    require!(new_index > 0, GarError::InvalidParameter);
+    // Loose upper bound — ~273 years at 1-day epochs; catches operator
+    // typos (e.g. extra zero) without blocking any realistic AO carry-over.
+    require!(new_index <= 100_000, GarError::InvalidParameter);
+
+    let settings = &mut ctx.accounts.epoch_settings;
+    require!(!settings.enabled, GarError::EpochsAlreadyEnabled);
+    require!(
+        settings.current_epoch_index == 0,
+        GarError::EpochCounterAlreadyAdvanced
+    );
+
+    let clock = Clock::get()?;
+    let old_genesis = settings.genesis_timestamp;
+    let new_genesis = clock
+        .unix_timestamp
+        .checked_sub(
+            (new_index as i64)
+                .checked_mul(settings.epoch_duration)
+                .ok_or(GarError::ArithmeticOverflow)?,
+        )
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    settings.current_epoch_index = new_index;
+    settings.genesis_timestamp = new_genesis;
+
+    emit!(crate::EpochCounterAdvancedEvent {
+        admin: ctx.accounts.authority.key(),
+        new_index,
+        old_genesis_timestamp: old_genesis,
+        new_genesis_timestamp: new_genesis,
+        epoch_duration: settings.epoch_duration,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "EpochSettings.current_epoch_index 0 → {}; genesis re-anchored {} → {} (duration={}s)",
+        new_index,
+        old_genesis,
+        new_genesis,
+        settings.epoch_duration
+    );
+
+    Ok(())
+}
+
 /// Close the EpochSettings PDA, refunding rent to the recorded authority.
 ///
 /// Authority-only. Intended for fresh-init / authority-led recovery: closing

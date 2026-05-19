@@ -117,6 +117,27 @@ pub mod ario_gar {
         )
     }
 
+    /// Override `GatewaySettings.withdrawal_period` — the lock duration
+    /// applied to every NEW operator-stake or delegate withdrawal vault.
+    /// Mirrors `admin_set_epoch_duration`'s pattern for epoch tuning.
+    ///
+    /// Existing withdrawal vaults are unaffected (their unlock timestamps
+    /// were stamped at create time). Only withdrawals initiated AFTER this
+    /// call use the new period. Authority-only. Minimum 60 seconds.
+    ///
+    /// Primary use case is devnet testing: the production default
+    /// (`WITHDRAWAL_LOCK_PERIOD` = 30 days) is impractical for end-to-end
+    /// claim-withdrawal validation on a real cluster. Secondary use case
+    /// is emergency tuning by the multisig without a code upgrade. See
+    /// `instructions::initialize::admin_set_withdrawal_period` for the
+    /// full motivation comment.
+    pub fn admin_set_withdrawal_period(
+        ctx: Context<AdminSetWithdrawalPeriod>,
+        new_period_seconds: i64,
+    ) -> Result<()> {
+        instructions::initialize::admin_set_withdrawal_period(ctx, new_period_seconds)
+    }
+
     // =========================================
     // GATEWAY LIFECYCLE (F10-F12)
     // =========================================
@@ -280,6 +301,24 @@ pub mod ario_gar {
         new_duration: i64,
     ) -> Result<()> {
         instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
+    }
+
+    /// Authority-gated one-shot to set `current_epoch_index` to a non-zero
+    /// starting value (and re-anchor `genesis_timestamp` so the first
+    /// `create_epoch` fires immediately for that index). Use case:
+    /// AO → Solana cutover where Solana should pick up at AO's last
+    /// epoch + 1 for indexer / dashboard / reward-decay continuity.
+    ///
+    /// Pre-conditions: `enabled == false` AND
+    /// `current_epoch_index == 0`. After the cranker advances the
+    /// counter (or epochs are enabled), the lever is permanently
+    /// locked. See `instructions::epoch::admin_set_current_epoch_index`
+    /// for the full rationale.
+    pub fn admin_set_current_epoch_index(
+        ctx: Context<UpdateEpochSettings>,
+        new_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_current_epoch_index(ctx, new_index)
     }
 
     /// Close the EpochSettings PDA (authority-only). The only path to
@@ -875,6 +914,36 @@ pub struct EpochDurationUpdatedEvent {
     pub old_genesis_timestamp: i64,
     pub new_genesis_timestamp: i64,
     pub current_epoch_index: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_current_epoch_index`. The one-shot AO →
+/// Solana cutover lever. Indexers tracking the epoch counter need
+/// this to know Solana didn't actually run epochs 0..(new_index-1) —
+/// the counter jumped. Without this event, an indexer scanning
+/// `EpochCreatedEvent`s would see epoch numbers start at `new_index`
+/// out of nowhere and might log warnings or treat earlier indices as
+/// "missing." This event explicitly records the discontinuity.
+#[event]
+pub struct EpochCounterAdvancedEvent {
+    pub admin: Pubkey,
+    pub new_index: u64,
+    pub old_genesis_timestamp: i64,
+    pub new_genesis_timestamp: i64,
+    pub epoch_duration: i64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_withdrawal_period`. Indexers tracking the
+/// withdrawal-claim eligibility window need this to recompute
+/// `unlock_timestamp = vault.created_at + settings.withdrawal_period` for
+/// any NEW withdrawal vault created after the timestamp here. Existing
+/// vaults retain their stamped `unlock_timestamp` and are unaffected.
+#[event]
+pub struct WithdrawalPeriodUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_period_seconds: i64,
+    pub new_period_seconds: i64,
     pub timestamp: i64,
 }
 
