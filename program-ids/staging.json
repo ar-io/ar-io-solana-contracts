@@ -9,16 +9,17 @@
     "ario_ant_escrow": null
   },
   "programs": {
-    "ario_core": "4QDDbsU6GJ3FLLW9HFdfyt6roeVm855PFHCuMyB4fEsW",
-    "ario_gar": "Bt7Q4UdcMwZmi5QoD5VCEgVk1XCif7mkftoCk76m6Lou",
-    "ario_arns": "2saz1GMynPgjctHE5aTXcZe26xNxHpJeoFVYdqUH9Yj8",
-    "ario_ant": "GS6nhMuBkCQwjJPWYfRDntGiyXANYehoKaVk25KHbnWa",
-    "ario_ant_escrow": "GBTCZzzV97HFzCMiFRs6BYgptLK9fuUmZGrWoYEUFwih"
+    "ario_core": "Hai5QH2GVNpJ12FH834NW5mnZVMShLDZXaM35eZCWcfc",
+    "ario_gar": "dkzN3hW6qTejB64JGz4RL9bVAw3WVyr9smLCyo6TRqo",
+    "ario_arns": "7zsDc1xMH6oBTqkaKVGKkrdaXWe75VfNQ2HvSMgec33M",
+    "ario_ant": "4Hdcb2fN7yx5csvaBYfxZKAVF2SHPWLxUjFSt1AzWRK6",
+    "ario_ant_escrow": "EtXxuWoD2fNv9gRQFiXEuxpSWJSMaqy6RFvjiTJ2idu6"
   },
   "mints": {
     "ario": null
   },
   "external": {
     "mpl_core": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
-  }
+  },
+  "lastUpdated": "2026-05-20T18:46:40Z"
 }
