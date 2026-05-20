@@ -14428,9 +14428,10 @@ fn program_test_with_pre_refactor_settings(authority: &Pubkey, mint: &Pubkey) ->
 
     let (settings_key, settings_bump) = settings_pda();
     // Pre-refactor: 32 bytes shorter (no arns_program_id) AND 24 bytes shorter
-    // (no supply counters: total_staked, total_delegated, total_withdrawn).
-    // Matches handler's `old_size = new_size - 32 - 24`.
-    let pre_size = GatewaySettings::SIZE - 32 - 24;
+    // (no supply counters: total_staked, total_delegated, total_withdrawn) AND
+    // 3 bytes shorter (no SchemaVersion).
+    // Matches handler's `old_size = new_size - 32 - 24 - SCHEMA_VERSION_SIZE`.
+    let pre_size = GatewaySettings::SIZE - 32 - 24 - 3;
     let mut data = vec![0u8; pre_size];
     let disc = hash(b"account:GatewaySettings");
     data[..8].copy_from_slice(&disc.to_bytes()[..8]);
@@ -14492,7 +14493,7 @@ async fn test_migrate_settings_set_arns_program_id_backfills() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(pre.data.len(), GatewaySettings::SIZE - 32 - 24);
+    assert_eq!(pre.data.len(), GatewaySettings::SIZE - 32 - 24 - 3);
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -14529,7 +14530,10 @@ async fn test_migrate_settings_set_arns_program_id_backfills() {
     assert_eq!(settings.arns_program_id, arns_pid);
     assert_eq!(settings.authority, authority.pubkey());
     // bump must match what was at the OLD bump offset (we just shifted it)
-    assert_eq!(settings.bump, pre.data[GatewaySettings::SIZE - 32 - 24 - 1]);
+    assert_eq!(
+        settings.bump,
+        pre.data[GatewaySettings::SIZE - 32 - 24 - 3 - 1]
+    );
 }
 
 #[tokio::test]

@@ -250,6 +250,7 @@ mod tests {
             period_zero_start_timestamp: period_zero_start,
             criteria: DEMAND_CRITERIA_REVENUE,
             bump: 0,
+            version: DEMAND_FACTOR_VERSION,
         }
     }
 

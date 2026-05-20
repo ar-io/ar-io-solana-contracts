@@ -357,6 +357,7 @@ mod tests {
             undername_limit: 10,
             purchase_price: 1_000_000,
             bump: 0,
+            version: ario_arns::state::SchemaVersion::new(1, 0, 0),
             name: name.to_string(),
         }
     }

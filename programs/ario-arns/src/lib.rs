@@ -6,11 +6,16 @@ pub mod error;
 pub mod instructions;
 pub mod migration;
 pub mod pricing;
+pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
 pub use migration::*;
 use state::PurchaseType;
+use state::{
+    SchemaVersion, ARNS_CONFIG_VERSION, ARNS_RECORD_VERSION, DEMAND_FACTOR_VERSION,
+    RESERVED_NAME_VERSION, RETURNED_NAME_VERSION,
+};
 
 /// AR.IO ArNS Registry Program
 ///
@@ -391,6 +396,104 @@ pub mod ario_arns {
     }
 
     // =========================================
+    // SCHEMA MIGRATION (per-account version upgrade)
+    // =========================================
+
+    /// Migrate an `ArnsConfig` PDA to the latest schema version.
+    /// Permissionless — anyone can pay the realloc rent.
+    pub fn migrate_arns_config(ctx: Context<MigrateArnsConfig>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(
+            config.version < ARNS_CONFIG_VERSION,
+            error::ArnsError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_arns_config_version(config)?;
+        msg!(
+            "ArnsConfig migrated to {}.{}.{}",
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a `DemandFactor` PDA to the latest schema version.
+    /// Permissionless — anyone can pay the realloc rent.
+    pub fn migrate_demand_factor(ctx: Context<MigrateDemandFactor>) -> Result<()> {
+        let demand_factor = &mut ctx.accounts.demand_factor;
+        require!(
+            demand_factor.version < DEMAND_FACTOR_VERSION,
+            error::ArnsError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_demand_factor_version(demand_factor)?;
+        msg!(
+            "DemandFactor migrated to {}.{}.{}",
+            demand_factor.version.major,
+            demand_factor.version.minor,
+            demand_factor.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a single `ArnsRecord` PDA to the latest schema version.
+    /// Permissionless — anyone can pay the realloc rent. Call once per
+    /// name that needs migrating.
+    pub fn migrate_arns_record(ctx: Context<MigrateArnsRecord>) -> Result<()> {
+        let record = &mut ctx.accounts.record;
+        require!(
+            record.version < ARNS_RECORD_VERSION,
+            error::ArnsError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_arns_record_version(record)?;
+        msg!(
+            "ArnsRecord '{}' migrated to {}.{}.{}",
+            record.name,
+            record.version.major,
+            record.version.minor,
+            record.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a single `ReturnedName` PDA to the latest schema version.
+    /// Permissionless — anyone can pay the realloc rent.
+    pub fn migrate_returned_name(ctx: Context<MigrateReturnedName>) -> Result<()> {
+        let returned_name = &mut ctx.accounts.returned_name;
+        require!(
+            returned_name.version < RETURNED_NAME_VERSION,
+            error::ArnsError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_returned_name_version(returned_name)?;
+        msg!(
+            "ReturnedName '{}' migrated to {}.{}.{}",
+            returned_name.name,
+            returned_name.version.major,
+            returned_name.version.minor,
+            returned_name.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a single `ReservedName` PDA to the latest schema version.
+    /// Permissionless — anyone can pay the realloc rent.
+    pub fn migrate_reserved_name(ctx: Context<MigrateReservedName>, name: String) -> Result<()> {
+        let reserved_name = &mut ctx.accounts.reserved_name;
+        require!(
+            reserved_name.version < RESERVED_NAME_VERSION,
+            error::ArnsError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_reserved_name_version(reserved_name)?;
+        msg!(
+            "ReservedName '{}' migrated to {}.{}.{}",
+            name,
+            reserved_name.version.major,
+            reserved_name.version.minor,
+            reserved_name.version.patch,
+        );
+        Ok(())
+    }
+
+    // =========================================
     // MIGRATION OPERATIONS
     // =========================================
 
@@ -416,6 +519,91 @@ pub mod ario_arns {
     pub fn finalize_migration(ctx: Context<FinalizeMigration>) -> Result<()> {
         finalize_migration_handler(ctx)
     }
+}
+
+// =========================================
+// SCHEMA MIGRATION ACCOUNT CONTEXTS
+// =========================================
+
+#[derive(Accounts)]
+pub struct MigrateArnsConfig<'info> {
+    #[account(
+        mut,
+        seeds = [state::ARNS_CONFIG_SEED],
+        bump = config.bump,
+        realloc = state::ArnsConfig::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub config: Account<'info, state::ArnsConfig>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateDemandFactor<'info> {
+    #[account(
+        mut,
+        seeds = [state::DEMAND_FACTOR_SEED],
+        bump = demand_factor.bump,
+        realloc = state::DemandFactor::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub demand_factor: Account<'info, state::DemandFactor>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateArnsRecord<'info> {
+    #[account(
+        mut,
+        seeds = [state::ARNS_RECORD_SEED, record.name_hash.as_ref()],
+        bump = record.bump,
+        realloc = state::ArnsRecord::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub record: Account<'info, state::ArnsRecord>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateReturnedName<'info> {
+    #[account(
+        mut,
+        seeds = [state::RETURNED_NAME_SEED, returned_name.name_hash.as_ref()],
+        bump = returned_name.bump,
+        realloc = state::ReturnedName::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub returned_name: Account<'info, state::ReturnedName>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(name: String)]
+pub struct MigrateReservedName<'info> {
+    #[account(
+        mut,
+        seeds = [state::RESERVED_NAME_SEED, &crate::pricing::hash_name(&name)],
+        bump = reserved_name.bump,
+        realloc = state::ReservedName::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub reserved_name: Account<'info, state::ReservedName>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // =========================================

@@ -99,8 +99,10 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
     let observer_lookup = &mut ctx.accounts.observer_lookup;
     observer_lookup.gateway = ctx.accounts.operator.key();
     observer_lookup.bump = ctx.bumps.observer_lookup;
+    observer_lookup.version = OBSERVER_LOOKUP_VERSION;
     gateway.cumulative_reward_per_token = 0;
     gateway.bump = ctx.bumps.gateway;
+    gateway.version = GATEWAY_VERSION;
 
     // Add to registry
     let mut registry = ctx.accounts.registry.load_mut()?;
@@ -195,6 +197,11 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
     let excess_amount = pre_stake.saturating_sub(min_stake);
 
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.operator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
     let exit_id = counter.next_id;
     let excess_id = exit_id.checked_add(1).ok_or(GarError::ArithmeticOverflow)?;
 
@@ -221,6 +228,7 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
         exit.is_exit_vault = true;
         exit.is_protected = protected_amount > 0;
         exit.bump = ctx.bumps.withdrawal;
+        exit.version = WITHDRAWAL_VERSION;
     }
 
     // 2. Manual create excess vault when warranted.
@@ -299,6 +307,7 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
             is_exit_vault: true,
             is_protected: false,
             bump: vault_bump,
+            version: WITHDRAWAL_VERSION,
         };
         let mut data = excess_acc.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -484,6 +493,7 @@ pub fn update_observer_address(
     let new_lookup = &mut ctx.accounts.new_observer_lookup;
     new_lookup.gateway = ctx.accounts.operator.key();
     new_lookup.bump = ctx.bumps.new_observer_lookup;
+    new_lookup.version = OBSERVER_LOOKUP_VERSION;
 
     emit!(ObserverAddressUpdatedEvent {
         operator: gateway.operator,
@@ -534,6 +544,11 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
     let excess_amount = post_slash.saturating_sub(min_stake);
 
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = gateway.operator;
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
     let exit_id = counter.next_id;
     let excess_id = exit_id.checked_add(1).ok_or(GarError::ArithmeticOverflow)?;
 
@@ -557,6 +572,7 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
         exit.is_exit_vault = protected_amount > 0;
         exit.is_protected = protected_amount > 0;
         exit.bump = ctx.bumps.withdrawal;
+        exit.version = WITHDRAWAL_VERSION;
     }
 
     // 2. Manual create excess vault when post_slash > min_stake.
@@ -631,6 +647,7 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
             is_exit_vault: true,
             is_protected: false,
             bump: vault_bump,
+            version: WITHDRAWAL_VERSION,
         };
         let mut data = excess_acc.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);

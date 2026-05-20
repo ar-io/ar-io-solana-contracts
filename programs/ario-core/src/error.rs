@@ -154,4 +154,13 @@ pub enum ArioError {
 
     #[msg("Migration deadline has passed")]
     MigrationExpired,
+
+    // =========================================
+    // SCHEMA MIGRATION ERRORS
+    // =========================================
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
 }

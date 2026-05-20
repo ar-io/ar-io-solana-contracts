@@ -33,6 +33,8 @@ pub struct AntMigrationConfig {
     pub migration_active: bool,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl AntMigrationConfig {
@@ -40,7 +42,8 @@ impl AntMigrationConfig {
         + PUBKEY_SIZE       // authority
         + PUBKEY_SIZE       // migration_authority
         + 1                 // migration_active: bool
-        + BUMP_SIZE;
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -188,6 +191,9 @@ pub const ANT_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
 pub const ANT_CONTROLLERS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const ANT_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const ANT_RECORD_METADATA_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ANT_MIGRATION_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ACL_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ACL_PAGE_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 /// Per-ANT configuration and metadata stored alongside the Metaplex Core asset.
 /// Seeds: ["ant_config", mint]
@@ -353,11 +359,14 @@ pub struct AclConfig {
     pub total_entries: u64,
     /// PDA bump.
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl AclConfig {
-    /// Discriminator + user + page_count(u64) + total_entries(u64) + bump.
-    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + 8 + 8 + BUMP_SIZE;
+    /// Discriminator + user + page_count(u64) + total_entries(u64) + bump + version.
+    pub const SIZE: usize =
+        ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + 8 + 8 + BUMP_SIZE + SCHEMA_VERSION_SIZE;
 }
 
 /// One page of ACL entries for a user (ADR-012).
@@ -381,12 +390,18 @@ pub struct AclPage {
     pub entries: Vec<AclEntry>,
     /// PDA bump.
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl AclPage {
-    /// Minimum on-chain size: discriminator + user + page_idx(u64) + vec_len(0) + bump.
-    pub const MIN_SIZE: usize =
-        ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + 8 + BORSH_LEN_PREFIX + BUMP_SIZE;
+    /// Minimum on-chain size: discriminator + user + page_idx(u64) + vec_len(0) + bump + version.
+    pub const MIN_SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE
+        + 8
+        + BORSH_LEN_PREFIX
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 
     /// Maximum on-chain size: `MIN_SIZE + MAX_ACL_PAGE_ENTRIES * AclEntry::SIZE`.
     pub const MAX_SIZE: usize = Self::MIN_SIZE + MAX_ACL_PAGE_ENTRIES * AclEntry::SIZE;
@@ -1145,14 +1160,14 @@ mod tests {
 
     #[test]
     fn test_acl_config_size() {
-        // disc(8) + user(32) + page_count(8) + total_entries(8) + bump(1)
-        assert_eq!(AclConfig::SIZE, 8 + 32 + 8 + 8 + 1);
+        // disc(8) + user(32) + page_count(8) + total_entries(8) + bump(1) + version(3)
+        assert_eq!(AclConfig::SIZE, 8 + 32 + 8 + 8 + 1 + 3);
     }
 
     #[test]
     fn test_acl_page_min_and_max_size() {
-        // disc(8) + user(32) + page_idx(8) + vec_len(4) + bump(1)
-        assert_eq!(AclPage::MIN_SIZE, 8 + 32 + 8 + 4 + 1);
+        // disc(8) + user(32) + page_idx(8) + vec_len(4) + bump(1) + version(3)
+        assert_eq!(AclPage::MIN_SIZE, 8 + 32 + 8 + 4 + 1 + 3);
         assert_eq!(
             AclPage::MAX_SIZE,
             AclPage::MIN_SIZE + MAX_ACL_PAGE_ENTRIES * AclEntry::SIZE
@@ -1191,6 +1206,7 @@ mod tests {
             page_idx: 0,
             entries: entries.clone(),
             bump: 0,
+            version: ACL_PAGE_VERSION,
         };
         assert_eq!(page.current_size(), AclPage::size_for(entries.len()));
     }
@@ -1218,6 +1234,7 @@ mod tests {
                 },
             ],
             bump: 0,
+            version: ACL_PAGE_VERSION,
         };
         assert_eq!(page.position_of(&asset_a, AclRole::Owner as u8), Some(0));
         assert_eq!(

@@ -133,6 +133,7 @@ pub mod buy_name {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         // Update config
         let config = &mut ctx.accounts.config;
@@ -342,6 +343,7 @@ pub mod buy_returned_name {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         // Update config
         let config = &mut ctx.accounts.config;

@@ -6,7 +6,7 @@ use crate::{
     events::encode_recipient_pubkey_for_event,
     state::{
         derive_initial_nonce, validated_protocol_and_len, EscrowToken, ASSET_TYPE_VAULT,
-        ESCROW_VAULT_SEED, RECIPIENT_PUBKEY_MAX_LEN,
+        ESCROW_TOKEN_VERSION, ESCROW_VAULT_SEED, RECIPIENT_PUBKEY_MAX_LEN,
     },
     EscrowDepositedEvent,
 };
@@ -77,7 +77,7 @@ pub fn handler(
         .ok_or(EscrowError::ArithmeticOverflow)?;
 
     let escrow = &mut ctx.accounts.escrow;
-    escrow.version = 1;
+    escrow.version = ESCROW_TOKEN_VERSION;
     escrow.bump = ctx.bumps.escrow;
     escrow.depositor = ctx.accounts.depositor.key();
     escrow.asset_type = ASSET_TYPE_VAULT;
@@ -96,7 +96,7 @@ pub fn handler(
     escrow.deposit_slot = deposit_slot;
     escrow.vault_end_timestamp = vault_end_timestamp;
     escrow.vault_revocable = revocable;
-    escrow._reserved = [0u8; 32];
+    escrow._reserved = [0u8; 30];
 
     let (recipient_pubkey_buf, recipient_pubkey_len) = encode_recipient_pubkey_for_event(
         escrow.recipient_protocol,

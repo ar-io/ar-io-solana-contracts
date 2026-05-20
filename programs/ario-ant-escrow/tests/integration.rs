@@ -33,9 +33,9 @@ use solana_sdk::{
 use ario_ant_escrow::error::EscrowError;
 use ario_ant_escrow::state::{
     derive_initial_nonce, EscrowAnt, EscrowToken, ARWEAVE_PUBKEY_LEN, ASSET_TYPE_ANT,
-    ASSET_TYPE_TOKEN, ASSET_TYPE_VAULT, ESCROW_ANT_SEED, ESCROW_TOKEN_SEED, ESCROW_VAULT_SEED,
-    ESCROW_VERSION_V1, ETHEREUM_PUBKEY_LEN, MPL_CORE_PROGRAM_ID, PROTOCOL_ARWEAVE,
-    PROTOCOL_ETHEREUM,
+    ASSET_TYPE_TOKEN, ASSET_TYPE_VAULT, ESCROW_ANT_SEED, ESCROW_ANT_VERSION, ESCROW_TOKEN_SEED,
+    ESCROW_TOKEN_VERSION, ESCROW_VAULT_SEED, ETHEREUM_PUBKEY_LEN, MPL_CORE_PROGRAM_ID,
+    PROTOCOL_ARWEAVE, PROTOCOL_ETHEREUM,
 };
 use ario_ant_escrow::{
     EscrowCancelledEvent, EscrowClaimedEvent, EscrowDepositedEvent, EscrowRecipientUpdatedEvent,
@@ -426,7 +426,7 @@ async fn test_deposit_ant_arweave() {
 
     // EscrowAnt populated correctly.
     let escrow = fetch_escrow(&mut ctx, asset_kp.pubkey()).await;
-    assert_eq!(escrow.version, ESCROW_VERSION_V1);
+    assert_eq!(escrow.version, ESCROW_ANT_VERSION);
     assert_eq!(escrow.depositor, depositor.pubkey());
     assert_eq!(escrow.ant_mint, asset_kp.pubkey());
     assert_eq!(escrow.recipient_protocol, PROTOCOL_ARWEAVE);
@@ -1819,7 +1819,7 @@ async fn test_deposit_tokens_happy_path() {
 
     // Verify PDA state.
     let escrow = fetch_escrow_token(&mut ctx, escrow_addr).await;
-    assert_eq!(escrow.version, 1);
+    assert_eq!(escrow.version, ESCROW_TOKEN_VERSION);
     assert_eq!(escrow.depositor, setup.depositor.pubkey());
     assert_eq!(escrow.asset_type, ASSET_TYPE_TOKEN);
     assert_eq!(escrow.amount, amount);
@@ -2235,7 +2235,7 @@ async fn test_deposit_vault_happy_path() {
     .expect("deposit_vault should succeed");
 
     let escrow = fetch_escrow_token(&mut ctx, escrow_addr).await;
-    assert_eq!(escrow.version, 1);
+    assert_eq!(escrow.version, ESCROW_TOKEN_VERSION);
     assert_eq!(escrow.depositor, setup.depositor.pubkey());
     assert_eq!(escrow.asset_type, ASSET_TYPE_VAULT);
     assert_eq!(escrow.amount, amount);

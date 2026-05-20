@@ -6,6 +6,7 @@ pub mod constants;
 pub mod error;
 pub mod instructions;
 pub mod migration;
+pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
@@ -362,6 +363,276 @@ pub mod ario_core {
     ) -> Result<()> {
         instructions::admin::admin_set_gar_program::handler(ctx, new_gar_program)
     }
+
+    // =========================================
+    // SCHEMA MIGRATION (per-account schema upgrade)
+    // =========================================
+
+    /// Migrate an ArioConfig account to the latest schema version.
+    /// Permissionless — anyone can pay the realloc rent.
+    pub fn migrate_config(ctx: Context<MigrateConfig>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(
+            config.version < state::ARIO_CONFIG_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_config_version(config)?;
+        msg!(
+            "ArioConfig migrated to {}.{}.{}",
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a Balance account to the latest schema version.
+    pub fn migrate_balance(ctx: Context<MigrateBalance>) -> Result<()> {
+        let balance = &mut ctx.accounts.balance;
+        require!(
+            balance.version < state::BALANCE_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_balance_version(balance)?;
+        msg!(
+            "Balance migrated to {}.{}.{}",
+            balance.version.major,
+            balance.version.minor,
+            balance.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a VaultCounter account to the latest schema version.
+    pub fn migrate_vault_counter(ctx: Context<MigrateVaultCounter>) -> Result<()> {
+        let counter = &mut ctx.accounts.vault_counter;
+        require!(
+            counter.version < state::VAULT_COUNTER_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_vault_counter_version(counter)?;
+        msg!(
+            "VaultCounter migrated to {}.{}.{}",
+            counter.version.major,
+            counter.version.minor,
+            counter.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a Vault account to the latest schema version.
+    pub fn migrate_vault(ctx: Context<MigrateVault>, vault_id: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        require!(
+            vault.version < state::VAULT_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_vault_version(vault)?;
+        msg!(
+            "Vault migrated to {}.{}.{}",
+            vault.version.major,
+            vault.version.minor,
+            vault.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a PrimaryNameRequest account to the latest schema version.
+    pub fn migrate_primary_name_request(ctx: Context<MigratePrimaryNameRequest>) -> Result<()> {
+        let request = &mut ctx.accounts.request;
+        require!(
+            request.version < state::PRIMARY_NAME_REQUEST_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_primary_name_request_version(request)?;
+        msg!(
+            "PrimaryNameRequest migrated to {}.{}.{}",
+            request.version.major,
+            request.version.minor,
+            request.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a PrimaryName account to the latest schema version.
+    pub fn migrate_primary_name(ctx: Context<MigratePrimaryName>) -> Result<()> {
+        let name = &mut ctx.accounts.primary_name;
+        require!(
+            name.version < state::PRIMARY_NAME_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_primary_name_version(name)?;
+        msg!(
+            "PrimaryName migrated to {}.{}.{}",
+            name.version.major,
+            name.version.minor,
+            name.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a PrimaryNameReverse account to the latest schema version.
+    pub fn migrate_primary_name_reverse(ctx: Context<MigratePrimaryNameReverse>) -> Result<()> {
+        let reverse = &mut ctx.accounts.reverse;
+        require!(
+            reverse.version < state::PRIMARY_NAME_REVERSE_VERSION,
+            error::ArioError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_primary_name_reverse_version(reverse)?;
+        msg!(
+            "PrimaryNameReverse migrated to {}.{}.{}",
+            reverse.version.major,
+            reverse.version.minor,
+            reverse.version.patch,
+        );
+        Ok(())
+    }
+}
+
+// =========================================
+// SCHEMA MIGRATION ACCOUNT CONTEXTS
+// =========================================
+
+#[derive(Accounts)]
+pub struct MigrateConfig<'info> {
+    #[account(
+        mut,
+        seeds = [state::CONFIG_SEED],
+        bump = config.bump,
+        realloc = state::ArioConfig::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub config: Account<'info, state::ArioConfig>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateBalance<'info> {
+    #[account(
+        mut,
+        seeds = [state::BALANCE_SEED, owner.key().as_ref()],
+        bump = balance.bump,
+        realloc = state::Balance::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub balance: Account<'info, state::Balance>,
+
+    /// CHECK: balance owner
+    pub owner: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateVaultCounter<'info> {
+    #[account(
+        mut,
+        seeds = [state::VAULT_COUNTER_SEED, owner.key().as_ref()],
+        bump = vault_counter.bump,
+        realloc = state::VaultCounter::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub vault_counter: Account<'info, state::VaultCounter>,
+
+    /// CHECK: vault counter owner
+    pub owner: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(vault_id: u64)]
+pub struct MigrateVault<'info> {
+    #[account(
+        mut,
+        seeds = [state::VAULT_SEED, owner.key().as_ref(), &vault_id.to_le_bytes()],
+        bump = vault.bump,
+        realloc = state::Vault::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub vault: Account<'info, state::Vault>,
+
+    /// CHECK: vault owner
+    pub owner: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigratePrimaryNameRequest<'info> {
+    #[account(
+        mut,
+        seeds = [state::PRIMARY_NAME_REQUEST_SEED, initiator.key().as_ref()],
+        bump = request.bump,
+        realloc = state::PrimaryNameRequest::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub request: Account<'info, state::PrimaryNameRequest>,
+
+    /// CHECK: request initiator
+    pub initiator: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigratePrimaryName<'info> {
+    #[account(
+        mut,
+        seeds = [state::PRIMARY_NAME_SEED, owner.key().as_ref()],
+        bump = primary_name.bump,
+        realloc = state::PrimaryName::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub primary_name: Account<'info, state::PrimaryName>,
+
+    /// CHECK: primary name owner
+    pub owner: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigratePrimaryNameReverse<'info> {
+    #[account(
+        mut,
+        seeds = [state::PRIMARY_NAME_REVERSE_SEED, &anchor_lang::solana_program::hash::hash(reverse.name.to_lowercase().as_bytes()).to_bytes()[..32]],
+        bump = reverse.bump,
+        realloc = state::PrimaryNameReverse::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub reverse: Account<'info, state::PrimaryNameReverse>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 // =========================================

@@ -129,4 +129,13 @@ pub enum EscrowError {
     /// canonical claim message reconstructed from on-chain escrow state.
     #[msg("Attested message does not match canonical claim message")]
     AttestationMessageMismatch,
+
+    // ----- Schema migration errors -----
+    /// Account is already at the latest schema version.
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    /// Unknown schema version — no migration path exists from this version.
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
 }

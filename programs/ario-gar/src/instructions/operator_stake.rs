@@ -81,6 +81,11 @@ pub fn decrease_operator_stake(ctx: Context<DecreaseOperatorStake>, amount: u64)
     // Create withdrawal
     let withdrawal = &mut ctx.accounts.withdrawal;
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.operator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
 
     withdrawal.owner = ctx.accounts.operator.key();
     withdrawal.withdrawal_id = counter.next_id;
@@ -95,6 +100,7 @@ pub fn decrease_operator_stake(ctx: Context<DecreaseOperatorStake>, amount: u64)
     withdrawal.is_exit_vault = false;
     withdrawal.is_protected = false;
     withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
 
     counter.next_id = counter
         .next_id

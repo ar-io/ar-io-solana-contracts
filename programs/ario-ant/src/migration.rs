@@ -239,6 +239,7 @@ pub fn initialize_migration_handler(
     config.migration_authority = params.migration_authority;
     config.migration_active = true;
     config.bump = ctx.bumps.migration_config;
+    config.version = ANT_MIGRATION_CONFIG_VERSION;
     msg!("ANT migration config initialized");
     Ok(())
 }

@@ -190,6 +190,7 @@ pub fn import_balance_handler(
     balance.owner = owner;
     balance.amount = amount;
     balance.bump = ctx.bumps.balance;
+    balance.version = BALANCE_VERSION;
 
     // Pre-registered branch: distribute tokens to the recipient ATA.
     // Unregistered (owner == migration_authority) skips — those tokens stay

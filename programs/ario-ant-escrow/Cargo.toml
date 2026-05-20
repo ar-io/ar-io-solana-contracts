@@ -61,6 +61,7 @@ unsafe-allow-test-attestor-pubkey = []
 # default and pick a real network explicitly via
 # `cargo build-sbf --no-default-features --features network-mainnet`
 # (or network-devnet) — `build-sbf.sh` does this for us.
+migration-test = []
 default = ["network-mainnet", "unsafe-allow-test-attestor-pubkey"]
 
 [dependencies]

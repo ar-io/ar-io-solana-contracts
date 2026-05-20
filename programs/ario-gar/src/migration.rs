@@ -243,8 +243,9 @@ pub fn migrate_settings_set_arns_program_id_handler(
 ) -> Result<()> {
     let info = ctx.accounts.settings.to_account_info();
     let new_size = GatewaySettings::SIZE;
-    // pre-refactor size: one Pubkey shorter AND no supply counters (3×u64 = 24 bytes)
-    let old_size = new_size - 32 - 24;
+    // pre-refactor size: one Pubkey shorter (no arns_program_id), no supply
+    // counters (3×u64 = 24 bytes), and no schema version field (3 bytes).
+    let old_size = new_size - 32 - 24 - SCHEMA_VERSION_SIZE;
 
     let current_size = info.data_len();
     if current_size == new_size {
@@ -285,8 +286,9 @@ pub fn migrate_settings_set_arns_program_id_handler(
     // Write the new arns_program_id at the slot previously occupied by `bump`
     // and extending into the freshly-realloc'd zero-filled tail.
     data[old_size - 1..old_size - 1 + 32].copy_from_slice(arns_program_id.as_ref());
-    // Repaint the bump in its new location (last byte of the new layout).
-    data[new_size - 1] = bump_byte;
+    // Repaint the bump in its new location (before the trailing version field).
+    // Layout tail: ... | bump (1) | version (3) |
+    data[new_size - 1 - SCHEMA_VERSION_SIZE] = bump_byte;
 
     msg!(
         "GatewaySettings backfilled: arns_program_id = {}",

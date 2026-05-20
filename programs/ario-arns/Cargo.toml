@@ -32,6 +32,7 @@ devnet-shrunk = ["ario-gar/devnet-shrunk"]
 # identifier into its canonical claim message).
 network-mainnet = []
 network-devnet = []
+migration-test = []
 default = []
 
 [dependencies]

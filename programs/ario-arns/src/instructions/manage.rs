@@ -398,6 +398,7 @@ pub mod release_name {
         returned.returned_at = timestamp;
         returned.initiator = ctx.accounts.caller.key();
         returned.bump = ctx.bumps.returned_name;
+        returned.version = RETURNED_NAME_VERSION;
 
         // Update prune schedule
         let config = &mut ctx.accounts.config;

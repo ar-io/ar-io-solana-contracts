@@ -130,6 +130,7 @@ pub fn register_acl_config_handler(ctx: Context<RegisterAclConfig>, user: Pubkey
     cfg.page_count = 0;
     cfg.total_entries = 0;
     cfg.bump = ctx.bumps.acl_config;
+    cfg.version = ACL_CONFIG_VERSION;
     msg!("AclConfig initialized for {}", user);
     Ok(())
 }
@@ -154,6 +155,7 @@ pub fn add_acl_page_handler(ctx: Context<AddAclPage>) -> Result<()> {
     page.page_idx = cfg.page_count;
     page.entries = Vec::new();
     page.bump = ctx.bumps.acl_page;
+    page.version = ACL_PAGE_VERSION;
 
     cfg.page_count = cfg
         .page_count

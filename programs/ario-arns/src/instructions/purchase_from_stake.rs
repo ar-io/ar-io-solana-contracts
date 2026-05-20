@@ -230,6 +230,7 @@ pub mod buy_name_from_delegation {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -428,6 +429,7 @@ pub mod buy_name_from_operator_stake {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -623,6 +625,7 @@ pub mod buy_returned_name_from_delegation {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -792,6 +795,7 @@ pub mod buy_returned_name_from_operator_stake {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1249,6 +1253,7 @@ pub mod buy_name_from_withdrawal {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1439,6 +1444,7 @@ pub mod buy_returned_name_from_withdrawal {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1624,6 +1630,7 @@ pub mod buy_name_from_funding_plan {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1830,6 +1837,7 @@ pub mod buy_returned_name_from_funding_plan {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config

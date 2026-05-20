@@ -56,6 +56,7 @@ pub fn save_observations(
     observation.report_tx_id = report_tx_id;
     observation.submitted_at = clock.unix_timestamp;
     observation.bump = ctx.bumps.observation;
+    observation.version = OBSERVATION_VERSION;
 
     // Running tally: increment failure_counts for failed gateways
     let active = epoch.active_gateway_count as usize;
