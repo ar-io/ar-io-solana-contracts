@@ -829,8 +829,10 @@ mod tests {
 
     #[test]
     fn arns_config_size() {
-        // 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 3 = 182
+        #[cfg(not(feature = "migration-test"))]
         assert_eq!(ArnsConfig::SIZE, 182);
+        #[cfg(feature = "migration-test")]
+        assert_eq!(ArnsConfig::SIZE, 182 + 8 + 4 + 1);
     }
 
     /// ADR-016 / BD-100 layout pin. The memcmp offsets (owner @ 40,
