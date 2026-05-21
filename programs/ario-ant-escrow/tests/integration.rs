@@ -5135,3 +5135,261 @@ async fn test_deposit_vault_emits_deposited_event() {
     assert_eq!(ev.recipient_protocol, PROTOCOL_ETHEREUM);
     assert_eq!(ev.recipient_pubkey_len, 20);
 }
+
+// =========================================================================
+// RENT RECLAIM — admin_purge_unclaimed_ant
+// =========================================================================
+// Coverage:
+//   - rejects when signer != ArioConfig.authority
+//   - rejects when grace period hasn't elapsed
+//   - succeeds after grace period (warps slot, asserts burn + close)
+//
+// These tests pre-populate an `ArioConfig` PDA via `pt.add_account` so we
+// can verify the cross-program auth check without spinning up the full
+// `ario_core` initialize flow. The bytes are constructed via
+// `AnchorSerialize` on a zero-initialized `ArioConfig` with our test
+// authority pubkey set — every other field defaults are fine since
+// admin_purge_unclaimed_ant only reads `.authority`.
+
+use ario_ant_escrow::state::UNCLAIMED_PURGE_GRACE_SLOTS;
+use ario_core::state::ArioConfig;
+
+fn ario_config_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"ario_config"], &ario_core::ID)
+}
+
+/// Build the bytes for a fake `ArioConfig` account with the given
+/// authority. All other fields are zeroed. Suitable only for tests that
+/// exercise ixs which only read `ArioConfig.authority`.
+fn fake_ario_config_bytes(authority: Pubkey, bump: u8) -> Vec<u8> {
+    use anchor_lang::{AnchorSerialize, Discriminator};
+    let config = ArioConfig {
+        authority,
+        mint: Pubkey::default(),
+        arns_program: Pubkey::default(),
+        treasury: Pubkey::default(),
+        total_supply: 0,
+        protocol_balance: 0,
+        circulating_supply: 0,
+        locked_supply: 0,
+        min_vault_duration: 0,
+        max_vault_duration: 0,
+        primary_name_request_expiry: 0,
+        migration_active: false,
+        migration_authority: Pubkey::default(),
+        bump,
+        gar_program: Pubkey::default(),
+    };
+    let mut bytes = ArioConfig::DISCRIMINATOR.to_vec();
+    config.serialize(&mut bytes).unwrap();
+    // Pad to exact SIZE so Anchor's deserializer doesn't complain about
+    // a short account (a few historical configs were exactly SIZE).
+    bytes.resize(ArioConfig::SIZE, 0);
+    bytes
+}
+
+fn program_test_with_ario_config(authority: &Pubkey) -> ProgramTest {
+    let mut pt = program_test();
+    let (config_addr, bump) = ario_config_pda();
+    let data = fake_ario_config_bytes(*authority, bump);
+    let lamports = solana_sdk::rent::Rent::default().minimum_balance(data.len());
+    pt.add_account(
+        config_addr,
+        solana_sdk::account::Account {
+            lamports,
+            data,
+            owner: ario_core::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    pt
+}
+
+async fn admin_purge_tx(
+    ctx: &mut ProgramTestContext,
+    asset: Pubkey,
+    authority: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (escrow, _) = escrow_pda(&asset);
+    let (ario_config, _) = ario_config_pda();
+    let accounts = ario_ant_escrow::accounts::AdminPurgeUnclaimedAnt {
+        escrow,
+        ant_asset: asset,
+        ario_config,
+        authority: authority.pubkey(),
+        mpl_core_program: MPL_CORE_PROGRAM_ID,
+        system_program: solana_sdk::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = ario_ant_escrow::instruction::AdminPurgeUnclaimedAnt {}.data();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Ix {
+            program_id: ario_ant_escrow::ID,
+            accounts,
+            data,
+        }],
+        Some(&authority.pubkey()),
+        &[authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_admin_purge_rejects_unauthorized() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let real_authority = Keypair::new();
+    let attacker = Keypair::new();
+    let mut ctx = program_test_with_ario_config(&real_authority.pubkey())
+        .start_with_context()
+        .await;
+
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    airdrop(&mut ctx, &attacker.pubkey(), 5_000_000_000).await;
+
+    let asset_kp = Keypair::new();
+    mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0),
+    )
+    .await
+    .expect("deposit");
+
+    // Even if we somehow elapsed the grace period, attacker can't purge.
+    let result = admin_purge_tx(&mut ctx, asset_kp.pubkey(), &attacker).await;
+    assert_anchor_error!(result, EscrowError::Unauthorized);
+}
+
+#[tokio::test]
+async fn test_admin_purge_rejects_grace_not_elapsed() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let authority = Keypair::new();
+    let mut ctx = program_test_with_ario_config(&authority.pubkey())
+        .start_with_context()
+        .await;
+
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    airdrop(&mut ctx, &authority.pubkey(), 5_000_000_000).await;
+
+    let asset_kp = Keypair::new();
+    mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0),
+    )
+    .await
+    .expect("deposit");
+
+    // Right after deposit, the grace period definitively hasn't elapsed
+    // (current_slot - deposit_slot is single digits, vs. 394M required).
+    let result = admin_purge_tx(&mut ctx, asset_kp.pubkey(), &authority).await;
+    assert_anchor_error!(result, EscrowError::PurgeGraceNotElapsed);
+}
+
+#[tokio::test]
+async fn test_admin_purge_succeeds_after_grace() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let authority = Keypair::new();
+    let mut ctx = program_test_with_ario_config(&authority.pubkey())
+        .start_with_context()
+        .await;
+
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    airdrop(&mut ctx, &authority.pubkey(), 5_000_000_000).await;
+
+    let asset_kp = Keypair::new();
+    mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0),
+    )
+    .await
+    .expect("deposit");
+
+    // Warp past the grace period. `warp_to_slot` advances the slot the
+    // bank reports via Clock::get(); admin_purge consults it.
+    let (escrow_addr, _) = escrow_pda(&asset_kp.pubkey());
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap().unwrap();
+    let escrow: EscrowAnt = EscrowAnt::try_deserialize(&mut escrow_acct.data.as_slice()).unwrap();
+    let target_slot = escrow.deposit_slot + UNCLAIMED_PURGE_GRACE_SLOTS + 1;
+    ctx.warp_to_slot(target_slot).expect("warp past grace");
+
+    let authority_lamports_before = ctx
+        .banks_client
+        .get_account(authority.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    admin_purge_tx(&mut ctx, asset_kp.pubkey(), &authority)
+        .await
+        .expect("purge after grace");
+
+    // Escrow PDA closed
+    let escrow_after = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_after.is_none() || escrow_after.as_ref().unwrap().data.is_empty(),
+        "escrow PDA should be closed after purge"
+    );
+
+    // Asset state after BurnV1: mpl-core marks the asset's discriminator
+    // as `Uninitialized` (data[0] == 0) but does NOT close the account
+    // or refund its rent — that's mpl-core's design. So the asset stays
+    // around as an inert tombstone. The load-bearing protocol outcome
+    // is captured by:
+    //   1. The asset is no longer recognized as live mpl-core state
+    //      (Discriminator::Uninitialized at byte 0).
+    //   2. The escrow PDA's rent flowed to authority (next assertion).
+    // The asset's own rent (~$0.21) is stranded in the tombstone — an
+    // mpl-core limitation, not an escrow bug. Future work could ship
+    // a permissionless `close_burned_asset` if mpl-core ever exposes one.
+    let asset_after = ctx
+        .banks_client
+        .get_account(asset_kp.pubkey())
+        .await
+        .unwrap();
+    if let Some(acct) = asset_after.as_ref() {
+        assert!(
+            !acct.data.is_empty() && acct.data[0] == 0,
+            "asset's discriminator should be Uninitialized after burn (data[0..1]={:?})",
+            acct.data.first(),
+        );
+    }
+
+    // Rent flowed to authority (net positive after tx fee)
+    let authority_lamports_after = ctx
+        .banks_client
+        .get_account(authority.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert!(
+        authority_lamports_after > authority_lamports_before,
+        "authority should net-positive after purge (before={}, after={})",
+        authority_lamports_before,
+        authority_lamports_after,
+    );
+}
