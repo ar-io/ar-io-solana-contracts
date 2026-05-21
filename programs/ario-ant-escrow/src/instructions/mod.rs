@@ -8,6 +8,7 @@
 // `ario-core` / `ario-arns` / `ario-gar`.
 #![allow(ambiguous_glob_reexports)]
 
+pub mod admin_purge_unclaimed;
 pub mod cancel;
 pub mod cancel_token_deposit;
 pub mod cancel_vault_deposit;
@@ -24,6 +25,7 @@ pub mod update_recipient;
 pub mod update_token_recipient;
 pub mod update_vault_recipient;
 
+pub use admin_purge_unclaimed::*;
 pub use cancel::*;
 pub use cancel_token_deposit::*;
 pub use cancel_vault_deposit::*;
