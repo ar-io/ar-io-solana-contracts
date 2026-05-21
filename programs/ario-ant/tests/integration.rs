@@ -1036,17 +1036,17 @@ async fn test_add_controller_max_reached() {
 
     initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
 
-    // Owner is already controller #1. Add 9 more to reach MAX_CONTROLLERS (10).
-    for i in 0..9 {
+    // Owner is already controller #1. Add 3 more to reach MAX_CONTROLLERS (4).
+    for i in 0..3 {
         let controller = Pubkey::new_unique();
         send_add_controller(&mut ctx, &asset.pubkey(), &owner, controller)
             .await
             .unwrap_or_else(|e| panic!("Failed to add controller {}: {:?}", i + 2, e));
     }
 
-    // Verify we have 10
+    // Verify we have 4
     let controllers = fetch_controllers(&mut ctx, &asset.pubkey()).await;
-    assert_eq!(controllers.controllers.len(), 10);
+    assert_eq!(controllers.controllers.len(), 4);
 
     // Try to add the 11th — should fail
     let overflow_controller = Pubkey::new_unique();
@@ -1904,7 +1904,7 @@ async fn test_initialize_description_too_long() {
         target: test_arweave_id(),
         target_protocol: None,
         logo: String::new(),
-        description: "x".repeat(513), // MAX_DESCRIPTION_LENGTH = 512
+        description: "x".repeat(129), // exceeds MAX_DESCRIPTION_LENGTH = 128
         keywords: vec![],
     };
     let result = send_initialize(&mut ctx, &asset.pubkey(), &owner, params).await;
@@ -2333,8 +2333,8 @@ async fn test_set_record_invalid_keywords() {
         display_name: None,
         record_logo: None,
         record_description: None,
-        // MAX_KEYWORDS = 8; 9 → InvalidKeyword
-        record_keywords: Some((0..9).map(|i| format!("kw{}", i)).collect()),
+        // MAX_KEYWORDS = 3; 4 → InvalidKeyword
+        record_keywords: Some((0..4).map(|i| format!("kw{}", i)).collect()),
     };
     let result = send_set_record_metadata(&mut ctx, &asset.pubkey(), &owner, params).await;
     assert_anchor_error!(result, AntError::InvalidKeyword);
