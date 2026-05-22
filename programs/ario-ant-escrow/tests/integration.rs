@@ -5179,6 +5179,7 @@ fn fake_ario_config_bytes(authority: Pubkey, bump: u8) -> Vec<u8> {
         migration_authority: Pubkey::default(),
         bump,
         gar_program: Pubkey::default(),
+        version: ario_core::state::ARIO_CONFIG_VERSION,
     };
     let mut bytes = ArioConfig::DISCRIMINATOR.to_vec();
     config.serialize(&mut bytes).unwrap();

@@ -22849,8 +22849,7 @@ async fn test_migrate_epoch_settings_realloc() {
         .unwrap();
     assert_eq!(acct.data.len(), EpochSettings::SIZE);
 
-    let es =
-        EpochSettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    let es = EpochSettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
     assert_eq!(es.version, EPOCH_SETTINGS_VERSION);
     assert_eq!(es.bump, epoch_settings_bump);
     assert_eq!(es.epoch_duration, 86_400);
@@ -23000,11 +22999,11 @@ async fn test_migrate_observation_realloc() {
     offset += 8; // epoch_index
     data[offset..offset + 32].copy_from_slice(observer.pubkey().as_ref());
     offset += 32; // observer
-    // gateway_results: [u8; 375] — leave as zeroes
+                  // gateway_results: [u8; 375] — leave as zeroes
     offset += 375;
     data[offset..offset + 2].copy_from_slice(&10u16.to_le_bytes());
     offset += 2; // gateway_count
-    // report_tx_id: [u8; 32] — leave as zeroes
+                 // report_tx_id: [u8; 32] — leave as zeroes
     offset += 32;
     data[offset..offset + 8].copy_from_slice(&1_000_000i64.to_le_bytes());
     offset += 8; // submitted_at
@@ -23076,8 +23075,7 @@ async fn test_migrate_observation_realloc() {
         .unwrap();
     assert_eq!(acct.data.len(), Observation::SIZE);
 
-    let obs =
-        Observation::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    let obs = Observation::try_deserialize(&mut acct.data.as_slice()).unwrap();
     assert_eq!(obs.version, OBSERVATION_VERSION);
     assert_eq!(obs.bump, observation_bump);
     assert_eq!(obs.epoch_index, epoch_index);
