@@ -51,9 +51,17 @@ const OUT_ROOT = resolve(CLIENT_ROOT, 'src');
 
 // Target cluster — drives cfg-conditional field dedup. See
 // `dedupeCfgConditionalFields` for the size-pick logic.
+//
+// 'staging' is a mainnet dress-rehearsal deployed against Solana devnet
+// (per `release-clients-ts.yml` workflow input description). It carries
+// the same production-sized registries as 'mainnet' but routes to its
+// own `@staging` npm dist-tag so consumers tracking `@devnet` aren't
+// pulled to the pre-mainnet artifact unexpectedly.
 const CLUSTER = (process.env.CLUSTER ?? 'devnet').toLowerCase();
-if (CLUSTER !== 'devnet' && CLUSTER !== 'mainnet') {
-  console.error(`[codegen] CLUSTER must be 'devnet' or 'mainnet'; got '${CLUSTER}'`);
+if (CLUSTER !== 'devnet' && CLUSTER !== 'staging' && CLUSTER !== 'mainnet') {
+  console.error(
+    `[codegen] CLUSTER must be 'devnet', 'staging', or 'mainnet'; got '${CLUSTER}'`,
+  );
   process.exit(1);
 }
 console.log(`[codegen] CLUSTER=${CLUSTER}`);
@@ -135,13 +143,15 @@ console.log(`[codegen] ${PROGRAMS.length} programs ✓`);
  *   - `CLUSTER=devnet` (default): keep the SMALLER variant. Matches
  *     `build-sbf.sh BUILD_NETWORK=devnet` which compiles the .so with
  *     `--features devnet-shrunk`.
- *   - `CLUSTER=mainnet`: keep the LARGER variant. Matches the default
- *     workspace features (no `devnet-shrunk`), used for production deploys.
+ *   - `CLUSTER=staging` and `CLUSTER=mainnet`: keep the LARGER variant.
+ *     Matches the default workspace features (no `devnet-shrunk`).
+ *     'staging' is a mainnet dress-rehearsal on Solana devnet — same
+ *     registry sizes, separate dist-tag for downstream tracking.
  *
  * The CI release workflow sets `CLUSTER` from the workflow input.
  */
 function dedupeCfgConditionalFields(idl) {
-  const preferSmaller = CLUSTER !== 'mainnet';
+  const preferSmaller = CLUSTER === 'devnet';
   const dedupe = (type) => {
     if (!type || !type.fields || !Array.isArray(type.fields)) return;
     const seen = new Map(); // name -> { idx, size }
