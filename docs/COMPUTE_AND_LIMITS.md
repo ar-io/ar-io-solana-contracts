@@ -113,7 +113,7 @@ runs ~80K CU on surfpool, well below the budget. See `programs/ario-arns/src/mpl
 | `ArnsRecord`    | 188         | `["arns_record", name_hash]` | Per-name record; name_hash = SHA256(name.to_lowercase()) |
 | `ReturnedName`  | 136         | `["returned_name", name_hash]` | Returned name auction state |
 | `ReservedName`  | 150         | `["reserved_name", name_hash]` | Reserved name entry |
-| `NameRegistry`  | 8,000,040   | `["name_registry"]` | Zero-copy; 200,000 name slots (40 bytes each) |
+| `NameRegistry`  | **2,000,040 (initial)** | `["name_registry"]` | **Dynamic-capacity (ADR-020):** 40-byte header + byte-offset slot array. Initial deploy 50,000 slots (~2 MB); expandable via `admin_expand_name_registry` up to any target. Slot count derived from `data.len()`, no header field. |
 
 **NameEntry size:** 40 bytes (32 name_hash + 4 registry_index + 4 padding)
 
@@ -313,9 +313,10 @@ stays at minimum for 7 consecutive periods, the entire fee table is permanently 
 
 ### Zero-copy pre-allocation requirement
 
-`GatewayRegistry` (120,040 bytes) and `NameRegistry` (8,000,040 bytes) exceed the
-10,240-byte `MAX_PERMITTED_DATA_INCREASE` limit. These accounts **cannot** be created
-via Anchor's `init` constraint in a normal instruction. They must be:
+`GatewayRegistry` (168,040 bytes) and `NameRegistry` (initial 2,000,040 bytes,
+dynamic per ADR-020) exceed the 10,240-byte `MAX_PERMITTED_DATA_INCREASE` limit.
+These accounts **cannot** be created via Anchor's `init` constraint in a normal
+instruction. They must be:
 
 1. **Pre-allocated** by a separate transaction (`create_account` with sufficient space)
 2. **Discriminator pre-written** before the `initialize` instruction runs
