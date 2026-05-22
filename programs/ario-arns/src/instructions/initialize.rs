@@ -60,8 +60,10 @@ pub fn handler(ctx: Context<InitializeArns>, params: InitializeArnsParams) -> Re
 }
 
 /// Grow the NameRegistry PDA in ≤10KB steps per transaction (see ario-gar `create_gateway_registry`).
+/// Initial size targets `INITIAL_CAPACITY` slots (50K mainnet, 200 devnet-shrunk).
+/// Post-deploy growth uses `admin_expand_name_registry`.
 pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
-    const TARGET: usize = 8 + NameRegistry::SIZE;
+    let target: usize = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
 
     let rent = Rent::get()?;
     let reg = ctx.accounts.name_registry.to_account_info();
@@ -71,7 +73,7 @@ pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
 
     let current_len = reg.data_len() as usize;
 
-    if current_len == TARGET {
+    if current_len == target {
         let data = reg.try_borrow_data()?;
         let expected = hash(b"account:NameRegistry");
         if data.len() >= 8 && data[..8] == expected.to_bytes()[..8] {
@@ -87,7 +89,7 @@ pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
     }
 
     if reg.data_is_empty() {
-        let initial = TARGET.min(MAX_PERMITTED_DATA_INCREASE);
+        let initial = target.min(MAX_PERMITTED_DATA_INCREASE);
         let required = rent.minimum_balance(initial);
         let bump = ctx.bumps.name_registry;
         let signer_seeds: &[&[&[u8]]] = &[&[NAME_REGISTRY_SEED, &[bump]]];
@@ -111,7 +113,7 @@ pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
             &[reg.clone(), system.clone()],
             signer_seeds,
         )?;
-        if initial == TARGET {
+        if initial == target {
             write_name_registry_header(&reg, auth_pk)?;
             msg!(
                 "NameRegistry created ({} max names)",
@@ -121,9 +123,9 @@ pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
         return Ok(());
     }
 
-    require!(current_len < TARGET, ArnsError::NameRegistryAlreadyExists);
+    require!(current_len < target, ArnsError::NameRegistryAlreadyExists);
 
-    let next_len = (current_len + MAX_PERMITTED_DATA_INCREASE).min(TARGET);
+    let next_len = (current_len + MAX_PERMITTED_DATA_INCREASE).min(target);
     let min_balance = rent.minimum_balance(next_len);
     let needed = min_balance.saturating_sub(reg.lamports());
     if needed > 0 {
@@ -134,7 +136,7 @@ pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
     }
     reg.realloc(next_len, true)?;
 
-    if next_len == TARGET {
+    if next_len == target {
         write_name_registry_header(&reg, auth_pk)?;
         msg!(
             "NameRegistry created ({} max names)",
@@ -152,19 +154,19 @@ fn write_name_registry_header(reg: &AccountInfo, authority: Pubkey) -> Result<()
     Ok(())
 }
 
-/// Recovery-only: shrink an over-sized `NameRegistry` PDA back to the
-/// current binary's expected size, refunding the rent diff to the
-/// authority. Mirrors `ario_gar::admin_shrink_gateway_registry` — see
-/// that ix's doc comment for the full rationale (build-flag flip
-/// crosses `NameRegistry::SIZE`, causes `AccountLoader::load` to panic;
-/// this ix uses `AccountInfo` so it doesn't trip the size check).
+/// Shrink the `NameRegistry` PDA to fit `target_capacity` slots, refunding
+/// the rent diff to the authority. With ADR-020's dynamic-capacity layout
+/// this ix is parameterized: the caller picks any target ≥ current
+/// `header.count` (refuses otherwise to avoid data loss).
 ///
 /// Authority-gated AND `migration_active`-gated. Inert after mainnet
-/// `finalize_migration`. Refuses to truncate populated slot data
-/// (`count <= MAX_NAMES`).
-pub fn admin_shrink_name_registry(ctx: Context<AdminShrinkNameRegistry>) -> Result<()> {
+/// `finalize_migration`.
+pub fn admin_shrink_name_registry(
+    ctx: Context<AdminShrinkNameRegistry>,
+    target_capacity: u32,
+) -> Result<()> {
     let name_registry = &ctx.accounts.name_registry;
-    let target = 8 + NameRegistry::SIZE;
+    let target = NameRegistry::bytes_for_capacity(target_capacity as usize);
 
     let current_len = name_registry.data_len();
     require!(current_len > target, ArnsError::RegistryAlreadyShrunk);
@@ -175,11 +177,8 @@ pub fn admin_shrink_name_registry(ctx: Context<AdminShrinkNameRegistry>) -> Resu
             data[40..44]
                 .try_into()
                 .map_err(|_| ArnsError::InvalidAccountData)?,
-        ) as usize;
-        require!(
-            count <= NameRegistry::MAX_NAMES,
-            ArnsError::ShrinkWouldLoseData
         );
+        require!(count <= target_capacity, ArnsError::ShrinkWouldLoseData);
     }
 
     name_registry.realloc(target, false)?;
@@ -194,6 +193,58 @@ pub fn admin_shrink_name_registry(ctx: Context<AdminShrinkNameRegistry>) -> Resu
         current_len,
         target,
         refund
+    );
+    Ok(())
+}
+
+/// Expand the `NameRegistry` PDA to fit `target_capacity` slots. Pays the
+/// rent difference from `authority`. Reallocs by ≤10KB per call (Solana
+/// limit), so a large expansion is split across multiple txs — the caller
+/// invokes the ix repeatedly until `data.len() >= bytes_for_capacity(target)`.
+///
+/// Authority-gated. No `migration_active` constraint — expansion is a
+/// permanent protocol-lifecycle operation, useful post-cutover as well
+/// as during migration.
+///
+/// Idempotent: calling with `target_capacity ≤ current` is a no-op.
+pub fn admin_expand_name_registry(
+    ctx: Context<AdminExpandNameRegistry>,
+    target_capacity: u32,
+) -> Result<()> {
+    let reg = &ctx.accounts.name_registry;
+    let target = NameRegistry::bytes_for_capacity(target_capacity as usize);
+    let current_len = reg.data_len();
+
+    // No-op if already at or above target.
+    if current_len >= target {
+        return Ok(());
+    }
+
+    let next_len = (current_len + MAX_PERMITTED_DATA_INCREASE).min(target);
+
+    // Pay any rent shortfall (lamport-griefing-resistant: we always pay
+    // up to the minimum, never less).
+    let min_balance = Rent::get()?.minimum_balance(next_len);
+    let needed = min_balance.saturating_sub(reg.lamports());
+    if needed > 0 {
+        invoke(
+            &system_instruction::transfer(ctx.accounts.authority.key, reg.key, needed),
+            &[
+                ctx.accounts.authority.to_account_info(),
+                reg.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+    }
+
+    reg.realloc(next_len, false)?;
+
+    msg!(
+        "NameRegistry expanded: {} -> {} bytes (target capacity {} slots, target bytes {})",
+        current_len,
+        next_len,
+        target_capacity,
+        target,
     );
     Ok(())
 }
@@ -271,13 +322,32 @@ pub struct AdminShrinkNameRegistry<'info> {
     )]
     pub config: Account<'info, ArnsConfig>,
 
-    /// CHECK: deliberately `AccountInfo` rather than `AccountLoader` so the
-    /// ix works against an oversized account whose current bytes no longer
-    /// match the binary's `NameRegistry::SIZE`. PDA seed check ensures we
-    /// only touch the canonical registry.
+    /// CHECK: variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// PDA seed check ensures we only touch the canonical registry.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
     pub name_registry: AccountInfo<'info>,
 
     #[account(mut)]
     pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AdminExpandNameRegistry<'info> {
+    /// Authority gate via `has_one`. NO `migration_active` constraint —
+    /// expansion is a permanent protocol-lifecycle op, callable any time.
+    #[account(
+        seeds = [ARNS_CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ crate::error::ArnsError::Unauthorized,
+    )]
+    pub config: Account<'info, ArnsConfig>,
+
+    /// CHECK: variable-size NameRegistry (ADR-020 dynamic-capacity).
+    #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
+    pub name_registry: AccountInfo<'info>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
 }
