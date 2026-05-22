@@ -421,24 +421,12 @@ pub mod release_name {
         // name without a live record means the name was released, not
         // that the asset still owns it).
 
-        // Remove from name registry
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        let mut found_idx = None;
-        for i in 0..count {
-            if registry.names[i].name_hash == name_hash {
-                found_idx = Some(i);
-                break;
-            }
-        }
-        if let Some(idx) = found_idx {
-            // Swap-remove: move last entry to this slot
-            if idx < count - 1 {
-                registry.names[idx] = registry.names[count - 1];
-                registry.names[idx].registry_index = idx as u32;
-            }
-            registry.names[count - 1] = NameEntry::default();
-            registry.count = registry.count.saturating_sub(1);
+        // Remove from name registry (swap-remove via byte-offset helper,
+        // ADR-020 dynamic-capacity layout).
+        {
+            let registry_info = &ctx.accounts.name_registry;
+            let mut registry_data = registry_info.try_borrow_mut_data()?;
+            remove_name_entry_by_hash(&mut registry_data, name_hash);
         }
 
         // ArNS record account closed by close constraint
@@ -636,8 +624,10 @@ pub struct ReleaseName<'info> {
     )]
     pub returned_name: Account<'info, ReturnedName>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     #[account(mut)]
     pub caller: Signer<'info>,

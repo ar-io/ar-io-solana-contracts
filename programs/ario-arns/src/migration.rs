@@ -150,24 +150,24 @@ pub fn import_registry_entry_handler(
         ArnsError::MigrationExpired
     );
 
-    let mut registry = ctx.accounts.registry.load_mut()?;
+    let registry_info = &ctx.accounts.registry;
+    let mut data = registry_info.try_borrow_mut_data()?;
 
+    let count_before = name_registry_header(&data).count as usize;
+    // registry_index must match the position being written
     require!(
-        (registry.count as usize) < NameRegistry::MAX_NAMES,
-        ArnsError::RegistryFull
+        registry_index == count_before as u32,
+        ArnsError::InvalidAccountData
     );
 
-    let idx = registry.count as usize;
-
-    // registry_index must match the position being written
-    require!(registry_index == idx as u32, ArnsError::InvalidAccountData);
-
-    registry.names[idx] = NameEntry {
-        name_hash,
-        registry_index,
-        _padding: [0u8; 4],
-    };
-    registry.count += 1;
+    let _written_idx = append_name_entry(
+        &mut data,
+        NameEntry {
+            name_hash,
+            registry_index,
+            _padding: [0u8; 4],
+        },
+    )?;
 
     Ok(())
 }
@@ -211,8 +211,12 @@ pub struct ImportRegistryEntry<'info> {
     )]
     pub config: Account<'info, ArnsConfig>,
     pub authority: Signer<'info>,
-    #[account(mut)]
-    pub registry: AccountLoader<'info, NameRegistry>,
+    /// CHECK: Variable-size NameRegistry account. Validated by PDA-seed
+    /// constraint; handler uses byte-offset helpers (`append_name_entry`,
+    /// `name_registry_header`) instead of `AccountLoader` because the
+    /// header is fixed-size but the slot array isn't (ADR-020).
+    #[account(mut, seeds = [crate::state::NAME_REGISTRY_SEED], bump)]
+    pub registry: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
