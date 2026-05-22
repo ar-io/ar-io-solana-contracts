@@ -90,6 +90,83 @@ pub const GATEWAY_OPERATOR_DISCOUNT_PCT: u64 = 200_000;
 pub const NUM_NAME_LENGTH_FEES: usize = 51;
 
 // =========================================
+// SIZING CONSTANTS
+// =========================================
+
+/// Anchor account discriminator (first 8 bytes of SHA-256("account:<Name>")).
+pub const ANCHOR_DISCRIMINATOR_SIZE: usize = 8;
+
+/// Solana `Pubkey` serialized size.
+pub const PUBKEY_SIZE: usize = 32;
+
+/// Borsh `u32` length prefix used for `String` and `Vec<T>`.
+pub const BORSH_LEN_PREFIX: usize = 4;
+
+/// Borsh `Option<T>` discriminant byte (0 = None, 1 = Some).
+pub const BORSH_OPTION_PREFIX: usize = 1;
+
+/// Bump seed (single `u8`).
+pub const BUMP_SIZE: usize = 1;
+
+/// `SchemaVersion { major, minor, patch }` — 3 consecutive u8s.
+pub const SCHEMA_VERSION_SIZE: usize = 3;
+
+// =========================================
+// SCHEMA VERSIONING
+// =========================================
+
+/// Semantic version for ArNS on-chain account schemas.
+///
+/// Stored as three consecutive `u8` bytes (3 bytes on the wire).
+/// `Ord` is derived lexicographically over `(major, minor, patch)`, which
+/// matches semver precedence: major is compared first, then minor, then
+/// patch. This means `config.version < ARNS_CONFIG_VERSION` is a valid
+/// "needs migration" guard.
+///
+/// Bump rules:
+///   - `major`: breaking layout change (field removed, type changed, reorder)
+///   - `minor`: additive layout change (new field appended, default = zero)
+///   - `patch`: logic-only change (no layout change; bump optional for audits)
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
+pub struct SchemaVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl SchemaVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Current schema version for each ArNS account type.
+///
+/// Bump the appropriate constant when changing the on-chain layout; the
+/// `schema_migration` module's dispatch functions key off the stored version
+/// to walk an account through every intermediate step up to the new current.
+#[cfg(not(feature = "migration-test"))]
+pub const ARNS_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+#[cfg(feature = "migration-test")]
+pub const ARNS_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
+pub const DEMAND_FACTOR_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ARNS_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const RETURNED_NAME_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const RESERVED_NAME_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+
+// =========================================
 // GENESIS FEES (mARIO)
 // =========================================
 
@@ -192,14 +269,35 @@ pub struct ArnsConfig {
     pub migration_authority: Pubkey,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
+    /// Schema v1.1.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.0.0→1.1.0 migration arm with a default of 1000.
+    #[cfg(feature = "migration-test")]
+    pub field_1: u64,
+    /// Schema v1.2.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.1.0→1.2.0 migration arm with a default of 42.
+    #[cfg(feature = "migration-test")]
+    pub field_2: u32,
+    /// Schema v1.3.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.2.0→1.3.0 migration arm with a default of true.
+    #[cfg(feature = "migration-test")]
+    pub field_3: bool,
 }
 
 impl ArnsConfig {
     // discriminator(8) + authority(32) + mint(32) + treasury(32) + grace_period(8)
     // + return_auction_duration(8) + max_lease_length_years(1) + total_names_registered(8)
     // + next_records_prune(8) + next_returned_names_prune(8)
-    // + migration_active(1) + migration_authority(32) + bump(1)
-    pub const SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1;
+    // + migration_active(1) + migration_authority(32) + bump(1) + version(3)
+    #[cfg(not(feature = "migration-test"))]
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 3;
+
+    #[cfg(feature = "migration-test")]
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 3
+        + 8   // field_1: u64
+        + 4   // field_2: u32
+        + 1; // field_3: bool
 }
 
 // =========================================
@@ -238,6 +336,8 @@ pub struct DemandFactor {
     pub criteria: u8,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 /// Demand factor criteria: which metric determines if demand is increasing
@@ -255,6 +355,7 @@ impl DemandFactor {
     // + period_zero_start_timestamp(8)
     // + criteria(1)
     // + bump(1)
+    // + version(3)
     pub const SIZE: usize = 8
         + 8
         + 8
@@ -266,7 +367,8 @@ impl DemandFactor {
         + (8 * NUM_NAME_LENGTH_FEES)
         + 8
         + 1
-        + 1;
+        + 1
+        + 3;
 }
 
 // =========================================
@@ -297,7 +399,8 @@ impl DemandFactor {
 ///   - undername_limit:       122 (2)
 ///   - purchase_price:        124 (8)
 ///   - bump:                  132 (1)
-///   - name (variable-length): 133 (4 + ≤51)
+///   - version:               133 (3)
+///   - name (variable-length): 136 (4 + ≤51)
 #[account]
 pub struct ArnsRecord {
     /// SHA256 hash of lowercase name (used for PDA derivation)
@@ -322,6 +425,8 @@ pub struct ArnsRecord {
     pub purchase_price: u64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
     /// The name string (max 51 chars, original casing preserved).
     /// Variable-length — must remain the last field so all preceding
     /// fields stay at fixed byte offsets for memcmp filtering.
@@ -331,9 +436,9 @@ pub struct ArnsRecord {
 impl ArnsRecord {
     // discriminator(8) + name_hash(32) + owner(32) + ant(32)
     // + purchase_type(1) + start_timestamp(8) + end_timestamp(1 + 8)
-    // + undername_limit(2) + purchase_price(8) + bump(1)
+    // + undername_limit(2) + purchase_price(8) + bump(1) + version(3)
     // + name(4 + MAX_NAME_LENGTH)
-    pub const SIZE: usize = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + (4 + MAX_NAME_LENGTH);
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + 3 + (4 + MAX_NAME_LENGTH);
 
     /// Byte offset of `ant` within the account data. Memcmp filter
     /// target for "ArNS records by ANT mint" point queries. SDK
@@ -404,12 +509,14 @@ pub struct ReturnedName {
     pub returned_at: i64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl ReturnedName {
     // discriminator(8) + name(4 + MAX_NAME_LENGTH) + name_hash(32)
-    // + initiator(32) + returned_at(8) + bump(1)
-    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 32 + 32 + 8 + 1;
+    // + initiator(32) + returned_at(8) + bump(1) + version(3)
+    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 32 + 32 + 8 + 1 + 3;
 }
 
 // =========================================
@@ -432,12 +539,14 @@ pub struct ReservedName {
     pub created_at: i64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl ReservedName {
     // discriminator(8) + name(4 + MAX_NAME_LENGTH) + reserved_for(1 + 32)
-    // + expires_at(1 + 8) + reserved_by(32) + created_at(8) + bump(1)
-    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 33 + 9 + 32 + 8 + 1;
+    // + expires_at(1 + 8) + reserved_by(32) + created_at(8) + bump(1) + version(3)
+    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 33 + 9 + 32 + 8 + 1 + 3;
 }
 
 // =========================================
@@ -764,6 +873,7 @@ mod tests {
             undername_limit: 10,
             purchase_price: 1_000_000,
             bump: 0,
+            version: ARNS_RECORD_VERSION,
         }
     }
 
@@ -779,6 +889,7 @@ mod tests {
             undername_limit: 10,
             purchase_price: 5_000_000,
             bump: 0,
+            version: ARNS_RECORD_VERSION,
         }
     }
 
@@ -872,34 +983,33 @@ mod tests {
 
     #[test]
     fn demand_factor_size() {
-        // 8 + 8 + 8 + 8 + 8 + 4 + 56 + 56 + 408 + 8 + 1 + 1 = 574
-        assert_eq!(DemandFactor::SIZE, 574);
+        // 8 + 8 + 8 + 8 + 8 + 4 + 56 + 56 + 408 + 8 + 1 + 1 + 3 = 577
+        assert_eq!(DemandFactor::SIZE, 577);
     }
 
     #[test]
     fn arns_config_size() {
-        // 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 = 179
-        assert_eq!(ArnsConfig::SIZE, 179);
+        #[cfg(not(feature = "migration-test"))]
+        assert_eq!(ArnsConfig::SIZE, 182);
+        #[cfg(feature = "migration-test")]
+        assert_eq!(ArnsConfig::SIZE, 182 + 8 + 4 + 1);
     }
 
-    /// ADR-016 / BD-100 layout pin. The asset-side ANT Program design
-    /// deliberately keeps `ArnsRecord` at its pre-PR-40 size (188 bytes)
-    /// — the registry-side approach would have grown this to 220, and
-    /// any future reintroduction of an `ant_program: Pubkey` field
-    /// here would silently bloat every name's rent forever. If this
-    /// assertion fails, refresh the SIZE comment AND the `ANT_OFFSET`
-    /// memcmp constant in `sdk/src/solana/constants.ts`. (See PR #40
-    /// for the rejected registry-side design.)
+    /// ADR-016 / BD-100 layout pin. The memcmp offsets (owner @ 40,
+    /// ant @ 72) are load-bearing — the SDK pins them in
+    /// `sdk/src/solana/constants.ts`. The `version` field sits after
+    /// `bump` (offset 133, 3 bytes) and before the variable-length
+    /// `name` (offset 136) so all fixed-offset fields are unchanged.
     #[test]
-    fn arns_record_layout_pinned_at_188_bytes() {
+    fn arns_record_layout_pinned_at_191_bytes() {
         // discriminator(8) + name_hash(32) + owner(32) + ant(32)
         // + purchase_type(1) + start_timestamp(8) + end_timestamp(1+8)
-        // + undername_limit(2) + purchase_price(8) + bump(1)
+        // + undername_limit(2) + purchase_price(8) + bump(1) + version(3)
         // + name(4 + MAX_NAME_LENGTH=51)
-        // = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + 4 + 51
-        // = 188
-        assert_eq!(ArnsRecord::SIZE, 188);
-        // Byte offsets pinned for the SDK's memcmp queries.
+        // = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + 3 + 4 + 51
+        // = 191
+        assert_eq!(ArnsRecord::SIZE, 191);
+        // Byte offsets pinned for the SDK's memcmp queries — MUST NOT CHANGE.
         assert_eq!(ArnsRecord::OWNER_OFFSET, 40);
         assert_eq!(ArnsRecord::ANT_OFFSET, 72);
     }
@@ -1018,15 +1128,15 @@ mod tests {
     }
 
     #[test]
-    fn demand_factor_size_574() {
+    fn demand_factor_size_577() {
         // discriminator(8) + current_demand_factor(8) + current_period(8)
         // + purchases_this_period(8) + revenue_this_period(8)
         // + consecutive_periods_with_min_demand_factor(4)
         // + trailing_period_purchases(8*7=56)
         // + trailing_period_revenues(8*7=56)
         // + fees(8*51=408) + period_zero_start_timestamp(8)
-        // + criteria(1) + bump(1) = 574
-        assert_eq!(DemandFactor::SIZE, 574);
+        // + criteria(1) + bump(1) + version(3) = 577
+        assert_eq!(DemandFactor::SIZE, 577);
     }
 
     fn make_demand_factor(
@@ -1048,6 +1158,7 @@ mod tests {
             period_zero_start_timestamp: 0,
             criteria,
             bump: 0,
+            version: DEMAND_FACTOR_VERSION,
         }
     }
 

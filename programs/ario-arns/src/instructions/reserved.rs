@@ -24,6 +24,7 @@ pub mod reserve {
         reserved.reserved_by = ctx.accounts.authority.key();
         reserved.created_at = clock.unix_timestamp;
         reserved.bump = ctx.bumps.reserved_name;
+        reserved.version = RESERVED_NAME_VERSION;
 
         emit!(NameReservedEvent {
             authority: ctx.accounts.authority.key(),

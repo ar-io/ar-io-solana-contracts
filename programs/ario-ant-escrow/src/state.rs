@@ -1,10 +1,45 @@
 use anchor_lang::prelude::*;
 
-/// Schema version stamped into every freshly-initialized `EscrowAnt`.
-/// Bump only on a layout change that requires a migration instruction; the
-/// `_reserved` tail is intended to absorb additive field changes without a
-/// bump.
-pub const ESCROW_VERSION_V1: u8 = 1;
+// =========================================
+// SCHEMA VERSIONING
+// =========================================
+
+/// Semver-style schema version for forward-compatible migrations.
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
+pub struct SchemaVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl SchemaVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+pub const SCHEMA_VERSION_SIZE: usize = 3;
+
+/// Current schema version for EscrowAnt accounts.
+#[cfg(not(feature = "migration-test"))]
+pub const ESCROW_ANT_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+#[cfg(feature = "migration-test")]
+pub const ESCROW_ANT_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
+
+/// Current schema version for EscrowToken accounts.
+pub const ESCROW_TOKEN_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 /// Recipient identity protocols supported by v1.
 pub const PROTOCOL_ARWEAVE: u8 = 0;
@@ -150,8 +185,8 @@ const _: () = {
 /// hooks so additive field changes can ship without a `realloc` migration.
 #[account]
 pub struct EscrowAnt {
-    /// Schema version. v1 = `ESCROW_VERSION_V1`.
-    pub version: u8,
+    /// Schema version. v1 = `ESCROW_ANT_VERSION`.
+    pub version: SchemaVersion,
     /// Cached PDA bump. Faster than `find_program_address` on signer-seed
     /// reconstruction during transfer CPIs.
     pub bump: u8,
@@ -179,14 +214,26 @@ pub struct EscrowAnt {
     /// support tooling.
     pub deposit_slot: u64,
     /// Reserved bytes. Hold zero until repurposed in a future schema bump.
-    pub _reserved: [u8; 32],
+    /// Shrunk from 32 to 30 to absorb the SchemaVersion expansion (u8→3 bytes).
+    #[cfg(not(feature = "migration-test"))]
+    pub _reserved: [u8; 30],
+    #[cfg(feature = "migration-test")]
+    pub _reserved: [u8; 17],
+    #[cfg(feature = "migration-test")]
+    pub field_1: u64,
+    #[cfg(feature = "migration-test")]
+    pub field_2: u32,
+    #[cfg(feature = "migration-test")]
+    pub field_3: bool,
 }
 
 impl EscrowAnt {
     /// Total on-chain byte size including the 8-byte Anchor discriminator.
     /// Used by the `init` constraint's `space = EscrowAnt::SIZE` literal.
+    /// The migration-test feature carves test fields out of `_reserved`
+    /// (17 + 8 + 4 + 1 = 30), so the total stays identical.
     pub const SIZE: usize = 8  // anchor discriminator
-        + 1                    // version
+        + 3                    // version (SchemaVersion)
         + 1                    // bump
         + 32                   // depositor
         + 32                   // ant_mint
@@ -195,7 +242,7 @@ impl EscrowAnt {
         + RECIPIENT_PUBKEY_MAX_LEN
         + 32                   // nonce
         + 8                    // deposit_slot
-        + 32; // _reserved
+        + 30; // _reserved (or 17 + 8 + 4 + 1 under migration-test)
 
     /// Returns the active prefix of the recipient pubkey blob. Convenience
     /// for verifiers that only need the meaningful bytes.
@@ -245,8 +292,8 @@ pub const ESCROW_VAULT_SEED: &[u8] = b"escrow_vault";
 /// `sha256("vault-escrow:" + arweave_addr + ":" + vault_id)`.
 #[account]
 pub struct EscrowToken {
-    /// Schema version. v1 = 1.
-    pub version: u8,
+    /// Schema version. v1 = `SchemaVersion::new(1, 0, 0)`.
+    pub version: SchemaVersion,
     /// PDA bump.
     pub bump: u8,
     /// Wallet that deposited the tokens.
@@ -276,12 +323,13 @@ pub struct EscrowToken {
     /// False for liquid token escrows.
     pub vault_revocable: bool,
     /// Reserved for future fields.
-    pub _reserved: [u8; 32],
+    /// Shrunk from 32 to 30 to absorb the SchemaVersion expansion (u8→3 bytes).
+    pub _reserved: [u8; 30],
 }
 
 impl EscrowToken {
     pub const SIZE: usize = 8  // anchor discriminator
-        + 1                    // version
+        + 3                    // version (SchemaVersion)
         + 1                    // bump
         + 32                   // depositor
         + 1                    // asset_type
@@ -295,7 +343,7 @@ impl EscrowToken {
         + 8                    // deposit_slot
         + 8                    // vault_end_timestamp
         + 1                    // vault_revocable
-        + 32; // _reserved
+        + 30; // _reserved
 
     /// Returns the active prefix of the recipient pubkey blob.
     #[inline]

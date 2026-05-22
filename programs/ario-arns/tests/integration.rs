@@ -8827,6 +8827,7 @@ mod fund_from_stake {
             initiator: setup.operator,
             returned_at: now - (15 * 86_400),
             bump: returned_bump,
+            version: ario_arns::state::RETURNED_NAME_VERSION,
         };
         let mut returned_data = vec![];
         returned.try_serialize(&mut returned_data).unwrap();

@@ -40,6 +40,7 @@ pub fn initialize(ctx: Context<InitializeGar>, params: InitializeParams) -> Resu
     settings.total_delegated = 0;
     settings.total_withdrawn = 0;
     settings.bump = ctx.bumps.settings;
+    settings.version = GATEWAY_SETTINGS_VERSION;
 
     msg!("GAR program initialized");
     Ok(())
@@ -242,6 +243,7 @@ pub fn initialize_epochs(
     settings.failed_gateway_slash_rate = 1_000_000;
     settings.disable_at = 0;
     settings.bump = ctx.bumps.epoch_settings;
+    settings.version = EPOCH_SETTINGS_VERSION;
 
     msg!("Epoch settings initialized");
     Ok(())
@@ -332,7 +334,7 @@ pub struct InitializeEpochs<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + EpochSettings::SIZE,
+        space = EpochSettings::SIZE,
         seeds = [EPOCH_SETTINGS_SEED],
         bump,
     )]

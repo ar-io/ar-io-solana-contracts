@@ -14428,9 +14428,10 @@ fn program_test_with_pre_refactor_settings(authority: &Pubkey, mint: &Pubkey) ->
 
     let (settings_key, settings_bump) = settings_pda();
     // Pre-refactor: 32 bytes shorter (no arns_program_id) AND 24 bytes shorter
-    // (no supply counters: total_staked, total_delegated, total_withdrawn).
-    // Matches handler's `old_size = new_size - 32 - 24`.
-    let pre_size = GatewaySettings::SIZE - 32 - 24;
+    // (no supply counters: total_staked, total_delegated, total_withdrawn) AND
+    // 3 bytes shorter (no SchemaVersion).
+    // Matches handler's `old_size = new_size - 32 - 24 - SCHEMA_VERSION_SIZE`.
+    let pre_size = GatewaySettings::SIZE - 32 - 24 - 3;
     let mut data = vec![0u8; pre_size];
     let disc = hash(b"account:GatewaySettings");
     data[..8].copy_from_slice(&disc.to_bytes()[..8]);
@@ -14492,7 +14493,7 @@ async fn test_migrate_settings_set_arns_program_id_backfills() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(pre.data.len(), GatewaySettings::SIZE - 32 - 24);
+    assert_eq!(pre.data.len(), GatewaySettings::SIZE - 32 - 24 - 3);
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -14529,7 +14530,10 @@ async fn test_migrate_settings_set_arns_program_id_backfills() {
     assert_eq!(settings.arns_program_id, arns_pid);
     assert_eq!(settings.authority, authority.pubkey());
     // bump must match what was at the OLD bump offset (we just shifted it)
-    assert_eq!(settings.bump, pre.data[GatewaySettings::SIZE - 32 - 24 - 1]);
+    assert_eq!(
+        settings.bump,
+        pre.data[GatewaySettings::SIZE - 32 - 24 - 3 - 1]
+    );
 }
 
 #[tokio::test]
@@ -22712,4 +22716,369 @@ async fn test_finalize_migration_emits_event() {
     );
     // slot is whatever the test runtime provides; just verify it's set.
     let _ = ev.slot;
+}
+
+// =========================================
+// MIGRATE EPOCH SETTINGS / OBSERVATION — realloc coverage
+// =========================================
+
+/// Inject an EpochSettings at the old on-chain size (8 + SIZE_without_version,
+/// due to the prior double-counted discriminator) with version bytes reading as
+/// SchemaVersion{0,0,0}, call migrate_epoch_settings, and assert the account
+/// shrinks to EpochSettings::SIZE with version set.
+#[tokio::test]
+async fn test_migrate_epoch_settings_realloc() {
+    use anchor_lang::solana_program::hash::hash;
+
+    let authority = Keypair::new();
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+
+    let (epoch_settings_key, epoch_settings_bump) = epoch_settings_pda();
+    // Old on-chain size: init used `space = 8 + SIZE_without_version` (double-counted disc).
+    // SIZE_without_version = EpochSettings::SIZE - SCHEMA_VERSION_SIZE.
+    let old_on_chain_size = 8 + (EpochSettings::SIZE - SCHEMA_VERSION_SIZE);
+    let mut data = vec![0u8; old_on_chain_size];
+
+    let disc = hash(b"account:EpochSettings");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+
+    let mut offset = 8;
+    data[offset..offset + 32].copy_from_slice(authority.pubkey().as_ref());
+    offset += 32; // authority
+    data[offset..offset + 8].copy_from_slice(&86_400i64.to_le_bytes());
+    offset += 8; // epoch_duration
+    data[offset] = 50;
+    offset += 1; // prescribed_observer_count
+    data[offset] = 2;
+    offset += 1; // prescribed_name_count
+    data[offset..offset + 8].copy_from_slice(&Gateway::MIN_OPERATOR_STAKE.to_le_bytes());
+    offset += 8; // min_observer_stake
+    data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+    offset += 2; // slash_rate
+    data[offset] = 1;
+    offset += 1; // enabled
+    data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    offset += 8; // current_epoch_index
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8; // genesis_timestamp
+    data[offset..offset + 8].copy_from_slice(&(180i64 * 86_400).to_le_bytes());
+    offset += 8; // tenure_weight_duration
+    data[offset..offset + 8].copy_from_slice(&4u64.to_le_bytes());
+    offset += 8; // max_tenure_weight
+    data[offset..offset + 8].copy_from_slice(&900_000u64.to_le_bytes());
+    offset += 8; // gateway_reward_ratio
+    data[offset..offset + 8].copy_from_slice(&100_000u64.to_le_bytes());
+    offset += 8; // observer_reward_ratio
+    data[offset..offset + 8].copy_from_slice(&250_000u64.to_le_bytes());
+    offset += 8; // missed_observation_penalty_rate
+    data[offset..offset + 8].copy_from_slice(&1_000u64.to_le_bytes());
+    offset += 8; // max_reward_rate
+    data[offset..offset + 8].copy_from_slice(&500u64.to_le_bytes());
+    offset += 8; // min_reward_rate
+    data[offset..offset + 8].copy_from_slice(&365u64.to_le_bytes());
+    offset += 8; // reward_decay_start_epoch
+    data[offset..offset + 8].copy_from_slice(&547u64.to_le_bytes());
+    offset += 8; // reward_decay_last_epoch
+    data[offset] = 30;
+    offset += 1; // max_consecutive_failures
+    data[offset..offset + 8].copy_from_slice(&1_000_000u64.to_le_bytes());
+    offset += 8; // failed_gateway_slash_rate
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8; // disable_at
+    data[offset] = epoch_settings_bump;
+    // Trailing bytes (from double-count) are zeros — version reads as {0,0,0}
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        epoch_settings_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(old_on_chain_size),
+            data,
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Verify pre-migration: oversized from old double-counted init
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), old_on_chain_size);
+
+    // Call migrate_epoch_settings
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateEpochSettings {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Verify post-migration: correct size and version
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), EpochSettings::SIZE);
+
+    let es = EpochSettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(es.version, EPOCH_SETTINGS_VERSION);
+    assert_eq!(es.bump, epoch_settings_bump);
+    assert_eq!(es.epoch_duration, 86_400);
+}
+
+/// Calling migrate_epoch_settings on an already-current account fails with
+/// AlreadyLatestVersion.
+#[tokio::test]
+async fn test_migrate_epoch_settings_already_latest() {
+    use anchor_lang::solana_program::hash::hash;
+
+    let authority = Keypair::new();
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+
+    // Inject EpochSettings at current SIZE with version already set to latest
+    let (epoch_settings_key, epoch_settings_bump) = epoch_settings_pda();
+    let size = EpochSettings::SIZE;
+    let mut data = vec![0u8; size];
+    let disc = hash(b"account:EpochSettings");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+    let mut offset = 8;
+    data[offset..offset + 32].copy_from_slice(authority.pubkey().as_ref());
+    offset += 32;
+    data[offset..offset + 8].copy_from_slice(&86_400i64.to_le_bytes());
+    offset += 8;
+    data[offset] = 50;
+    offset += 1;
+    data[offset] = 2;
+    offset += 1;
+    data[offset..offset + 8].copy_from_slice(&Gateway::MIN_OPERATOR_STAKE.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+    offset += 2;
+    data[offset] = 1;
+    offset += 1;
+    data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&(180i64 * 86_400).to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&4u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&900_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&100_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&250_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&1_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&500u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&365u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&547u64.to_le_bytes());
+    offset += 8;
+    data[offset] = 30;
+    offset += 1;
+    data[offset..offset + 8].copy_from_slice(&1_000_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8;
+    data[offset] = epoch_settings_bump;
+    offset += 1;
+    // Write version = EPOCH_SETTINGS_VERSION (1.0.0)
+    data[offset] = EPOCH_SETTINGS_VERSION.major;
+    data[offset + 1] = EPOCH_SETTINGS_VERSION.minor;
+    data[offset + 2] = EPOCH_SETTINGS_VERSION.patch;
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        epoch_settings_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(size),
+            data,
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateEpochSettings {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, GarError::AlreadyLatestVersion);
+}
+
+/// Inject an Observation at the old on-chain size (8 + SIZE_without_version,
+/// due to the prior double-counted discriminator) with version bytes reading
+/// as SchemaVersion{0,0,0}, call migrate_observation, and assert account
+/// shrinks to Observation::SIZE with version set.
+#[tokio::test]
+async fn test_migrate_observation_realloc() {
+    use anchor_lang::solana_program::hash::hash;
+
+    let authority = Keypair::new();
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let observer = Keypair::new();
+    let epoch_index: u64 = 7;
+
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+
+    let (observation_key, observation_bump) = observation_pda(epoch_index, &observer.pubkey());
+    // Old on-chain size: init used `space = 8 + SIZE_without_version` (double-counted disc).
+    let old_on_chain_size = 8 + (Observation::SIZE - SCHEMA_VERSION_SIZE);
+    let mut data = vec![0u8; old_on_chain_size];
+
+    let disc = hash(b"account:Observation");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+
+    let mut offset = 8;
+    data[offset..offset + 8].copy_from_slice(&epoch_index.to_le_bytes());
+    offset += 8; // epoch_index
+    data[offset..offset + 32].copy_from_slice(observer.pubkey().as_ref());
+    offset += 32; // observer
+                  // gateway_results: [u8; 375] — leave as zeroes
+    offset += 375;
+    data[offset..offset + 2].copy_from_slice(&10u16.to_le_bytes());
+    offset += 2; // gateway_count
+                 // report_tx_id: [u8; 32] — leave as zeroes
+    offset += 32;
+    data[offset..offset + 8].copy_from_slice(&1_000_000i64.to_le_bytes());
+    offset += 8; // submitted_at
+    data[offset] = observation_bump;
+    // Trailing bytes (from double-count) are zeros — version reads as {0,0,0}
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        observation_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(old_on_chain_size),
+            data,
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // Fund observer so it can be passed as a non-signer account
+    pt.add_account(
+        observer.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Verify pre-migration: oversized from old double-counted init
+    let acct = ctx
+        .banks_client
+        .get_account(observation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), old_on_chain_size);
+
+    // Call migrate_observation
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateObservation {
+                observer: observer.pubkey(),
+                observation: observation_key,
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateObservation { epoch_index }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Verify post-migration: correct size and version
+    let acct = ctx
+        .banks_client
+        .get_account(observation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), Observation::SIZE);
+
+    let obs = Observation::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(obs.version, OBSERVATION_VERSION);
+    assert_eq!(obs.bump, observation_bump);
+    assert_eq!(obs.epoch_index, epoch_index);
+    assert_eq!(obs.observer, observer.pubkey());
+    assert_eq!(obs.gateway_count, 10);
 }

@@ -309,4 +309,13 @@ pub enum GarError {
 
     #[msg("Shrinking would truncate populated registry slot data")]
     ShrinkWouldLoseData,
+
+    // =========================================
+    // SCHEMA MIGRATION ERRORS
+    // =========================================
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
 }

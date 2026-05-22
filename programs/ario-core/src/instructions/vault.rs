@@ -46,6 +46,7 @@ pub mod create_vault {
         // Always set owner and bump (idempotent for init_if_needed)
         counter.owner = ctx.accounts.owner.key();
         counter.bump = ctx.bumps.vault_counter;
+        counter.version = VAULT_COUNTER_VERSION;
 
         vault.owner = ctx.accounts.owner.key();
         vault.vault_id = counter.next_id;
@@ -58,6 +59,7 @@ pub mod create_vault {
         vault.controller = None;
         vault.revocable = false;
         vault.bump = ctx.bumps.vault;
+        vault.version = VAULT_VERSION;
 
         // Increment counter
         counter.next_id = counter
@@ -137,6 +139,7 @@ pub mod vaulted_transfer {
         // Always set owner and bump (idempotent for init_if_needed)
         counter.owner = ctx.accounts.recipient.key();
         counter.bump = ctx.bumps.recipient_vault_counter;
+        counter.version = VAULT_COUNTER_VERSION;
 
         vault.owner = ctx.accounts.recipient.key();
         vault.vault_id = counter.next_id;
@@ -153,6 +156,7 @@ pub mod vaulted_transfer {
         };
         vault.revocable = revocable;
         vault.bump = ctx.bumps.vault;
+        vault.version = VAULT_VERSION;
 
         // Increment counter
         counter.next_id = counter

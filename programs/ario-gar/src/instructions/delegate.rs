@@ -86,6 +86,7 @@ pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
         delegation.start_timestamp = clock.unix_timestamp;
         delegation.reward_debt = gateway.cumulative_reward_per_token;
         delegation.bump = ctx.bumps.delegation;
+        delegation.version = DELEGATION_VERSION;
     }
 
     // Update gateway totals
@@ -147,6 +148,11 @@ pub fn decrease_delegate_stake(ctx: Context<DecreaseDelegateStake>, amount: u64)
     // Create withdrawal
     let withdrawal = &mut ctx.accounts.withdrawal;
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.delegator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
 
     withdrawal.owner = ctx.accounts.delegator.key();
     withdrawal.withdrawal_id = counter.next_id;
@@ -161,6 +167,7 @@ pub fn decrease_delegate_stake(ctx: Context<DecreaseDelegateStake>, amount: u64)
     withdrawal.is_exit_vault = false;
     withdrawal.is_protected = false;
     withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
 
     counter.next_id = counter
         .next_id
@@ -228,6 +235,11 @@ pub fn claim_delegate_from_leaving_gateway(
     // Create withdrawal for delegate
     let withdrawal = &mut ctx.accounts.withdrawal;
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.delegator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
 
     withdrawal.owner = ctx.accounts.delegator.key();
     withdrawal.withdrawal_id = counter.next_id;
@@ -247,6 +259,7 @@ pub fn claim_delegate_from_leaving_gateway(
     withdrawal.is_exit_vault = false;
     withdrawal.is_protected = false;
     withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
 
     counter.next_id = counter
         .next_id
@@ -421,6 +434,7 @@ pub fn redelegate_stake(ctx: Context<RedelegateStake>, amount: u64) -> Result<()
         target_delegation.start_timestamp = clock.unix_timestamp;
         target_delegation.reward_debt = target_gateway.cumulative_reward_per_token;
         target_delegation.bump = ctx.bumps.target_delegation;
+        target_delegation.version = DELEGATION_VERSION;
     }
     target_gateway.total_delegated_stake = target_gateway
         .total_delegated_stake
@@ -446,6 +460,10 @@ pub fn redelegate_stake(ctx: Context<RedelegateStake>, amount: u64) -> Result<()
     }
 
     // Update redelegation tracking
+    if redelegation.bump == 0 {
+        redelegation.bump = ctx.bumps.redelegation_record;
+        redelegation.version = REDELEGATION_RECORD_VERSION;
+    }
     if clock.unix_timestamp >= redelegation.fee_reset_at {
         redelegation.redelegation_count = 1;
     } else {

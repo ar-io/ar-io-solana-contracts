@@ -25,6 +25,7 @@ pub const ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("A
 pub mod error;
 pub mod instructions;
 pub mod migration;
+pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
@@ -544,6 +545,378 @@ pub mod ario_gar {
             total_withdrawn,
         )
     }
+
+    // =========================================
+    // SCHEMA MIGRATION (version bump + realloc)
+    // =========================================
+
+    pub fn migrate_gateway_settings(ctx: Context<MigrateGatewaySettings>) -> Result<()> {
+        let account = &mut ctx.accounts.settings;
+        require!(
+            account.version < state::GATEWAY_SETTINGS_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_gateway_settings_version(account)?;
+        msg!(
+            "GatewaySettings migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_gateway(ctx: Context<MigrateGateway>) -> Result<()> {
+        let account = &mut ctx.accounts.gateway;
+        require!(
+            account.version < state::GATEWAY_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_gateway_version(account)?;
+        msg!(
+            "Gateway migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_delegation(ctx: Context<MigrateDelegation>) -> Result<()> {
+        let account = &mut ctx.accounts.delegation;
+        require!(
+            account.version < state::DELEGATION_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_delegation_version(account)?;
+        msg!(
+            "Delegation migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_withdrawal_counter(ctx: Context<MigrateWithdrawalCounter>) -> Result<()> {
+        let account = &mut ctx.accounts.withdrawal_counter;
+        require!(
+            account.version < state::WITHDRAWAL_COUNTER_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_withdrawal_counter_version(account)?;
+        msg!(
+            "WithdrawalCounter migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_withdrawal(ctx: Context<MigrateWithdrawal>, withdrawal_id: u64) -> Result<()> {
+        let _ = withdrawal_id;
+        let account = &mut ctx.accounts.withdrawal;
+        require!(
+            account.version < state::WITHDRAWAL_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_withdrawal_version(account)?;
+        msg!(
+            "Withdrawal migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_allowlist_entry(ctx: Context<MigrateAllowlistEntry>) -> Result<()> {
+        let account = &mut ctx.accounts.allowlist_entry;
+        require!(
+            account.version < state::ALLOWLIST_ENTRY_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_allowlist_entry_version(account)?;
+        msg!(
+            "AllowlistEntry migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_observer_lookup(ctx: Context<MigrateObserverLookup>) -> Result<()> {
+        let account = &mut ctx.accounts.observer_lookup;
+        require!(
+            account.version < state::OBSERVER_LOOKUP_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_observer_lookup_version(account)?;
+        msg!(
+            "ObserverLookup migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_redelegation_record(ctx: Context<MigrateRedelegationRecord>) -> Result<()> {
+        let account = &mut ctx.accounts.redelegation_record;
+        require!(
+            account.version < state::REDELEGATION_RECORD_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_redelegation_record_version(account)?;
+        msg!(
+            "RedelegationRecord migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_epoch_settings(ctx: Context<MigrateEpochSettings>) -> Result<()> {
+        let account = &mut ctx.accounts.epoch_settings;
+        require!(
+            account.version < state::EPOCH_SETTINGS_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_epoch_settings_version(account)?;
+        msg!(
+            "EpochSettings migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_observation(ctx: Context<MigrateObservation>, epoch_index: u64) -> Result<()> {
+        let _ = epoch_index;
+        let account = &mut ctx.accounts.observation;
+        require!(
+            account.version < state::OBSERVATION_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_observation_version(account)?;
+        msg!(
+            "Observation migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+}
+
+// =========================================
+// SCHEMA MIGRATION ACCOUNT CONTEXTS
+// =========================================
+
+#[derive(Accounts)]
+pub struct MigrateGatewaySettings<'info> {
+    #[account(
+        mut,
+        seeds = [state::SETTINGS_SEED],
+        bump = settings.bump,
+        realloc = state::GatewaySettings::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub settings: Account<'info, state::GatewaySettings>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateGateway<'info> {
+    /// CHECK: gateway operator
+    pub operator: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::GATEWAY_SEED, operator.key().as_ref()],
+        bump = gateway.bump,
+        realloc = state::Gateway::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub gateway: Account<'info, state::Gateway>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateDelegation<'info> {
+    /// CHECK: gateway operator key used in PDA seeds
+    pub gateway: AccountInfo<'info>,
+
+    /// CHECK: delegator key used in PDA seeds
+    pub delegator: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::DELEGATION_SEED, gateway.key().as_ref(), delegator.key().as_ref()],
+        bump = delegation.bump,
+        realloc = state::Delegation::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub delegation: Account<'info, state::Delegation>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateWithdrawalCounter<'info> {
+    /// CHECK: owner key used in PDA seeds
+    pub owner: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::WITHDRAWAL_COUNTER_SEED, owner.key().as_ref()],
+        bump = withdrawal_counter.bump,
+        realloc = state::WithdrawalCounter::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub withdrawal_counter: Account<'info, state::WithdrawalCounter>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(withdrawal_id: u64)]
+pub struct MigrateWithdrawal<'info> {
+    /// CHECK: owner key used in PDA seeds
+    pub owner: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::WITHDRAWAL_SEED, owner.key().as_ref(), &withdrawal_id.to_le_bytes()],
+        bump = withdrawal.bump,
+        realloc = state::Withdrawal::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub withdrawal: Account<'info, state::Withdrawal>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateAllowlistEntry<'info> {
+    /// CHECK: gateway operator key used in PDA seeds
+    pub gateway: AccountInfo<'info>,
+
+    /// CHECK: delegate key used in PDA seeds
+    pub delegate: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ALLOWLIST_SEED, gateway.key().as_ref(), delegate.key().as_ref()],
+        bump = allowlist_entry.bump,
+        realloc = state::AllowlistEntry::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub allowlist_entry: Account<'info, state::AllowlistEntry>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateObserverLookup<'info> {
+    /// CHECK: observer address used in PDA seeds
+    pub observer: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::OBSERVER_LOOKUP_SEED, observer.key().as_ref()],
+        bump = observer_lookup.bump,
+        realloc = state::ObserverLookup::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub observer_lookup: Account<'info, state::ObserverLookup>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateRedelegationRecord<'info> {
+    /// CHECK: delegator key used in PDA seeds
+    pub delegator: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::REDELEGATION_SEED, delegator.key().as_ref()],
+        bump = redelegation_record.bump,
+        realloc = state::RedelegationRecord::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub redelegation_record: Account<'info, state::RedelegationRecord>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateEpochSettings<'info> {
+    #[account(
+        mut,
+        seeds = [state::EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        realloc = state::EpochSettings::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub epoch_settings: Account<'info, state::EpochSettings>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct MigrateObservation<'info> {
+    /// CHECK: observer key used in PDA seeds
+    pub observer: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::OBSERVATION_SEED, &epoch_index.to_le_bytes(), observer.key().as_ref()],
+        bump = observation.bump,
+        realloc = state::Observation::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub observation: Account<'info, state::Observation>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // =========================================

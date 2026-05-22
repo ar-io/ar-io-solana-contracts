@@ -762,6 +762,64 @@ pub mod ario_ant {
     }
 
     // =========================================
+    // SCHEMA MIGRATION — AntMigrationConfig, AclConfig, AclPage
+    // =========================================
+
+    /// Migrate the singleton `AntMigrationConfig` account to the latest schema.
+    pub fn migrate_ant_migration_config(ctx: Context<AntMigrationConfigMigration>) -> Result<()> {
+        let config = &mut ctx.accounts.migration_config;
+        require!(
+            config.version < ANT_MIGRATION_CONFIG_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_migration_config_version(config)?;
+        msg!(
+            "AntMigrationConfig migrated to {}.{}.{}",
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a user's `AclConfig` account to the latest schema.
+    pub fn migrate_acl_config(ctx: Context<AclConfigMigration>) -> Result<()> {
+        let config = &mut ctx.accounts.acl_config;
+        require!(
+            config.version < ACL_CONFIG_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_acl_config_version(config)?;
+        msg!(
+            "AclConfig for {} migrated to {}.{}.{}",
+            config.user,
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a user's `AclPage` account to the latest schema.
+    pub fn migrate_acl_page(ctx: Context<AclPageMigration>, page_idx: u64) -> Result<()> {
+        let page = &mut ctx.accounts.acl_page;
+        require!(
+            page.version < ACL_PAGE_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_acl_page_version(page)?;
+        msg!(
+            "AclPage {} for {} migrated to {}.{}.{}",
+            page_idx,
+            page.user,
+            page.version.major,
+            page.version.minor,
+            page.version.patch,
+        );
+        Ok(())
+    }
+
+    // =========================================
     // TRANSFER (wrapped MPL Core transferV1 + reconcile + owner ACL swap)
     // =========================================
 
@@ -1999,6 +2057,67 @@ pub struct AntMigrationRecordMetadata<'info> {
     pub record_metadata: Account<'info, AntRecordMetadata>,
 
     /// Anyone can pay to migrate any ANT record metadata (permissionless)
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AntMigrationConfigMigration<'info> {
+    #[account(
+        mut,
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump = migration_config.bump,
+        realloc = AntMigrationConfig::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub migration_config: Account<'info, AntMigrationConfig>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AclConfigMigration<'info> {
+    /// CHECK: the user whose ACL this is
+    pub user: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ACL_CONFIG_SEED, user.key().as_ref()],
+        bump = acl_config.bump,
+        realloc = AclConfig::SIZE,
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub acl_config: Account<'info, AclConfig>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(page_idx: u64)]
+pub struct AclPageMigration<'info> {
+    /// CHECK: the user whose ACL page this is
+    pub user: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ACL_PAGE_SEED, user.key().as_ref(), &page_idx.to_le_bytes()],
+        bump = acl_page.bump,
+        realloc = AclPage::size_for(acl_page.entries.len()),
+        realloc::payer = payer,
+        realloc::zero = false,
+    )]
+    pub acl_page: Account<'info, AclPage>,
+
     #[account(mut)]
     pub payer: Signer<'info>,
 

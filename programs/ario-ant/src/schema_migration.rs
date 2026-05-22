@@ -2,8 +2,10 @@ use anchor_lang::prelude::*;
 
 use crate::error::AntError;
 use crate::state::{
-    AntConfig, AntControllers, AntRecord, AntRecordMetadata, SchemaVersion, ANT_CONFIG_VERSION,
-    ANT_CONTROLLERS_VERSION, ANT_RECORD_METADATA_VERSION, ANT_RECORD_VERSION,
+    AclConfig, AclPage, AntConfig, AntControllers, AntMigrationConfig, AntRecord,
+    AntRecordMetadata, SchemaVersion, ACL_CONFIG_VERSION, ACL_PAGE_VERSION, ANT_CONFIG_VERSION,
+    ANT_CONTROLLERS_VERSION, ANT_MIGRATION_CONFIG_VERSION, ANT_RECORD_METADATA_VERSION,
+    ANT_RECORD_VERSION,
 };
 
 /// Walk an `AntConfig` account from its current version to `ANT_CONFIG_VERSION`.
@@ -96,6 +98,52 @@ pub fn migrate_record_version(record: &mut AntRecord) -> Result<()> {
 pub fn migrate_record_metadata_version(metadata: &mut AntRecordMetadata) -> Result<()> {
     while metadata.version < ANT_RECORD_METADATA_VERSION {
         match metadata.version {
+            _ => return err!(AntError::UnknownSchemaVersion),
+        }
+    }
+    Ok(())
+}
+
+/// Walk an `AntMigrationConfig` account from its current version to
+/// `ANT_MIGRATION_CONFIG_VERSION`.
+#[allow(
+    clippy::never_loop,
+    clippy::while_immutable_condition,
+    clippy::match_single_binding
+)]
+pub fn migrate_migration_config_version(config: &mut AntMigrationConfig) -> Result<()> {
+    while config.version < ANT_MIGRATION_CONFIG_VERSION {
+        match config.version {
+            _ => return err!(AntError::UnknownSchemaVersion),
+        }
+    }
+    Ok(())
+}
+
+/// Walk an `AclConfig` account from its current version to `ACL_CONFIG_VERSION`.
+#[allow(
+    clippy::never_loop,
+    clippy::while_immutable_condition,
+    clippy::match_single_binding
+)]
+pub fn migrate_acl_config_version(config: &mut AclConfig) -> Result<()> {
+    while config.version < ACL_CONFIG_VERSION {
+        match config.version {
+            _ => return err!(AntError::UnknownSchemaVersion),
+        }
+    }
+    Ok(())
+}
+
+/// Walk an `AclPage` account from its current version to `ACL_PAGE_VERSION`.
+#[allow(
+    clippy::never_loop,
+    clippy::while_immutable_condition,
+    clippy::match_single_binding
+)]
+pub fn migrate_acl_page_version(page: &mut AclPage) -> Result<()> {
+    while page.version < ACL_PAGE_VERSION {
+        match page.version {
             _ => return err!(AntError::UnknownSchemaVersion),
         }
     }

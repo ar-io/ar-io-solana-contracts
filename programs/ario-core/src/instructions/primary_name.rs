@@ -444,6 +444,7 @@ pub mod request_primary_name {
             .checked_add(config.primary_name_request_expiry)
             .ok_or(ArioError::ArithmeticOverflow)?;
         request.bump = ctx.bumps.request;
+        request.version = PRIMARY_NAME_REQUEST_VERSION;
 
         emit!(PrimaryNameRequestedEvent {
             initiator: request.initiator,
@@ -573,6 +574,7 @@ pub mod request_and_set_primary_name {
         primary_name.name = name.to_lowercase();
         primary_name.set_at = clock.unix_timestamp;
         primary_name.bump = ctx.bumps.primary_name;
+        primary_name.version = PRIMARY_NAME_VERSION;
 
         // BUG-1: Enforce primary name uniqueness via reverse lookup
         let reverse = &mut ctx.accounts.primary_name_reverse;
@@ -582,6 +584,7 @@ pub mod request_and_set_primary_name {
         reverse.name = name.to_lowercase();
         reverse.owner = ctx.accounts.initiator.key();
         reverse.bump = ctx.bumps.primary_name_reverse;
+        reverse.version = PRIMARY_NAME_REVERSE_VERSION;
 
         emit!(PrimaryNameSetEvent {
             owner: primary_name.owner,
@@ -695,6 +698,7 @@ pub mod approve_primary_name {
         primary_name.name = request.name.clone();
         primary_name.set_at = clock.unix_timestamp;
         primary_name.bump = ctx.bumps.primary_name;
+        primary_name.version = PRIMARY_NAME_VERSION;
 
         // BUG-1: Enforce primary name uniqueness via reverse lookup
         let reverse = &mut ctx.accounts.primary_name_reverse;
@@ -704,6 +708,7 @@ pub mod approve_primary_name {
         reverse.name = request.name.clone();
         reverse.owner = request.initiator;
         reverse.bump = ctx.bumps.primary_name_reverse;
+        reverse.version = PRIMARY_NAME_REVERSE_VERSION;
 
         emit!(PrimaryNameSetEvent {
             owner: primary_name.owner,
@@ -1364,6 +1369,7 @@ pub mod request_primary_name_from_funding_plan {
             .checked_add(config.primary_name_request_expiry)
             .ok_or(ArioError::ArithmeticOverflow)?;
         request.bump = ctx.bumps.request;
+        request.version = PRIMARY_NAME_REQUEST_VERSION;
 
         emit!(PrimaryNameRequestedEvent {
             initiator: request.initiator,
@@ -1491,6 +1497,7 @@ pub mod request_and_set_primary_name_from_funding_plan {
         primary_name.name = name.to_lowercase();
         primary_name.set_at = clock.unix_timestamp;
         primary_name.bump = ctx.bumps.primary_name;
+        primary_name.version = PRIMARY_NAME_VERSION;
 
         let reverse = &mut ctx.accounts.primary_name_reverse;
         if reverse.owner != Pubkey::default() && reverse.owner != ctx.accounts.initiator.key() {
@@ -1499,6 +1506,7 @@ pub mod request_and_set_primary_name_from_funding_plan {
         reverse.name = name.to_lowercase();
         reverse.owner = ctx.accounts.initiator.key();
         reverse.bump = ctx.bumps.primary_name_reverse;
+        reverse.version = PRIMARY_NAME_REVERSE_VERSION;
 
         emit!(PrimaryNameSetEvent {
             owner: primary_name.owner,

@@ -6341,6 +6341,7 @@ fn seed_migration_config(pt: &mut ProgramTest, authority: &Pubkey) -> Pubkey {
         migration_authority: Pubkey::new_unique(),
         migration_active: true,
         bump,
+        version: ario_ant::state::ANT_MIGRATION_CONFIG_VERSION,
     };
     let mut data = ario_ant::state::AntMigrationConfig::DISCRIMINATOR.to_vec();
     cfg.serialize(&mut data).unwrap();

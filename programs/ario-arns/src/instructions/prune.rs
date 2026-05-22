@@ -229,6 +229,7 @@ pub mod prune_to_returned {
         returned.returned_at = clock.unix_timestamp;
         returned.initiator = config.key(); // Protocol-initiated (100% to protocol on buy)
         returned.bump = ctx.bumps.returned_name;
+        returned.version = RETURNED_NAME_VERSION;
 
         // Update prune schedule
         let prune_ts = clock

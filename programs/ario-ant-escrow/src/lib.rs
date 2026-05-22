@@ -35,6 +35,7 @@ pub mod error;
 pub mod events;
 pub mod instructions;
 pub mod mpl_core_cpi;
+pub mod schema_migration;
 pub mod state;
 pub mod vault_introspect;
 pub mod verify;
@@ -252,4 +253,113 @@ pub mod ario_ant_escrow {
     ) -> Result<()> {
         instructions::update_vault_recipient::handler(ctx, new_protocol, new_pubkey)
     }
+
+    // =================================================================
+    // Schema Migration
+    // =================================================================
+
+    /// Migrate an `EscrowAnt` account to the latest schema version.
+    /// Since _reserved absorbs the size delta, no realloc is needed.
+    pub fn migrate_escrow_ant(ctx: Context<MigrateEscrowAnt>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(
+            escrow.version < state::ESCROW_ANT_VERSION,
+            error::EscrowError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_escrow_ant_version(escrow)?;
+        msg!(
+            "EscrowAnt migrated to {}.{}.{}",
+            escrow.version.major,
+            escrow.version.minor,
+            escrow.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate an `EscrowToken` account to the latest schema version.
+    /// Since _reserved absorbs the size delta, no realloc is needed.
+    pub fn migrate_escrow_token(
+        ctx: Context<MigrateEscrowToken>,
+        _asset_id: [u8; 32],
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(
+            escrow.version < state::ESCROW_TOKEN_VERSION,
+            error::EscrowError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_escrow_token_version(escrow)?;
+        msg!(
+            "EscrowToken migrated to {}.{}.{}",
+            escrow.version.major,
+            escrow.version.minor,
+            escrow.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate an `EscrowToken` vault account to the latest schema version.
+    /// Uses ESCROW_VAULT_SEED for PDA derivation.
+    pub fn migrate_escrow_vault(
+        ctx: Context<MigrateEscrowVault>,
+        _asset_id: [u8; 32],
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(
+            escrow.version < state::ESCROW_TOKEN_VERSION,
+            error::EscrowError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_escrow_token_version(escrow)?;
+        msg!(
+            "EscrowVault migrated to {}.{}.{}",
+            escrow.version.major,
+            escrow.version.minor,
+            escrow.version.patch,
+        );
+        Ok(())
+    }
+}
+
+// =================================================================
+// Migration Account Contexts
+// =================================================================
+
+#[derive(Accounts)]
+pub struct MigrateEscrowAnt<'info> {
+    /// CHECK: ANT mint used to derive the escrow PDA
+    pub ant_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ESCROW_ANT_SEED, ant_mint.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, state::EscrowAnt>,
+}
+
+#[derive(Accounts)]
+#[instruction(asset_id: [u8; 32])]
+pub struct MigrateEscrowToken<'info> {
+    /// CHECK: depositor whose escrow PDA we're migrating
+    pub depositor: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ESCROW_TOKEN_SEED, depositor.key().as_ref(), asset_id.as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, state::EscrowToken>,
+}
+
+#[derive(Accounts)]
+#[instruction(asset_id: [u8; 32])]
+pub struct MigrateEscrowVault<'info> {
+    /// CHECK: depositor whose vault escrow PDA we're migrating
+    pub depositor: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ESCROW_VAULT_SEED, depositor.key().as_ref(), asset_id.as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, state::EscrowToken>,
 }

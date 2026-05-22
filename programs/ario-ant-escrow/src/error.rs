@@ -130,6 +130,16 @@ pub enum EscrowError {
     #[msg("Attested message does not match canonical claim message")]
     AttestationMessageMismatch,
 
+    // ----- Schema migration errors -----
+    /// Account is already at the latest schema version.
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    /// Unknown schema version — no migration path exists from this version.
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
+
+    // ----- Admin purge errors -----
     /// `admin_purge_unclaimed_ant`: signer is not `ArioConfig.authority`.
     /// Only the protocol admin may purge abandoned escrows.
     #[msg("Unauthorized: only the protocol authority may call this instruction")]

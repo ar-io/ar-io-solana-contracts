@@ -330,6 +330,11 @@ pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
     epoch.prescriptions_done = 0;
     epoch.hashchain = hashchain.to_bytes();
     epoch.bump = ctx.bumps.epoch;
+    epoch.version_bytes = [
+        EPOCH_VERSION.major,
+        EPOCH_VERSION.minor,
+        EPOCH_VERSION.patch,
+    ];
 
     // Increment current epoch for next creation
     epoch_settings.current_epoch_index = epoch_settings

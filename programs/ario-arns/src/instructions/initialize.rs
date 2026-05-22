@@ -28,6 +28,7 @@ pub fn handler(ctx: Context<InitializeArns>, params: InitializeArnsParams) -> Re
     config.migration_active = true;
     config.migration_authority = params.migration_authority;
     config.bump = ctx.bumps.config;
+    config.version = ARNS_CONFIG_VERSION;
 
     // Initialize demand factor with genesis fees
     let demand = &mut ctx.accounts.demand_factor;
@@ -54,6 +55,7 @@ pub fn handler(ctx: Context<InitializeArns>, params: InitializeArnsParams) -> Re
     demand.period_zero_start_timestamp = params.period_zero_start_timestamp;
     demand.criteria = DEMAND_CRITERIA_REVENUE; // Explicit: revenue-based measurement
     demand.bump = ctx.bumps.demand_factor;
+    demand.version = DEMAND_FACTOR_VERSION;
 
     msg!("ArNS registry initialized");
     Ok(())
