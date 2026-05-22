@@ -6049,10 +6049,18 @@ async fn test_close_ant_record_succeeds_for_owner() {
         priority: None,
         record_owner: None,
     };
-    send_set_record(&mut ctx, &asset.pubkey(), &owner, params).await.unwrap();
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
 
     let (record_key, _) = record_pda(&asset.pubkey(), "blog");
-    let rent_before = ctx.banks_client.get_account(record_key).await.unwrap().unwrap().lamports;
+    let rent_before = ctx
+        .banks_client
+        .get_account(record_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
     let owner_lamports_before = ctx
         .banks_client
         .get_account(owner.pubkey())
@@ -6113,7 +6121,9 @@ async fn test_close_ant_record_rejects_non_owner() {
         priority: None,
         record_owner: None,
     };
-    send_set_record(&mut ctx, &asset.pubkey(), &owner, params).await.unwrap();
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
 
     let result = send_close_ant_record(&mut ctx, &asset.pubkey(), &stranger, "blog").await;
     assert_anchor_error!(result, AntError::NotNftHolder);
@@ -6245,7 +6255,9 @@ async fn test_close_ant_record_metadata_rejects_non_owner() {
         priority: None,
         record_owner: None,
     };
-    send_set_record(&mut ctx, &asset.pubkey(), &owner, params).await.unwrap();
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
     let meta_params = SetRecordMetadataParams {
         undername: "blog".to_string(),
         display_name: Some("Blog".to_string()),

@@ -5330,7 +5330,12 @@ async fn test_admin_purge_succeeds_after_grace() {
     // Warp past the grace period. `warp_to_slot` advances the slot the
     // bank reports via Clock::get(); admin_purge consults it.
     let (escrow_addr, _) = escrow_pda(&asset_kp.pubkey());
-    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap().unwrap();
+    let escrow_acct = ctx
+        .banks_client
+        .get_account(escrow_addr)
+        .await
+        .unwrap()
+        .unwrap();
     let escrow: EscrowAnt = EscrowAnt::try_deserialize(&mut escrow_acct.data.as_slice()).unwrap();
     let target_slot = escrow.deposit_slot + UNCLAIMED_PURGE_GRACE_SLOTS + 1;
     ctx.warp_to_slot(target_slot).expect("warp past grace");

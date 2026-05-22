@@ -1210,10 +1210,7 @@ pub mod ario_ant {
     /// Core asset owner. Rent flows to the caller. The corresponding
     /// `AntRecordMetadata` PDA (if any) must be closed separately via
     /// `close_ant_record_metadata`.
-    pub fn close_ant_record(
-        ctx: Context<CloseAntRecord>,
-        _undername: String,
-    ) -> Result<()> {
+    pub fn close_ant_record(ctx: Context<CloseAntRecord>, _undername: String) -> Result<()> {
         let asset_data = ctx.accounts.asset.try_borrow_data()?;
         let nft_owner = read_mpl_core_owner(&asset_data)?;
         drop(asset_data);
