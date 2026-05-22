@@ -141,8 +141,11 @@ pub const NAME_LENGTH_MULTIPLIERS: [u16; 6] = [
 /// Arweave transaction ID length
 pub const ARWEAVE_TX_ID_LENGTH: usize = 43;
 
-/// Maximum controllers per ANT
-pub const MAX_CONTROLLERS_PER_ANT: u8 = 10;
+/// Maximum controllers per ANT. Synced to `ario_ant::state::MAX_CONTROLLERS`
+/// (dropped 10 → 4 on 2026-05-21 for mainnet rent shrink). Keep these two
+/// constants identical — `ario-core` exposes this to non-ant callers that
+/// need the protocol cap without depending on ario-ant.
+pub const MAX_CONTROLLERS_PER_ANT: u8 = 4;
 
 /// Default TTL for records (in seconds)
 pub const DEFAULT_RECORD_TTL: u32 = 3600; // 1 hour

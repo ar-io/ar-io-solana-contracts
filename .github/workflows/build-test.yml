@@ -8,8 +8,9 @@ name: Lint & Test
 #
 # Packages that CPI into Metaplex Core (ario-arns, ario-ant,
 # ario-ant-escrow) are NOT tested here: native solana-program-test
-# needs mpl_core.so under BPF_OUT_DIR (see CLAUDE.md).  Run those via
-# release / local `anchor build` + staged fixture.
+# needs mpl_core.so under BPF_OUT_DIR (see CLAUDE.md). For those, run
+# `scripts/test-integration.sh` locally (handles all setup correctly)
+# or trigger the `bpf-integration` workflow manually for a CI run.
 #
 # Release pipelines call this workflow as a gate only; full on-chain
 # validation remains the deploy / manual test path.

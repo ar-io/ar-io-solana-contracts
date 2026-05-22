@@ -308,9 +308,121 @@ pub fn set_update_authority_signed_by_pda<'info>(
     Ok(())
 }
 
+// =========================================
+// BurnV1 — destroys a Metaplex Core asset
+// =========================================
+//
+// Used by `admin_purge_unclaimed_ant` to permanently destroy an
+// abandoned ANT after the 5-year grace period. The asset's rent flows
+// to `payer` (the migration_authority).
+//
+// BurnV1 instruction data:
+//   - discriminator: u8 = 12
+//   - compression_proof: Option<CompressionProof> — None (0x00) for ANTs
+//
+// BurnV1 account order (Metaplex Core canonical):
+//   0. asset           writable
+//   1. collection      optional readonly (None → mpl_core program id)
+//   2. payer           writable, signer  (rent recipient)
+//   3. authority       optional signer  (asset owner — the escrow PDA)
+//   4. system_program  readonly
+//   5. log_wrapper     optional readonly (None → mpl_core program id)
+
+/// MPL Core BurnV1 instruction discriminator.
+pub const BURN_V1_DISCRIMINATOR: u8 = 12;
+
+/// Build the raw instruction data for BurnV1. Like TransferV1, the
+/// `compression_proof` is always `None` for uncompressed ANTs.
+pub fn encode_burn_v1_ix_data() -> Vec<u8> {
+    vec![
+        BURN_V1_DISCRIMINATOR,
+        0u8, // Option<CompressionProof> = None
+    ]
+}
+
+/// Build the canonical `AccountMeta` list for BurnV1.
+fn burn_v1_metas(
+    asset: Pubkey,
+    payer: Pubkey,
+    authority: Pubkey,
+    system_program: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(asset, false), // 0. asset (writable)
+        AccountMeta::new_readonly(MPL_CORE_PROGRAM_ID, false), // 1. collection (None)
+        AccountMeta::new(payer, true),  // 2. payer (signer, writable, rent recipient)
+        AccountMeta::new_readonly(authority, true), // 3. authority (asset owner)
+        AccountMeta::new_readonly(system_program, false), // 4. system_program
+        AccountMeta::new_readonly(MPL_CORE_PROGRAM_ID, false), // 5. log_wrapper (None)
+    ]
+}
+
+/// CPI into MPL Core `BurnV1` where the asset's current owner is the
+/// escrow PDA. Used by `admin_purge_unclaimed_ant`. `signer_seeds` must
+/// match the escrow PDA's seeds + bump.
+///
+/// Rent on the asset flows to `payer` (the migration_authority).
+pub fn burn_asset_signed_by_pda<'info>(
+    asset: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    authority_pda: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    mpl_core_program: &AccountInfo<'info>,
+    signer_seeds: &[&[u8]],
+) -> Result<()> {
+    let metas = burn_v1_metas(
+        asset.key(),
+        payer.key(),
+        authority_pda.key(),
+        system_program.key(),
+    );
+    let ix = Instruction {
+        program_id: MPL_CORE_PROGRAM_ID,
+        accounts: metas,
+        data: encode_burn_v1_ix_data(),
+    };
+    let collection_placeholder = mpl_core_program.clone();
+    let log_wrapper_placeholder = mpl_core_program.clone();
+    invoke_signed(
+        &ix,
+        &[
+            asset.clone(),
+            collection_placeholder,
+            payer.clone(),
+            authority_pda.clone(),
+            system_program.clone(),
+            log_wrapper_placeholder,
+        ],
+        &[signer_seeds],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn burn_v1_data_is_two_bytes() {
+        // disc(0C) + compression_proof::None(00) = 0x0C 0x00
+        assert_eq!(encode_burn_v1_ix_data(), vec![0x0C, 0x00]);
+    }
+
+    #[test]
+    fn burn_v1_metas_layout() {
+        let asset = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let sysprog = anchor_lang::solana_program::system_program::ID;
+
+        let metas = burn_v1_metas(asset, payer, authority, sysprog);
+        assert_eq!(metas.len(), 6);
+        assert_eq!(metas[1].pubkey, MPL_CORE_PROGRAM_ID); // collection placeholder
+        assert_eq!(metas[5].pubkey, MPL_CORE_PROGRAM_ID); // log_wrapper placeholder
+        assert!(metas[0].is_writable && !metas[0].is_signer); // asset writable
+        assert!(metas[2].is_writable && metas[2].is_signer); // payer writable+signer
+        assert!(!metas[3].is_writable && metas[3].is_signer); // authority signer-only
+    }
 
     #[test]
     fn transfer_v1_data_is_two_bytes() {

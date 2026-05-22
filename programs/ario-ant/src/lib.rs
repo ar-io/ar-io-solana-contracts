@@ -1246,6 +1246,174 @@ pub mod ario_ant {
     }
 
     // =========================================
+    // RENT RECLAIM (user-callable + admin orphan cleanup)
+    // =========================================
+    //
+    // Four user-callable closes that let the current NFT holder destroy
+    // their ANT's on-chain state and recover rent. Order-independent —
+    // close any PDA in any order. The mpl-core asset itself is burned via
+    // a separate mpl-core `BurnV1` ix (not gated through ario-ant); this
+    // module only closes the per-ANT state we own.
+    //
+    // Authorization: every user-callable close re-reads the asset's MPL
+    // Core owner field on-chain and verifies the signer matches. Stale
+    // owner (e.g., after a transfer) is rejected.
+    //
+    // Plus one admin-callable cleanup for the post-purge case where the
+    // mpl-core asset has been burned (by `ario-ant-escrow::admin_purge`)
+    // and the per-ANT state remains orphaned. Authority-only, refunds to
+    // the migration_authority.
+
+    /// Close a single `AntRecord` PDA. Caller must be the current MPL
+    /// Core asset owner. Rent flows to the caller. The corresponding
+    /// `AntRecordMetadata` PDA (if any) must be closed separately via
+    /// `close_ant_record_metadata`.
+    pub fn close_ant_record(ctx: Context<CloseAntRecord>, _undername: String) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntRecordClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            undername_hash: ctx.accounts.record.undername.as_bytes().to_vec(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Close a single `AntRecordMetadata` PDA. Caller must be the current
+    /// MPL Core asset owner. Rent flows to the caller.
+    pub fn close_ant_record_metadata_for_owner(
+        ctx: Context<CloseAntRecordMetadataForOwner>,
+        _undername: String,
+    ) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntRecordMetadataClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            undername_hash: ctx.accounts.record_metadata.undername_hash.to_vec(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Close the ANT's `AntControllers` PDA. Caller must be the current
+    /// MPL Core asset owner. Rent flows to the caller.
+    pub fn close_ant_controllers(ctx: Context<CloseAntControllers>) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntControllersClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Close the ANT's `AntConfig` PDA. Caller must be the current MPL
+    /// Core asset owner. Rent flows to the caller. Does NOT require
+    /// other per-ANT PDAs to be closed first — leaves them recoverable
+    /// via separate ixs, or as orphaned-but-permissionless-closeable via
+    /// `close_orphaned_record_metadata` after the parent record's gone.
+    pub fn close_ant_config(ctx: Context<CloseAntConfig>) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntConfigClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Admin-only cleanup of per-ANT state for an asset that has been
+    /// burned by `ario_ant_escrow::admin_purge_unclaimed_ant`. Closes
+    /// `AntConfig` + `AntControllers` if present, and any AntRecord +
+    /// AntRecordMetadata PDAs passed via `remaining_accounts`. Refunds
+    /// all rent to the configured migration_authority.
+    ///
+    /// Pre-condition: the mpl-core asset for `mint` must already be
+    /// closed (System-owned, empty data). This ensures no user can
+    /// reconcile / claim the orphaned state after cleanup.
+    pub fn admin_close_orphaned_ant_state<'info>(
+        ctx: Context<'_, '_, '_, 'info, AdminCloseOrphanedAntState<'info>>,
+    ) -> Result<()> {
+        // The asset account must be in the post-burn state: System-owned
+        // and zero data. If it's still mpl-core-owned, the asset is
+        // alive — refuse, this is for orphaned-state recovery only.
+        let asset = &ctx.accounts.asset;
+        require!(
+            asset.data_is_empty() && asset.owner == &anchor_lang::system_program::ID,
+            AntError::AssetStillExists
+        );
+
+        let mut closed_records: u32 = 0;
+        let mut closed_metadata: u32 = 0;
+        let authority_info = ctx.accounts.authority.to_account_info();
+        for acct in ctx.remaining_accounts.iter() {
+            // Per-account discriminator dispatch — close whichever PDA
+            // type this happens to be. Authority-mode trusts the caller
+            // to pass legitimate per-ANT PDAs; the Anchor close pattern
+            // refunds to the authority regardless.
+            if acct.data_is_empty() {
+                continue;
+            }
+            // Clone the 8-byte discriminator out so the data borrow drops
+            // before we call `close_account_to_authority` (which mutates
+            // the account's data again).
+            let disc: [u8; 8] = {
+                let data = acct.try_borrow_data()?;
+                if data.len() < 8 {
+                    continue;
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[0..8]);
+                buf
+            };
+            if disc == AntRecord::DISCRIMINATOR {
+                close_account_to_authority(acct, &authority_info)?;
+                closed_records += 1;
+            } else if disc == AntRecordMetadata::DISCRIMINATOR {
+                close_account_to_authority(acct, &authority_info)?;
+                closed_metadata += 1;
+            }
+        }
+
+        emit!(OrphanedAntStateClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            closed_records,
+            closed_metadata,
+            closer: ctx.accounts.authority.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    // =========================================
     // ATTRIBUTES SYNC (Sprint 3 / ADR-016 reshape)
     // =========================================
 
@@ -2315,6 +2483,178 @@ pub const RECORD_METADATA_FIELD_ALL: u8 = 0;
 pub const ACL_ROLE_OWNER: u8 = 0;
 pub const ACL_ROLE_CONTROLLER: u8 = 1;
 
+// =========================================
+// RENT RECLAIM — Accounts structs
+// =========================================
+
+/// Close one `AntRecord` PDA. Caller signs as the NFT owner.
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct CloseAntRecord<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint; read in the
+    /// handler to verify caller == current owner.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_SEED, asset.key().as_ref(), &hash_undername(&undername.to_lowercase())],
+        bump = record.bump,
+        close = caller,
+    )]
+    pub record: Account<'info, AntRecord>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Close one `AntRecordMetadata` PDA for the current NFT owner.
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct CloseAntRecordMetadataForOwner<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_META_SEED, asset.key().as_ref(), &hash_undername(&undername.to_lowercase())],
+        bump = record_metadata.bump,
+        close = caller,
+    )]
+    pub record_metadata: Account<'info, AntRecordMetadata>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Close the `AntControllers` PDA. Caller signs as the NFT owner.
+#[derive(Accounts)]
+pub struct CloseAntControllers<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
+        bump = controllers.bump,
+        close = caller,
+    )]
+    pub controllers: Account<'info, AntControllers>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Close the `AntConfig` PDA. Caller signs as the NFT owner.
+#[derive(Accounts)]
+pub struct CloseAntConfig<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
+        bump = config.bump,
+        close = caller,
+    )]
+    pub config: Account<'info, AntConfig>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Admin-only post-burn cleanup of orphaned per-ANT PDAs. The asset must
+/// already be closed (System-owned, empty data) — typically because
+/// `ario_ant_escrow::admin_purge_unclaimed_ant` burned it.
+///
+/// Closes whichever of `AntConfig` + `AntControllers` are passed (mut),
+/// plus iterates `remaining_accounts` for AntRecord + AntRecordMetadata
+/// PDAs (discriminator-dispatched). All rent refunds to `authority`.
+#[derive(Accounts)]
+pub struct AdminCloseOrphanedAntState<'info> {
+    /// CHECK: Must be the post-burn state (System-owned, empty).
+    /// Validated in the handler — refuses to proceed if the asset is
+    /// still mpl-core-owned (i.e. alive). PDA derivations below use
+    /// `asset.key()` directly so the asset and the closed PDAs are
+    /// cryptographically bound (security audit fix: previously a
+    /// separate `mint_key` field allowed an attacker to pass an
+    /// unrelated empty asset + a LIVE ANT's mint pubkey as `mint_key`,
+    /// closing the live ANT's state to themselves).
+    pub asset: AccountInfo<'info>,
+
+    /// Admin authority gate. `has_one = authority` constrains the
+    /// signer to equal `AntMigrationConfig.authority` — without this,
+    /// the original ix was permissionless and would have let any
+    /// caller route per-ANT rent to themselves (security audit fix).
+    #[account(
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump = migration_config.bump,
+        has_one = authority @ AntError::Unauthorized,
+    )]
+    pub migration_config: Account<'info, AntMigrationConfig>,
+
+    /// AntConfig PDA — closed to `authority`. Seeded on the asset's
+    /// own pubkey (which survives mpl-core BurnV1 unchanged), so the
+    /// post-burn check on `asset` proves the live state below was
+    /// orphaned by THIS asset's burn — not some other live ANT.
+    #[account(
+        mut,
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
+        bump = config.bump,
+        close = authority,
+    )]
+    pub config: Account<'info, AntConfig>,
+
+    /// AntControllers PDA — closed to `authority`. Same asset-bound
+    /// PDA derivation as `config`.
+    #[account(
+        mut,
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
+        bump = controllers.bump,
+        close = authority,
+    )]
+    pub controllers: Account<'info, AntControllers>,
+
+    /// Protocol admin authority. Verified to equal
+    /// `migration_config.authority` via `has_one` above.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+/// Manual account close — used by `admin_close_orphaned_ant_state` to
+/// close arbitrary AntRecord / AntRecordMetadata PDAs passed in
+/// `remaining_accounts`. Mirrors Anchor's `close = recipient` semantics:
+/// drain lamports → recipient, zero the data, reassign to system program.
+fn close_account_to_authority<'info>(
+    account: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+) -> Result<()> {
+    let lamports = account.lamports();
+    **account.try_borrow_mut_lamports()? = 0;
+    **authority.try_borrow_mut_lamports()? = authority
+        .lamports()
+        .checked_add(lamports)
+        .ok_or(AntError::ArithmeticOverflow)?;
+    let mut data = account.try_borrow_mut_data()?;
+    for byte in data.iter_mut() {
+        *byte = 0;
+    }
+    drop(data);
+    account.assign(&anchor_lang::solana_program::system_program::ID);
+    Ok(())
+}
+
 /// Emitted when a record is created or updated via `set_record`.
 #[event]
 pub struct RecordSetEvent {
@@ -2493,5 +2833,53 @@ pub struct AclEntryRemovedEvent {
     pub address: Pubkey,
     /// 0 = Owner, 1 = Controller
     pub role: u8,
+    pub timestamp: i64,
+}
+
+// =========================================
+// RENT RECLAIM events
+// =========================================
+
+/// Emitted when an `AntRecord` PDA is closed (user-callable).
+#[event]
+pub struct AntRecordClosedEvent {
+    pub mint: Pubkey,
+    pub undername_hash: Vec<u8>,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when an `AntRecordMetadata` PDA is closed by the NFT owner.
+#[event]
+pub struct AntRecordMetadataClosedEvent {
+    pub mint: Pubkey,
+    pub undername_hash: Vec<u8>,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when the `AntControllers` PDA is closed.
+#[event]
+pub struct AntControllersClosedEvent {
+    pub mint: Pubkey,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when the `AntConfig` PDA is closed.
+#[event]
+pub struct AntConfigClosedEvent {
+    pub mint: Pubkey,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when admin-cleanup batches close orphaned per-ANT state.
+#[event]
+pub struct OrphanedAntStateClosedEvent {
+    pub mint: Pubkey,
+    pub closed_records: u32,
+    pub closed_metadata: u32,
+    pub closer: Pubkey,
     pub timestamp: i64,
 }

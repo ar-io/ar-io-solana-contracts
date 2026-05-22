@@ -938,7 +938,7 @@ For Ethereum, show the EIP-191 prefix as a separate block so users can see what'
 
 3. **Solana → Solana escrow (Ed25519 path).** Trivial to add given the multi-protocol design. Useful for sub-account flows and enterprise wallets that want to escrow ANTs internally.
 
-4. **Permissionless cleanup of abandoned escrows.** Add a no-op `prune_abandoned` instruction with a long expiry (e.g., 5 years of zero activity) that allows anyone to close the escrow and burn the rent. Solves the state-bloat concern at minor UX cost. Decide if this is worth the complexity vs accepting the ~$0.67 abandonment cost.
+4. **Permissionless cleanup of abandoned escrows.** ✅ **SHIPPED via ADR-019 (2026-05-21)** as `admin_purge_unclaimed_ant` — admin-gated rather than fully permissionless (signer must equal `ArioConfig.authority`) to keep mainnet treasury flows on a single key, but otherwise matches this design with a 5-year grace via `UNCLAIMED_PURGE_GRACE_SLOTS = 394_200_000`. Paired with `admin_close_orphaned_ant_state` in `ario-ant` for post-burn per-ANT PDA cleanup. See `RENT_RECLAIM.md` for the operator runbook.
 
 5. **Multi-recipient escrows.** `recipient: OneOf<Vec<Pubkey>>` allowing any of N keys to claim. Useful for enterprise wallets with multi-key arrangements. Adds verification complexity and account size; defer until use case is concrete.
 

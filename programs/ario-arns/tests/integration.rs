@@ -111,7 +111,7 @@ fn program_test_with_registry() -> ProgramTest {
     pt.add_program("mpl_core", MPL_CORE_PROGRAM_ID, None);
 
     // Pre-create NameRegistry
-    let registry_size = 8 + NameRegistry::SIZE;
+    let registry_size = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
     let rent = solana_sdk::rent::Rent::default();
     let mut data = vec![0u8; registry_size];
     // Write zero-copy discriminator
@@ -5700,7 +5700,7 @@ mod fund_from_stake {
         let rent = solana_sdk::rent::Rent::default();
 
         // --- NameRegistry (ario-arns, zero-copy) ---
-        let nr_size = 8 + NameRegistry::SIZE;
+        let nr_size = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
         let mut nr_data = vec![0u8; nr_size];
         let nr_disc = hash(b"account:NameRegistry");
         nr_data[..8].copy_from_slice(&nr_disc.to_bytes()[..8]);
@@ -10137,7 +10137,7 @@ async fn test_buy_name_registry_full() {
     pt.set_compute_max_units(1_000_000);
     pt.add_program("mpl_core", MPL_CORE_PROGRAM_ID, None);
 
-    let registry_size = 8 + NameRegistry::SIZE;
+    let registry_size = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
     let rent = solana_sdk::rent::Rent::default();
     let mut data = vec![0u8; registry_size];
     let disc = hash(b"account:NameRegistry");
@@ -11118,4 +11118,149 @@ async fn test_claim_reserved_name_emits_event() {
     let ev = expect_event!(&logs, ario_arns::ReservedNameClaimedEvent);
     assert_eq!(ev.claimer, ctx.payer.pubkey());
     assert_eq!(ev.name, name);
+}
+
+// =========================================================================
+// admin_expand_name_registry tests (ADR-020 dynamic-capacity)
+// =========================================================================
+
+async fn send_admin_expand(
+    ctx: &mut ProgramTestContext,
+    setup: &ArnsSetup,
+    target_capacity: u32,
+    authority: &solana_sdk::signature::Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let name_registry_key =
+        solana_sdk::pubkey::Pubkey::find_program_address(&[NAME_REGISTRY_SEED], &ario_arns::ID).0;
+    let accounts = ario_arns::accounts::AdminExpandNameRegistry {
+        config: setup.config_key,
+        name_registry: name_registry_key,
+        authority: authority.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let data = ario_arns::instruction::AdminExpandNameRegistry { target_capacity }.data();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data,
+        }],
+        Some(&authority.pubkey()),
+        &[authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_admin_expand_name_registry_grows_capacity() {
+    let mut ctx = program_test_with_registry().start_with_context().await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name_registry_key =
+        solana_sdk::pubkey::Pubkey::find_program_address(&[NAME_REGISTRY_SEED], &ario_arns::ID).0;
+    let before = ctx
+        .banks_client
+        .get_account(name_registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let initial_capacity = NameRegistry::INITIAL_CAPACITY as u32;
+
+    // Expand by one MAX_PERMITTED_DATA_INCREASE chunk. Each chunk is
+    // 10240 bytes = 256 NameEntry slots, so target +256 capacity fits
+    // in a single tx.
+    let payer_clone = ctx.payer.insecure_clone();
+    send_admin_expand(&mut ctx, &setup, initial_capacity + 256, &payer_clone)
+        .await
+        .expect("expand should succeed");
+
+    let after = ctx
+        .banks_client
+        .get_account(name_registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        after.data.len() > before.data.len(),
+        "registry should grow ({} -> {})",
+        before.data.len(),
+        after.data.len(),
+    );
+    // Specifically: data.len() should now correspond to ≥ initial+256 capacity.
+    let new_cap = slot_capacity(&after.data);
+    assert!(
+        new_cap >= (initial_capacity as usize + 256),
+        "new capacity {} should be >= {}",
+        new_cap,
+        initial_capacity + 256,
+    );
+}
+
+#[tokio::test]
+async fn test_admin_expand_name_registry_idempotent_when_target_le_current() {
+    let mut ctx = program_test_with_registry().start_with_context().await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name_registry_key =
+        solana_sdk::pubkey::Pubkey::find_program_address(&[NAME_REGISTRY_SEED], &ario_arns::ID).0;
+    let before = ctx
+        .banks_client
+        .get_account(name_registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Calling expand with target == current capacity is a no-op.
+    let current_cap = NameRegistry::INITIAL_CAPACITY as u32;
+    let payer_clone = ctx.payer.insecure_clone();
+    send_admin_expand(&mut ctx, &setup, current_cap, &payer_clone)
+        .await
+        .expect("idempotent expand should succeed");
+
+    let after = ctx
+        .banks_client
+        .get_account(name_registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.data.len(),
+        after.data.len(),
+        "no-op expand should not change account size"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_expand_name_registry_rejects_non_authority() {
+    let mut ctx = program_test_with_registry().start_with_context().await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let attacker = solana_sdk::signature::Keypair::new();
+    // Fund the attacker so the tx can be submitted (fee payer).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &attacker.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund).await.unwrap();
+
+    // Non-authority signer triggers `has_one = authority` failure
+    // (ArnsError::Unauthorized).
+    let result = send_admin_expand(
+        &mut ctx,
+        &setup,
+        (NameRegistry::INITIAL_CAPACITY + 256) as u32,
+        &attacker,
+    )
+    .await;
+    assert!(result.is_err(), "non-authority caller must be rejected");
 }

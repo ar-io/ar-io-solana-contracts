@@ -77,6 +77,15 @@ pub mod ario_ant_escrow {
         instructions::cancel::handler(ctx)
     }
 
+    /// Burn an unclaimed escrow ANT after the 5-year grace period. Admin
+    /// only (signer must = `ArioConfig.authority`). Refunds the asset's
+    /// rent + the escrow PDA's rent to the admin. Implements
+    /// `ANT_ESCROW_DESIGN.md` §11 "Permissionless cleanup of abandoned
+    /// escrows" (originally deferred for v1).
+    pub fn admin_purge_unclaimed_ant(ctx: Context<AdminPurgeUnclaimedAnt>) -> Result<()> {
+        instructions::admin_purge_unclaimed::handler(ctx)
+    }
+
     /// Re-target the escrow at a different recipient identity. Rotates the
     /// nonce so any in-flight claim sigs bound to the prior recipient are
     /// invalidated. Only callable by `escrow.depositor`.

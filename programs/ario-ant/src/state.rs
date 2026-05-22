@@ -65,19 +65,28 @@ pub const MAX_TTL_SECONDS: u32 = 86400;
 /// Maximum ANT name / display name length (matches Lua MAX_NAME_LENGTH = 61)
 pub const MAX_NAME_LENGTH: usize = 61;
 
-/// Maximum description length (reduced from Lua's 512 for rent savings; 256 is
-/// generous for a domain-name blurb).
-pub const MAX_DESCRIPTION_LENGTH: usize = 256;
+/// Maximum description length. Tightened from 256 → 128 (2026-05-21) after
+/// snapshot audit showed p99=107 chars across 1,040 source descriptions —
+/// 128 covers 99% without truncation. Save ~3.2 SOL of rent across a
+/// mainnet-scale migration. Lua's was 512; protocol has been progressively
+/// shrinking this as real usage patterns clarify.
+pub const MAX_DESCRIPTION_LENGTH: usize = 128;
 
-/// Maximum number of keywords (reduced from Lua's 16 for rent savings;
-/// 8 is sufficient for discovery/tagging use cases).
-pub const MAX_KEYWORDS: usize = 8;
+/// Maximum number of keywords. Tightened from 8 → 3 (2026-05-21) after
+/// snapshot audit showed p99=4 keywords (1% of ANTs have more). 3 covers
+/// the typical-use case while saving 180 bytes per AntConfig × 3,551 ANTs
+/// ≈ 4.5 SOL of mainnet rent. Lua's was 16.
+pub const MAX_KEYWORDS: usize = 3;
 
 /// Maximum keyword length (matches Lua MAX_KEYWORD_LENGTH = 32)
 pub const MAX_KEYWORD_LENGTH: usize = 32;
 
-/// Maximum number of controllers
-pub const MAX_CONTROLLERS: usize = 10;
+/// Maximum number of controllers. Tightened from 10 → 4 (2026-05-21) after
+/// snapshot audit showed p99=2 controllers (exactly 1 ANT in 3,551 has 7;
+/// loses 3 on migration — acceptable, manually surfaced via the
+/// migration's pre-flight check). Save 128 bytes per AntControllers ×
+/// 3,551 ≈ 3.2 SOL of mainnet rent.
+pub const MAX_CONTROLLERS: usize = 4;
 
 /// Maximum number of ACL entries per `AclPage` (ADR-012).
 ///
@@ -991,11 +1000,12 @@ mod tests {
     }
 
     #[test]
-    fn test_keywords_max_8() {
-        let kws: Vec<String> = (0..8).map(|i| format!("kw{}", i)).collect();
+    fn test_keywords_max_count() {
+        // MAX_KEYWORDS = 3 (tightened from 8 for mainnet rent shrink).
+        let kws: Vec<String> = (0..3).map(|i| format!("kw{}", i)).collect();
         assert!(validate_keywords(&kws));
 
-        let too_many: Vec<String> = (0..9).map(|i| format!("kw{}", i)).collect();
+        let too_many: Vec<String> = (0..4).map(|i| format!("kw{}", i)).collect();
         assert!(!validate_keywords(&too_many));
     }
 
@@ -1025,11 +1035,11 @@ mod tests {
 
     #[test]
     fn test_keyword_valid_special_chars() {
+        // MAX_KEYWORDS = 3 — pick three to verify special-char acceptance.
         assert!(validate_keywords(&[
             "hello-world".to_string(),
             "foo_bar".to_string(),
             "#trending".to_string(),
-            "@mention".to_string(),
         ]));
     }
 
@@ -1078,8 +1088,9 @@ mod tests {
         assert_eq!(DEFAULT_TTL_SECONDS, 900);
         assert_eq!(MAX_TTL_SECONDS, 86400);
         assert_eq!(MAX_NAME_LENGTH, 61);
-        assert_eq!(MAX_DESCRIPTION_LENGTH, 256); // reduced from Lua's 512
-        assert_eq!(MAX_KEYWORDS, 8); // reduced from Lua's 16
+        assert_eq!(MAX_DESCRIPTION_LENGTH, 128); // reduced from 256 → 128 (mainnet rent shrink, 2026-05-21)
+        assert_eq!(MAX_KEYWORDS, 3); // reduced from 8 → 3 (mainnet rent shrink, 2026-05-21)
+        assert_eq!(MAX_CONTROLLERS, 4); // reduced from 10 → 4 (mainnet rent shrink, 2026-05-21)
         assert_eq!(MAX_KEYWORD_LENGTH, 32);
         assert_eq!(ARWEAVE_TX_ID_LENGTH, 43);
     }
@@ -1093,7 +1104,7 @@ mod tests {
 
     #[test]
     fn test_controller_limit() {
-        assert_eq!(MAX_CONTROLLERS, 10);
+        assert_eq!(MAX_CONTROLLERS, 4);
     }
 
     // =========================================
@@ -1117,10 +1128,13 @@ mod tests {
         #[cfg(feature = "migration-test")]
         let expected = base + 8 + 4 + 1; // field_1: u64 + field_2: u32 + field_3: bool
         assert_eq!(AntConfig::SIZE, expected);
+        // Tightened from 760 → 452 (-308 bytes) on 2026-05-21:
+        //   description: 256→128 (-128 b)
+        //   keywords: 8×32 → 3×32 (-180 b)
         #[cfg(not(feature = "migration-test"))]
-        assert_eq!(AntConfig::SIZE, 760);
+        assert_eq!(AntConfig::SIZE, 452);
         #[cfg(feature = "migration-test")]
-        assert_eq!(AntConfig::SIZE, 773);
+        assert_eq!(AntConfig::SIZE, 465);
     }
 
     #[test]
@@ -1428,8 +1442,9 @@ mod tests {
     }
 
     #[test]
-    fn test_keywords_exactly_8() {
-        let kws: Vec<String> = (0..8).map(|i| format!("kw{}", i)).collect();
+    fn test_keywords_exactly_max() {
+        // MAX_KEYWORDS = 3
+        let kws: Vec<String> = (0..3).map(|i| format!("kw{}", i)).collect();
         assert!(validate_keywords(&kws));
     }
 
@@ -1634,11 +1649,12 @@ mod tests {
     }
 
     #[test]
-    fn test_description_max_length_256() {
-        assert_eq!(MAX_DESCRIPTION_LENGTH, 256);
-        let valid = "a".repeat(256);
+    fn test_description_max_length() {
+        // MAX_DESCRIPTION_LENGTH = 128 (tightened from 256 on 2026-05-21)
+        assert_eq!(MAX_DESCRIPTION_LENGTH, 128);
+        let valid = "a".repeat(128);
         assert!(valid.len() <= MAX_DESCRIPTION_LENGTH);
-        let too_long = "a".repeat(257);
+        let too_long = "a".repeat(129);
         assert!(too_long.len() > MAX_DESCRIPTION_LENGTH);
     }
 
@@ -1680,7 +1696,9 @@ mod tests {
             + BUMP_SIZE
             + SCHEMA_VERSION_SIZE;
         assert_eq!(AntRecordMetadata::SIZE, expected);
-        assert_eq!(AntRecordMetadata::SIZE, 744);
+        // Tightened from 744 → 436 (-308 b) on 2026-05-21 via the same
+        // description (256→128) + keywords (8×32→3×32) shrinks as AntConfig.
+        assert_eq!(AntRecordMetadata::SIZE, 436);
     }
 
     // =========================================

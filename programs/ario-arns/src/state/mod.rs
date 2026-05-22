@@ -553,38 +553,198 @@ impl ReservedName {
 // NAME REGISTRY (for epoch prescription)
 // =========================================
 
-/// Global name registry for efficient enumeration
-/// PDA: ["name_registry"]
-/// NOTE: Uses zero-copy for performance with large name counts.
-/// This enables the epoch system to prescribe names without an off-chain indexer.
+/// Global name registry for efficient enumeration.
+/// PDA: `["name_registry"]`
 ///
-/// **Capacity is build-time configurable.** Production builds use 200,000
-/// slots (~8 MB on-chain, ~57 SOL rent). Devnet/testnet smoke-test builds
-/// enable `--features devnet-shrunk` to compile with 200 slots (~8 KB,
-/// ~0.06 SOL rent). Anchor zero-copy requires the on-chain account size
-/// to match the binary's struct size exactly — deploying a mismatched
-/// pair will panic on every `AccountLoader::load()`. See the matching
-/// note on `GatewayRegistry`.
+/// **Dynamic-capacity layout (ADR-020, 2026-05-22):** The on-chain
+/// account is variable-size — the struct here is the header only (40
+/// bytes), and slots live after it as a raw byte array. Slot count is
+/// derived from `data.len()` at read time, so reallocs (expand/shrink)
+/// don't need to update any header field. This pattern is used by
+/// OpenBook v2, MarginFi, Phoenix, and mpl-core itself.
+///
+/// Layout in bytes:
+/// ```text
+/// [0..8]    Anchor discriminator
+/// [8..48]   header (this struct: authority, count, _padding)
+/// [48..]    NameEntry slots (40 bytes each, count derived from data.len())
+/// ```
+///
+/// Slot access goes through the `name_slots` / `name_slots_mut` helpers
+/// below — every reading ix uses `AccountInfo` and these helpers
+/// instead of `AccountLoader<NameRegistry>`, because the header size
+/// is fixed but the slot array isn't.
+///
+/// **Initial deploy capacity:** `INITIAL_CAPACITY` slots (50,000 on
+/// mainnet, 200 on `devnet-shrunk`). Expandable via
+/// `admin_expand_name_registry` up to any reasonable target.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct NameRegistry {
     pub authority: Pubkey,
     pub count: u32,
     pub _padding: [u8; 4],
-    /// Array of name hashes (SHA256) for registered active names
-    /// Names are added when purchased and removed when expired/released
-    #[cfg(not(feature = "devnet-shrunk"))]
-    pub names: [NameEntry; 200_000],
-    #[cfg(feature = "devnet-shrunk")]
-    pub names: [NameEntry; 200],
 }
 
 impl NameRegistry {
-    pub const SIZE: usize = 32 + 4 + 4 + (NameEntry::SIZE * Self::MAX_NAMES);
+    /// On-chain struct size (header only). Excludes the 8-byte Anchor
+    /// discriminator. Used by Anchor's `init` constraint and by
+    /// `AccountLoader` size check.
+    pub const SIZE: usize = 32 + 4 + 4;
+    /// Byte offset where the first NameEntry slot begins (includes the
+    /// 8-byte discriminator).
+    pub const HEADER_BYTES: usize = 8 + Self::SIZE;
+    /// Initial slot count provisioned at deploy time. Expandable via
+    /// `admin_expand_name_registry`.
     #[cfg(not(feature = "devnet-shrunk"))]
-    pub const MAX_NAMES: usize = 200_000;
+    pub const INITIAL_CAPACITY: usize = 50_000;
     #[cfg(feature = "devnet-shrunk")]
-    pub const MAX_NAMES: usize = 200;
+    pub const INITIAL_CAPACITY: usize = 200;
+
+    /// Backward-compatible alias — many callers still reference
+    /// `NameRegistry::MAX_NAMES` to bound iteration. Semantically the
+    /// same as INITIAL_CAPACITY for fresh deployments, but on a
+    /// post-expand registry the actual capacity (derived from
+    /// `data.len()` via `slot_capacity`) may be higher.
+    pub const MAX_NAMES: usize = Self::INITIAL_CAPACITY;
+
+    /// Total account bytes for a registry at the given slot capacity.
+    /// Includes the 8-byte discriminator.
+    pub const fn bytes_for_capacity(slots: usize) -> usize {
+        Self::HEADER_BYTES + slots * NameEntry::SIZE
+    }
+}
+
+/// Compute the current slot capacity from raw account data length.
+/// Round-trips through `(data.len() - HEADER_BYTES) / NameEntry::SIZE`.
+/// The trailing bytes beyond `capacity * 40` (if data.len() isn't a
+/// perfect multiple) are ignored.
+pub fn slot_capacity(data: &[u8]) -> usize {
+    data.len().saturating_sub(NameRegistry::HEADER_BYTES) / NameEntry::SIZE
+}
+
+/// Read-only slice view of every NameEntry slot. Returns an empty
+/// slice if the account is too small to contain the header. Bounds
+/// check defends against truncated registries (audit finding #4).
+pub fn name_slots(data: &[u8]) -> &[NameEntry] {
+    if data.len() < NameRegistry::HEADER_BYTES {
+        return &[];
+    }
+    let cap = slot_capacity(data);
+    let end = NameRegistry::HEADER_BYTES + cap * NameEntry::SIZE;
+    bytemuck::cast_slice(&data[NameRegistry::HEADER_BYTES..end])
+}
+
+/// Mutable slice view of every NameEntry slot. Same shape as
+/// `name_slots` but allows in-place edits + swap_remove during
+/// `buy_record` / `release` flows. Empty slice on truncated input.
+pub fn name_slots_mut(data: &mut [u8]) -> &mut [NameEntry] {
+    if data.len() < NameRegistry::HEADER_BYTES {
+        return &mut [];
+    }
+    let cap = slot_capacity(data);
+    let end = NameRegistry::HEADER_BYTES + cap * NameEntry::SIZE;
+    bytemuck::cast_slice_mut(&mut data[NameRegistry::HEADER_BYTES..end])
+}
+
+/// Read the registry header (authority + count + padding) from raw
+/// account data. Skips the 8-byte Anchor discriminator. Callers must
+/// ensure `data.len() >= HEADER_BYTES` — the wrapping ixs already
+/// enforce this via PDA-seed-constrained account access, but in-program
+/// callers should prefer the fallible `try_name_registry_header` below
+/// if working with raw bytes from an unknown source.
+pub fn name_registry_header(data: &[u8]) -> &NameRegistry {
+    bytemuck::from_bytes(&data[8..NameRegistry::HEADER_BYTES])
+}
+
+/// Mutable header reader. Used by `buy_record` / `release` to bump
+/// `count`.
+pub fn name_registry_header_mut(data: &mut [u8]) -> &mut NameRegistry {
+    bytemuck::from_bytes_mut(&mut data[8..NameRegistry::HEADER_BYTES])
+}
+
+/// Fallible variants — return an `InvalidAccountData` error instead
+/// of panicking on truncated input. Use these in handlers that receive
+/// account data through `remaining_accounts` or other paths where the
+/// PDA-seed validation can't statically guarantee the size.
+pub fn try_name_registry_header(data: &[u8]) -> Result<&NameRegistry> {
+    require!(
+        data.len() >= NameRegistry::HEADER_BYTES,
+        crate::error::ArnsError::InvalidAccountData
+    );
+    Ok(name_registry_header(data))
+}
+
+pub fn try_name_registry_header_mut(data: &mut [u8]) -> Result<&mut NameRegistry> {
+    require!(
+        data.len() >= NameRegistry::HEADER_BYTES,
+        crate::error::ArnsError::InvalidAccountData
+    );
+    Ok(name_registry_header_mut(data))
+}
+
+/// Append a new NameEntry to the registry. Returns the index it was
+/// written at. Errors with `RegistryFull` if `count >= capacity` (no
+/// expansion auto-triggered; caller must call `admin_expand_name_registry`
+/// in a separate tx).
+///
+/// Encapsulates the borrow-checker dance: header and slot bytes are
+/// non-overlapping regions, but `bytemuck::from_bytes_mut` returns a
+/// reference that conflicts with `cast_slice_mut`. We work around it
+/// by scoping each borrow narrowly.
+pub fn append_name_entry(data: &mut [u8], entry: NameEntry) -> Result<u32> {
+    let capacity = slot_capacity(data);
+    let count_before = name_registry_header(data).count as usize;
+    require!(
+        count_before < capacity,
+        crate::error::ArnsError::RegistryFull
+    );
+    let new_count = (count_before as u32)
+        .checked_add(1)
+        .ok_or(crate::error::ArnsError::ArithmeticOverflow)?;
+    name_registry_header_mut(data).count = new_count;
+    name_slots_mut(data)[count_before] = entry;
+    Ok(count_before as u32)
+}
+
+/// Remove the NameEntry with the given `name_hash` via swap-remove
+/// (move last slot into the freed position, zero out the now-unused
+/// last slot, decrement count). No-op if the hash is not found. The
+/// moved slot's `registry_index` self-pointer is updated to its new
+/// position.
+///
+/// Used by `release_name_to_returned` / lease-expiry cleanup paths.
+pub fn remove_name_entry_by_hash(data: &mut [u8], name_hash: [u8; 32]) -> bool {
+    // Defensive cap: if a post-shrink registry ever had `count` exceed
+    // the new capacity (shouldn't happen — admin_shrink rejects that
+    // — but cheap to defend), don't iterate past the slot region.
+    let count = (name_registry_header(data).count as usize).min(slot_capacity(data));
+    if count == 0 {
+        return false;
+    }
+
+    let mut found_idx: Option<usize> = None;
+    for j in 0..count {
+        if name_slots(data)[j].name_hash == name_hash {
+            found_idx = Some(j);
+            break;
+        }
+    }
+    let idx = match found_idx {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let last = count - 1;
+    if idx != last {
+        let last_entry = name_slots(data)[last];
+        let slots = name_slots_mut(data);
+        slots[idx] = last_entry;
+        slots[idx].registry_index = idx as u32;
+    }
+    name_slots_mut(data)[last] = NameEntry::default();
+    name_registry_header_mut(data).count = (count - 1) as u32;
+    true
 }
 
 /// Entry in the name registry for enumeration
