@@ -11,6 +11,17 @@ use crate::state::{
 pub fn migrate_config_version(config: &mut ArioConfig) -> Result<()> {
     while config.version < ARIO_CONFIG_VERSION {
         match config.version {
+            // Bootstrap arm: accounts created before PR #51/#53 introduced
+            // versioning have version={0,0,0} after the realloc-zero. Stamp
+            // them at the post-#53 baseline (1.0.0) — no data transformation,
+            // just the version field becomes correct.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                config.version = SchemaVersion::new(1, 0, 0);
+            }
             #[cfg(feature = "migration-test")]
             SchemaVersion {
                 major: 1,
@@ -52,6 +63,14 @@ pub fn migrate_config_version(config: &mut ArioConfig) -> Result<()> {
 pub fn migrate_balance_version(balance: &mut Balance) -> Result<()> {
     while balance.version < BALANCE_VERSION {
         match balance.version {
+            // Bootstrap arm — see `migrate_config_version` for rationale.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                balance.version = SchemaVersion::new(1, 0, 0);
+            }
             _ => return err!(ArioError::UnknownSchemaVersion),
         }
     }
@@ -66,6 +85,14 @@ pub fn migrate_balance_version(balance: &mut Balance) -> Result<()> {
 pub fn migrate_vault_counter_version(counter: &mut VaultCounter) -> Result<()> {
     while counter.version < VAULT_COUNTER_VERSION {
         match counter.version {
+            // Bootstrap arm — see `migrate_config_version` for rationale.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                counter.version = SchemaVersion::new(1, 0, 0);
+            }
             _ => return err!(ArioError::UnknownSchemaVersion),
         }
     }
@@ -80,6 +107,14 @@ pub fn migrate_vault_counter_version(counter: &mut VaultCounter) -> Result<()> {
 pub fn migrate_vault_version(vault: &mut Vault) -> Result<()> {
     while vault.version < VAULT_VERSION {
         match vault.version {
+            // Bootstrap arm — see `migrate_config_version` for rationale.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                vault.version = SchemaVersion::new(1, 0, 0);
+            }
             _ => return err!(ArioError::UnknownSchemaVersion),
         }
     }
@@ -94,6 +129,14 @@ pub fn migrate_vault_version(vault: &mut Vault) -> Result<()> {
 pub fn migrate_primary_name_request_version(request: &mut PrimaryNameRequest) -> Result<()> {
     while request.version < PRIMARY_NAME_REQUEST_VERSION {
         match request.version {
+            // Bootstrap arm — see `migrate_config_version` for rationale.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                request.version = SchemaVersion::new(1, 0, 0);
+            }
             _ => return err!(ArioError::UnknownSchemaVersion),
         }
     }
@@ -108,6 +151,14 @@ pub fn migrate_primary_name_request_version(request: &mut PrimaryNameRequest) ->
 pub fn migrate_primary_name_version(name: &mut PrimaryName) -> Result<()> {
     while name.version < PRIMARY_NAME_VERSION {
         match name.version {
+            // Bootstrap arm — see `migrate_config_version` for rationale.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                name.version = SchemaVersion::new(1, 0, 0);
+            }
             _ => return err!(ArioError::UnknownSchemaVersion),
         }
     }
@@ -122,6 +173,14 @@ pub fn migrate_primary_name_version(name: &mut PrimaryName) -> Result<()> {
 pub fn migrate_primary_name_reverse_version(reverse: &mut PrimaryNameReverse) -> Result<()> {
     while reverse.version < PRIMARY_NAME_REVERSE_VERSION {
         match reverse.version {
+            // Bootstrap arm — see `migrate_config_version` for rationale.
+            SchemaVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            } => {
+                reverse.version = SchemaVersion::new(1, 0, 0);
+            }
             _ => return err!(ArioError::UnknownSchemaVersion),
         }
     }
