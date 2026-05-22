@@ -887,7 +887,7 @@ pub struct MigrateEpochSettings<'info> {
         mut,
         seeds = [state::EPOCH_SETTINGS_SEED],
         bump = epoch_settings.bump,
-        realloc = 8 + state::EpochSettings::SIZE,
+        realloc = state::EpochSettings::SIZE,
         realloc::payer = payer,
         realloc::zero = false,
     )]
@@ -908,7 +908,7 @@ pub struct MigrateObservation<'info> {
         mut,
         seeds = [state::OBSERVATION_SEED, &epoch_index.to_le_bytes(), observer.key().as_ref()],
         bump = observation.bump,
-        realloc = 8 + state::Observation::SIZE,
+        realloc = state::Observation::SIZE,
         realloc::payer = payer,
         realloc::zero = false,
     )]

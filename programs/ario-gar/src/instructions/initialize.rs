@@ -334,7 +334,7 @@ pub struct InitializeEpochs<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + EpochSettings::SIZE,
+        space = EpochSettings::SIZE,
         seeds = [EPOCH_SETTINGS_SEED],
         bump,
     )]

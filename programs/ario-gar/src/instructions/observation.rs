@@ -120,7 +120,7 @@ pub struct SaveObservations<'info> {
     #[account(
         init,
         payer = observer,
-        space = 8 + Observation::SIZE,
+        space = Observation::SIZE,
         seeds = [OBSERVATION_SEED, &epoch_index.to_le_bytes(), observer.key().as_ref()],
         bump,
     )]
