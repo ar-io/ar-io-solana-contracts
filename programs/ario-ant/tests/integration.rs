@@ -5909,3 +5909,458 @@ async fn test_close_orphaned_record_metadata_rejects_when_record_alive() {
         send_close_orphaned_record_metadata(&mut ctx, &asset.pubkey(), &stranger, "blog").await;
     assert_anchor_error!(result, AntError::RecordStillExists);
 }
+
+// =========================================================================
+// RENT RECLAIM — user-callable close ixs + admin orphan cleanup
+// =========================================================================
+// Coverage:
+//   - close_ant_record (happy + non-owner rejected)
+//   - close_ant_record_metadata_for_owner (non-owner rejected)
+//   - close_ant_controllers (happy + non-owner rejected)
+//   - close_ant_config (happy + non-owner rejected)
+//   - admin_close_orphaned_ant_state (asset-still-alive rejected)
+//   - End-to-end: owner closes records → controllers → config
+
+/// Fund a fresh keypair as a system-owned account so it can pay tx fees.
+/// Matches the pattern used by `test_initialize_ant`.
+fn fund_user(pt: &mut ProgramTest, who: &Pubkey) {
+    pt.add_account(
+        *who,
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+}
+
+async fn send_close_ant_record(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+    undername: &str,
+) -> std::result::Result<(), BanksClientError> {
+    let (record_key, _) = record_pda(asset, undername);
+    let accounts = ario_ant::accounts::CloseAntRecord {
+        asset: *asset,
+        record: record_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntRecord {
+            _undername: undername.to_string(),
+        }
+        .data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_close_ant_record_metadata_for_owner(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+    undername: &str,
+) -> std::result::Result<(), BanksClientError> {
+    let (meta_key, _) = record_metadata_pda(asset, undername);
+    let accounts = ario_ant::accounts::CloseAntRecordMetadataForOwner {
+        asset: *asset,
+        record_metadata: meta_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntRecordMetadataForOwner {
+            _undername: undername.to_string(),
+        }
+        .data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_close_ant_controllers(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (controllers_key, _) = controllers_pda(asset);
+    let accounts = ario_ant::accounts::CloseAntControllers {
+        asset: *asset,
+        controllers: controllers_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntControllers {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_close_ant_config(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (config_key, _) = config_pda(asset);
+    let accounts = ario_ant::accounts::CloseAntConfig {
+        asset: *asset,
+        config: config_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntConfig {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_close_ant_record_succeeds_for_owner() {
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    // Add a non-@ record so closing it doesn't fight @-record protection
+    let params = SetRecordParams {
+        undername: "blog".to_string(),
+        target: test_arweave_id(),
+        target_protocol: 0,
+        ttl_seconds: 900,
+        priority: None,
+        record_owner: None,
+    };
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
+
+    let (record_key, _) = record_pda(&asset.pubkey(), "blog");
+    let rent_before = ctx
+        .banks_client
+        .get_account(record_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    let owner_lamports_before = ctx
+        .banks_client
+        .get_account(owner.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    send_close_ant_record(&mut ctx, &asset.pubkey(), &owner, "blog")
+        .await
+        .unwrap();
+
+    // PDA is closed (data empty + System-owned)
+    let acct = ctx.banks_client.get_account(record_key).await.unwrap();
+    assert!(acct.is_none() || acct.unwrap().data.is_empty());
+
+    // Refund went to owner (modulo tx fees the owner also paid as payer)
+    let owner_lamports_after = ctx
+        .banks_client
+        .get_account(owner.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert!(
+        owner_lamports_after > owner_lamports_before - rent_before / 2,
+        "owner should net-positive after closing record (refund={}, before={}, after={})",
+        rent_before,
+        owner_lamports_before,
+        owner_lamports_after,
+    );
+}
+
+#[tokio::test]
+async fn test_close_ant_record_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    let params = SetRecordParams {
+        undername: "blog".to_string(),
+        target: test_arweave_id(),
+        target_protocol: 0,
+        ttl_seconds: 900,
+        priority: None,
+        record_owner: None,
+    };
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
+
+    let result = send_close_ant_record(&mut ctx, &asset.pubkey(), &stranger, "blog").await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_ant_controllers_succeeds_for_owner() {
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let exists_before = ctx
+        .banks_client
+        .get_account(controllers_key)
+        .await
+        .unwrap()
+        .is_some();
+    assert!(exists_before);
+
+    send_close_ant_controllers(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    let after = ctx.banks_client.get_account(controllers_key).await.unwrap();
+    assert!(after.is_none() || after.unwrap().data.is_empty());
+}
+
+#[tokio::test]
+async fn test_close_ant_controllers_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let result = send_close_ant_controllers(&mut ctx, &asset.pubkey(), &stranger).await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_ant_config_succeeds_for_owner() {
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    assert!(ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .is_some());
+
+    send_close_ant_config(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    let after = ctx.banks_client.get_account(config_key).await.unwrap();
+    assert!(after.is_none() || after.unwrap().data.is_empty());
+}
+
+#[tokio::test]
+async fn test_close_ant_config_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let result = send_close_ant_config(&mut ctx, &asset.pubkey(), &stranger).await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_ant_record_metadata_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    // Add a record + metadata so there's something to attempt to close
+    let params = SetRecordParams {
+        undername: "blog".to_string(),
+        target: test_arweave_id(),
+        target_protocol: 0,
+        ttl_seconds: 900,
+        priority: None,
+        record_owner: None,
+    };
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
+    let meta_params = SetRecordMetadataParams {
+        undername: "blog".to_string(),
+        display_name: Some("Blog".to_string()),
+        record_logo: None,
+        record_description: None,
+        record_keywords: None,
+    };
+    send_set_record_metadata(&mut ctx, &asset.pubkey(), &owner, meta_params)
+        .await
+        .unwrap();
+
+    let result =
+        send_close_ant_record_metadata_for_owner(&mut ctx, &asset.pubkey(), &stranger, "blog")
+            .await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_all_then_records_order_independent() {
+    // End-to-end: owner closes records → controllers → config, in that
+    // order. Verifies each ix independently doesn't block the next.
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    // 2 records
+    for undername in &["blog", "docs"] {
+        let params = SetRecordParams {
+            undername: undername.to_string(),
+            target: test_arweave_id(),
+            target_protocol: 0,
+            ttl_seconds: 900,
+            priority: None,
+            record_owner: None,
+        };
+        send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+            .await
+            .unwrap();
+    }
+
+    // Close records first
+    for undername in &["blog", "docs"] {
+        send_close_ant_record(&mut ctx, &asset.pubkey(), &owner, undername)
+            .await
+            .unwrap();
+    }
+
+    // Then controllers (no record dependency)
+    send_close_ant_controllers(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    // Then config (no controllers dependency)
+    send_close_ant_config(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    // All four PDAs closed
+    for key in &[
+        config_pda(&asset.pubkey()).0,
+        controllers_pda(&asset.pubkey()).0,
+        record_pda(&asset.pubkey(), "blog").0,
+        record_pda(&asset.pubkey(), "docs").0,
+    ] {
+        let acct = ctx.banks_client.get_account(*key).await.unwrap();
+        assert!(acct.is_none() || acct.unwrap().data.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_admin_close_orphaned_rejects_when_asset_alive() {
+    // The asset has NOT been burned — admin_close_orphaned must refuse.
+    let owner = Keypair::new();
+    let authority = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        mint_key: asset.pubkey(),
+        config: config_key,
+        controllers: controllers_key,
+        authority: authority.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&authority.pubkey()),
+        &[&authority],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, AntError::AssetStillExists);
+}

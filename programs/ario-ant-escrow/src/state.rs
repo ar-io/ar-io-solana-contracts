@@ -24,6 +24,13 @@ pub const RECIPIENT_PUBKEY_MAX_LEN: usize = ARWEAVE_PUBKEY_LEN;
 /// escrow account per ANT.
 pub const ESCROW_ANT_SEED: &[u8] = b"escrow_ant";
 
+/// Grace period in slots before `admin_purge_unclaimed_ant` will accept a
+/// purge call on an escrow. ~5 years at Solana's ~2.5 slots/s
+/// (`5 * 365 * 86_400 * 2.5`). Slot-based because `EscrowAnt.deposit_slot`
+/// is the only on-chain time anchor on the escrow record. At a 5-year
+/// horizon the slot-vs-wallclock drift is irrelevant for abandonment.
+pub const UNCLAIMED_PURGE_GRACE_SLOTS: u64 = 394_200_000;
+
 /// Metaplex Core program ID. Mirrored from `ario-ant` so this crate stays
 /// self-contained (no `cpi`-feature dependency on `ario-ant`).
 pub const MPL_CORE_PROGRAM_ID: Pubkey =

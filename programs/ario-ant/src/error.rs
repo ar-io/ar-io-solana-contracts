@@ -173,4 +173,14 @@ pub enum AntError {
     /// does not point at the asset being synced.
     #[msg("Invalid ArnsRecord for sync_attributes")]
     InvalidArnsRecord,
+
+    /// `admin_close_orphaned_ant_state`: the asset must be in post-burn
+    /// state (System-owned, empty data) before per-ANT orphans can be
+    /// cleaned up.
+    #[msg("Asset still exists — cannot clean up orphaned state for a live asset")]
+    AssetStillExists,
+
+    /// Arithmetic overflow during manual account-close lamport math.
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
 }

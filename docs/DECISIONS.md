@@ -1350,6 +1350,104 @@ Adopt a **two-phase ABI policy** for Anchor `#[event]` structs:
 
 ---
 
+## ADR-019: Rent Reclamation via User-Callable Closes + Admin Escrow Purge
+
+**Date:** 2026-05-21
+**Status:** Accepted
+**Deciders:** vilenarios + Claude
+
+### Context
+
+Mainnet ARIO migration deposits ~170 SOL ($14.5K at $85/SOL) of permanent
+on-chain rent across 3,551 ANT mints, 14,679 records, 666 gateways, 737
+balances, etc. After A+B+C optimizations the floor is ~$13.5K. The
+remaining concern: 78% of ANTs (~2,762) will sit in `ario-ant-escrow`
+indefinitely if their AO-side owners never opt into Solana. Their rent
+is locked forever absent a recovery mechanism.
+
+Separately, individual users who own (post-claim) ANTs and want to
+delete them have no on-chain path to recover their own rent —
+`AntConfig`, `AntControllers`, `AntRecord`, and `AntRecordMetadata`
+PDAs have no close ixs (only the niche `close_orphaned_record_metadata`
+exists). The protocol traps user rent permanently for a missing
+lifecycle ix.
+
+### Decision
+
+Ship two distinct capabilities in v1 mainnet:
+
+**1. User-callable closes (ario-ant):** 4 new ixs let the current MPL
+Core asset owner destroy their own per-ANT state and recover rent:
+`close_ant_record`, `close_ant_record_metadata_for_owner`,
+`close_ant_controllers`, `close_ant_config`. Each re-reads the asset's
+MPL Core owner field on-chain via `read_mpl_core_owner` and rejects
+non-owners (`AntError::NotNftHolder`). Order-independent — close any
+PDA in any sequence. The MPL Core asset itself is burned separately
+via mpl-core's standard `BurnV1` (no wrapper needed). Refund recipient:
+`caller` via Anchor's `close = caller` constraint.
+
+**2. Admin escrow purge (ario-ant-escrow):** `admin_purge_unclaimed_ant`
+burns an abandoned escrow ANT and reclaims the escrow PDA's rent to
+the protocol authority. Auth gate: signer must equal
+`ArioConfig.authority` (cross-program read via existing `cpi` feature
+dep on ario-core). Time gate:
+`Clock::slot - escrow.deposit_slot >= UNCLAIMED_PURGE_GRACE_SLOTS`
+(394_200_000 slots ≈ 5 years at Solana's ~2.5 slots/s). Implements
+`ANT_ESCROW_DESIGN.md` §11 "Permissionless cleanup of abandoned
+escrows" — originally deferred for v1, now shipped.
+
+**3. Admin orphan cleanup (ario-ant):** `admin_close_orphaned_ant_state`
+sweeps per-ANT PDAs that survive a `BurnV1` purge. Closes `AntConfig`
++ `AntControllers` directly, walks `remaining_accounts` for any
+`AntRecord` / `AntRecordMetadata` PDAs. Refunds rent to authority.
+Preconditioned on the asset being in post-burn state (System-owned,
+empty data) — refuses on live assets to prevent admin closure of
+user-reconcilable state (`AntError::AssetStillExists`).
+
+### Slot-based grace period (not unix timestamp)
+
+`EscrowAnt.deposit_slot: u64` already exists on the schema (used as a
+nonce-derivation salt). Repurposed for the grace check. Slot vs.
+wall-clock drift at the ~5-year horizon is small enough to be
+irrelevant for abandonment semantics.
+
+### Why not configurable
+
+Hardcoded `UNCLAIMED_PURGE_GRACE_SLOTS`. A configurable knob would add
+admin attack surface (admin could lower it post-deploy to purge sooner)
+for negligible flexibility. If wall-clock-anchored grace becomes
+desirable, ship via v2 contract upgrade.
+
+### Mpl-core BurnV1 limitation
+
+mpl-core's `BurnV1` marks the asset's discriminator as `Uninitialized`
+(byte 0 = 0) but does NOT close the account or refund its rent. So
+`admin_purge_unclaimed_ant` recovers the EscrowAnt PDA's rent
+(~few k lamports) but the asset's own ~$0.21 of rent stays stranded
+in an inert tombstone. This is mpl-core's design; a future
+`close_burned_asset` could be added if mpl-core ever exposes a way
+to reclaim that.
+
+### Consequences
+
+- ~$4,300 of escrow rent eventually recoverable to protocol treasury
+  across the 2,762 unattested ANTs once grace elapses (5+ years).
+- Individual users can self-burn their ANTs and recover own rent.
+- Protocol surface grows by 6 ixs (4 user + 2 admin). Audit delta is
+  contained: standard `close = recipient` patterns plus one
+  cross-program `ArioConfig.authority` check.
+- The mpl-core stranded-rent limitation means we recover protocol
+  PDA rent but not the underlying NFT rent. Acceptable trade-off
+  for v1; revisit if mpl-core ever adds a close primitive.
+
+### References
+
+- Branch: `feat/rent-reclaim-mainnet` in `ar-io-solana-contracts`
+- Plan doc: `solana-ar-io/docs/RENT_RECLAIM_PLAN.md`
+- Original deferred design: `docs/ANT_ESCROW_DESIGN.md:941`
+
+---
+
 ## ADR-XXX: [Title]
 
 **Date:** YYYY-MM-DD
