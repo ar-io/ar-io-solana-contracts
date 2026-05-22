@@ -244,11 +244,11 @@ jobs:
         run: |
           set -euo pipefail
           # `DIST_TAG` is set by the previous step from validated cluster
-          # input, so it's already one of `latest` | `devnet`. Validate
-          # again as belt-and-braces — `npm publish --tag <x>` happily
-          # accepts arbitrary strings, so even a future-step mistake
-          # shouldn't let a devnet build poison the mainnet tag.
-          if [[ "$DIST_TAG" != "latest" && "$DIST_TAG" != "devnet" ]]; then
+          # input, so it's already one of `latest` | `staging` | `devnet`.
+          # Validate again as belt-and-braces — `npm publish --tag <x>`
+          # happily accepts arbitrary strings, so even a future-step
+          # mistake shouldn't let a devnet build poison the mainnet tag.
+          if [[ "$DIST_TAG" != "latest" && "$DIST_TAG" != "staging" && "$DIST_TAG" != "devnet" ]]; then
             echo "::error::Invalid dist-tag: '$DIST_TAG'"
             exit 1
           fi
