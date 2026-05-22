@@ -41,7 +41,7 @@ pub enum AntError {
     #[msg("Controller not found")]
     ControllerNotFound,
 
-    #[msg("Maximum controllers reached (10)")]
+    #[msg("Maximum controllers reached (4)")]
     MaxControllersReached,
 
     #[msg("Name too long (max 61 characters)")]
@@ -50,10 +50,10 @@ pub enum AntError {
     #[msg("Name cannot be empty")]
     NameEmpty,
 
-    #[msg("Description too long (max 256 characters)")]
+    #[msg("Description too long (max 128 characters)")]
     DescriptionTooLong,
 
-    #[msg("Too many keywords (max 8)")]
+    #[msg("Too many keywords (max 3)")]
     TooManyKeywords,
 
     #[msg("Keyword too long (max 32 characters)")]

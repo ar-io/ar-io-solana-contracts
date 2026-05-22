@@ -173,11 +173,7 @@ pub fn admin_shrink_name_registry(
 
     {
         let data = name_registry.try_borrow_data()?;
-        let count = u32::from_le_bytes(
-            data[40..44]
-                .try_into()
-                .map_err(|_| ArnsError::InvalidAccountData)?,
-        );
+        let count = try_name_registry_header(&data)?.count;
         require!(count <= target_capacity, ArnsError::ShrinkWouldLoseData);
     }
 
