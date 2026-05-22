@@ -1448,6 +1448,80 @@ to reclaim that.
 
 ---
 
+## ADR-020: Dynamic-Capacity NameRegistry (Header + Byte-Offset Slots, Live Expansion)
+
+**Date:** 2026-05-22
+**Status:** Accepted
+**Deciders:** vilenarios + Claude
+
+### Context
+
+Pre-ADR `NameRegistry` was a fixed-200K bytemuck array (`[NameEntry;
+200_000]`) compiled into the binary. On-chain account had to be
+exactly 8MB to satisfy `AccountLoader::load()`. Every mainnet deploy
+paid ~55.7 SOL (~$4,734) for an account initially holding ~3,500
+names (1.75% utilization) — over-provisioning against a hard ceiling.
+
+### Decision
+
+Refactor to a **header + byte-offset slot** layout. 40-byte header
+(`authority`, `count`, `_padding`) + variable-length `NameEntry` byte
+array, slot count derived from `data.len()`. Initial deploy provisions
+50K slots (~2 MB, ~13.9 SOL); live growth via
+`admin_expand_name_registry` (reallocs in ≤10KB chunks).
+
+Standard Solana pattern (OpenBook v2, MarginFi, Phoenix, mpl-core).
+
+### Wire-compatibility
+
+Header layout byte-identical to pre-ADR (authority [0..32], count
+[32..36], padding [36..40]). **Existing live 8MB registries work
+with new code, no migration ix.** Cross-program readers
+(`ario-gar::read_name_registry_header`) unchanged.
+
+### Slot capacity from `data.len()` (no header field)
+
+Considered adding `capacity: u32` to header. Rejected:
+- `data.len()` already source of truth (realloc atomic)
+- Old layout's `_padding: [u8; 4]` is zero bytes — would deserialize
+  as `capacity = 0` and break everything
+- Simpler eliminates a drift bug
+
+### Reading-ix refactor
+
+14 sites switched `AccountLoader<NameRegistry>` → `AccountInfo` +
+helpers (`name_slots`, `append_name_entry`, etc.) in `purchase.rs`,
+`purchase_from_stake.rs`, `manage.rs`, `prune.rs`, `migration.rs`.
+
+### Admin-gated, not permissionless
+
+Auth via `ArnsConfig.has_one = authority`. Permissionless variant
+considered but deferred — expansion rent isn't trivial (~$3.5K from
+50K → 200K) and treasury control is the right v1 shape.
+
+### Hardcoded initial capacity vs configurable
+
+`INITIAL_CAPACITY = 50_000` is compile-time (200 under `devnet-shrunk`).
+Configurable rejected — initial sizing is a protocol-wide policy, not
+a per-deploy knob. Bumping requires contract upgrade.
+
+### Consequences
+
+- Day-1 mainnet save: **~$3,553** (41.8 SOL × $85/SOL)
+- New ix: `admin_expand_name_registry`; `admin_shrink_name_registry`
+  signature changed (now takes `target_capacity: u32`)
+- Audit focus: byte-offset bounds, append/swap_remove helpers,
+  multi-step expand atomicity, rent-diff math
+- Validated by 109 → 112 integration tests (+3 for admin_expand)
+
+### References
+
+- Branch: `feat/dynamic-name-registry` (PR #57, merged 2026-05-22)
+- Plan doc: `solana-ar-io/docs/DYNAMIC_NAME_REGISTRY_PLAN.md`
+- Helpers: `programs/ario-arns/src/state/mod.rs`
+
+---
+
 ## ADR-XXX: [Title]
 
 **Date:** YYYY-MM-DD
