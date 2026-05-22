@@ -514,10 +514,13 @@ pub fn slot_capacity(data: &[u8]) -> usize {
     data.len().saturating_sub(NameRegistry::HEADER_BYTES) / NameEntry::SIZE
 }
 
-/// Read-only slice view of every NameEntry slot. The slice length
-/// equals `slot_capacity(data)`. Slots may be zero (representing an
-/// empty/freed slot — see `NameEntry` semantics).
+/// Read-only slice view of every NameEntry slot. Returns an empty
+/// slice if the account is too small to contain the header. Bounds
+/// check defends against truncated registries (audit finding #4).
 pub fn name_slots(data: &[u8]) -> &[NameEntry] {
+    if data.len() < NameRegistry::HEADER_BYTES {
+        return &[];
+    }
     let cap = slot_capacity(data);
     let end = NameRegistry::HEADER_BYTES + cap * NameEntry::SIZE;
     bytemuck::cast_slice(&data[NameRegistry::HEADER_BYTES..end])
@@ -525,15 +528,22 @@ pub fn name_slots(data: &[u8]) -> &[NameEntry] {
 
 /// Mutable slice view of every NameEntry slot. Same shape as
 /// `name_slots` but allows in-place edits + swap_remove during
-/// `buy_record` / `release` flows.
+/// `buy_record` / `release` flows. Empty slice on truncated input.
 pub fn name_slots_mut(data: &mut [u8]) -> &mut [NameEntry] {
+    if data.len() < NameRegistry::HEADER_BYTES {
+        return &mut [];
+    }
     let cap = slot_capacity(data);
     let end = NameRegistry::HEADER_BYTES + cap * NameEntry::SIZE;
     bytemuck::cast_slice_mut(&mut data[NameRegistry::HEADER_BYTES..end])
 }
 
 /// Read the registry header (authority + count + padding) from raw
-/// account data. Skips the 8-byte Anchor discriminator.
+/// account data. Skips the 8-byte Anchor discriminator. Callers must
+/// ensure `data.len() >= HEADER_BYTES` — the wrapping ixs already
+/// enforce this via PDA-seed-constrained account access, but in-program
+/// callers should prefer the fallible `try_name_registry_header` below
+/// if working with raw bytes from an unknown source.
 pub fn name_registry_header(data: &[u8]) -> &NameRegistry {
     bytemuck::from_bytes(&data[8..NameRegistry::HEADER_BYTES])
 }
@@ -542,6 +552,26 @@ pub fn name_registry_header(data: &[u8]) -> &NameRegistry {
 /// `count`.
 pub fn name_registry_header_mut(data: &mut [u8]) -> &mut NameRegistry {
     bytemuck::from_bytes_mut(&mut data[8..NameRegistry::HEADER_BYTES])
+}
+
+/// Fallible variants — return an `InvalidAccountData` error instead
+/// of panicking on truncated input. Use these in handlers that receive
+/// account data through `remaining_accounts` or other paths where the
+/// PDA-seed validation can't statically guarantee the size.
+pub fn try_name_registry_header(data: &[u8]) -> Result<&NameRegistry> {
+    require!(
+        data.len() >= NameRegistry::HEADER_BYTES,
+        crate::error::ArnsError::InvalidAccountData
+    );
+    Ok(name_registry_header(data))
+}
+
+pub fn try_name_registry_header_mut(data: &mut [u8]) -> Result<&mut NameRegistry> {
+    require!(
+        data.len() >= NameRegistry::HEADER_BYTES,
+        crate::error::ArnsError::InvalidAccountData
+    );
+    Ok(name_registry_header_mut(data))
 }
 
 /// Append a new NameEntry to the registry. Returns the index it was
@@ -576,7 +606,10 @@ pub fn append_name_entry(data: &mut [u8], entry: NameEntry) -> Result<u32> {
 ///
 /// Used by `release_name_to_returned` / lease-expiry cleanup paths.
 pub fn remove_name_entry_by_hash(data: &mut [u8], name_hash: [u8; 32]) -> bool {
-    let count = name_registry_header(data).count as usize;
+    // Defensive cap: if a post-shrink registry ever had `count` exceed
+    // the new capacity (shouldn't happen — admin_shrink rejects that
+    // — but cheap to defend), don't iterate past the slot region.
+    let count = (name_registry_header(data).count as usize).min(slot_capacity(data));
     if count == 0 {
         return false;
     }

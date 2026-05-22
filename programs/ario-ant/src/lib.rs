@@ -1346,7 +1346,7 @@ pub mod ario_ant {
         }
 
         emit!(OrphanedAntStateClosedEvent {
-            mint: ctx.accounts.mint_key.key(),
+            mint: ctx.accounts.asset.key(),
             closed_records,
             closed_metadata,
             closer: ctx.accounts.authority.key(),
@@ -2466,35 +2466,49 @@ pub struct CloseAntConfig<'info> {
 pub struct AdminCloseOrphanedAntState<'info> {
     /// CHECK: Must be the post-burn state (System-owned, empty).
     /// Validated in the handler — refuses to proceed if the asset is
-    /// still mpl-core-owned (i.e. alive). The mint pubkey is read from
-    /// `mint_key`, not from this account, since the data has been zeroed.
+    /// still mpl-core-owned (i.e. alive). PDA derivations below use
+    /// `asset.key()` directly so the asset and the closed PDAs are
+    /// cryptographically bound (security audit fix: previously a
+    /// separate `mint_key` field allowed an attacker to pass an
+    /// unrelated empty asset + a LIVE ANT's mint pubkey as `mint_key`,
+    /// closing the live ANT's state to themselves).
     pub asset: AccountInfo<'info>,
 
-    /// CHECK: Used only for PDA derivation. Trusted to be the mint pubkey
-    /// of the (now-burned) asset.
-    pub mint_key: AccountInfo<'info>,
+    /// Admin authority gate. `has_one = authority` constrains the
+    /// signer to equal `AntMigrationConfig.authority` — without this,
+    /// the original ix was permissionless and would have let any
+    /// caller route per-ANT rent to themselves (security audit fix).
+    #[account(
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump = migration_config.bump,
+        has_one = authority @ AntError::Unauthorized,
+    )]
+    pub migration_config: Account<'info, AntMigrationConfig>,
 
-    /// AntConfig PDA — closed if present. Anchor `close` handles the
-    /// no-data case gracefully; if the account doesn't exist we hit
-    /// `AccountNotInitialized` and the caller should omit it.
+    /// AntConfig PDA — closed to `authority`. Seeded on the asset's
+    /// own pubkey (which survives mpl-core BurnV1 unchanged), so the
+    /// post-burn check on `asset` proves the live state below was
+    /// orphaned by THIS asset's burn — not some other live ANT.
     #[account(
         mut,
-        seeds = [ANT_CONFIG_SEED, mint_key.key().as_ref()],
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
         bump = config.bump,
         close = authority,
     )]
     pub config: Account<'info, AntConfig>,
 
-    /// AntControllers PDA — closed if present.
+    /// AntControllers PDA — closed to `authority`. Same asset-bound
+    /// PDA derivation as `config`.
     #[account(
         mut,
-        seeds = [ANT_CONTROLLERS_SEED, mint_key.key().as_ref()],
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
         bump = controllers.bump,
         close = authority,
     )]
     pub controllers: Account<'info, AntControllers>,
 
-    /// The migration_authority — only this key can call.
+    /// Protocol admin authority. Verified to equal
+    /// `migration_config.authority` via `has_one` above.
     #[account(mut)]
     pub authority: Signer<'info>,
 }

@@ -6329,14 +6329,46 @@ async fn test_close_all_then_records_order_independent() {
     }
 }
 
+/// Pre-populate an `AntMigrationConfig` PDA with `authority` set to the
+/// given pubkey. Used by `admin_close_orphaned_ant_state` tests so the
+/// ix's `has_one = authority` gate can be verified end-to-end without
+/// running through `initialize_migration`.
+fn seed_migration_config(pt: &mut ProgramTest, authority: &Pubkey) -> Pubkey {
+    use anchor_lang::{AnchorSerialize, Discriminator};
+    let (pda, bump) = migration_config_pda();
+    let cfg = ario_ant::state::AntMigrationConfig {
+        authority: *authority,
+        migration_authority: Pubkey::new_unique(),
+        migration_active: true,
+        bump,
+    };
+    let mut data = ario_ant::state::AntMigrationConfig::DISCRIMINATOR.to_vec();
+    cfg.serialize(&mut data).unwrap();
+    data.resize(ario_ant::state::AntMigrationConfig::SIZE, 0);
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        pda,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(data.len()),
+            data,
+            owner: ario_ant::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    pda
+}
+
 #[tokio::test]
 async fn test_admin_close_orphaned_rejects_when_asset_alive() {
-    // The asset has NOT been burned — admin_close_orphaned must refuse.
+    // The asset has NOT been burned — admin_close_orphaned must refuse
+    // with AssetStillExists (after passing the new authority gate).
     let owner = Keypair::new();
     let authority = Keypair::new();
     let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
     fund_user(&mut pt, &owner.pubkey());
     fund_user(&mut pt, &authority.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &authority.pubkey());
     let mut ctx = pt.start_with_context().await;
     initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
 
@@ -6344,7 +6376,7 @@ async fn test_admin_close_orphaned_rejects_when_asset_alive() {
     let (controllers_key, _) = controllers_pda(&asset.pubkey());
     let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
         asset: asset.pubkey(),
-        mint_key: asset.pubkey(),
+        migration_config,
         config: config_key,
         controllers: controllers_key,
         authority: authority.pubkey(),
@@ -6363,4 +6395,48 @@ async fn test_admin_close_orphaned_rejects_when_asset_alive() {
     );
     let result = ctx.banks_client.process_transaction(tx).await;
     assert_anchor_error!(result, AntError::AssetStillExists);
+}
+
+/// Audit fix: admin_close_orphaned_ant_state previously had no authority
+/// gate — any signer could route per-ANT rent to themselves. The
+/// `has_one = authority @ Unauthorized` constraint added in this fix
+/// must reject non-authority signers BEFORE the AssetStillExists check.
+/// Without this regression test, the original bug would silently
+/// re-enter on any refactor.
+#[tokio::test]
+async fn test_admin_close_orphaned_rejects_non_authority() {
+    let owner = Keypair::new();
+    let real_authority = Keypair::new();
+    let attacker = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &real_authority.pubkey());
+    fund_user(&mut pt, &attacker.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &real_authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: attacker.pubkey(), // ← NOT real_authority
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, AntError::Unauthorized);
 }
