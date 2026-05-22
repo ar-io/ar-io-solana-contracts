@@ -186,4 +186,3 @@ pub fn migrate_primary_name_reverse_version(reverse: &mut PrimaryNameReverse) ->
     }
     Ok(())
 }
-

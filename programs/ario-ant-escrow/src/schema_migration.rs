@@ -78,4 +78,3 @@ pub fn migrate_escrow_token_version(escrow: &mut EscrowToken) -> Result<()> {
     }
     Ok(())
 }
-

@@ -208,4 +208,3 @@ pub fn migrate_acl_page_version(page: &mut AclPage) -> Result<()> {
     }
     Ok(())
 }
-
