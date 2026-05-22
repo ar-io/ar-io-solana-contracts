@@ -65,15 +65,32 @@ pub const ED25519_PROGRAM_ID: Pubkey =
 ///
 /// All `claim_*_attested` instructions match the Ed25519Program ix
 /// signer against this constant via `verify::attested::verify_attested_signature`.
+///
+/// **Build-mode swap:** the `unsafe-allow-test-attestor-pubkey` feature
+/// (enabled in `default = [...]`) substitutes the deterministic test
+/// pubkey derived from seed `[1u8; 32]`, so integration tests can
+/// construct valid Ed25519Program ixs from a known secret. Real-network
+/// builds disable this default and fall back to the production pubkey
+/// below.
+#[cfg(not(feature = "unsafe-allow-test-attestor-pubkey"))]
 pub const ATTESTOR_PUBKEY: Pubkey =
     solana_program::pubkey!("CKgG3xMKEzd2gWEZTvyrukdZHYb4hwyeTsBMeh8w9mkW");
+
+/// Test-build override of `ATTESTOR_PUBKEY` — the deterministic test
+/// pubkey (seed `[1u8; 32]`). Compiled when `unsafe-allow-test-attestor-pubkey`
+/// is enabled (default features). Real-network builds drop the default and
+/// pick up the prod constant above instead.
+#[cfg(feature = "unsafe-allow-test-attestor-pubkey")]
+pub const ATTESTOR_PUBKEY: Pubkey =
+    solana_program::pubkey::Pubkey::new_from_array(TEST_ATTESTOR_PUBKEY_BYTES);
 
 /// Deterministic test value of `ATTESTOR_PUBKEY` (derived from Ed25519
 /// seed `[1u8; 32]`). Public knowledge — used by integration tests so
 /// they can construct valid Ed25519Program ixs without provisioning a
 /// real attestor key. **Must never reach a real cluster** because
-/// anyone can recompute the secret seed.
-const TEST_ATTESTOR_PUBKEY_BYTES: [u8; 32] = [
+/// anyone can recompute the secret seed; the const-eval guard below
+/// enforces that at build time.
+pub(crate) const TEST_ATTESTOR_PUBKEY_BYTES: [u8; 32] = [
     0x8a, 0x88, 0xe3, 0xdd, 0x74, 0x09, 0xf1, 0x95, 0xfd, 0x52, 0xdb, 0x2d, 0x3c, 0xba, 0x5d, 0x72,
     0xca, 0x67, 0x09, 0xbf, 0x1d, 0x94, 0x12, 0x1b, 0xf3, 0x74, 0x88, 0x01, 0xb4, 0x0f, 0x6f, 0x5c,
 ];
