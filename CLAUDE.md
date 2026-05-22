@@ -292,17 +292,27 @@ cargo test                                      # all tests
 cargo test -p ario-core                         # one program
 cargo test -p ario-gar test_join_network        # specific test
 
-# Tests that CPI into Metaplex Core (UpdatePluginV1 trait sync) need
-# mpl_core.so staged + BPF_OUT_DIR set + the program's own .so present:
-#   ario-arns      — all integration tests
-#   ario-ant       — clear_attributes + sync_attributes only
-#   ario-ant-escrow — integration + event-coverage tests
-cargo build-sbf --manifest-path programs/ario-arns/Cargo.toml   # or ario-ant / -ant-escrow
-cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-arns
-# Same recipe for ario-ant's MPL-Core-CPI tests:
-BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-ant \
-  --test clear_attributes --test sync_attributes
+# Integration tests touching Metaplex Core (UpdatePluginV1 trait sync,
+# TransferV1, BurnV1) need mpl_core.so staged + BPF_OUT_DIR set + the
+# program's own .so aligned with the source's declare_id. Use the
+# wrapper — it stages mpl_core.so, rebuilds .so files against the
+# current source, and passes the right feature flags. Avoids the
+# `Custom(4100) DeclaredProgramIdMismatch` foot-gun that bites after
+# `build-sbf.sh --sync` leaves a synced .so paired with restored
+# placeholder source.
+./scripts/test-integration.sh ario-arns                 # one suite
+./scripts/test-integration.sh ario-ant-escrow test_admin_purge   # filtered
+./scripts/test-integration.sh --all                     # everything
+FAST=1 ./scripts/test-integration.sh ario-arns          # skip rebuild
+
+# Manual recipe (DO NOT USE unless you know why — most snags come from
+# skipping the wrapper). Requires `target/deploy/<prog>.so` aligned
+# with the source `declare_id!()` value. If you ran build-sbf.sh --sync
+# the .so is mismatched; rebuild with plain `cargo build-sbf`:
+#   cargo build-sbf --features devnet-shrunk
+#   cp programs/ario-ant-escrow/tests/fixtures/mpl_core.so target/deploy/
+#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test --features devnet-shrunk \
+#     -p ario-arns --test integration
 
 # Devnet deploy (idempotent — re-runs upgrade against the same program IDs)
 bash scripts/devnet-deploy.sh
