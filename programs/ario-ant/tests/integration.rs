@@ -1809,10 +1809,22 @@ async fn test_migrate_ant_version() {
         "Pre-created ANT should have version 0.0.0"
     );
 
-    // Migrate attempt on a 0.0.0 account — the dispatch function has no arm
-    // for that version, so it returns UnknownSchemaVersion.
+    // Migrate the 0.0.0 account — the bootstrap arm in `migrate_config_version`
+    // stamps it at the post-#53 baseline 1.0.0. This models the pre-#53 upgrade
+    // path: accounts created before versioning existed get the version field
+    // zero-filled by realloc, then this migration brings them to 1.0.0.
     let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner).await;
-    assert_anchor_error!(result, AntError::UnknownSchemaVersion);
+    assert!(
+        result.is_ok(),
+        "Bootstrap migration from 0.0.0 should succeed, got: {:?}",
+        result
+    );
+    let config2_after = fetch_config(&mut ctx, &asset2.pubkey()).await;
+    assert_eq!(
+        config2_after.version,
+        SchemaVersion::new(1, 0, 0),
+        "Bootstrap migration should bring account to 1.0.0"
+    );
 }
 
 // =========================================
