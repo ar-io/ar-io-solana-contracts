@@ -34,6 +34,10 @@ migration-test = []
 # identifier into its canonical claim message).
 network-mainnet = []
 network-devnet = []
+# Post-finalize recovery ix. **NEVER ENABLE FOR MAINNET BUILDS.** See
+# programs/ario-ant/src/recovery.rs and the CI guard at
+# .github/workflows/recovery-feature-guard.yml.
+recovery = []
 default = []
 
 [dependencies]

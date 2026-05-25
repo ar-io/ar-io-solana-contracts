@@ -6,11 +6,15 @@ pub mod constants;
 pub mod error;
 pub mod instructions;
 pub mod migration;
+#[cfg(feature = "recovery")]
+pub mod recovery;
 pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
 pub use migration::*;
+#[cfg(feature = "recovery")]
+pub use recovery::*;
 
 // =========================================
 // Event wire constants (PR-5)
@@ -362,6 +366,47 @@ pub mod ario_core {
         new_gar_program: Pubkey,
     ) -> Result<()> {
         instructions::admin::admin_set_gar_program::handler(ctx, new_gar_program)
+    }
+
+    // =========================================
+    // POST-FINALIZE RECOVERY (build-gated, NOT IN MAINNET)
+    // =========================================
+    //
+    // These dispatch arms exist only when compiled with `--features
+    // recovery`. The mainnet release build (`develop` branch, default
+    // features) omits them entirely — the discriminators don't appear
+    // in the resulting .so. See `recovery.rs` for the full rationale +
+    // lifecycle, and `.github/workflows/recovery-feature-guard.yml`
+    // for the CI guard that asserts release builds never include them.
+
+    /// Post-finalize generic PDA repair (multi-sig only). Mirrors
+    /// `import_account` but is NOT gated on `migration_active` and
+    /// strictly fails-if-exists. See `recovery.rs`.
+    ///
+    /// `AdminPostFinalizeRepairAccount` is re-exported at crate root
+    /// via `pub use recovery::*;` (also cfg-gated), so Anchor's
+    /// `#[program]` macro can resolve the bare-ident Context type.
+    #[cfg(feature = "recovery")]
+    pub fn admin_post_finalize_repair_account(
+        ctx: Context<AdminPostFinalizeRepairAccount>,
+        seeds: Vec<Vec<u8>>,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        recovery::admin_post_finalize_repair_account_handler(ctx, seeds, data)
+    }
+
+    /// Post-finalize Balance repair (multi-sig only). Mirrors
+    /// `import_balance` (incl. treasury → recipient ATA SPL transfer)
+    /// but is NOT gated on `migration_active`. Anchor `init` on the
+    /// Balance PDA gives fail-if-exists atomically before any SPL
+    /// transfer fires. See `recovery.rs`.
+    #[cfg(feature = "recovery")]
+    pub fn admin_post_finalize_repair_balance(
+        ctx: Context<AdminPostFinalizeRepairBalance>,
+        owner: Pubkey,
+        amount: u64,
+    ) -> Result<()> {
+        recovery::admin_post_finalize_repair_balance_handler(ctx, owner, amount)
     }
 
     // =========================================

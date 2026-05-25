@@ -1,0 +1,99 @@
+# Recovery feature guard
+#
+# Enforces the invariant that the `recovery` cargo feature is NEVER
+# enabled on `develop` or any release build. The feature adds
+# `admin_post_finalize_repair_*` ixs that bypass the `migration_active`
+# lock-out (see programs/ario-core/src/recovery.rs). It only ever runs
+# on a dedicated `staging-recovery` branch, used one-time to fill
+# silent-import gaps on staging-v1 then deployed away in a re-lock.
+#
+# This job runs on every PR + push to develop and to mainnet release
+# tags. It fails if:
+#   1. A workspace cargo build with default features compiles the
+#      recovery module (greps generated `.so` / target dirs).
+#   2. Anything on `develop` declares `recovery` in the default-feature
+#      list of any program's Cargo.toml.
+#   3. The branch under review is `develop` or a release tag AND any
+#      file under `programs/*/src/recovery.rs` is in the diff.
+#
+# If you're editing recovery.rs on the `staging-recovery` branch, this
+# guard doesn't fire (push-event branch != develop/release).
+
+name: recovery-feature-guard
+
+on:
+  push:
+    branches: [develop]
+    tags: ['v*']
+  pull_request:
+    branches: [develop]
+
+jobs:
+  no-recovery-in-mainnet-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-recovery-guard-${{ hashFiles('Cargo.lock') }}
+      - name: Build workspace with default features
+        run: cargo check --workspace --all-targets
+      - name: Assert recovery module did not compile
+        # `cargo check --workspace` with default features should NOT have
+        # produced any artifacts referencing recovery symbols. Look at
+        # the metadata of every per-crate dep-info file under target/
+        # and fail if any mentions `recovery.rs`.
+        run: |
+          set -euo pipefail
+          if find target -name '*.d' -print0 2>/dev/null | xargs -0 grep -l 'recovery\.rs' 2>/dev/null; then
+            echo "::error::Default-feature build compiled recovery.rs — this should never happen on develop or release."
+            exit 1
+          fi
+          echo "OK: no recovery.rs artifacts under default-features build."
+
+  no-recovery-in-default-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no Cargo.toml lists recovery in default
+        # `default = [..., "recovery", ...]` would silently enable the
+        # backdoor in every build. The feature must always be opt-in.
+        run: |
+          set -euo pipefail
+          BAD=$(grep -RnE '^default\s*=\s*\[.*"recovery".*\]' programs/*/Cargo.toml || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::Found 'recovery' inside a 'default' feature list:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "OK: no Cargo.toml lists 'recovery' in default features."
+
+  no-recovery-diff-on-develop:
+    if: github.event_name == 'pull_request' && github.base_ref == 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject PRs to develop that touch recovery.rs
+        # Recovery work lives on its own branch + release tag. PRs to
+        # develop must never touch the recovery files (intent: keep
+        # recovery code out of the mainnet code path's history).
+        run: |
+          set -euo pipefail
+          DIFF=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)
+          BAD=$(echo "$DIFF" | grep -E '^programs/[^/]+/src/recovery\.rs$' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::PR to develop touches recovery.rs:"
+            echo "$BAD"
+            echo "::error::Recovery work must land on the 'staging-recovery' branch, not develop."
+            exit 1
+          fi
+          echo "OK: PR does not modify any recovery.rs."

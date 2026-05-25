@@ -318,4 +318,15 @@ pub enum GarError {
 
     #[msg("Unknown schema version — no migration path exists from this version")]
     UnknownSchemaVersion,
+
+    // =========================================
+    // RECOVERY ERRORS
+    // =========================================
+    // Only raised by post-finalize repair ixs (themselves cfg-gated on
+    // `recovery`). The variant is unconditionally compiled because
+    // Anchor's `#[error_code]` macro rejects extra attributes
+    // (incl. `#[cfg]`) on variants. Inert in mainnet builds — the only
+    // code path that returns it doesn't exist there.
+    #[msg("Account already exists — recovery refuses to overwrite working state")]
+    AccountAlreadyExists,
 }

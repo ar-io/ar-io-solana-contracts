@@ -6,12 +6,16 @@ pub mod acl;
 pub mod error;
 pub mod migration;
 pub mod mpl_core_cpi;
+#[cfg(feature = "recovery")]
+pub mod recovery;
 pub mod schema_migration;
 pub mod state;
 
 pub use acl::*;
 use error::AntError;
 pub use migration::*;
+#[cfg(feature = "recovery")]
+pub use recovery::*;
 use state::*;
 
 /// AR.IO ANT (Arweave Name Token) Program
@@ -668,6 +672,26 @@ pub mod ario_ant {
     /// Permanently disable migration imports (main authority only)
     pub fn finalize_migration(ctx: Context<FinalizeMigration>) -> Result<()> {
         finalize_migration_handler(ctx)
+    }
+
+    // =========================================
+    // POST-FINALIZE RECOVERY (build-gated, NOT IN MAINNET)
+    // =========================================
+    //
+    // See `recovery.rs` in this program + `programs/ario-core/src/recovery.rs`
+    // for the full rationale. CI guard at
+    // `.github/workflows/recovery-feature-guard.yml`.
+
+    /// Post-finalize generic PDA repair (multi-sig only). Mirrors
+    /// `import_account` (incl. `validate_ant_account_borsh`) but is NOT
+    /// gated on `migration_active` and strictly fails-if-exists.
+    #[cfg(feature = "recovery")]
+    pub fn admin_post_finalize_repair_account(
+        ctx: Context<AdminPostFinalizeRepairAccount>,
+        seeds: Vec<Vec<u8>>,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        recovery::admin_post_finalize_repair_account_handler(ctx, seeds, data)
     }
 
     // =========================================

@@ -172,7 +172,7 @@ fn validate_ant_record_metadata_borsh_payload(data: &[u8]) -> Result<()> {
 }
 
 /// Structural check so truncated or garbage blobs fail (replaces full heap deserialize).
-fn validate_ant_account_borsh(disc: &[u8; 8], data: &[u8]) -> Result<()> {
+pub fn validate_ant_account_borsh(disc: &[u8; 8], data: &[u8]) -> Result<()> {
     let h_cfg = hash(b"account:AntConfig").to_bytes();
     let h_ctrl = hash(b"account:AntControllers").to_bytes();
     let h_rec = hash(b"account:AntRecord").to_bytes();

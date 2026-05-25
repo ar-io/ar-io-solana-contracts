@@ -29,6 +29,13 @@ migration-test = []
 # identifier into its canonical claim message).
 network-mainnet = []
 network-devnet = []
+# Post-finalize recovery ixs. **NEVER ENABLE FOR MAINNET BUILDS.** Adds
+# `admin_post_finalize_repair_account` + `admin_post_finalize_repair_balance`
+# multi-sig-gated ixs that bypass the `migration_active` lock-out, used
+# one-time to fix staging-v1's silent batched-import gaps. See
+# programs/ario-core/src/recovery.rs. The CI guard at
+# .github/workflows/recovery-feature-guard.yml enforces this on release.
+recovery = []
 default = []
 
 [dependencies]

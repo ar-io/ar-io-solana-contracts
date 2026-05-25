@@ -6,11 +6,15 @@ pub mod error;
 pub mod instructions;
 pub mod migration;
 pub mod pricing;
+#[cfg(feature = "recovery")]
+pub mod recovery;
 pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
 pub use migration::*;
+#[cfg(feature = "recovery")]
+pub use recovery::*;
 use state::PurchaseType;
 use state::{
     SchemaVersion, ARNS_CONFIG_VERSION, ARNS_RECORD_VERSION, DEMAND_FACTOR_VERSION,
@@ -533,6 +537,26 @@ pub mod ario_arns {
     /// Permanently disable migration imports (main authority only)
     pub fn finalize_migration(ctx: Context<FinalizeMigration>) -> Result<()> {
         finalize_migration_handler(ctx)
+    }
+
+    // =========================================
+    // POST-FINALIZE RECOVERY (build-gated, NOT IN MAINNET)
+    // =========================================
+    //
+    // See `recovery.rs` in this program + `programs/ario-core/src/recovery.rs`
+    // for the full rationale. CI guard at
+    // `.github/workflows/recovery-feature-guard.yml`.
+
+    /// Post-finalize generic PDA repair (multi-sig only). Mirrors
+    /// `import_account` but is NOT gated on `migration_active` and
+    /// strictly fails-if-exists.
+    #[cfg(feature = "recovery")]
+    pub fn admin_post_finalize_repair_account(
+        ctx: Context<AdminPostFinalizeRepairAccount>,
+        seeds: Vec<Vec<u8>>,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        recovery::admin_post_finalize_repair_account_handler(ctx, seeds, data)
     }
 }
 

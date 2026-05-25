@@ -156,4 +156,13 @@ pub enum ArnsError {
 
     #[msg("Unknown schema version — no migration path exists from this version")]
     UnknownSchemaVersion,
+
+    // =========================================
+    // RECOVERY ERRORS
+    // =========================================
+    // Only raised by post-finalize repair ixs (themselves cfg-gated on
+    // `recovery`). Variant is unconditionally compiled because Anchor's
+    // `#[error_code]` macro rejects extra attributes on variants.
+    #[msg("Account already exists — recovery refuses to overwrite working state")]
+    AccountAlreadyExists,
 }

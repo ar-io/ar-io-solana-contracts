@@ -25,11 +25,15 @@ pub const ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("A
 pub mod error;
 pub mod instructions;
 pub mod migration;
+#[cfg(feature = "recovery")]
+pub mod recovery;
 pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
 pub use migration::*;
+#[cfg(feature = "recovery")]
+pub use recovery::*;
 
 // Re-export funding-plan types so external callers (tests, ArNS / ario-core
 // CPI wrappers, SDK codegen via the IDL) can construct `FundingSourceSpec`
@@ -342,6 +346,27 @@ pub mod ario_gar {
         epoch_index: u64,
     ) -> Result<()> {
         instructions::epoch::admin_close_stale_epoch(ctx, epoch_index)
+    }
+
+    // =========================================
+    // POST-FINALIZE RECOVERY (build-gated, NOT IN MAINNET)
+    // =========================================
+    //
+    // See `recovery.rs` in this program + `programs/ario-core/src/recovery.rs`
+    // for the full rationale. The CI guard at
+    // `.github/workflows/recovery-feature-guard.yml` asserts that release
+    // builds never include this dispatch arm.
+
+    /// Post-finalize generic PDA repair (multi-sig only). Mirrors
+    /// `import_account` but is NOT gated on `migration_active` and
+    /// strictly fails-if-exists.
+    #[cfg(feature = "recovery")]
+    pub fn admin_post_finalize_repair_account(
+        ctx: Context<AdminPostFinalizeRepairAccount>,
+        seeds: Vec<Vec<u8>>,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        recovery::admin_post_finalize_repair_account_handler(ctx, seeds, data)
     }
 
     /// Create a new epoch (F23)

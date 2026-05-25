@@ -33,6 +33,10 @@ devnet-shrunk = ["ario-gar/devnet-shrunk"]
 network-mainnet = []
 network-devnet = []
 migration-test = []
+# Post-finalize recovery ix. **NEVER ENABLE FOR MAINNET BUILDS.** See
+# programs/ario-arns/src/recovery.rs and the CI guard at
+# .github/workflows/recovery-feature-guard.yml.
+recovery = []
 default = []
 
 [dependencies]
