@@ -24,14 +24,18 @@
 #
 # What this script does:
 #
-#   1. Stages mpl_core.so into `target/test-fixtures/` and (if absent)
-#      also into `target/deploy/` so both lookup paths see it.
+#   1. Stages mpl_core.so into `target/test-fixtures/` (the test-only
+#      BPF_OUT_DIR).
 #   2. **Rebuilds every ario-*.so via plain `cargo build-sbf`** (NO
 #      --sync) so the .so files match the source's *current*
 #      declare_id values. Whether source is in placeholder mode or
 #      synced mode, the freshly-built .so will match the lib that
-#      `cargo test` compiles.
-#   3. Runs the requested cargo test target.
+#      `cargo test` compiles. Built via `--sbf-out-dir target/test-fixtures`
+#      so artifacts never land in `target/deploy` — the escrow test .so
+#      embeds the PUBLIC test attestor key and must not be reused by a
+#      deploy flow (see the SECURITY note at the build step below).
+#   3. Runs the requested cargo test target with BPF_OUT_DIR pointed at
+#      `target/test-fixtures`.
 #
 # Usage:
 #   ./scripts/test-integration.sh ario-arns
@@ -51,25 +55,35 @@ if [[ ! -f "$MPL_CORE_SRC" ]]; then
     exit 1
 fi
 
-# Stage mpl_core.so in both lookup locations. Idempotent.
-mkdir -p "$FIXTURES_DIR" "$DEPLOY_DIR"
-for dst in "$FIXTURES_DIR/mpl_core.so" "$DEPLOY_DIR/mpl_core.so"; do
-    src_size=$(stat -c%s "$MPL_CORE_SRC")
-    dst_size=$(stat -c%s "$dst" 2>/dev/null || echo 0)
-    if [[ "$src_size" != "$dst_size" ]]; then
-        cp "$MPL_CORE_SRC" "$dst"
-    fi
-done
+# SECURITY: test artifacts are built into a test-only directory
+# ($FIXTURES_DIR), never into target/deploy. The escrow .so under test is
+# compiled with `unsafe-allow-test-attestor-pubkey`, which bakes in the
+# PUBLIC deterministic test attestor key (seed [1u8; 32]). target/deploy is
+# the canonical deploy path that build-sbf.sh / anchor build write to and
+# that devnet-deploy.sh + mainnet-prepare-upgrade.sh reuse (incl. with
+# SKIP_BUILD=1). If a test-key escrow .so landed there, a reuse-the-artifact
+# deploy could ship a binary that accepts forged Arweave attestations. So we
+# keep the two directories disjoint and point BPF_OUT_DIR at the test dir.
+mkdir -p "$FIXTURES_DIR"
+
+# Stage mpl_core.so into the test-only lookup dir. Idempotent.
+src_size=$(stat -c%s "$MPL_CORE_SRC")
+dst_size=$(stat -c%s "$FIXTURES_DIR/mpl_core.so" 2>/dev/null || echo 0)
+if [[ "$src_size" != "$dst_size" ]]; then
+    cp "$MPL_CORE_SRC" "$FIXTURES_DIR/mpl_core.so"
+fi
 
 # Rebuild .so files to match current source's declare_id. Skip via
 # FAST=1 when iterating tests against an already-fresh build.
 if [[ "${FAST:-0}" != "1" ]]; then
-    echo "==> Rebuilding ario-*.so against current source (FAST=1 to skip)"
-    # Build all 5 programs. devnet-shrunk so registry sizes match the
-    # in-tree integration-test fixture expectations.
-    cargo build-sbf --features devnet-shrunk 2>&1 | tail -3
+    echo "==> Rebuilding ario-*.so into $FIXTURES_DIR (FAST=1 to skip)"
+    # Build all 5 programs into the test dir (NOT target/deploy) via
+    # --sbf-out-dir. devnet-shrunk so registry sizes match the in-tree
+    # integration-test fixture expectations.
+    cargo build-sbf --features devnet-shrunk --sbf-out-dir "$FIXTURES_DIR" 2>&1 | tail -3
     # Re-build escrow ALONE with the opt-in test attestor key, overwriting
-    # the prod-key .so the workspace build just produced.
+    # the prod-key escrow .so the workspace build just produced — again into
+    # the test dir only.
     #
     # `unsafe-allow-test-attestor-pubkey` is deliberately NOT in escrow's
     # default features (it would bake the public test attestor key into
@@ -79,12 +93,13 @@ if [[ "${FAST:-0}" != "1" ]]; then
     # workspace-level `cargo build-sbf --features <name>` is rejected by
     # cargo-build-sbf 2.1.0 unless every selected package declares <name>,
     # so we scope it to escrow via --manifest-path.
-    echo "==> Rebuilding ario_ant_escrow.so with unsafe-allow-test-attestor-pubkey"
+    echo "==> Rebuilding ario_ant_escrow.so with unsafe-allow-test-attestor-pubkey (test dir only)"
     cargo build-sbf --manifest-path programs/ario-ant-escrow/Cargo.toml \
-        --features unsafe-allow-test-attestor-pubkey 2>&1 | tail -3
+        --features unsafe-allow-test-attestor-pubkey \
+        --sbf-out-dir "$FIXTURES_DIR" 2>&1 | tail -3
 fi
 
-export BPF_OUT_DIR="$DEPLOY_DIR"
+export BPF_OUT_DIR="$FIXTURES_DIR"
 
 # When `--features devnet-shrunk` is on for the .so build, the lib
 # compiled by `cargo test` must use the same feature so struct sizes
