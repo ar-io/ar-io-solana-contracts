@@ -221,6 +221,16 @@ step 3 "Build (BUILD_NETWORK=$BUILD_NETWORK; sync declare_id!() from manifest)"
 # correct (live) program IDs baked in; the source tree is unchanged.
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   warn "SKIP_BUILD=1 — reusing existing target/deploy/*.so (caller asserts declare_id!() matches manifest)"
+  # SECURITY: the source-level check-attestor-pubkey.sh --strict above cannot
+  # see what's baked into a prebuilt .so. Only reuse artifacts produced by
+  # build-sbf.sh / anchor build (real-network features). NEVER reuse a
+  # target/deploy/ario_ant_escrow.so produced by scripts/test-integration.sh
+  # — that builds escrow with `unsafe-allow-test-attestor-pubkey` (public test
+  # attestor key). The wrapper now builds into target/test-fixtures, not
+  # target/deploy, so a clean tree is safe; this warning guards against a
+  # manual `cargo build-sbf --features unsafe-allow-test-attestor-pubkey`
+  # having clobbered the deploy artifact. When in doubt, drop SKIP_BUILD.
+  warn "SKIP_BUILD=1 — ensure target/deploy/*.so came from build-sbf.sh, NOT a test build"
 else
   PROGRAM_IDS_PATH="$PROGRAM_IDS_PATH" BUILD_NETWORK="$BUILD_NETWORK" \
     bash "$REPO_ROOT/build-sbf.sh" --sync-from-manifest

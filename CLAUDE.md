@@ -313,6 +313,18 @@ FAST=1 ./scripts/test-integration.sh ario-arns          # skip rebuild
 #   cp programs/ario-ant-escrow/tests/fixtures/mpl_core.so target/deploy/
 #   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test --features devnet-shrunk \
 #     -p ario-arns --test integration
+#
+# ESCROW ONLY: the `claim_*_attested` tests sign with the deterministic
+# test attestor key, which lives behind the opt-in
+# `unsafe-allow-test-attestor-pubkey` feature (kept OUT of escrow's
+# default features so it can never reach a deploy artifact — see
+# programs/ario-ant-escrow/Cargo.toml). Add it to BOTH the .so build and
+# the `cargo test` invocation (cargo applies it only to escrow):
+#   cargo build-sbf --features devnet-shrunk,unsafe-allow-test-attestor-pubkey
+#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test \
+#     --features devnet-shrunk,unsafe-allow-test-attestor-pubkey \
+#     -p ario-ant-escrow --test integration
+# The wrapper (test-integration.sh) does this automatically.
 
 # Devnet deploy (idempotent — re-runs upgrade against the same program IDs)
 bash scripts/devnet-deploy.sh
