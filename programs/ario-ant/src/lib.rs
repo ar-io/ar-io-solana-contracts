@@ -1374,26 +1374,39 @@ pub mod ario_ant {
         let mut closed_records: u32 = 0;
         let mut closed_metadata: u32 = 0;
         let authority_info = ctx.accounts.authority.to_account_info();
+        let asset_key = asset.key();
         for acct in ctx.remaining_accounts.iter() {
             // Per-account discriminator dispatch — close whichever PDA
-            // type this happens to be. Authority-mode trusts the caller
-            // to pass legitimate per-ANT PDAs; the Anchor close pattern
-            // refunds to the authority regardless.
+            // type this happens to be. Each record is bound to the asset
+            // being cleaned (see the mint check below); within that, the
+            // Anchor close pattern refunds to the authority.
             if acct.data_is_empty() {
                 continue;
             }
-            // Clone the 8-byte discriminator out so the data borrow drops
-            // before we call `close_account_to_authority` (which mutates
-            // the account's data again).
-            let disc: [u8; 8] = {
+            // Read the 8-byte discriminator AND the record's `mint` field
+            // (bytes 8..40 — the first field on both AntRecord and
+            // AntRecordMetadata) in one borrow, then drop it before
+            // `close_account_to_authority` mutates the account's data.
+            let (disc, record_mint): ([u8; 8], Pubkey) = {
                 let data = acct.try_borrow_data()?;
-                if data.len() < 8 {
+                if data.len() < 40 {
                     continue;
                 }
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&data[0..8]);
-                buf
+                let mut disc = [0u8; 8];
+                disc.copy_from_slice(&data[0..8]);
+                let mut mint = [0u8; 32];
+                mint.copy_from_slice(&data[8..40]);
+                (disc, Pubkey::new_from_array(mint))
             };
+            if disc == AntRecord::DISCRIMINATOR || disc == AntRecordMetadata::DISCRIMINATOR {
+                // Defense-in-depth: bind every closed record to the asset
+                // being cleaned up. The auth gate already restricts this ix
+                // to the migration authority; this stops that authority from
+                // accidentally passing (and thereby closing + draining the
+                // rent of) a live record belonging to a DIFFERENT asset —
+                // e.g. via a tooling bug that mixes up account lists.
+                require_keys_eq!(record_mint, asset_key, AntError::OrphanRecordAssetMismatch);
+            }
             if disc == AntRecord::DISCRIMINATOR {
                 close_account_to_authority(acct, &authority_info)?;
                 closed_records += 1;

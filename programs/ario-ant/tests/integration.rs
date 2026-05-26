@@ -6453,3 +6453,149 @@ async fn test_admin_close_orphaned_rejects_non_authority() {
     let result = ctx.banks_client.process_transaction(tx).await;
     assert_anchor_error!(result, AntError::Unauthorized);
 }
+
+/// Helper: rewrite `asset` to the post-burn state (System-owned, empty)
+/// so `admin_close_orphaned_ant_state` passes the AssetStillExists check
+/// and reaches the remaining_accounts close loop.
+async fn set_asset_post_burn(ctx: &mut ProgramTestContext, asset: &Pubkey) {
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let post_burn = solana_sdk::account::Account {
+        lamports: rent.minimum_balance(0),
+        data: vec![],
+        owner: solana_sdk::system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(asset, &post_burn.into());
+}
+
+/// Helper: seed a minimal `AntRecord`-shaped account for `mint` at
+/// `addr`. Only the 8-byte discriminator + 32-byte `mint` field matter —
+/// the close loop reads those raw and never borsh-deserializes the rest.
+async fn seed_raw_ant_record(ctx: &mut ProgramTestContext, addr: &Pubkey, mint: &Pubkey) {
+    use anchor_lang::Discriminator;
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let mut data = ario_ant::state::AntRecord::DISCRIMINATOR.to_vec();
+    data.extend_from_slice(mint.as_ref());
+    data.resize(ario_ant::state::AntRecord::SIZE, 0);
+    let account = solana_sdk::account::Account {
+        lamports: rent.minimum_balance(data.len()),
+        data,
+        owner: ario_ant::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(addr, &account.into());
+}
+
+/// Audit follow-up (Codex finding #3): the remaining_accounts close loop
+/// closes AntRecord / AntRecordMetadata by discriminator. Even though the
+/// ix is now authority-gated, the migration authority must not be able to
+/// (accidentally) close a record belonging to a DIFFERENT asset and
+/// refund its rent here. Each record's stored `mint` must equal
+/// `asset.key()`, else OrphanRecordAssetMismatch — the whole tx reverts.
+#[tokio::test]
+async fn test_admin_close_orphaned_rejects_foreign_record() {
+    let owner = Keypair::new();
+    let authority = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &authority.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    // Real config + controllers for `asset`, then transition asset to
+    // post-burn so the handler reaches the close loop.
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    set_asset_post_burn(&mut ctx, &asset.pubkey()).await;
+
+    // A record for a DIFFERENT asset, wrongly included in the cleanup.
+    let foreign_mint = Pubkey::new_unique();
+    let (foreign_record, _) = record_pda(&foreign_mint, "sub");
+    seed_raw_ant_record(&mut ctx, &foreign_record, &foreign_mint).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: authority.pubkey(),
+    };
+    let mut metas = accounts.to_account_metas(None);
+    metas.push(solana_sdk::instruction::AccountMeta::new(
+        foreign_record,
+        false,
+    ));
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: metas,
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&authority.pubkey()),
+        &[&authority],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, AntError::OrphanRecordAssetMismatch);
+
+    // The foreign record must be untouched (tx reverted), not drained.
+    let still_there = ctx.banks_client.get_account(foreign_record).await.unwrap();
+    assert!(still_there.is_some(), "foreign record must NOT be closed");
+}
+
+/// Happy-path counterpart: a record whose `mint == asset` is a legitimate
+/// orphan and IS closed (rent refunded to the authority). Guards against
+/// the mint-binding check being too strict / wrong byte offset, which no
+/// existing test would otherwise catch.
+#[tokio::test]
+async fn test_admin_close_orphaned_closes_matching_record() {
+    let owner = Keypair::new();
+    let authority = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &authority.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    set_asset_post_burn(&mut ctx, &asset.pubkey()).await;
+
+    // A record that genuinely belongs to `asset` (mint == asset).
+    let (orphan_record, _) = record_pda(&asset.pubkey(), "sub");
+    seed_raw_ant_record(&mut ctx, &orphan_record, &asset.pubkey()).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: authority.pubkey(),
+    };
+    let mut metas = accounts.to_account_metas(None);
+    metas.push(solana_sdk::instruction::AccountMeta::new(
+        orphan_record,
+        false,
+    ));
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: metas,
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&authority.pubkey()),
+        &[&authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The matching record was closed (drained to 0 lamports → GC'd).
+    let closed = ctx.banks_client.get_account(orphan_record).await.unwrap();
+    assert!(closed.is_none(), "matching record should have been closed");
+}
