@@ -632,6 +632,11 @@ pub struct InitializeArnsParams {
     pub treasury: Pubkey,
     pub period_zero_start_timestamp: i64,
     pub migration_authority: Pubkey,
+    /// Genesis demand factor (RATE_SCALE fixed-point, `DEMAND_FACTOR_SCALE`
+    /// = 1.0). The migration seeds this to AO's live value (~9.8) so ArNS
+    /// pricing matches the source network at cutover instead of resetting
+    /// to 1.0. Must be `>= DEMAND_FACTOR_MIN`.
+    pub initial_demand_factor: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]

@@ -760,6 +760,7 @@ async fn setup_arns(ctx: &mut ProgramTestContext) -> ArnsSetup {
                     treasury: protocol_token.pubkey(),
                     period_zero_start_timestamp: TEST_PERIOD_ZERO_START,
                     migration_authority: ctx.payer.pubkey(),
+                    initial_demand_factor: 1_000_000, // DEMAND_FACTOR_SCALE (1.0)
                 },
             }
             .data(),
@@ -7382,6 +7383,7 @@ mod fund_from_stake {
                         treasury: treasury.pubkey(),
                         period_zero_start_timestamp: TEST_PERIOD_ZERO_START,
                         migration_authority: payer_pk,
+                        initial_demand_factor: 1_000_000, // DEMAND_FACTOR_SCALE (1.0)
                     },
                 }
                 .data(),
