@@ -582,7 +582,7 @@ async fn test_claim_vault_arweave_attested_active_happy_path() {
         escrow_ata.pubkey(),
         amount,
         lock_duration,
-        true, // revocable — exercises the revocable=true branch of introspection
+        false, // escrow rejects revocable; re-locks are always non-revocable (ADR-021)
         PROTOCOL_ARWEAVE,
         modulus.to_vec(),
     )
@@ -659,7 +659,7 @@ async fn test_claim_vault_arweave_attested_active_happy_path() {
         payer.pubkey(), // sender = payer (separate from claimant)
         amount,
         remaining,
-        true, // matches escrow.vault_revocable
+        false, // non-revocable re-lock (the only kind the escrow accepts; ADR-021)
     );
 
     // Build the canonical message exactly as the on-chain attested ix
@@ -753,8 +753,8 @@ async fn test_claim_vault_arweave_attested_active_happy_path() {
         "new vault must hold the escrowed amount"
     );
     assert!(
-        vault.revocable,
-        "new vault must inherit escrow.vault_revocable=true"
+        !vault.revocable,
+        "re-locked vault must be non-revocable (escrow never produces revocable; ADR-021)"
     );
 
     // Counter advanced.
@@ -780,6 +780,186 @@ async fn test_claim_vault_arweave_attested_active_happy_path() {
     assert_eq!(
         claimant_primary_bal, 0,
         "active claim must NOT deliver to claimant's primary ATA"
+    );
+}
+
+/// ADR-021 regression guard for the Codex finding: an active-vault claim
+/// whose sibling `vaulted_transfer` is **revocable** must be rejected. A
+/// revocable re-lock would set `controller = sender` (the attacker-choosable
+/// claim-tx payer), who could then `revoke_vault` and steal the funds before
+/// expiry — and the attestation binds no controller. The escrow introspection
+/// only accepts non-revocable re-locks, so this claim fails with
+/// `RevocableVaultUnsupported` even though every other parameter matches.
+#[tokio::test]
+async fn test_claim_vault_active_rejects_revocable_relock() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test_with_core().start_with_context().await;
+
+    let amount = 500_000_000u64;
+    let lock_duration = 30 * 86_400i64;
+    let setup = setup_with_initialized_core(&mut ctx, amount).await;
+    let (escrow_pda, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_pda, &setup.mint_kp.pubkey()).await;
+
+    let modulus = [0xAAu8; 512];
+    // Escrow itself is non-revocable (deposit rejects revocable). The attack
+    // is the claimant/payer trying to re-lock revocably anyway.
+    deposit_vault(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        lock_duration,
+        false,
+        PROTOCOL_ARWEAVE,
+        modulus.to_vec(),
+    )
+    .await;
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_pda).await;
+
+    let claimant = Keypair::new();
+    let payer = Keypair::new();
+    let claimant_ata = Keypair::new();
+    let payer_ata = Keypair::new();
+    airdrop(&mut ctx, &claimant.pubkey(), 1_000_000_000).await;
+    airdrop(&mut ctx, &payer.pubkey(), 5_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+    create_token_account(
+        &mut ctx,
+        &payer_ata,
+        &setup.mint_kp.pubkey(),
+        &payer.pubkey(),
+    )
+    .await;
+
+    let clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    let remaining = escrow_state.vault_end_timestamp - clock.unix_timestamp;
+    assert!(remaining > 0, "vault must still be active for this test");
+
+    let (counter_pda, _) = Pubkey::find_program_address(
+        &[VAULT_COUNTER_SEED, claimant.pubkey().as_ref()],
+        &ario_core::ID,
+    );
+    let new_vault_id: u64 = 0;
+    let (new_vault_pda, _) = Pubkey::find_program_address(
+        &[
+            VAULT_SEED,
+            claimant.pubkey().as_ref(),
+            &new_vault_id.to_le_bytes(),
+        ],
+        &ario_core::ID,
+    );
+    let new_vault_ata = Keypair::new();
+    create_token_account(
+        &mut ctx,
+        &new_vault_ata,
+        &setup.mint_kp.pubkey(),
+        &new_vault_pda,
+    )
+    .await;
+
+    let vaulted_ix = build_vaulted_transfer_ix(
+        setup.config_pda,
+        claimant.pubkey(),
+        counter_pda,
+        new_vault_pda,
+        payer_ata.pubkey(),
+        new_vault_ata.pubkey(),
+        payer.pubkey(),
+        amount,
+        remaining,
+        true, // REVOCABLE — the disallowed re-lock; must be rejected (ADR-021)
+    );
+
+    let canonical = build_escrow_canonical(
+        "vault",
+        &setup.asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &modulus,
+    );
+    use ed25519_dalek::Signer;
+    let kp = test_attestor_keypair();
+    let attest_sig: [u8; 64] = kp.sign(&canonical).to_bytes();
+    let attestor_pubkey_bytes: [u8; 32] = kp.public.to_bytes();
+    let ed25519_ix = build_ed25519_sigverify_ix(&attestor_pubkey_bytes, &attest_sig, &canonical);
+
+    let claim_accounts = ario_ant_escrow::accounts::ClaimVaultArweaveAttested {
+        escrow: escrow_pda,
+        escrow_token_account: escrow_ata.pubkey(),
+        claimant_token_account: claimant_ata.pubkey(),
+        payer_token_account: payer_ata.pubkey(),
+        claimant: claimant.pubkey(),
+        depositor: setup.depositor.pubkey(),
+        payer: payer.pubkey(),
+        instructions_sysvar: solana_sdk::sysvar::instructions::id(),
+        token_program: spl_token::id(),
+        system_program: solana_sdk::system_program::ID,
+    }
+    .to_account_metas(None);
+    let claim_data = ario_ant_escrow::instruction::ClaimVaultArweaveAttested {
+        message_nonce: escrow_state.nonce,
+    }
+    .data();
+    let claim_ix = Ix {
+        program_id: ario_ant_escrow::ID,
+        accounts: claim_accounts,
+        data: claim_data,
+    };
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            ed25519_ix,
+            claim_ix,
+            vaulted_ix,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+    let err = ctx
+        .banks_client
+        .process_transaction(tx)
+        .await
+        .expect_err("revocable re-lock must be rejected");
+    let expected =
+        anchor_lang::error::ERROR_CODE_OFFSET + EscrowError::RevocableVaultUnsupported as u32;
+    let code = match err {
+        solana_program_test::BanksClientError::TransactionError(
+            solana_sdk::transaction::TransactionError::InstructionError(
+                _,
+                solana_sdk::instruction::InstructionError::Custom(code),
+            ),
+        ) => code,
+        other => panic!("expected a Custom program error, got {other:?}"),
+    };
+    assert_eq!(
+        code, expected,
+        "expected RevocableVaultUnsupported ({expected}), got {code}"
+    );
+
+    // Atomic: the escrow must be untouched (claim reverted, no tokens moved).
+    let escrow_acct = ctx.banks_client.get_account(escrow_pda).await.unwrap();
+    assert!(
+        escrow_acct.is_some(),
+        "escrow PDA must survive the reverted claim"
     );
 }
 

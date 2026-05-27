@@ -26,7 +26,10 @@ const VAULTED_TRANSFER_DISC: [u8; 8] = [0x09, 0xc0, 0x19, 0x26, 0x6d, 0xea, 0xbf
 /// - Discriminator matches vaulted_transfer
 /// - amount (u64 LE at offset 8) == expected_amount
 /// - lock_duration_seconds (i64 LE at offset 16) >= min_lock_duration
-/// - revocable (bool at offset 24) == expected_revocable
+/// - revocable (bool at offset 24) == FALSE — the escrow only ever re-locks
+///   non-revocable vaults (a revocable re-lock's controller would be the
+///   unbound claim-tx payer; see ADR-021). A revocable-but-otherwise-matching
+///   transfer returns `RevocableVaultUnsupported`.
 /// - The recipient account (index 5 in the instruction's accounts)
 ///   matches expected_recipient
 ///
@@ -39,12 +42,23 @@ pub fn verify_vaulted_transfer_in_tx(
     ario_core_program_id: &Pubkey,
     expected_amount: u64,
     min_lock_duration: i64,
-    expected_revocable: bool,
     expected_recipient: &Pubkey,
     tolerance_seconds: i64,
 ) -> Result<()> {
-    // Iterate through all instructions looking for a matching vaulted_transfer
+    // Iterate through all instructions looking for a matching vaulted_transfer.
+    //
+    // The escrow ONLY re-locks NON-revocable vaults: a revocable re-lock makes
+    // the `vaulted_transfer` sender the vault controller (`ario_core` sets
+    // `controller = sender` when revocable), and the sender is the
+    // attacker-choosable claim-tx payer — who could then `revoke_vault` and
+    // steal the re-locked funds before expiry. The claim attestation binds the
+    // claimant/amount/nonce but NOT the controller, so revocable re-locks have
+    // no safe binding. See ADR-021. (`deposit_vault` also rejects revocable, so
+    // `expected_revocable` is implicitly false everywhere.)
     let mut found = false;
+    // A transfer that matches everything EXCEPT it's revocable — tracked so we
+    // can return a clear error instead of the opaque "missing transfer" one.
+    let mut saw_revocable_match = false;
     let mut idx: u16 = 0;
 
     loop {
@@ -76,11 +90,18 @@ pub fn verify_vaulted_transfer_in_tx(
 
                 if amount == expected_amount
                     && lock_duration >= min_lock_duration - tolerance_seconds
-                    && revocable == expected_revocable
                     && recipient_matches
                 {
-                    found = true;
-                    break;
+                    if revocable {
+                        // Matches in every other respect but is revocable —
+                        // not an acceptable re-lock. Keep scanning (a valid
+                        // non-revocable sibling could appear later), but
+                        // remember it for a precise error.
+                        saw_revocable_match = true;
+                    } else {
+                        found = true;
+                        break;
+                    }
                 }
             }
         }
@@ -92,6 +113,11 @@ pub fn verify_vaulted_transfer_in_tx(
         }
     }
 
+    // A revocable re-lock that otherwise matched is rejected with a precise
+    // error rather than the generic "missing transfer".
+    if !found && saw_revocable_match {
+        return err!(EscrowError::RevocableVaultUnsupported);
+    }
     require!(found, EscrowError::MissingVaultedTransferInstruction);
     Ok(())
 }

@@ -674,6 +674,15 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | **Solana Behavior** | The same handlers are permissionless on Solana (matches the post-2026-04 Lua spec — see PR `feat(arns/permissionless)` at commit `91ed230`). Anyone with ARIO can call `extend_lease` or `upgrade_name` against any name they don't own; the cost is paid from the caller's own token account, and the operation succeeds. As a side effect, the caller's payment ticks the demand-factor's per-period counters and can elevate prices for the rest of the period. |
 | **Rationale** | A whale could spam these handlers to bid up `demand_factor` and indirectly raise prices for legitimate buyers within the same period. Cost to the attacker is real (each tx pays the actual upgrade/extend price). Lua behaves the same way after its own permissionless conversion, so this isn't a Solana divergence — but it's worth noting because the optics differ from how observers might expect demand factor to evolve. No code mitigation; documented for transparency and to inform demand-factor monitoring expectations. |
 
+### BD-105: Migrated Vaults Are Non-Revocable (2026-05-27)
+
+| | |
+|---|---|
+| **Lua Behavior** | AO `vaults` can be revocable: a grantor (`vaultedTransfer` sender) locks tokens for a beneficiary and may `revokeVault` to claw them back before expiry. Revocability + revoker identity are part of AO vault state. |
+| **Solana Behavior** | `ario-ant-escrow` neither accepts nor produces revocable vaults: `deposit_vault` rejects `revocable=true` (`RevocableVaultUnsupported`) and active-vault claim re-locks must be non-revocable (`verify_vaulted_transfer_in_tx`). Claimants own the re-locked vault and withdraw via `release_vault` at expiry. `ario_core::vaulted_transfer(revocable=true)`/`revoke_vault` remain valid for *direct* (non-escrow) use — only the escrow opts out. |
+| **Why** | The escrow has no field for the legitimate revoker, so a revocable re-lock could only assign control to the unbound claim-tx payer (`vaulted_transfer` sets `controller = sender`, and forbids `sender == recipient` so it can't be the claimant) — a theft vector (Codex finding). The migration importer (`solana-ar-io` `batch-escrow.ts`) already deposits every vault non-revocable, so no AO revocability is actually lost. See ADR-021 for the decision and the rejected alternatives (grantor-binding; authority-as-revoker). |
+| **Solana-only nuance** | `EscrowToken.vault_revocable` is retained for layout/ABI stability but is always `false`. Faithful preservation of AO clawback would require capturing the grantor in escrow state + a second Arweave→Solana attestation for that grantor — out of scope for the migration. |
+
 ### BD-104: Epoch Counter Carry-Over from AO at Solana Genesis (2026-05-19)
 
 | | |

@@ -953,7 +953,7 @@ Vault escrows handle two cases depending on the vault's lock status at claim tim
 The escrow uses **transaction instruction introspection** (the same pattern as Solana's Ed25519/secp256k1 precompile programs) to enforce that the claimant receives a time-locked vault, not liquid tokens. The flow:
 
 1. The escrow program reads `sysvar::instructions` and iterates through all instructions in the current transaction (up to a **20-instruction loop limit**).
-2. It looks for a matching `ario_core::vaulted_transfer` instruction — verified by program ID, Anchor discriminator, amount, lock duration, revocability, and recipient account.
+2. It looks for a matching `ario_core::vaulted_transfer` instruction — verified by program ID, Anchor discriminator, amount, lock duration, and recipient account. The re-lock must be **non-revocable** (a revocable one is rejected with `RevocableVaultUnsupported`; see ADR-021 / BD-105) — otherwise the unbound claim-tx payer would become the revocation controller and could steal the funds before expiry.
 3. A **60-second tolerance** is applied to the lock duration to account for clock drift between transaction construction and execution.
 4. If no matching instruction is found, the transaction reverts atomically with `MissingVaultedTransferInstruction`.
 5. If verification passes, the escrow transfers tokens to the payer's ATA. The sibling `vaulted_transfer` instruction then creates a time-locked vault for the claimant with the remaining lock duration.

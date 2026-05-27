@@ -91,6 +91,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-017 | Off-Chain Attestor for Arweave RSA-PSS Signature Verification | accepted | [`DECISIONS.md`](../DECISIONS.md) |
 | ADR-018 | Anchor `#[event]` ABI Policy (Pre-Release Append-Only, Frozen at Mainnet Cutover) | accepted | [`DECISIONS.md`](../DECISIONS.md) |
 | ADR-020 | Schema-Migration Loading — Grow-Then-Deserialize, Append-Only Versioning | accepted | [`0020-schema-migration-grow-then-deserialize.md`](0020-schema-migration-grow-then-deserialize.md) |
+| ADR-021 | Escrow Vault Re-locks Are Non-Revocable | accepted | [`0021-escrow-vault-relocks-non-revocable.md`](0021-escrow-vault-relocks-non-revocable.md) |
 
 ### Numbering anomalies
 

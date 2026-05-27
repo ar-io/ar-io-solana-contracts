@@ -965,6 +965,8 @@ The program now has **15 total instructions**: the original 5 ANT instructions p
 
 Active vaults (where `end_timestamp > now`) are claimed using transaction instruction introspection: the escrow verifies via `sysvar::instructions` that a matching `ario_core::vaulted_transfer` instruction exists in the same transaction (20-instruction loop limit, 60-second tolerance on lock duration). The sibling `vaulted_transfer` creates a new time-locked vault for the claimant preserving the remaining lock duration. Expired vaults are claimed as liquid SPL transfers. This preserves the protocol's staking/locking invariants.
 
+The re-lock must be **non-revocable** (introspection requires `revocable == false`; `deposit_vault` likewise rejects `revocable=true`). A revocable re-lock would set `vault.controller = sender`, where `sender` is the unbound claim-tx payer — who could then `revoke_vault` and steal the funds before expiry, since the attestation binds no controller (and `vaulted_transfer` forbids `sender == recipient`, so it can never be the claimant). See **ADR-021** / **BD-105**. `ario_core` revocable vaults are unaffected for direct use; only the escrow declines to produce/accept them.
+
 **Account model:**
 
 Token and vault escrows use a shared `EscrowToken` account type (711 bytes) with an `asset_type` discriminator field. PDA derivation includes the depositor pubkey (unlike ANT escrows) to allow multiple depositors to escrow the same token mint independently:

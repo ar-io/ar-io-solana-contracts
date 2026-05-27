@@ -63,7 +63,6 @@ pub fn handler(ctx: Context<ClaimVaultArweaveAttested>, message_nonce: [u8; 32])
     let bump = escrow.bump;
     let amount = escrow.amount;
     let vault_end_timestamp = escrow.vault_end_timestamp;
-    let vault_revocable = escrow.vault_revocable;
     let escrow_pda = escrow.key();
 
     let bump_bytes = [bump];
@@ -90,7 +89,6 @@ pub fn handler(ctx: Context<ClaimVaultArweaveAttested>, message_nonce: [u8; 32])
             &ario_core::ID,
             amount,
             remaining,
-            vault_revocable,
             &ctx.accounts.claimant.key(),
             60,
         )?;

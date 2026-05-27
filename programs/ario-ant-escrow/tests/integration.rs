@@ -2207,6 +2207,36 @@ async fn test_claim_tokens_protocol_mismatch_fails() {
 // =========================================
 
 #[tokio::test]
+async fn test_deposit_vault_rejects_revocable() {
+    // ADR-021 regression guard: the escrow has no field for a legitimate
+    // revoker, so a revocable vault could only ever be controlled by the
+    // unbound claim-tx payer (theft). `deposit_vault` rejects revocable=true
+    // at the source, so the unhonorable flag can never be stored.
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let amount = 500_000_000u64;
+    let setup = setup_token_escrow(&mut ctx, amount).await;
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_addr, &setup.mint_kp.pubkey()).await;
+
+    let result = deposit_vault_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400i64,
+        true, // revocable — must be rejected
+        PROTOCOL_ETHEREUM,
+        ethereum_address_fixture(0xEE),
+    )
+    .await;
+    assert_anchor_error!(result, EscrowError::RevocableVaultUnsupported);
+}
+
+#[tokio::test]
 async fn test_deposit_vault_happy_path() {
     if skip_if_no_bpf_artifacts() {
         return;
@@ -2227,7 +2257,7 @@ async fn test_deposit_vault_happy_path() {
         escrow_ata.pubkey(),
         amount,
         lock_duration,
-        true, // revocable
+        false, // escrow rejects revocable (ADR-021); happy path is non-revocable
         PROTOCOL_ETHEREUM,
         eth_addr.clone(),
     )
@@ -2240,7 +2270,7 @@ async fn test_deposit_vault_happy_path() {
     assert_eq!(escrow.asset_type, ASSET_TYPE_VAULT);
     assert_eq!(escrow.amount, amount);
     assert_eq!(escrow.recipient_protocol, PROTOCOL_ETHEREUM);
-    assert!(escrow.vault_revocable);
+    assert!(!escrow.vault_revocable);
     // vault_end_timestamp should be clock.unix_timestamp + lock_duration.
     // We can't know the exact clock time, but it should be > 0 and in the future.
     assert!(
@@ -2427,7 +2457,7 @@ async fn test_cancel_vault_deposit() {
         escrow_ata.pubkey(),
         amount,
         30 * 86_400,
-        true, // revocable — irrelevant for cancel by depositor, but exercises the path
+        false, // deposit rejects revocable (ADR-021); cancel is depositor-only regardless
         PROTOCOL_ETHEREUM,
         ethereum_address_fixture(0xAA),
     )
@@ -2509,7 +2539,7 @@ async fn test_update_vault_recipient() {
         escrow_ata.pubkey(),
         amount,
         30 * 86_400,
-        true,
+        false, // escrow rejects revocable (ADR-021)
         PROTOCOL_ARWEAVE,
         arweave_pubkey_fixture(0xAA),
     )
@@ -2539,7 +2569,7 @@ async fn test_update_vault_recipient() {
     assert_ne!(after.nonce, nonce_before, "nonce did not rotate");
     // Vault-specific fields untouched by recipient update.
     assert_eq!(after.amount, amount);
-    assert!(after.vault_revocable);
+    assert!(!after.vault_revocable);
     assert!(after.vault_end_timestamp > 0);
 }
 
@@ -5100,7 +5130,7 @@ async fn test_deposit_vault_emits_deposited_event() {
         asset_id: setup.asset_id,
         amount,
         lock_duration_seconds: lock_duration,
-        revocable: true,
+        revocable: false, // escrow rejects revocable (ADR-021)
         recipient_protocol: PROTOCOL_ETHEREUM,
         recipient_pubkey: eth_addr.clone(),
     }

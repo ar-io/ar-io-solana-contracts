@@ -319,8 +319,11 @@ pub struct EscrowToken {
     /// For vault escrows: the unix timestamp at which the vault unlocks.
     /// Zero for liquid token escrows.
     pub vault_end_timestamp: i64,
-    /// For vault escrows: whether the vault is revocable.
-    /// False for liquid token escrows.
+    /// Reserved. Always `false`: `deposit_vault` rejects `revocable=true` and
+    /// claim re-locks are always non-revocable (the escrow has no field for a
+    /// legitimate revoker, so a revocable re-lock could only be controlled by
+    /// the unbound claim-tx payer — a theft vector). Kept for layout/ABI
+    /// stability. See ADR-021. (Also `false` for liquid token escrows.)
     pub vault_revocable: bool,
     /// Reserved for future fields.
     /// Shrunk from 32 to 30 to absorb the SchemaVersion expansion (u8→3 bytes).
