@@ -371,12 +371,23 @@ pub mod ario_core {
     /// Migrate an ArioConfig account to the latest schema version.
     /// Permissionless — anyone can pay the realloc rent.
     pub fn migrate_config(ctx: Context<MigrateConfig>) -> Result<()> {
-        let config = &mut ctx.accounts.config;
+        let info = ctx.accounts.config.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ArioConfig::SIZE,
+        )?;
+        let mut config: state::ArioConfig = {
+            let data = info.try_borrow_data()?;
+            state::ArioConfig::try_deserialize(&mut &data[..])?
+        };
         require!(
             config.version < state::ARIO_CONFIG_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_config_version(config)?;
+        schema_migration::migrate_config_version(&mut config)?;
+        schema_migration::write_account(&info, &config)?;
         msg!(
             "ArioConfig migrated to {}.{}.{}",
             config.version.major,
@@ -387,13 +398,29 @@ pub mod ario_core {
     }
 
     /// Migrate a Balance account to the latest schema version.
+    ///
+    /// Grow-then-deserialize: the account is loaded as `UncheckedAccount`,
+    /// grown to the current `Balance::SIZE` first (so a pre-versioning
+    /// account doesn't EOF on the appended `version` field), then
+    /// deserialized and version-stamped. See `schema_migration::grow_account`.
     pub fn migrate_balance(ctx: Context<MigrateBalance>) -> Result<()> {
-        let balance = &mut ctx.accounts.balance;
+        let info = ctx.accounts.balance.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Balance::SIZE,
+        )?;
+        let mut balance: state::Balance = {
+            let data = info.try_borrow_data()?;
+            state::Balance::try_deserialize(&mut &data[..])?
+        };
         require!(
             balance.version < state::BALANCE_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_balance_version(balance)?;
+        schema_migration::migrate_balance_version(&mut balance)?;
+        schema_migration::write_account(&info, &balance)?;
         msg!(
             "Balance migrated to {}.{}.{}",
             balance.version.major,
@@ -405,12 +432,23 @@ pub mod ario_core {
 
     /// Migrate a VaultCounter account to the latest schema version.
     pub fn migrate_vault_counter(ctx: Context<MigrateVaultCounter>) -> Result<()> {
-        let counter = &mut ctx.accounts.vault_counter;
+        let info = ctx.accounts.vault_counter.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::VaultCounter::SIZE,
+        )?;
+        let mut counter: state::VaultCounter = {
+            let data = info.try_borrow_data()?;
+            state::VaultCounter::try_deserialize(&mut &data[..])?
+        };
         require!(
             counter.version < state::VAULT_COUNTER_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_vault_counter_version(counter)?;
+        schema_migration::migrate_vault_counter_version(&mut counter)?;
+        schema_migration::write_account(&info, &counter)?;
         msg!(
             "VaultCounter migrated to {}.{}.{}",
             counter.version.major,
@@ -421,13 +459,24 @@ pub mod ario_core {
     }
 
     /// Migrate a Vault account to the latest schema version.
-    pub fn migrate_vault(ctx: Context<MigrateVault>, vault_id: u64) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
+    pub fn migrate_vault(ctx: Context<MigrateVault>, _vault_id: u64) -> Result<()> {
+        let info = ctx.accounts.vault.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Vault::SIZE,
+        )?;
+        let mut vault: state::Vault = {
+            let data = info.try_borrow_data()?;
+            state::Vault::try_deserialize(&mut &data[..])?
+        };
         require!(
             vault.version < state::VAULT_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_vault_version(vault)?;
+        schema_migration::migrate_vault_version(&mut vault)?;
+        schema_migration::write_account(&info, &vault)?;
         msg!(
             "Vault migrated to {}.{}.{}",
             vault.version.major,
@@ -439,12 +488,23 @@ pub mod ario_core {
 
     /// Migrate a PrimaryNameRequest account to the latest schema version.
     pub fn migrate_primary_name_request(ctx: Context<MigratePrimaryNameRequest>) -> Result<()> {
-        let request = &mut ctx.accounts.request;
+        let info = ctx.accounts.request.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::PrimaryNameRequest::SIZE,
+        )?;
+        let mut request: state::PrimaryNameRequest = {
+            let data = info.try_borrow_data()?;
+            state::PrimaryNameRequest::try_deserialize(&mut &data[..])?
+        };
         require!(
             request.version < state::PRIMARY_NAME_REQUEST_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_primary_name_request_version(request)?;
+        schema_migration::migrate_primary_name_request_version(&mut request)?;
+        schema_migration::write_account(&info, &request)?;
         msg!(
             "PrimaryNameRequest migrated to {}.{}.{}",
             request.version.major,
@@ -456,12 +516,23 @@ pub mod ario_core {
 
     /// Migrate a PrimaryName account to the latest schema version.
     pub fn migrate_primary_name(ctx: Context<MigratePrimaryName>) -> Result<()> {
-        let name = &mut ctx.accounts.primary_name;
+        let info = ctx.accounts.primary_name.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::PrimaryName::SIZE,
+        )?;
+        let mut name: state::PrimaryName = {
+            let data = info.try_borrow_data()?;
+            state::PrimaryName::try_deserialize(&mut &data[..])?
+        };
         require!(
             name.version < state::PRIMARY_NAME_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_primary_name_version(name)?;
+        schema_migration::migrate_primary_name_version(&mut name)?;
+        schema_migration::write_account(&info, &name)?;
         msg!(
             "PrimaryName migrated to {}.{}.{}",
             name.version.major,
@@ -473,12 +544,44 @@ pub mod ario_core {
 
     /// Migrate a PrimaryNameReverse account to the latest schema version.
     pub fn migrate_primary_name_reverse(ctx: Context<MigratePrimaryNameReverse>) -> Result<()> {
-        let reverse = &mut ctx.accounts.reverse;
+        let info = ctx.accounts.reverse.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::PrimaryNameReverse::SIZE,
+        )?;
+        let mut reverse: state::PrimaryNameReverse = {
+            let data = info.try_borrow_data()?;
+            state::PrimaryNameReverse::try_deserialize(&mut &data[..])?
+        };
+        // This PDA's seed derives from `reverse.name`, which can only be read
+        // AFTER deserialization — so unlike the other migrate ixs we validate
+        // the PDA here in the handler (grow first is safe: a mismatch reverts
+        // the whole tx atomically). `realloc` already required program
+        // ownership and `try_deserialize` already checked the discriminator.
+        let name_hash =
+            anchor_lang::solana_program::hash::hash(reverse.name.to_lowercase().as_bytes());
+        let expected = Pubkey::create_program_address(
+            &[
+                state::PRIMARY_NAME_REVERSE_SEED,
+                &name_hash.to_bytes()[..32],
+                &[reverse.bump],
+            ],
+            &crate::ID,
+        )
+        .map_err(|_| error!(anchor_lang::error::ErrorCode::ConstraintSeeds))?;
+        require_keys_eq!(
+            info.key(),
+            expected,
+            anchor_lang::error::ErrorCode::ConstraintSeeds
+        );
         require!(
             reverse.version < state::PRIMARY_NAME_REVERSE_VERSION,
             error::ArioError::AlreadyLatestVersion
         );
-        schema_migration::migrate_primary_name_reverse_version(reverse)?;
+        schema_migration::migrate_primary_name_reverse_version(&mut reverse)?;
+        schema_migration::write_account(&info, &reverse)?;
         msg!(
             "PrimaryNameReverse migrated to {}.{}.{}",
             reverse.version.major,
@@ -495,15 +598,14 @@ pub mod ario_core {
 
 #[derive(Accounts)]
 pub struct MigrateConfig<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized in
+    /// the handler (grow-then-deserialize, see `schema_migration::grow_account`).
     #[account(
         mut,
         seeds = [state::CONFIG_SEED],
-        bump = config.bump,
-        realloc = state::ArioConfig::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub config: Account<'info, state::ArioConfig>,
+    pub config: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -513,15 +615,17 @@ pub struct MigrateConfig<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateBalance<'info> {
+    /// CHECK: PDA validated by seeds + canonical bump. Loaded as
+    /// `UncheckedAccount` (not `Account<Balance>`) so a pre-versioning,
+    /// shorter account can be grown by `grow_account` BEFORE deserialization
+    /// — see `schema_migration::grow_account`. The handler grows, then
+    /// borsh-deserializes `Balance` and re-serializes it.
     #[account(
         mut,
         seeds = [state::BALANCE_SEED, owner.key().as_ref()],
-        bump = balance.bump,
-        realloc = state::Balance::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub balance: Account<'info, state::Balance>,
+    pub balance: UncheckedAccount<'info>,
 
     /// CHECK: balance owner
     pub owner: AccountInfo<'info>,
@@ -534,15 +638,14 @@ pub struct MigrateBalance<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateVaultCounter<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized in
+    /// the handler (grow-then-deserialize, see `schema_migration::grow_account`).
     #[account(
         mut,
         seeds = [state::VAULT_COUNTER_SEED, owner.key().as_ref()],
-        bump = vault_counter.bump,
-        realloc = state::VaultCounter::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub vault_counter: Account<'info, state::VaultCounter>,
+    pub vault_counter: UncheckedAccount<'info>,
 
     /// CHECK: vault counter owner
     pub owner: AccountInfo<'info>,
@@ -556,15 +659,14 @@ pub struct MigrateVaultCounter<'info> {
 #[derive(Accounts)]
 #[instruction(vault_id: u64)]
 pub struct MigrateVault<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized in
+    /// the handler (grow-then-deserialize, see `schema_migration::grow_account`).
     #[account(
         mut,
         seeds = [state::VAULT_SEED, owner.key().as_ref(), &vault_id.to_le_bytes()],
-        bump = vault.bump,
-        realloc = state::Vault::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub vault: Account<'info, state::Vault>,
+    pub vault: UncheckedAccount<'info>,
 
     /// CHECK: vault owner
     pub owner: AccountInfo<'info>,
@@ -577,15 +679,14 @@ pub struct MigrateVault<'info> {
 
 #[derive(Accounts)]
 pub struct MigratePrimaryNameRequest<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized in
+    /// the handler (grow-then-deserialize, see `schema_migration::grow_account`).
     #[account(
         mut,
         seeds = [state::PRIMARY_NAME_REQUEST_SEED, initiator.key().as_ref()],
-        bump = request.bump,
-        realloc = state::PrimaryNameRequest::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub request: Account<'info, state::PrimaryNameRequest>,
+    pub request: UncheckedAccount<'info>,
 
     /// CHECK: request initiator
     pub initiator: AccountInfo<'info>,
@@ -598,15 +699,14 @@ pub struct MigratePrimaryNameRequest<'info> {
 
 #[derive(Accounts)]
 pub struct MigratePrimaryName<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized in
+    /// the handler (grow-then-deserialize, see `schema_migration::grow_account`).
     #[account(
         mut,
         seeds = [state::PRIMARY_NAME_SEED, owner.key().as_ref()],
-        bump = primary_name.bump,
-        realloc = state::PrimaryName::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub primary_name: Account<'info, state::PrimaryName>,
+    pub primary_name: UncheckedAccount<'info>,
 
     /// CHECK: primary name owner
     pub owner: AccountInfo<'info>,
@@ -619,15 +719,12 @@ pub struct MigratePrimaryName<'info> {
 
 #[derive(Accounts)]
 pub struct MigratePrimaryNameReverse<'info> {
-    #[account(
-        mut,
-        seeds = [state::PRIMARY_NAME_REVERSE_SEED, &anchor_lang::solana_program::hash::hash(reverse.name.to_lowercase().as_bytes()).to_bytes()[..32]],
-        bump = reverse.bump,
-        realloc = state::PrimaryNameReverse::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
-    )]
-    pub reverse: Account<'info, state::PrimaryNameReverse>,
+    /// CHECK: this PDA's seed derives from the stored `name`, which can't be
+    /// read before deserialization — so the seed/PDA check happens in the
+    /// handler after grow-then-deserialize (realloc enforces program
+    /// ownership; the handler re-derives the PDA and matches the key).
+    #[account(mut)]
+    pub reverse: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

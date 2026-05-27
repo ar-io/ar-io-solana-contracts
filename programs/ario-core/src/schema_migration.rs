@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{program::invoke, system_instruction};
 
 use crate::error::ArioError;
 use crate::state::{
@@ -6,6 +7,77 @@ use crate::state::{
     VaultCounter, ARIO_CONFIG_VERSION, BALANCE_VERSION, PRIMARY_NAME_REQUEST_VERSION,
     PRIMARY_NAME_REVERSE_VERSION, PRIMARY_NAME_VERSION, VAULT_COUNTER_VERSION, VAULT_VERSION,
 };
+
+/// Grow a program-owned PDA to `new_size` for an in-place schema migration,
+/// topping up rent from `payer`, then zero-fill the newly-appended tail.
+///
+/// **Why this exists (the schema-migration grow-then-deserialize pattern):**
+/// Anchor builds `Account<'info, T>` by borsh-deserializing the *new* layout
+/// BEFORE any `realloc` constraint runs. An account created under an older
+/// (shorter) layout therefore hits Borsh EOF and the instruction fails before
+/// it can grow the account — so `migrate_*` must NOT load the target as a
+/// typed `Account<T>`. Instead it loads it as an `UncheckedAccount`, calls
+/// this helper to grow first, and only THEN deserializes. Because versioned
+/// fields are appended at the byte-end and the appended tail is zeroed here,
+/// the `version` field reads as {0,0,0} and the bootstrap arm in
+/// `migrate_*_version` stamps the baseline.
+///
+/// Idempotent: a no-op when the account is already at/above `new_size`
+/// (callers then hit the `version < LATEST` AlreadyLatestVersion guard).
+/// Mirrors the proven `ario-gar::migration` UncheckedAccount pattern.
+pub fn grow_account<'info>(
+    info: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    new_size: usize,
+) -> Result<()> {
+    let current = info.data_len();
+    if current >= new_size {
+        return Ok(());
+    }
+    let rent = Rent::get()?;
+    let needed = rent
+        .minimum_balance(new_size)
+        .saturating_sub(info.lamports());
+    if needed > 0 {
+        invoke(
+            &system_instruction::transfer(payer.key, info.key, needed),
+            &[payer.clone(), info.clone(), system_program.clone()],
+        )?;
+    }
+    info.realloc(new_size, false)?;
+    // Deterministically zero the appended region (don't rely on runtime
+    // grow-zeroing) so the new trailing `version` field is {0,0,0}.
+    let mut data = info.try_borrow_mut_data()?;
+    for byte in data[current..new_size].iter_mut() {
+        *byte = 0;
+    }
+    Ok(())
+}
+
+/// Serialize `account` (8-byte discriminator + borsh body) back into `info`'s
+/// data buffer **without advancing the account's own data slice**.
+///
+/// The obvious `account.try_serialize(&mut *info.try_borrow_mut_data()?)`
+/// is a trap: `Write for &mut [u8]` advances the slice reference as it
+/// writes, and because that reference IS the account's data ref (shared via
+/// the `RefCell`), it leaves the AccountInfo pointing at the empty tail —
+/// truncating the account to 0 bytes. Anchor's own `exit` dodges this with a
+/// non-advancing `BpfWriter`; here we serialize into a temp buffer and
+/// copy by index. Account length is unchanged.
+pub fn write_account<'info, T: anchor_lang::AccountSerialize>(
+    info: &AccountInfo<'info>,
+    account: &T,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    account.try_serialize(&mut buf)?;
+    let mut data = info.try_borrow_mut_data()?;
+    if buf.len() > data.len() {
+        return Err(anchor_lang::error::ErrorCode::AccountDidNotSerialize.into());
+    }
+    data[..buf.len()].copy_from_slice(&buf);
+    Ok(())
+}
 
 #[allow(clippy::never_loop, clippy::while_immutable_condition)]
 pub fn migrate_config_version(config: &mut ArioConfig) -> Result<()> {
