@@ -32,25 +32,33 @@ pub fn grow_account<'info>(
     new_size: usize,
 ) -> Result<()> {
     let current = info.data_len();
-    if current >= new_size {
+    if current == new_size {
         return Ok(());
     }
-    let rent = Rent::get()?;
-    let needed = rent
-        .minimum_balance(new_size)
-        .saturating_sub(info.lamports());
-    if needed > 0 {
-        invoke(
-            &system_instruction::transfer(payer.key, info.key, needed),
-            &[payer.clone(), info.clone(), system_program.clone()],
-        )?;
-    }
-    info.realloc(new_size, false)?;
-    // Deterministically zero the appended region (don't rely on runtime
-    // grow-zeroing) so the new trailing `version` field is {0,0,0}.
-    let mut data = info.try_borrow_mut_data()?;
-    for byte in data[current..new_size].iter_mut() {
-        *byte = 0;
+    if current < new_size {
+        // Grow: top up rent for the larger account, then realloc and zero the
+        // appended region (so the new trailing `version` field is {0,0,0}).
+        let rent = Rent::get()?;
+        let needed = rent
+            .minimum_balance(new_size)
+            .saturating_sub(info.lamports());
+        if needed > 0 {
+            invoke(
+                &system_instruction::transfer(payer.key, info.key, needed),
+                &[payer.clone(), info.clone(), system_program.clone()],
+            )?;
+        }
+        info.realloc(new_size, false)?;
+        let mut data = info.try_borrow_mut_data()?;
+        for byte in data[current..new_size].iter_mut() {
+            *byte = 0;
+        }
+    } else {
+        // Shrink: an account over-allocated by a past init bug is trimmed to
+        // the canonical SIZE. The meaningful fields (incl. `version`) live in
+        // the first SIZE bytes; the trailing slack is dropped. Excess rent
+        // stays on the account (still rent-exempt). No top-up / zero needed.
+        info.realloc(new_size, false)?;
     }
     Ok(())
 }
