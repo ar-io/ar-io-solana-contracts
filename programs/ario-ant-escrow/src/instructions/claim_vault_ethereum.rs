@@ -67,7 +67,6 @@ pub fn handler(
     let bump = escrow.bump;
     let amount = escrow.amount;
     let vault_end_timestamp = escrow.vault_end_timestamp;
-    let vault_revocable = escrow.vault_revocable;
     let escrow_pda = escrow.key();
 
     let bump_bytes = [bump];
@@ -98,7 +97,6 @@ pub fn handler(
             &ario_core::ID,
             amount,
             remaining,
-            vault_revocable,
             &ctx.accounts.claimant.key(),
             60, // 60s tolerance for clock drift
         )?;

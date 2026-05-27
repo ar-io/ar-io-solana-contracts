@@ -150,4 +150,13 @@ pub enum EscrowError {
     /// since the escrow's `deposit_slot`. Retry later.
     #[msg("Cannot purge yet: the 5-year unclaimed-grace period has not elapsed")]
     PurgeGraceNotElapsed,
+
+    /// Revocable vaults are not supported by the escrow. The escrow has no
+    /// field for the legitimate revoker, so a revocable re-lock could only
+    /// assign control to an unbound party (the claim-tx payer) — a theft
+    /// vector. Rejected at `deposit_vault` and on the claim re-lock. See
+    /// ADR-021. (Direct `ario_core::vaulted_transfer` revocable vaults are
+    /// unaffected; only the escrow declines to produce/accept them.)
+    #[msg("Revocable vaults are not supported by the escrow (see ADR-021)")]
+    RevocableVaultUnsupported,
 }

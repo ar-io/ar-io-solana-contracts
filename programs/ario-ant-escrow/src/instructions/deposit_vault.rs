@@ -48,6 +48,12 @@ pub fn handler(
         lock_duration_seconds >= MIN_VAULT_LOCK_DURATION,
         EscrowError::VaultDurationTooShort
     );
+    // Revocable vaults are not supported by the escrow: it has no field for
+    // the legitimate revoker, so a revocable re-lock on claim could only
+    // assign control to the unbound claim-tx payer (theft). Reject the flag
+    // at the source so the field is never set to an unhonorable value.
+    // `escrow.vault_revocable` therefore stays `false`. See ADR-021.
+    require!(!revocable, EscrowError::RevocableVaultUnsupported);
 
     let (protocol, expected_len) =
         validated_protocol_and_len(recipient_protocol, recipient_pubkey.len()).ok_or_else(
