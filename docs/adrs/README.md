@@ -90,6 +90,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-016 | Pluggable ANT Program via Asset Attributes Plugin | accepted | [`DECISIONS.md`](../DECISIONS.md) |
 | ADR-017 | Off-Chain Attestor for Arweave RSA-PSS Signature Verification | accepted | [`DECISIONS.md`](../DECISIONS.md) |
 | ADR-018 | Anchor `#[event]` ABI Policy (Pre-Release Append-Only, Frozen at Mainnet Cutover) | accepted | [`DECISIONS.md`](../DECISIONS.md) |
+| ADR-020 | Schema-Migration Loading — Grow-Then-Deserialize, Append-Only Versioning | accepted | [`0020-schema-migration-grow-then-deserialize.md`](0020-schema-migration-grow-then-deserialize.md) |
 
 ### Numbering anomalies
 

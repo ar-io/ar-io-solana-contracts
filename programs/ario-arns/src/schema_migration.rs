@@ -1,7 +1,62 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{program::invoke, system_instruction};
 
 use crate::error::ArnsError;
 use crate::state::*;
+
+/// Resize a program-owned PDA to the canonical SIZE for an in-place schema
+/// migration (grow pre-versioning accounts; shrink ones over-allocated by a
+/// past init bug), then deserialize. Grow-then-deserialize: Anchor builds
+/// `Account<T>` from the NEW layout before `realloc` runs, so `migrate_*`
+/// loads the target as `UncheckedAccount`, calls this first, then
+/// deserializes. See ario-core's `schema_migration::grow_account`.
+pub fn grow_account<'info>(
+    info: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    new_size: usize,
+) -> Result<()> {
+    let current = info.data_len();
+    if current == new_size {
+        return Ok(());
+    }
+    if current < new_size {
+        let rent = Rent::get()?;
+        let needed = rent
+            .minimum_balance(new_size)
+            .saturating_sub(info.lamports());
+        if needed > 0 {
+            invoke(
+                &system_instruction::transfer(payer.key, info.key, needed),
+                &[payer.clone(), info.clone(), system_program.clone()],
+            )?;
+        }
+        info.realloc(new_size, false)?;
+        let mut data = info.try_borrow_mut_data()?;
+        for byte in data[current..new_size].iter_mut() {
+            *byte = 0;
+        }
+    } else {
+        info.realloc(new_size, false)?;
+    }
+    Ok(())
+}
+
+/// Serialize `account` back into `info` without advancing the account's own
+/// data slice (temp buffer + index copy). See ario-core's `write_account`.
+pub fn write_account<'info, T: anchor_lang::AccountSerialize>(
+    info: &AccountInfo<'info>,
+    account: &T,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    account.try_serialize(&mut buf)?;
+    let mut data = info.try_borrow_mut_data()?;
+    if buf.len() > data.len() {
+        return Err(anchor_lang::error::ErrorCode::AccountDidNotSerialize.into());
+    }
+    data[..buf.len()].copy_from_slice(&buf);
+    Ok(())
+}
 
 /// Walk an `ArnsConfig` account from its current version to `ARNS_CONFIG_VERSION`.
 ///

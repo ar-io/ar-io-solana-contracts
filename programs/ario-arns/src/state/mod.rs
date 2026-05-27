@@ -399,8 +399,8 @@ impl DemandFactor {
 ///   - undername_limit:       122 (2)
 ///   - purchase_price:        124 (8)
 ///   - bump:                  132 (1)
-///   - version:               133 (3)
-///   - name (variable-length): 136 (4 + ≤51)
+///   - name (variable-length): 133 (4 + ≤51)
+///   - version:               (after name; variable offset, byte-end)
 #[account]
 pub struct ArnsRecord {
     /// SHA256 hash of lowercase name (used for PDA derivation)
@@ -425,12 +425,16 @@ pub struct ArnsRecord {
     pub purchase_price: u64,
     /// PDA bump
     pub bump: u8,
-    /// Schema version for forward-compatible migrations.
-    pub version: SchemaVersion,
     /// The name string (max 51 chars, original casing preserved).
-    /// Variable-length — must remain the last field so all preceding
-    /// fields stay at fixed byte offsets for memcmp filtering.
+    /// Variable-length. The memcmp-filtered fixed fields (`owner` @40,
+    /// `ant` @72, …) all precede it, so their offsets stay stable.
     pub name: String,
+    /// Schema version for forward-compatible migrations. MUST be the
+    /// byte-end (last) field: it follows the variable-length `name` so a
+    /// pre-versioning record can be grown + zero-filled and read as
+    /// {0,0,0} → bootstrap. Reordered here from before `name` (which made
+    /// old records unloadable). See `schema_migration::grow_account`.
+    pub version: SchemaVersion,
 }
 
 impl ArnsRecord {

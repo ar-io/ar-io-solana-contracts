@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{program::invoke, system_instruction};
 
 use crate::error::GarError;
 use crate::state::{
@@ -8,6 +9,69 @@ use crate::state::{
     GATEWAY_VERSION, OBSERVATION_VERSION, OBSERVER_LOOKUP_VERSION, REDELEGATION_RECORD_VERSION,
     WITHDRAWAL_COUNTER_VERSION, WITHDRAWAL_VERSION,
 };
+
+/// Grow a program-owned PDA to `new_size` for an in-place schema migration,
+/// top up rent from `payer`, then zero the appended tail. See ario-core's
+/// `schema_migration::grow_account` for the full rationale (Anchor builds
+/// `Account<T>` by deserializing the NEW layout before `realloc` runs, so a
+/// pre-versioning shorter account would EOF — `migrate_*` loads the target as
+/// `UncheckedAccount`, grows first via this helper, then deserializes).
+/// Idempotent: no-op when already at/above `new_size`. Mirrors the
+/// `MigrateSettingsSetArnsProgramId` UncheckedAccount pattern in this module.
+pub fn grow_account<'info>(
+    info: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    new_size: usize,
+) -> Result<()> {
+    let current = info.data_len();
+    if current == new_size {
+        return Ok(());
+    }
+    if current < new_size {
+        // Grow: top up rent, realloc, zero the appended tail (new `version`
+        // reads {0,0,0}).
+        let rent = Rent::get()?;
+        let needed = rent
+            .minimum_balance(new_size)
+            .saturating_sub(info.lamports());
+        if needed > 0 {
+            invoke(
+                &system_instruction::transfer(payer.key, info.key, needed),
+                &[payer.clone(), info.clone(), system_program.clone()],
+            )?;
+        }
+        info.realloc(new_size, false)?;
+        let mut data = info.try_borrow_mut_data()?;
+        for byte in data[current..new_size].iter_mut() {
+            *byte = 0;
+        }
+    } else {
+        // Shrink: trim an account over-allocated by a past init bug to the
+        // canonical SIZE (meaningful fields incl. `version` are in the first
+        // SIZE bytes). Excess rent stays; still rent-exempt.
+        info.realloc(new_size, false)?;
+    }
+    Ok(())
+}
+
+/// Serialize `account` back into `info` WITHOUT advancing the account's own
+/// data slice (writing a typed value through `&mut *data` truncates the
+/// account — `Write for &mut [u8]` advances the slice ref). Temp buffer +
+/// index copy. See ario-core's `schema_migration::write_account`.
+pub fn write_account<'info, T: anchor_lang::AccountSerialize>(
+    info: &AccountInfo<'info>,
+    account: &T,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    account.try_serialize(&mut buf)?;
+    let mut data = info.try_borrow_mut_data()?;
+    if buf.len() > data.len() {
+        return Err(anchor_lang::error::ErrorCode::AccountDidNotSerialize.into());
+    }
+    data[..buf.len()].copy_from_slice(&buf);
+    Ok(())
+}
 
 /// Walk a `GatewaySettings` account from its current version to
 /// `GATEWAY_SETTINGS_VERSION`. Each match arm MUST advance

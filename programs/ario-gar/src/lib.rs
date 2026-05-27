@@ -551,12 +551,23 @@ pub mod ario_gar {
     // =========================================
 
     pub fn migrate_gateway_settings(ctx: Context<MigrateGatewaySettings>) -> Result<()> {
-        let account = &mut ctx.accounts.settings;
+        let info = ctx.accounts.settings.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::GatewaySettings::SIZE,
+        )?;
+        let mut account: state::GatewaySettings = {
+            let data = info.try_borrow_data()?;
+            state::GatewaySettings::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::GATEWAY_SETTINGS_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_gateway_settings_version(account)?;
+        schema_migration::migrate_gateway_settings_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "GatewaySettings migrated to {}.{}.{}",
             account.version.major,
@@ -567,12 +578,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_gateway(ctx: Context<MigrateGateway>) -> Result<()> {
-        let account = &mut ctx.accounts.gateway;
+        let info = ctx.accounts.gateway.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Gateway::SIZE,
+        )?;
+        let mut account: state::Gateway = {
+            let data = info.try_borrow_data()?;
+            state::Gateway::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::GATEWAY_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_gateway_version(account)?;
+        schema_migration::migrate_gateway_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "Gateway migrated to {}.{}.{}",
             account.version.major,
@@ -583,12 +605,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_delegation(ctx: Context<MigrateDelegation>) -> Result<()> {
-        let account = &mut ctx.accounts.delegation;
+        let info = ctx.accounts.delegation.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Delegation::SIZE,
+        )?;
+        let mut account: state::Delegation = {
+            let data = info.try_borrow_data()?;
+            state::Delegation::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::DELEGATION_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_delegation_version(account)?;
+        schema_migration::migrate_delegation_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "Delegation migrated to {}.{}.{}",
             account.version.major,
@@ -599,12 +632,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_withdrawal_counter(ctx: Context<MigrateWithdrawalCounter>) -> Result<()> {
-        let account = &mut ctx.accounts.withdrawal_counter;
+        let info = ctx.accounts.withdrawal_counter.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::WithdrawalCounter::SIZE,
+        )?;
+        let mut account: state::WithdrawalCounter = {
+            let data = info.try_borrow_data()?;
+            state::WithdrawalCounter::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::WITHDRAWAL_COUNTER_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_withdrawal_counter_version(account)?;
+        schema_migration::migrate_withdrawal_counter_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "WithdrawalCounter migrated to {}.{}.{}",
             account.version.major,
@@ -616,12 +660,23 @@ pub mod ario_gar {
 
     pub fn migrate_withdrawal(ctx: Context<MigrateWithdrawal>, withdrawal_id: u64) -> Result<()> {
         let _ = withdrawal_id;
-        let account = &mut ctx.accounts.withdrawal;
+        let info = ctx.accounts.withdrawal.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Withdrawal::SIZE,
+        )?;
+        let mut account: state::Withdrawal = {
+            let data = info.try_borrow_data()?;
+            state::Withdrawal::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::WITHDRAWAL_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_withdrawal_version(account)?;
+        schema_migration::migrate_withdrawal_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "Withdrawal migrated to {}.{}.{}",
             account.version.major,
@@ -632,12 +687,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_allowlist_entry(ctx: Context<MigrateAllowlistEntry>) -> Result<()> {
-        let account = &mut ctx.accounts.allowlist_entry;
+        let info = ctx.accounts.allowlist_entry.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::AllowlistEntry::SIZE,
+        )?;
+        let mut account: state::AllowlistEntry = {
+            let data = info.try_borrow_data()?;
+            state::AllowlistEntry::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::ALLOWLIST_ENTRY_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_allowlist_entry_version(account)?;
+        schema_migration::migrate_allowlist_entry_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "AllowlistEntry migrated to {}.{}.{}",
             account.version.major,
@@ -648,12 +714,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_observer_lookup(ctx: Context<MigrateObserverLookup>) -> Result<()> {
-        let account = &mut ctx.accounts.observer_lookup;
+        let info = ctx.accounts.observer_lookup.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ObserverLookup::SIZE,
+        )?;
+        let mut account: state::ObserverLookup = {
+            let data = info.try_borrow_data()?;
+            state::ObserverLookup::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::OBSERVER_LOOKUP_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_observer_lookup_version(account)?;
+        schema_migration::migrate_observer_lookup_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "ObserverLookup migrated to {}.{}.{}",
             account.version.major,
@@ -664,12 +741,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_redelegation_record(ctx: Context<MigrateRedelegationRecord>) -> Result<()> {
-        let account = &mut ctx.accounts.redelegation_record;
+        let info = ctx.accounts.redelegation_record.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::RedelegationRecord::SIZE,
+        )?;
+        let mut account: state::RedelegationRecord = {
+            let data = info.try_borrow_data()?;
+            state::RedelegationRecord::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::REDELEGATION_RECORD_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_redelegation_record_version(account)?;
+        schema_migration::migrate_redelegation_record_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "RedelegationRecord migrated to {}.{}.{}",
             account.version.major,
@@ -680,12 +768,23 @@ pub mod ario_gar {
     }
 
     pub fn migrate_epoch_settings(ctx: Context<MigrateEpochSettings>) -> Result<()> {
-        let account = &mut ctx.accounts.epoch_settings;
+        let info = ctx.accounts.epoch_settings.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::EpochSettings::SIZE,
+        )?;
+        let mut account: state::EpochSettings = {
+            let data = info.try_borrow_data()?;
+            state::EpochSettings::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::EPOCH_SETTINGS_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_epoch_settings_version(account)?;
+        schema_migration::migrate_epoch_settings_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "EpochSettings migrated to {}.{}.{}",
             account.version.major,
@@ -697,12 +796,23 @@ pub mod ario_gar {
 
     pub fn migrate_observation(ctx: Context<MigrateObservation>, epoch_index: u64) -> Result<()> {
         let _ = epoch_index;
-        let account = &mut ctx.accounts.observation;
+        let info = ctx.accounts.observation.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Observation::SIZE,
+        )?;
+        let mut account: state::Observation = {
+            let data = info.try_borrow_data()?;
+            state::Observation::try_deserialize(&mut &data[..])?
+        };
         require!(
             account.version < state::OBSERVATION_VERSION,
             error::GarError::AlreadyLatestVersion
         );
-        schema_migration::migrate_observation_version(account)?;
+        schema_migration::migrate_observation_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
         msg!(
             "Observation migrated to {}.{}.{}",
             account.version.major,
@@ -719,15 +829,14 @@ pub mod ario_gar {
 
 #[derive(Accounts)]
 pub struct MigrateGatewaySettings<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::SETTINGS_SEED],
-        bump = settings.bump,
-        realloc = state::GatewaySettings::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub settings: Account<'info, state::GatewaySettings>,
+    pub settings: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -739,15 +848,14 @@ pub struct MigrateGateway<'info> {
     /// CHECK: gateway operator
     pub operator: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::GATEWAY_SEED, operator.key().as_ref()],
-        bump = gateway.bump,
-        realloc = state::Gateway::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub gateway: Account<'info, state::Gateway>,
+    pub gateway: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -762,15 +870,14 @@ pub struct MigrateDelegation<'info> {
     /// CHECK: delegator key used in PDA seeds
     pub delegator: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::DELEGATION_SEED, gateway.key().as_ref(), delegator.key().as_ref()],
-        bump = delegation.bump,
-        realloc = state::Delegation::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub delegation: Account<'info, state::Delegation>,
+    pub delegation: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -782,15 +889,14 @@ pub struct MigrateWithdrawalCounter<'info> {
     /// CHECK: owner key used in PDA seeds
     pub owner: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::WITHDRAWAL_COUNTER_SEED, owner.key().as_ref()],
-        bump = withdrawal_counter.bump,
-        realloc = state::WithdrawalCounter::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub withdrawal_counter: Account<'info, state::WithdrawalCounter>,
+    pub withdrawal_counter: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -803,15 +909,14 @@ pub struct MigrateWithdrawal<'info> {
     /// CHECK: owner key used in PDA seeds
     pub owner: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::WITHDRAWAL_SEED, owner.key().as_ref(), &withdrawal_id.to_le_bytes()],
-        bump = withdrawal.bump,
-        realloc = state::Withdrawal::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub withdrawal: Account<'info, state::Withdrawal>,
+    pub withdrawal: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -826,15 +931,14 @@ pub struct MigrateAllowlistEntry<'info> {
     /// CHECK: delegate key used in PDA seeds
     pub delegate: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::ALLOWLIST_SEED, gateway.key().as_ref(), delegate.key().as_ref()],
-        bump = allowlist_entry.bump,
-        realloc = state::AllowlistEntry::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub allowlist_entry: Account<'info, state::AllowlistEntry>,
+    pub allowlist_entry: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -846,15 +950,14 @@ pub struct MigrateObserverLookup<'info> {
     /// CHECK: observer address used in PDA seeds
     pub observer: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::OBSERVER_LOOKUP_SEED, observer.key().as_ref()],
-        bump = observer_lookup.bump,
-        realloc = state::ObserverLookup::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub observer_lookup: Account<'info, state::ObserverLookup>,
+    pub observer_lookup: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -866,15 +969,14 @@ pub struct MigrateRedelegationRecord<'info> {
     /// CHECK: delegator key used in PDA seeds
     pub delegator: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::REDELEGATION_SEED, delegator.key().as_ref()],
-        bump = redelegation_record.bump,
-        realloc = state::RedelegationRecord::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub redelegation_record: Account<'info, state::RedelegationRecord>,
+    pub redelegation_record: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -883,15 +985,14 @@ pub struct MigrateRedelegationRecord<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateEpochSettings<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::EPOCH_SETTINGS_SEED],
-        bump = epoch_settings.bump,
-        realloc = state::EpochSettings::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub epoch_settings: Account<'info, state::EpochSettings>,
+    pub epoch_settings: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -904,15 +1005,14 @@ pub struct MigrateObservation<'info> {
     /// CHECK: observer key used in PDA seeds
     pub observer: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [state::OBSERVATION_SEED, &epoch_index.to_le_bytes(), observer.key().as_ref()],
-        bump = observation.bump,
-        realloc = state::Observation::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub observation: Account<'info, state::Observation>,
+    pub observation: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

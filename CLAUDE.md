@@ -228,6 +228,25 @@ changes are NOT backward-compatible — see "ArioConfig" in the
 schema-evolution checklist in [`docs/DECISIONS.md`](docs/DECISIONS.md)
 before modifying.
 
+### Schema versioning & `migrate_*` (ADR-020)
+
+`version: SchemaVersion` is **append-only and at the byte-end** of every
+borsh `#[account]` (after any variable-length field); new fields append at
+the end or carve from a `_reserved` tail. **Never reorder** an existing
+field post-launch. `migrate_*` instructions MUST use the
+**grow-then-deserialize** pattern (`schema_migration::grow_account` +
+`write_account` on an `UncheckedAccount`), NOT a typed `Account<T>` +
+`realloc` — Anchor deserializes the new layout *before* `realloc` runs, so a
+pre-version (shorter) account hits Borsh EOF (`AccountDidNotDeserialize`,
+3003) and the migration is unreachable. Serialize back via `write_account`'s
+temp-buffer copy, never `try_serialize(&mut *data)` (it advances and
+truncates the account). New migration tests must build a **genuine
+pre-version** account (old SIZE, no version bytes), not a full-size one with
+`version={0,0,0}`. Exception: `ario-ant-escrow` uses fixed-SIZE
+`_reserved`-absorbs accounts (no realloc ever) and keeps typed `Account<T>`;
+if a future escrow field exceeds `_reserved`, convert it to
+grow-then-deserialize. See [`docs/adrs/0020-…`](docs/adrs/0020-schema-migration-grow-then-deserialize.md).
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool

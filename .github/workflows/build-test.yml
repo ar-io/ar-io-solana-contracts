@@ -75,3 +75,14 @@ jobs:
         run: >-
           cargo test -p ario-core -p ario-gar -p ario-test-utils
           --no-fail-fast
+
+      # Schema-migration regression tests (ADR-020) are native (no Metaplex
+      # CPI / no BPF), so they run on the host job even though arns/ant
+      # integration suites need the BPF toolchain. These guard against the
+      # grow-then-deserialize bomb being reintroduced — they build GENUINE
+      # pre-version accounts, unlike the full-size version={0,0,0} fixtures.
+      # (core's schema_migration test already runs via `-p ario-core` above.)
+      - name: Test (schema-migration regressions — arns, ant)
+        run: >-
+          cargo test -p ario-arns -p ario-ant --test schema_migration
+          --no-fail-fast
