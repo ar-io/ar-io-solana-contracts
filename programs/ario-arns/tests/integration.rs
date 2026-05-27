@@ -2434,6 +2434,182 @@ async fn test_release_name_current_holder_succeeds() {
     assert_eq!(returned.initiator, new_holder.pubkey());
 }
 
+// `ant_asset` binding/ownership constraints (CodeRabbit PR #73). The
+// authorization reads the holder from `ant_asset`, so `ant_asset` is pinned by
+// account constraints to `arns_record.ant` AND to MPL Core ownership — both
+// emit `InvalidAntAsset` (NOT `NotAntHolder`: the account constraints fail
+// during Accounts validation, before the handler's holder check runs). These
+// guard against a caller swapping in a *different* ANT they happen to hold, or
+// a spoofed non-MPL account, to satisfy the holder check against the wrong key.
+
+/// reassign: passing an unrelated ANT (≠ `record.ant`) as `ant_asset` — even
+/// one the caller legitimately holds — is rejected.
+#[tokio::test]
+async fn test_reassign_name_rejects_wrong_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let other_ant_keypair = Keypair::new();
+    let other_ant = other_ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    mint_test_ant(&mut ctx, &other_ant_keypair).await; // caller holds this too
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "wrongasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let accounts = ario_arns::accounts::ReassignName {
+        config: config_pda().0,
+        arns_record: arns_record_key,
+        ant_asset: other_ant, // != record.ant (which is ant_key)
+        caller: ctx.payer.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data: ario_arns::instruction::ReassignName {
+                new_ant: Keypair::new().pubkey(),
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
+/// reassign: passing a non-MPL account (a random, non-existent pubkey) as
+/// `ant_asset` is rejected.
+#[tokio::test]
+async fn test_reassign_name_rejects_non_mpl_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "nonmplasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let accounts = ario_arns::accounts::ReassignName {
+        config: config_pda().0,
+        arns_record: arns_record_key,
+        ant_asset: Keypair::new().pubkey(), // not an MPL Core asset
+        caller: ctx.payer.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data: ario_arns::instruction::ReassignName {
+                new_ant: Keypair::new().pubkey(),
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
+/// release: passing an unrelated ANT (≠ `record.ant`) as `ant_asset` is rejected.
+#[tokio::test]
+async fn test_release_name_rejects_wrong_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let other_ant_keypair = Keypair::new();
+    let other_ant = other_ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    mint_test_ant(&mut ctx, &other_ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "wrongrelasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: other_ant, // != record.ant
+                caller: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
+/// release: passing a non-MPL account as `ant_asset` is rejected.
+#[tokio::test]
+async fn test_release_name_rejects_non_mpl_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "nonmplrelasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: Keypair::new().pubkey(), // not an MPL Core asset
+                caller: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
 // (deleted obsolete test `test_name_management_after_nft_transfer` — exercised the
 //  ARIO-ARNS-side trait sync mechanism that the Sprint 1-3
 //  reshape moved to `ario_ant::sync_attributes`. Round-trip
