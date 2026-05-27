@@ -138,8 +138,9 @@ echo "Solana: $(solana --version)"
 echo "Anchor: $(anchor --version)"
 echo "Cluster: $DEPLOY_CLUSTER"
 
-# Refuse to deploy with the test attestor pubkey baked in.
-"$REPO_ROOT/scripts/check-attestor-pubkey.sh" --strict
+# Refuse to deploy unless ATTESTOR_PUBKEY is not the test key AND matches
+# the devnet key pinned in program-ids/devnet.json.
+"$REPO_ROOT/scripts/check-attestor-pubkey.sh" --strict --cluster devnet
 
 # ------------------------------------------------------------
 step 1 "Load authority keypair and resolve program IDs from manifest"

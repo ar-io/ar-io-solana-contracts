@@ -20,5 +20,6 @@
   },
   "external": {
     "mpl_core": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
-  }
+  },
+  "attestor_pubkey": "CKgG3xMKEzd2gWEZTvyrukdZHYb4hwyeTsBMeh8w9mkW"
 }
