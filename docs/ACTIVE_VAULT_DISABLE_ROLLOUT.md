@@ -89,7 +89,12 @@ Dropping `payer_token_account` is an ABI change to the two claim ixs, so order:
 - [x] 1. Contracts: code
 - [x] 2. Contracts: tests (69/69 escrow BPF suite green; clippy/fmt clean)
 - [x] 3. Contracts: docs/ADR (ADR-022, BD-107, design/spec/CU/audit-brief)
-- [x] 4. Contracts: verify + PR — **PR #74, CI green, awaiting review/merge**
-- [ ] 5. SDK: changes + PR — *blocked on #74 merge + `@ar.io/solana-contracts` publish*
-- [ ] 6. Frontend: UX + PR — *blocked on (5)*
-- [ ] 7. Migration tooling: error string — *needs new escrow deployed to staging/devnet to validate*
+- [x] 4. Contracts: verify + PR — **#74 merged**
+- [x] 4a. Restoration playbook + code-comment breadcrumbs — **#75 open** (this PR; CI green)
+- [x] 4b. Bump `clients/ts/package.json` to `0.4.0` so the release workflow is
+      one-click (no version-override input needed). The next `Release clients/ts (npm)`
+      run with `cluster: staging` (or `devnet`) publishes `@ar.io/solana-contracts@0.4.0`
+      under that dist-tag — that publish unblocks the SDK + frontend drafts.
+- [ ] 5. SDK draft (ar-io-sdk#640) — *blocked: bump dep to the published version, push.*
+- [ ] 6. Frontend draft (ar-io-solana-escrow-app#2) — *blocked: chained on (5).*
+- [x] 7. Migration tooling: ar-io-solana-ar-io#157 (comment-only refresh; assertion was already permissive — no functional change).
