@@ -28,10 +28,13 @@ CU usage measured per instruction via `solana-program-test` simulation
 | Instruction                                  | Measured (CU) | Budget | Notes |
 |----------------------------------------------|---------------|--------|-------|
 | `deposit_vault`                              |   ~35,000     | 200K   | Account init + vault metadata copy; similar to `deposit_tokens` |
-| `claim_vault_arweave_attested` (expired)     |    50,204     | 200K   | **Arweave production path, expired vault.** Liquid SPL transfer; no sibling `vaulted_transfer` needed. |
-| `claim_vault_arweave_attested` (active)      |   ~80,000     | 200K   | **Arweave production path, active vault.** Sysvar loop scans the tx for the sibling `ario_core::vaulted_transfer` ix in addition to the preceding Ed25519Program ix. |
-| `claim_vault_ethereum` (expired)             |    same as `claim_tokens_ethereum` | 200K | Expired vaults use liquid SPL transfer (no `vaulted_transfer` sibling needed). |
-| `claim_vault_ethereum` (active)              |   ~150,000    | 200K   | ECDSA verification + instruction introspection to verify sibling `vaulted_transfer` |
+| `claim_vault_arweave_attested` (expired)     |    50,204     | 200K   | **Arweave production path, expired vault.** Liquid SPL transfer. |
+| `claim_vault_ethereum` (expired)             |    same as `claim_tokens_ethereum` | 200K | Expired vaults use liquid SPL transfer. |
+
+> **ADR-022 (2026-05-28):** active (still-locked) vault claims are now rejected
+> early with `VaultStillLocked` (cheap; no token movement). The former active
+> re-lock path and its `sysvar::instructions` loop were removed, so the prior
+> "(active)" rows (~80K Arweave / ~150K Ethereum) no longer exist.
 
 All claim paths fit comfortably within the 200K default CU budget — no
 `SetComputeUnitLimit(400_000)` needed. The earlier on-chain RSA-PSS
@@ -88,7 +91,7 @@ manually after any change to:
 - `src/verify/ethereum.rs` (precompile call shape)
 - `src/canonical.rs` (message length affects keccak/sha input size)
 - `src/mpl_core_cpi.rs` (TransferV1 CPI account list)
-- Token/vault instruction handlers (SPL transfer, `vault_introspect.rs` sysvar loop)
+- Token/vault instruction handlers (SPL transfer + close)
 
 ## Tx size (informational)
 

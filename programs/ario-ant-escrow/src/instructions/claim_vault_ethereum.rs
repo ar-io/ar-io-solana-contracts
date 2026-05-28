@@ -7,20 +7,17 @@ use crate::{
     state::{
         EscrowToken, ASSET_TYPE_VAULT, ESCROW_VAULT_SEED, ETHEREUM_PUBKEY_LEN, PROTOCOL_ETHEREUM,
     },
-    vault_introspect::verify_vaulted_transfer_in_tx,
     verify::ethereum::verify_personal_sign,
     EscrowClaimedEvent,
 };
 
 /// Release escrowed vault tokens after Ethereum ECDSA verification.
 ///
-/// **Active vault path:** Transfers tokens to the payer's ATA, then verifies
-/// that a matching `ario_core::vaulted_transfer` instruction exists in the
-/// same transaction (via sysvar::instructions introspection). This ensures
-/// the tokens end up in a time-locked vault for the claimant — the lock is
-/// enforced on-chain via transaction atomicity.
-///
-/// **Expired vault path:** Direct SPL transfer to the claimant's ATA (liquid).
+/// Active (still-locked) vault claims are rejected (`VaultStillLocked`). Only
+/// expired vaults are claimable, delivering liquid tokens directly to the
+/// claimant's ATA. The former active re-lock path (release-to-payer + sibling
+/// `vaulted_transfer` introspection) was removed — see the active-vault re-lock
+/// removal ADR. Ethereum auth is secp256k1 `verify_personal_sign` (no sysvar).
 pub fn handler(
     ctx: Context<ClaimVaultEthereum>,
     message_nonce: [u8; 32],
@@ -79,54 +76,31 @@ pub fn handler(
 
     let clock = Clock::get()?;
 
-    if clock.unix_timestamp < vault_end_timestamp {
-        // ============================================================
-        // Active vault — verify sibling vaulted_transfer FIRST, then
-        // transfer tokens to payer's ATA. Defense-in-depth: atomicity
-        // protects either way, but checking first is safer.
-        // ============================================================
-        let remaining = vault_end_timestamp
-            .checked_sub(clock.unix_timestamp)
-            .ok_or(EscrowError::ArithmeticOverflow)?;
+    // Active (still-locked) vault claims are DISABLED. The legacy active path
+    // released tokens to a wallet and only *introspected* the tx for a matching
+    // `ario_core::vaulted_transfer` re-lock — a check with no 1:1 binding
+    // between a claim and the re-lock it credited, so one `vaulted_transfer`
+    // could satisfy multiple claims (lock bypass / relayer skim; Codex finding).
+    // A locked vault must now wait until `vault_end_timestamp` and is then
+    // claimed liquid, exactly like any expired vault. See ADR (active-vault
+    // re-lock removal). The revocable-controller variant was already closed by
+    // ADR-021 / BD-105.
+    require!(
+        clock.unix_timestamp >= vault_end_timestamp,
+        EscrowError::VaultStillLocked
+    );
 
-        // Verify that the transaction includes a vaulted_transfer instruction
-        // with matching parameters. If not present → revert immediately,
-        // no token movement occurs.
-        verify_vaulted_transfer_in_tx(
-            &ctx.accounts.instructions_sysvar,
-            &ario_core::ID,
-            amount,
-            remaining,
-            &ctx.accounts.claimant.key(),
-            60, // 60s tolerance for clock drift
-        )?;
-
-        // Verification passed — safe to release tokens to payer's ATA.
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            SplTransfer {
-                from: ctx.accounts.escrow_token_account.to_account_info(),
-                to: ctx.accounts.payer_token_account.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            },
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx, amount)?;
-    } else {
-        // ============================================================
-        // Expired vault — liquid SPL transfer directly to claimant.
-        // ============================================================
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            SplTransfer {
-                from: ctx.accounts.escrow_token_account.to_account_info(),
-                to: ctx.accounts.claimant_token_account.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            },
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx, amount)?;
-    }
+    // Expired vault — liquid SPL transfer directly to claimant.
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        SplTransfer {
+            from: ctx.accounts.escrow_token_account.to_account_info(),
+            to: ctx.accounts.claimant_token_account.to_account_info(),
+            authority: ctx.accounts.escrow.to_account_info(),
+        },
+        signer_seeds,
+    );
+    token::transfer(cpi_ctx, amount)?;
 
     // 7. Close escrow token account.
     let cpi_close = CpiContext::new_with_signer(
@@ -151,10 +125,9 @@ pub fn handler(
     });
 
     msg!(
-        "escrow: claimed vault (ethereum) amount={} claimant={} expired={}",
+        "escrow: claimed expired vault (ethereum) amount={} claimant={}",
         amount,
-        ctx.accounts.claimant.key(),
-        clock.unix_timestamp >= vault_end_timestamp
+        ctx.accounts.claimant.key()
     );
 
     Ok(())
@@ -188,15 +161,6 @@ pub struct ClaimVaultEthereum<'info> {
     )]
     pub claimant_token_account: Account<'info, TokenAccount>,
 
-    /// Payer's ARIO token account (intermediate destination for active-vault
-    /// path — payer then sends them to vaulted_transfer in a sibling ix).
-    #[account(
-        mut,
-        constraint = payer_token_account.mint == escrow.ario_mint @ EscrowError::MintMismatch,
-        constraint = payer_token_account.owner == payer.key() @ EscrowError::TokenAccountOwnerMismatch,
-    )]
-    pub payer_token_account: Account<'info, TokenAccount>,
-
     /// Recipient of the vault/tokens — pubkey bound into canonical message.
     /// CHECK: validated by canonical message ↔ signature binding.
     pub claimant: AccountInfo<'info>,
@@ -206,16 +170,9 @@ pub struct ClaimVaultEthereum<'info> {
     #[account(mut)]
     pub depositor: AccountInfo<'info>,
 
-    /// Tx fee payer. For active vaults, also holds tokens temporarily
-    /// between the escrow release and the vaulted_transfer sibling ix.
+    /// Tx fee payer.
     #[account(mut)]
     pub payer: Signer<'info>,
-
-    /// Instructions sysvar — used to verify that a matching
-    /// vaulted_transfer instruction exists in the same transaction.
-    /// CHECK: validated by address constraint.
-    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
-    pub instructions_sysvar: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,

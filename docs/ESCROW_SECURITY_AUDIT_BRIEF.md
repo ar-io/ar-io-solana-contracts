@@ -52,16 +52,19 @@ the off-chain attestor service.
   pinned by a cross-toolchain test that re-runs every CI build.
 
 ### Vault claim pattern
-Active vault claims use **transaction instruction introspection** (same
-pattern as Solana's Ed25519/secp256k1 precompile programs):
-1. Escrow releases tokens to the payer's ATA
-2. Escrow reads `sysvar::instructions` to verify a matching
-   `ario_core::vaulted_transfer` instruction exists in the same tx
-3. If not found → revert (atomic — tokens return to escrow)
-4. The `vaulted_transfer` creates a time-locked vault for the claimant
+Vaults are claimable **only after** `vault_end_timestamp` and deliver
+**liquid** tokens to the claimant. A claim while still locked is rejected
+with `VaultStillLocked`.
 
-This avoids CPI into ario-core (which fails because system_program
-rejects data-carrying PDAs as payers for `create_account`).
+> **ADR-022 (2026-05-28):** the **active-vault re-lock path was removed.** It
+> previously released tokens to the payer's ATA and used `sysvar::instructions`
+> introspection to confirm a sibling `ario_core::vaulted_transfer` re-locked
+> them for the claimant. That introspection had no 1:1 claim↔re-lock binding,
+> so one `vaulted_transfer` could satisfy multiple batched claims (lock bypass
+> / relayer skim; Codex finding). The path was disabled (not reworked) because
+> it granted no liquidity, nothing depended on it, and escrow is pre-mainnet.
+> `vault_introspect.rs` is gone. See ADR-022 / BD-107. The revocable-controller
+> variant was independently closed by ADR-021 / BD-105.
 
 ### Account types
 - `EscrowAnt`: 661 bytes — holds ANT custody metadata
@@ -81,7 +84,6 @@ contracts/programs/ario-ant-escrow/src/
 ├── state.rs                          — EscrowAnt + EscrowToken structs, nonce derivation, ATTESTOR_PUBKEY constant, ED25519_PROGRAM_ID
 ├── error.rs                          — 25 error codes (4 added for attestation: MissingAttestationInstruction, MalformedAttestationInstruction, AttestationSignerMismatch, AttestationMessageMismatch)
 ├── canonical.rs                      — ANT + escrow canonical message builders
-├── vault_introspect.rs               — sysvar::instructions verification for sibling vaulted_transfer
 ├── mpl_core_cpi.rs                   — hand-rolled TransferV1 CPI
 ├── verify/
 │   ├── attested.rs                   — Ed25519 sysvar introspection (production Arweave path)
@@ -94,7 +96,7 @@ contracts/programs/ario-ant-escrow/src/
     ├── claim_ethereum.rs             — claim_ant_ethereum
     ├── claim_tokens_arweave_attested.rs — claim_tokens_arweave_attested
     ├── claim_tokens_ethereum.rs      — claim_tokens_ethereum
-    ├── claim_vault_arweave_attested.rs — claim_vault_arweave_attested (bundles sibling vaulted_transfer for active path)
+    ├── claim_vault_arweave_attested.rs — claim_vault_arweave_attested (expired→liquid; active→VaultStillLocked, ADR-022)
     ├── claim_vault_ethereum.rs       — claim_vault_ethereum
     ├── cancel.rs                     — cancel_deposit (ANT)
     ├── cancel_token_deposit.rs       — cancel_token_deposit
@@ -144,7 +146,7 @@ contracts/programs/ario-ant-escrow/fuzz/fuzz_targets/
 3. **MEV resistance:** anyone can submit, only named claimant receives
 4. **PKCS#1 v1.5 downgrade prevention:** attestor's `node:crypto` verifier uses `RSA_PKCS1_PSS_PADDING` exclusively (the only RSA verifier left after the on-chain path was removed)
 5. **ECDSA malleability prevention:** EIP-2 low-S enforcement
-6. **Vault lock enforcement:** instruction introspection verifies sibling `vaulted_transfer`
+6. **Vault lock enforcement:** still-locked claims rejected with `VaultStillLocked`; vaults claimable liquid only after `vault_end_timestamp` (active re-lock path removed — ADR-022)
 7. **Token theft prevention:** `claimant_token_account.owner == claimant.key()` constraint
 8. **Ed25519 introspection bounds-checking:** all offsets via `checked_add`; `*_ix_index` must equal `0xFFFF` (DATA_IN_SAME_IX) so the program rejects sigs/pubkeys/messages stored in *other* instructions
 9. **Attestor pubkey baked into program:** `ATTESTOR_PUBKEY` constant in `state.rs` is verified byte-for-byte in `verify_attested_signature`; rotation requires a `BPFLoaderUpgradeable` upgrade (no runtime authority)
@@ -194,9 +196,11 @@ contracts/programs/ario-ant-escrow/fuzz/fuzz_targets/
    - The program tolerates only the documented Ed25519Program ix layout
      (see Solana docs / SDK constants).
 
-3. **Vault instruction introspection (`vault_introspect.rs`)** — Novel pattern.
-   Verify that a transaction containing the matching `vaulted_transfer`
-   instruction is the ONLY way to claim an active vault. Check for bypass.
+3. **Vault claim gating (ADR-022)** — The active-vault re-lock path and its
+   `vault_introspect` were removed (the introspection lacked a 1:1 claim↔re-lock
+   binding → reuse/skim; Codex finding). Verify active claims are rejected with
+   `VaultStillLocked` before any token movement/close, and that the expired
+   liquid path + attestation are otherwise unchanged.
 
 4. **Canonical message reconstruction** — Cross-language byte-equivalence
    between Rust and TypeScript. Two surfaces: SDK

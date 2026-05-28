@@ -37,7 +37,6 @@ pub mod instructions;
 pub mod mpl_core_cpi;
 pub mod schema_migration;
 pub mod state;
-pub mod vault_introspect;
 pub mod verify;
 
 pub use events::{
