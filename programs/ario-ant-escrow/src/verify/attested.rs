@@ -18,7 +18,6 @@
 //! This is the same architectural pattern used by:
 //! - `claim_*_ethereum` (via secp256k1_recover syscall)
 //! - `claim_*_arweave` (via custom verify_rsa_pss_sha256 — too expensive for prod)
-//! - `vault_introspect` (verifies sibling ario_core::vaulted_transfer ix)
 //!
 //! ## Why not just `ed25519_verify` directly?
 //!

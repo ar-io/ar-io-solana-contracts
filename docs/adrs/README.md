@@ -92,6 +92,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-018 | Anchor `#[event]` ABI Policy (Pre-Release Append-Only, Frozen at Mainnet Cutover) | accepted | [`DECISIONS.md`](../DECISIONS.md) |
 | ADR-020 | Schema-Migration Loading — Grow-Then-Deserialize, Append-Only Versioning | accepted | [`0020-schema-migration-grow-then-deserialize.md`](0020-schema-migration-grow-then-deserialize.md) |
 | ADR-021 | Escrow Vault Re-locks Are Non-Revocable | accepted | [`0021-escrow-vault-relocks-non-revocable.md`](0021-escrow-vault-relocks-non-revocable.md) |
+| ADR-022 | Disable the Escrow Active-Vault Re-lock Path | accepted | [`0022-escrow-disable-active-vault-relock.md`](0022-escrow-disable-active-vault-relock.md) |
 
 ### Numbering anomalies
 

@@ -963,9 +963,11 @@ The program now has **15 total instructions**: the original 5 ANT instructions p
 
 **Vault claim behavior:**
 
-Active vaults (where `end_timestamp > now`) are claimed using transaction instruction introspection: the escrow verifies via `sysvar::instructions` that a matching `ario_core::vaulted_transfer` instruction exists in the same transaction (20-instruction loop limit, 60-second tolerance on lock duration). The sibling `vaulted_transfer` creates a new time-locked vault for the claimant preserving the remaining lock duration. Expired vaults are claimed as liquid SPL transfers. This preserves the protocol's staking/locking invariants.
+Vaults are claimable **only after** `end_timestamp` and are delivered as **liquid** SPL transfers to the claimant. A claim attempted while the vault is still locked (`now < end_timestamp`) is rejected with `VaultStillLocked`.
 
-The re-lock must be **non-revocable** (introspection requires `revocable == false`; `deposit_vault` likewise rejects `revocable=true`). A revocable re-lock would set `vault.controller = sender`, where `sender` is the unbound claim-tx payer — who could then `revoke_vault` and steal the funds before expiry, since the attestation binds no controller (and `vaulted_transfer` forbids `sender == recipient`, so it can never be the claimant). See **ADR-021** / **BD-105**. `ario_core` revocable vaults are unaffected for direct use; only the escrow declines to produce/accept them.
+> **ADR-022 (2026-05-28): the active-vault re-lock path was removed.** Previously, claiming a still-locked vault released tokens to a wallet and re-locked them for the claimant via a sibling `ario_core::vaulted_transfer` confirmed by `sysvar::instructions` introspection. That introspection had no 1:1 binding between a claim and the re-lock it credited, so one `vaulted_transfer` could satisfy multiple batched claims (lock bypass / relayer skim; Codex finding). Because the re-lock granted the claimant no liquidity, nothing depended on it (the migration claims vaults liquid-after-expiry), token/vault escrows are never purged, and escrow is pre-mainnet, the path was disabled rather than reworked. The heavier direct-CPI design that would preserve early-claim-with-preserved-lock is recorded in ADR-022 as the way to revive it. See **ADR-022** / **BD-107**.
+
+The earlier revocable-controller theft variant on the (now-removed) active path was independently closed by **ADR-021** / **BD-105**, and `deposit_vault` still rejects `revocable=true` (`RevocableVaultUnsupported`). `ario_core` revocable vaults are unaffected for direct use; only the escrow declines to produce/accept them.
 
 **Account model:**
 

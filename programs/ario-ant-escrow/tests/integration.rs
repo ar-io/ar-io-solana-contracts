@@ -2615,28 +2615,20 @@ async fn test_update_vault_recipient_non_depositor_fails() {
 // Vault Escrow — claim_vault_{arweave,ethereum}
 // =========================================
 //
-// These tests cover two of the three claim paths the on-chain handler
-// implements:
+// The on-chain handler implements exactly two claim outcomes for vaults:
 //
-//  - **Expired-vault path** (happy): the on-chain handler routes the SPL
-//    transfer straight to `claimant_token_account` and does NOT consult
-//    `vault_introspect`. We warp the test clock past `vault_end_timestamp`
-//    and assert the claim succeeds without any sibling instruction.
+//  - **Expired-vault path** (happy): once `clock >= vault_end_timestamp`,
+//    the handler routes the SPL transfer straight to
+//    `claimant_token_account` (liquid). We warp the test clock past
+//    `vault_end_timestamp` and assert the claim succeeds.
 //
-//  - **Active-vault path** (negative): the on-chain handler MUST find a
-//    matching `ario_core::vaulted_transfer` sibling in the same tx via
-//    `vault_introspect::verify_vaulted_transfer_in_tx`. We submit the
-//    claim while the vault is still active without that sibling and
-//    assert the on-chain handler rejects with
-//    `MissingVaultedTransferInstruction`.
-//
-// The **active-vault happy** path (claim + sibling vaulted_transfer in
-// the same tx, tokens re-locked into a new vault for the claimant) is
-// not exercised here — it requires `ario_core` to be deployed and
-// initialised inside this program-test runtime, which is a substantial
-// new test-infra expansion. End-to-end coverage of that path lives in
-// the SDK localnet suite (`sdk/src/solana/escrow-tokens.localnet.test.ts`)
-// where Surfpool already has all programs deployed.
+//  - **Active-vault path** (rejected): while `clock < vault_end_timestamp`,
+//    the handler rejects with `VaultStillLocked`. The former active
+//    re-lock path (release-to-payer + sibling `vaulted_transfer`
+//    introspection) was REMOVED — its introspection had no 1:1
+//    claim↔re-lock binding (reuse / redirection; Codex finding). See the
+//    active-vault re-lock removal ADR / ACTIVE_VAULT_DISABLE_ROLLOUT.md.
+//    A locked vault must wait until expiry, then claims liquid.
 
 async fn claim_vault_ethereum_tx(
     ctx: &mut ProgramTestContext,
@@ -2651,15 +2643,14 @@ async fn claim_vault_ethereum_tx(
     extra_ixs: Vec<Ix>,
 ) -> std::result::Result<(), BanksClientError> {
     let (escrow, _bump) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let _ = payer_ata_pubkey; // active-path intermediate account removed
     let accounts = ario_ant_escrow::accounts::ClaimVaultEthereum {
         escrow,
         escrow_token_account: escrow_ata_pubkey,
         claimant_token_account: claimant_ata_pubkey,
-        payer_token_account: payer_ata_pubkey,
         claimant: claimant.pubkey(),
         depositor: setup.depositor.pubkey(),
         payer: payer.pubkey(),
-        instructions_sysvar: solana_sdk::sysvar::instructions::id(),
         token_program: spl_token::id(),
         system_program: solana_sdk::system_program::ID,
     }
@@ -2786,7 +2777,7 @@ async fn test_claim_vault_ethereum_expired_happy_path() {
 }
 
 #[tokio::test]
-async fn test_claim_vault_ethereum_active_without_sibling_fails() {
+async fn test_claim_vault_ethereum_active_rejected() {
     if skip_if_no_bpf_artifacts() {
         return;
     }
@@ -2864,7 +2855,10 @@ async fn test_claim_vault_ethereum_active_without_sibling_fails() {
         vec![],
     )
     .await;
-    assert_anchor_error!(result, EscrowError::MissingVaultedTransferInstruction);
+    // Active (still-locked) vault claims are disabled — rejected regardless of
+    // any sibling instruction. (Pre-ADR this returned
+    // MissingVaultedTransferInstruction.)
+    assert_anchor_error!(result, EscrowError::VaultStillLocked);
 }
 
 // =========================================
@@ -4460,12 +4454,12 @@ async fn claim_vault_arweave_attested_tx(
         canonical_message,
     );
 
+    let _ = payer_ata_pubkey; // active-path intermediate account removed
     let (escrow, _bump) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
     let accounts = ario_ant_escrow::accounts::ClaimVaultArweaveAttested {
         escrow,
         escrow_token_account: escrow_ata_pubkey,
         claimant_token_account: claimant_ata_pubkey,
-        payer_token_account: payer_ata_pubkey,
         claimant: claimant.pubkey(),
         depositor: setup.depositor.pubkey(),
         payer: payer.pubkey(),
@@ -4584,6 +4578,98 @@ async fn test_claim_vault_arweave_attested_expired_happy_path() {
     );
 }
 
+/// Active (still-locked) Arweave-attested vault claim is rejected with
+/// `VaultStillLocked`, even with a valid attestation. The attestation is
+/// verified FIRST (so this proves the rejection is the lock gate, not an
+/// attestation failure), then the still-locked gate fires. Mirror of
+/// `test_claim_vault_ethereum_active_rejected`.
+#[tokio::test]
+async fn test_claim_vault_arweave_attested_active_rejected() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let amount = 500_000_000u64;
+    let setup = setup_token_escrow(&mut ctx, amount).await;
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_addr, &setup.mint_kp.pubkey()).await;
+
+    // 30-day lock — vault stays ACTIVE (we do NOT warp the clock).
+    deposit_vault_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400,
+        false,
+        PROTOCOL_ARWEAVE,
+        vec![0xAAu8; 512],
+    )
+    .await
+    .expect("deposit_vault should succeed");
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_addr).await;
+
+    let claimant = Keypair::new();
+    let claimant_ata = Keypair::new();
+    let payer_ata = Keypair::new();
+    airdrop(&mut ctx, &claimant.pubkey(), 2_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+    create_token_account(
+        &mut ctx,
+        &payer_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+
+    // Valid attestation over the canonical message (so we pass the sig gate
+    // and reach the still-locked gate).
+    let canonical = build_escrow_canonical(
+        "vault",
+        &setup.asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &[0xAAu8; 512],
+    );
+    let kp = test_attestor_keypair();
+    use ed25519_dalek::Signer;
+    let sig_bytes: [u8; 64] = kp.sign(&canonical).to_bytes();
+
+    let result = claim_vault_arweave_attested_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        &claimant,
+        claimant_ata.pubkey(),
+        &claimant,
+        payer_ata.pubkey(),
+        escrow_state.nonce,
+        &canonical,
+        sig_bytes,
+        vec![],
+    )
+    .await;
+    assert_anchor_error!(result, EscrowError::VaultStillLocked);
+
+    // Escrow must remain open and funded — nothing moved.
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_acct.is_some() && !escrow_acct.as_ref().unwrap().data.is_empty(),
+        "escrow PDA must remain open after a rejected active claim"
+    );
+    let escrow_bal = get_token_balance(&mut ctx, &escrow_ata.pubkey()).await;
+    assert_eq!(escrow_bal, amount, "escrow tokens must be untouched");
+}
+
 #[tokio::test]
 async fn measure_cu_claim_vault_arweave_attested_expired() {
     if skip_if_no_bpf_artifacts() {
@@ -4645,11 +4731,11 @@ async fn measure_cu_claim_vault_arweave_attested_expired() {
     let attestor_pubkey_bytes: [u8; 32] = ario_ant_escrow::state::ATTESTOR_PUBKEY.to_bytes();
     let ed25519_ix = build_ed25519_sigverify_ix(&attestor_pubkey_bytes, &sig_bytes, &canonical);
     let (escrow, _bump) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let _ = payer_ata; // active-path intermediate account removed
     let accounts = ario_ant_escrow::accounts::ClaimVaultArweaveAttested {
         escrow,
         escrow_token_account: escrow_ata.pubkey(),
         claimant_token_account: claimant_ata.pubkey(),
-        payer_token_account: payer_ata.pubkey(),
         claimant: claimant.pubkey(),
         depositor: setup.depositor.pubkey(),
         payer: claimant.pubkey(),

@@ -159,4 +159,13 @@ pub enum EscrowError {
     /// unaffected; only the escrow declines to produce/accept them.)
     #[msg("Revocable vaults are not supported by the escrow (see ADR-021)")]
     RevocableVaultUnsupported,
+
+    /// Active (still-locked) vault claims are disabled: a locked vault can only
+    /// be claimed after its `vault_end_timestamp`, at which point it is
+    /// delivered liquid to the claimant. The former active re-lock path was
+    /// removed because its sibling-`vaulted_transfer` introspection had no 1:1
+    /// claim↔re-lock binding (reuse / redirection). See the active-vault
+    /// re-lock removal ADR.
+    #[msg("Vault is still locked; claim is only available after the vault end timestamp")]
+    VaultStillLocked,
 }
