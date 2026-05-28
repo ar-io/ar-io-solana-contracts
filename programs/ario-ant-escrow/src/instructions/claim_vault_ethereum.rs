@@ -82,9 +82,12 @@ pub fn handler(
     // between a claim and the re-lock it credited, so one `vaulted_transfer`
     // could satisfy multiple claims (lock bypass / relayer skim; Codex finding).
     // A locked vault must now wait until `vault_end_timestamp` and is then
-    // claimed liquid, exactly like any expired vault. See ADR (active-vault
-    // re-lock removal). The revocable-controller variant was already closed by
-    // ADR-021 / BD-105.
+    // claimed liquid, exactly like any expired vault. See ADR-022 (and BD-107).
+    // The revocable-controller variant was already closed by ADR-021 / BD-105.
+    //
+    // To revive "claim early, stay locked": see
+    // `docs/RESTORE_ACTIVE_VAULT_RELOCK.md` for the step-by-step direct-CPI
+    // restoration playbook.
     require!(
         clock.unix_timestamp >= vault_end_timestamp,
         EscrowError::VaultStillLocked
