@@ -89,8 +89,10 @@ introspected sibling to reuse and no wallet redirection.
   and the escrow PDA can't fund that rent, so it needs a new ario-core
   instruction splitting the rent-payer from the sender, plus an escrow rework
   and a larger SDK change. Disproportionate for a feature nothing uses and that
-  grants no liquidity. **Recorded as the design starting point if "claim early,
-  stay locked" is ever a deliberate product requirement.**
+  grants no liquidity. **The step-by-step restoration playbook is committed at
+  [`docs/RESTORE_ACTIVE_VAULT_RELOCK.md`](../RESTORE_ACTIVE_VAULT_RELOCK.md)**
+  (ario-core ix design, escrow CPI block, SDK + frontend + docs checklist) so
+  the feature can be revived without re-deriving anything.
 - **Harden introspection (bind `sender_token_account`/`sender`)** — necessary
   but *insufficient*: it does not stop reuse (one sibling pulling from the
   payer's account still satisfies N claims).

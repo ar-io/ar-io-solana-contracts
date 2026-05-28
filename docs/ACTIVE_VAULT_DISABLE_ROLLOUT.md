@@ -3,7 +3,12 @@
 Working tracker for the multi-repo change that disables the active
 (still-locked) vault-claim re-lock path in `ario-ant-escrow`, closing the
 reused / unbound `vaulted_transfer` finding (Codex). Pairs with the ADR
-(see `docs/adrs/`). Delete or archive once all repos have shipped.
+(see `docs/adrs/0022-...`). Delete or archive once all repos have shipped.
+
+> **Want to bring active re-lock back later?** See
+> [`RESTORE_ACTIVE_VAULT_RELOCK.md`](RESTORE_ACTIVE_VAULT_RELOCK.md) for the
+> step-by-step direct-CPI restoration playbook (ario-core + escrow + SDK +
+> frontend + docs).
 
 ## Why
 
