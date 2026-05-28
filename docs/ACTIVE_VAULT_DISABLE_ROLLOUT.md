@@ -81,10 +81,10 @@ Dropping `payer_token_account` is an ABI change to the two claim ixs, so order:
 
 ## Status
 
-- [ ] 1. Contracts: code
-- [ ] 2. Contracts: tests
-- [ ] 3. Contracts: docs/ADR
-- [ ] 4. Contracts: verify + PR
-- [ ] 5. SDK: changes + PR (blocked on contract release)
-- [ ] 6. Frontend: UX + PR (blocked on SDK)
-- [ ] 7. Migration tooling: error string
+- [x] 1. Contracts: code
+- [x] 2. Contracts: tests (69/69 escrow BPF suite green; clippy/fmt clean)
+- [x] 3. Contracts: docs/ADR (ADR-022, BD-107, design/spec/CU/audit-brief)
+- [x] 4. Contracts: verify + PR — **PR #74, CI green, awaiting review/merge**
+- [ ] 5. SDK: changes + PR — *blocked on #74 merge + `@ar.io/solana-contracts` publish*
+- [ ] 6. Frontend: UX + PR — *blocked on (5)*
+- [ ] 7. Migration tooling: error string — *needs new escrow deployed to staging/devnet to validate*
