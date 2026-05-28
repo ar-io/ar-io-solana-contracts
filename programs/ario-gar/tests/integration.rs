@@ -23082,3 +23082,379 @@ async fn test_migrate_observation_realloc() {
     assert_eq!(obs.observer, observer.pubkey());
     assert_eq!(obs.gateway_count, 10);
 }
+
+// =========================================
+// Codex 2026-05-28: mid-epoch leave bias regression
+// =========================================
+//
+// Sets up three gateways in registry slots [small1, big_leaver, small2] where
+// `big_leaver` carries ~100x the composite weight of either small gateway.
+// After `tally_weights` accumulates the full pre-leave total into
+// `epoch.total_composite_weight`, `big_leaver` calls `leave_network`. That
+// zeroes its registry slot's `composite_weight` in place but does not
+// decrement the epoch total.
+//
+// Pre-fix `prescribe_epoch` sampled `random_value % stale_total` and the
+// "if !found" fallback attributed every dead-range hit (~99% of the
+// random_value space at 100x ratio) to the LAST non-zero slot — collapsing
+// observer selection onto `small2` and yielding `observer_count == 1` with
+// overwhelming probability across the 30-iteration roulette.
+//
+// Post-fix `prescribe_epoch` recomputes `total_weight` as a live walk of
+// current registry composite_weights, eliminating the dead range and the
+// fallback. With weights `[small1, 0, small2]` and balanced live total,
+// both surviving slots are selected and `observer_count == 2`.
+#[tokio::test]
+async fn test_prescribe_unbiased_after_mid_epoch_leave() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+
+    let big_op = Keypair::new();
+    let small2_op = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    for op in [&big_op, &small2_op] {
+        pt.add_account(
+            op.pubkey(),
+            solana_sdk::account::Account {
+                lamports: 50_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund the protocol token account so create_epoch reports non-zero
+    // total_eligible_rewards (otherwise reward calc is trivially zero and
+    // the test doesn't exercise the bias surface).
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Warp clock to 0 so all three gateways join BEFORE epoch.start_timestamp
+    // (set to 100 by pre_create_epoch_settings genesis_timestamp). Otherwise
+    // tally_weights would zero their effective_composite (SHOULD-13).
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    // Three gateways — registry slots fill in join order.
+    let payer_pk = ctx.payer.pubkey();
+    let small_stake = 20_000_000_000u64; // 20k ARIO (min_operator_stake)
+    let big_stake = 2_000_000_000_000u64; // 2M ARIO → ~100x stake_weight
+
+    // Slot 0: payer (small1).
+    let gw_small1_key = join_gateway(&mut ctx, &setup, small_stake).await;
+
+    // Slot 1: big_op (big_leaver). Mint enough to its ATA, fund SOL above.
+    let big_token = Keypair::new();
+    create_token_account(&mut ctx, &big_token, &setup.mint.pubkey(), &big_op.pubkey()).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &big_token.pubkey(),
+        &setup.mint_authority,
+        // 2x stake to ensure the join succeeds and leave_network's
+        // exit-vault rent overhead is covered.
+        big_stake.saturating_mul(2),
+    )
+    .await;
+    let gw_big_key =
+        join_gateway_with_operator(&mut ctx, &setup, &big_op, &big_token.pubkey(), big_stake).await;
+
+    // Slot 2: small2_op (accomplice / "last non-zero slot" in pre-fix fallback).
+    let small2_token = Keypair::new();
+    create_token_account(
+        &mut ctx,
+        &small2_token,
+        &setup.mint.pubkey(),
+        &small2_op.pubkey(),
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &small2_token.pubkey(),
+        &setup.mint_authority,
+        small_stake.saturating_mul(2),
+    )
+    .await;
+    let gw_small2_key = join_gateway_with_operator(
+        &mut ctx,
+        &setup,
+        &small2_op,
+        &small2_token.pubkey(),
+        small_stake,
+    )
+    .await;
+
+    // Warp past epoch.start (= 100) and pin slot so the hashchain is
+    // reproducible across test runs.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // create_epoch — active_gateway_count = 3.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally_weights — populates composite_weight for all 3 slots and
+    // accumulates the full pre-leave total into epoch.total_composite_weight.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gw_small1_key,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(gw_big_key, false));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gw_small2_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Snapshot the post-tally weights so we can prove (a) big_leaver
+    // dominates and (b) epoch.total_composite_weight reflects all three
+    // contributions — the exact precondition for the stale-total bias.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    let small1_weight = registry.gateways[0].composite_weight;
+    let big_weight = registry.gateways[1].composite_weight;
+    let small2_weight = registry.gateways[2].composite_weight;
+    assert!(
+        big_weight >= small1_weight.saturating_mul(50)
+            && big_weight >= small2_weight.saturating_mul(50),
+        "test setup invariant: big_leaver weight ({big_weight}) must dominate \
+         small1 ({small1_weight}) and small2 ({small2_weight}) by ≥50x so the \
+         bias surface is large enough to discriminate"
+    );
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let stale_total = epoch.total_composite_weight();
+    assert_eq!(
+        stale_total,
+        small1_weight as u128 + big_weight as u128 + small2_weight as u128,
+        "tally must accumulate every Joined slot's composite_weight"
+    );
+
+    // leave_network on big_leaver — between tally and prescribe. Zeroes its
+    // registry slot composite_weight in place; epoch.total_composite_weight
+    // stays at `stale_total` per gateway.rs::leave_network comment.
+    let (big_wd_counter, _) = withdrawal_counter_pda(&big_op.pubkey());
+    let (big_wd, _) = withdrawal_pda(&big_op.pubkey(), 0);
+    let (big_excess_wd, _) = withdrawal_pda(&big_op.pubkey(), 1);
+    let mut leave_accounts = ario_gar::accounts::LeaveNetwork {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_pda().0,
+        registry: setup.registry_key,
+        gateway: gw_big_key,
+        withdrawal_counter: big_wd_counter,
+        withdrawal: big_wd,
+        excess_withdrawal: Some(big_excess_wd),
+        operator: big_op.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let (big_observer_lookup, _) = observer_lookup_pda(&big_op.pubkey());
+    leave_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        big_observer_lookup,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: leave_accounts,
+            data: ario_gar::instruction::LeaveNetwork {}.data(),
+        }],
+        Some(&big_op.pubkey()),
+        &[&big_op],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Confirm the bias precondition: slot 1's composite_weight is now 0 but
+    // epoch.total_composite_weight is still the stale pre-leave total.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[1].composite_weight, 0,
+        "leave_network must zero the leaver's slot weight"
+    );
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.total_composite_weight(),
+        stale_total,
+        "leave_network must NOT decrement epoch.total_composite_weight \
+         (the snapshot the bias bug relied on)"
+    );
+
+    // prescribe_epoch — pass only the two SURVIVING gateway PDAs in
+    // remaining_accounts. Post-fix the live recompute samples modulo
+    // small1_weight + small2_weight, so both must be selected
+    // (observer_count == 2). Pre-fix the stale modulus + fallback would
+    // collapse selection onto small2 (last non-zero slot) with
+    // overwhelming probability, leaving observer_count == 1 and failing
+    // remaining_accounts validation (the unmatched gw_small1_key would be
+    // re-interpreted as a NameRegistry and fail the owner check).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gw_small1_key,
+        false,
+    ));
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gw_small2_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.prescriptions_done, 1,
+        "prescribe_epoch must flip prescriptions_done"
+    );
+    assert_eq!(
+        epoch.observer_count, 2,
+        "both surviving gateways must be selected; pre-fix the bias would \
+         collapse selection onto small2 and yield observer_count == 1"
+    );
+
+    let prescribed: std::collections::HashSet<Pubkey> = epoch.prescribed_observer_gateways
+        [..epoch.observer_count as usize]
+        .iter()
+        .copied()
+        .collect();
+    assert!(
+        prescribed.contains(&payer_pk),
+        "small1 (payer) must be prescribed — pre-fix the bias would leave it \
+         out with ~99.5% probability across the 30-iteration roulette"
+    );
+    assert!(
+        prescribed.contains(&small2_op.pubkey()),
+        "small2 must be prescribed"
+    );
+    assert!(
+        !prescribed.contains(&big_op.pubkey()),
+        "leaver (big_op) must never appear in prescribed_observer_gateways"
+    );
+}

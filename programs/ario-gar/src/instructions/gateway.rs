@@ -343,10 +343,13 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
     // failure tallies to whichever gateway took over the freed slot
     // (audit H2 / H3, 2026-04).
     //
-    // Known limitation: `epoch.total_composite_weight` is NOT decremented
-    // here. A leaver mid-epoch slightly biases prescribe_epoch's weighted
-    // roulette toward later slots (probability skew ≪ 1 slot). Acceptable
-    // pre-mainnet; documented for future cranker coordination.
+    // `epoch.total_composite_weight` is intentionally not decremented here.
+    // The snapshot stays meaningful for `EpochWeightsTalliedEvent` (which
+    // reports the tally-time total), and `prescribe_epoch` recomputes the
+    // live sum from current registry weights before sampling — so a leaver
+    // with cleared composite_weight cannot bias roulette toward downstream
+    // slots. See `epoch.rs::prescribe_epoch` "Sample modulo the *live* sum"
+    // comment for the Codex 2026-05-28 finding this guards against.
     let mut registry = ctx.accounts.registry.load_mut()?;
     let index = gateway.registry_index.index as usize;
     require!(

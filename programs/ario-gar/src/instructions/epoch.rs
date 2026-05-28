@@ -505,9 +505,26 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
     );
 
     let active_count = epoch.active_gateway_count as usize;
-    let total_weight = epoch.total_composite_weight();
 
     // --- Observer selection (weighted roulette) ---
+    //
+    // Sample modulo the *live* sum of current registry weights, not the
+    // `epoch.total_composite_weight` snapshot captured at tally. A gateway
+    // that calls `leave_network` (or hits permissionless `prune_gateway`)
+    // after `tally_weights` and before `prescribe_epoch` has its slot weight
+    // zeroed in place but the epoch total is not decremented (see
+    // `gateway.rs::leave_network`). Using the stale total opens a window
+    // where `random_value` falls into the leaver's now-empty weight range,
+    // and the previous fallback ("pick the last non-zero slot") collapsed
+    // that range onto a single tail slot — giving any downstream gateway
+    // ~`leaver_weight / total` selection share regardless of its own weight
+    // (Codex 2026-05-28 finding). The live recompute eliminates the dead
+    // range entirely, so no fallback is needed.
+    let mut total_weight: u128 = 0;
+    for i in 0..active_count {
+        total_weight = total_weight.saturating_add(registry.gateways[i].composite_weight as u128);
+    }
+
     let max_observers = std::cmp::min(
         epoch_settings.prescribed_observer_count as usize,
         active_count,
@@ -529,39 +546,20 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
                 u128::from_le_bytes(hash_bytes[..16].try_into().unwrap()) % total_weight;
 
             // Walk registry, accumulate weight. Slots with composite_weight==0
-            // (Leaving gateways, late-joiners, default-zeroed slots) are skipped
-            // — their cumulative contribution is zero, so the random pointer
-            // never lands inside their range. The eligibility filter on the
-            // selection branch additionally rejects any zero-weight slot that
-            // a future change might surface here (audit NEW-2).
+            // (Leaving gateways, late-joiners) contribute zero to the cumulative
+            // sum, so the random pointer cannot land inside their range. The
+            // `slot.composite_weight > 0` guard rejects any zero-weight slot
+            // that a future change might surface here (audit NEW-2).
+            //
+            // With `total_weight` computed live above, every `random_value` in
+            // `[0, total_weight)` lands inside an actual non-zero slot — there
+            // is no "off the end" case to fall back from.
             let mut cumulative: u128 = 0;
-            let mut found = false;
             for i in 0..active_count {
                 let slot = &registry.gateways[i];
                 cumulative += slot.composite_weight as u128;
                 if cumulative > random_value && slot.composite_weight > 0 {
                     // Check if already selected
-                    if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
-                    {
-                        epoch.prescribed_observer_gateways[selected_count] = slot.address;
-                        epoch.prescribed_observers[selected_count] = slot.address;
-                        selected_count += 1;
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            if !found && active_count > 0 {
-                // Fallback: select the last slot with non-zero weight (i.e.,
-                // the last reward-eligible Joined gateway). Walk backward to
-                // skip Leaving slots / late-joiners that may sit at higher
-                // indices (audit NEW-2 — fallback must not pick a leaver or
-                // a Pubkey::default placeholder).
-                for i in (0..active_count).rev() {
-                    let slot = &registry.gateways[i];
-                    if slot.composite_weight == 0 {
-                        continue;
-                    }
                     if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
                     {
                         epoch.prescribed_observer_gateways[selected_count] = slot.address;
@@ -985,4 +983,148 @@ pub struct CloseEpoch<'info> {
 
     #[account(mut)]
     pub payer: Signer<'info>,
+}
+
+#[cfg(test)]
+mod prescribe_roulette_math {
+    //! Pure-math tests for the `prescribe_epoch` weighted roulette. The
+    //! production loop walks `registry.gateways[..active_count]` directly;
+    //! this mirror lets us exhaust the random_value space against arbitrary
+    //! synthetic registries without spinning up `solana-program-test`.
+    //!
+    //! These tests document and lock down the fix for the Codex 2026-05-28
+    //! finding ("stale total + biased fallback selects later or last
+    //! non-zero slots"). See the "Sample modulo the *live* sum" comment in
+    //! `prescribe_epoch`.
+    fn live_total(weights: &[u64]) -> u128 {
+        weights
+            .iter()
+            .fold(0u128, |acc, &w| acc.saturating_add(w as u128))
+    }
+
+    /// Mirrors the production walk-and-sum at the top of `prescribe_epoch`'s
+    /// inner hash loop. Returns `None` only when the caller passes a
+    /// `random_value >= sum(weights)` (which the production code cannot do
+    /// because it computes `random_value % live_total`), or when all weights
+    /// are zero. The production code never reaches the previous "last
+    /// non-zero" fallback because there is no dead range to fall off of.
+    fn roulette_select(weights: &[u64], random_value: u128) -> Option<usize> {
+        let mut cumulative: u128 = 0;
+        for (i, &w) in weights.iter().enumerate() {
+            cumulative = cumulative.saturating_add(w as u128);
+            if cumulative > random_value && w > 0 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn live_total_excludes_leaver_weight() {
+        // Pre-tally: [small, big_leaver, accomplice] with composite [1, 100, 1].
+        // Post-leave: leaver's slot zeroed in place → [1, 0, 1].
+        // Pre-fix prescribe_epoch sampled `random_value % 102` (the stale
+        // epoch.total_composite_weight). Post-fix it samples `random_value % 2`.
+        let pre_tally = [1u64, 100, 1];
+        let post_leave = [1u64, 0, 1];
+        assert_eq!(live_total(&pre_tally), 102);
+        assert_eq!(live_total(&post_leave), 2);
+    }
+
+    #[test]
+    fn no_dead_range_post_leave() {
+        // With live_total = 2, every random_value in [0, 2) lands inside an
+        // actual non-zero slot — the production code's inner loop always
+        // terminates with a selection. The previous "if !found" fallback
+        // (epoch.rs pre-fix) was only reachable because the modulus was the
+        // stale, larger total; with the fix in place, that branch becomes
+        // structurally dead code and is removed.
+        let post_leave = [1u64, 0, 1];
+        let total = live_total(&post_leave);
+        for rv in 0..total {
+            let pick = roulette_select(&post_leave, rv)
+                .unwrap_or_else(|| panic!("random_value {rv} fell off the end of {post_leave:?}"));
+            assert_ne!(pick, 1, "leaver slot (index 1) must never be selected");
+            assert!(
+                post_leave[pick] > 0,
+                "selected slot must have non-zero composite_weight"
+            );
+        }
+    }
+
+    #[test]
+    fn distribution_is_uniform_post_leave() {
+        // [1, 0, 1] over live_total=2: each surviving slot wins exactly half
+        // the random_value space — recovering the unbiased 1:1 ratio between
+        // the small1 and accomplice gateways that pre-fix would have been
+        // skewed to 1:101 by the dead-range-plus-fallback bug.
+        let post_leave = [1u64, 0, 1];
+        let mut hits = [0usize; 3];
+        for rv in 0..live_total(&post_leave) {
+            hits[roulette_select(&post_leave, rv).unwrap()] += 1;
+        }
+        assert_eq!(hits, [1, 0, 1]);
+    }
+
+    #[test]
+    fn pre_fix_dead_range_matches_codex_poc() {
+        // Locks down the Codex 2026-05-28 PoC arithmetic. With weights
+        // [1, 0, 1] but the *stale* modulus 102, only random_value=0 picks
+        // slot 0 and only random_value=1 picks slot 2 via the main walk;
+        // random_value in [2, 101] (100 values, ~98% of the space) falls
+        // off the end. The pre-fix fallback attributed every one of those
+        // 100 to the last non-zero slot (slot 2) — producing the 101/102
+        // vs 1/102 bias. The fix eliminates the dead range, so this test
+        // also documents *why* the fallback was load-bearing on the bug
+        // and is now safe to delete.
+        let post_leave = [1u64, 0, 1];
+        let stale_total = 102u128;
+        let mut main_hits = [0usize; 3];
+        let mut dead_range = 0usize;
+        for rv in 0..stale_total {
+            match roulette_select(&post_leave, rv) {
+                Some(idx) => main_hits[idx] += 1,
+                None => dead_range += 1,
+            }
+        }
+        assert_eq!(main_hits, [1, 0, 1]);
+        assert_eq!(dead_range, 100);
+    }
+
+    #[test]
+    fn all_zero_weights_returns_none() {
+        // Outer guard `if total_weight > 0` skips the loop, but for
+        // defense-in-depth the inner walk must return None rather than
+        // panicking or selecting slot 0 when nothing is eligible.
+        let weights = [0u64, 0, 0];
+        assert_eq!(live_total(&weights), 0);
+        assert_eq!(roulette_select(&weights, 0), None);
+    }
+
+    #[test]
+    fn single_nonzero_slot_wins_everything() {
+        // The all-but-one-left case: only slot 2 is reward-eligible, every
+        // random_value in [0, 5) selects it.
+        let weights = [0u64, 0, 5, 0];
+        assert_eq!(live_total(&weights), 5);
+        for rv in 0..live_total(&weights) {
+            assert_eq!(roulette_select(&weights, rv), Some(2));
+        }
+    }
+
+    #[test]
+    fn leaver_at_tail_is_skipped() {
+        // The pre-fix fallback walked backward from the last slot; this
+        // could have re-selected a stale-tail leaver if `composite_weight`
+        // weren't checked. With the fix, the fallback is gone — but the
+        // forward walk's `slot.composite_weight > 0` guard still rejects a
+        // zero-weight tail. Lock that down so a future refactor can't
+        // regress (audit NEW-2 — fallback must not pick a leaver).
+        let weights = [1u64, 1, 0];
+        assert_eq!(live_total(&weights), 2);
+        for rv in 0..live_total(&weights) {
+            let pick = roulette_select(&weights, rv).unwrap();
+            assert_ne!(pick, 2, "tail leaver (zero weight) must not be selected");
+        }
+    }
 }
