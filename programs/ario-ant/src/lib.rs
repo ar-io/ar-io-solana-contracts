@@ -688,25 +688,15 @@ pub mod ario_ant {
         let system_program = ctx.accounts.system_program.to_account_info();
 
         // Grow-then-deserialize each account (see schema_migration::grow_account).
+        // grow_account is idempotent when the account is already at target
+        // size (early-return inside the helper), so calling both before the
+        // version gate doesn't waste rent for fully-migrated ANTs.
         let config_info = ctx.accounts.ant_config.to_account_info();
         schema_migration::grow_account(&config_info, &payer, &system_program, AntConfig::SIZE)?;
         let mut config: AntConfig = {
             let data = config_info.try_borrow_data()?;
             AntConfig::try_deserialize(&mut &data[..])?
         };
-        require!(
-            config.version < ANT_CONFIG_VERSION,
-            AntError::AlreadyLatestVersion
-        );
-        schema_migration::migrate_config_version(&mut config)?;
-        schema_migration::write_account(&config_info, &config)?;
-        msg!(
-            "ANT {} config migrated to {}.{}.{}",
-            asset_key,
-            config.version.major,
-            config.version.minor,
-            config.version.patch,
-        );
 
         let controllers_info = ctx.accounts.ant_controllers.to_account_info();
         schema_migration::grow_account(
@@ -719,7 +709,37 @@ pub mod ario_ant {
             let data = controllers_info.try_borrow_data()?;
             AntControllers::try_deserialize(&mut &data[..])?
         };
-        if controllers.version < ANT_CONTROLLERS_VERSION {
+
+        // Per-account version gates (audit M-6, 2026-05-29). Pre-fix,
+        // `require!(config.version < ANT_CONFIG_VERSION, ...)` bailed
+        // BEFORE the controllers check, so controllers-only migrations
+        // became unreachable any time `ANT_CONTROLLERS_VERSION` was
+        // bumped without a parallel `ANT_CONFIG_VERSION` bump. Today
+        // both versions are (1,0,0) so the bug is latent — but the
+        // first future controllers-only schema change would have
+        // produced ANTs with up-to-date config and stale controllers
+        // that this ix could never reach. The split gate below makes
+        // migrate_ant succeed iff EITHER account needs migration.
+        let config_needs_migrate = config.version < ANT_CONFIG_VERSION;
+        let controllers_needs_migrate = controllers.version < ANT_CONTROLLERS_VERSION;
+        require!(
+            config_needs_migrate || controllers_needs_migrate,
+            AntError::AlreadyLatestVersion
+        );
+
+        if config_needs_migrate {
+            schema_migration::migrate_config_version(&mut config)?;
+            schema_migration::write_account(&config_info, &config)?;
+            msg!(
+                "ANT {} config migrated to {}.{}.{}",
+                asset_key,
+                config.version.major,
+                config.version.minor,
+                config.version.patch,
+            );
+        }
+
+        if controllers_needs_migrate {
             schema_migration::migrate_controllers_version(&mut controllers)?;
             schema_migration::write_account(&controllers_info, &controllers)?;
             msg!(
