@@ -8035,6 +8035,202 @@ async fn test_compound_delegation_rewards() {
 }
 
 // -----------------------------------------
+// test_compound_delegation_rewards_permissionless (audit M-2, 2026-05-29)
+//
+// `compound_delegation_rewards` MUST be invokable by any signer — not just
+// the delegator themselves. INVARIANTS.md describes the ix as
+// "permissionless" because compounding only moves a delegate's pending
+// rewards into their active stake on their OWN balance; no funds move
+// between accounts and no authorization is required. Pre-this-fix the
+// account struct required `delegator: Signer<'info>`, contradicting the
+// documented model and blocking (a) the off-chain monitor's Invariant 1
+// health check and (b) `finalize_gone` for gateways with dormant pending
+// delegate rewards.
+//
+// This test pins the new behavior: a third-party signer (not the
+// delegator) calls compound on the delegator's behalf and the
+// instruction succeeds with the same state mutation.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_compound_delegation_rewards_permissionless() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Set up a real delegator (the holder of the Delegation PDA).
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(
+        &mut ctx,
+        &delegator_token,
+        &setup.mint.pubkey(),
+        &delegator_pk,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let delegate_amount = 100_000_000u64;
+    let (delegation_key, _) = delegation_pda(&payer_pk, &delegator_pk);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake {
+                amount: delegate_amount,
+            }
+            .data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Inject pending reward (same simulation as test_compound_delegation_rewards).
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    gw.cumulative_reward_per_token = 1_000_000_000_000_000_000u128; // 1e18
+    let mut new_data = Vec::new();
+    gw.try_serialize(&mut new_data).unwrap();
+    let original_len = gw_account.data.len();
+    new_data.resize(original_len, 0);
+    ctx.set_account(
+        &gateway_key,
+        &solana_sdk::account::Account {
+            lamports: gw_account.lamports,
+            data: new_data,
+            owner: gw_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // ---- The permissionless invocation ----
+    // A THIRD-PARTY caller — not the delegator — invokes compound on the
+    // delegator's behalf. The `delegator` ACCOUNT in the metas is still the
+    // delegator's pubkey (it's a PDA-derivation source bound by the seeds
+    // constraint), but it is NOT a signer here. Pre-this-fix this fails
+    // with `MissingRequiredSignature`; post-fix it succeeds.
+    let third_party = Keypair::new();
+    let third_party_pk = third_party.pubkey();
+    // Fund the third party so they can pay tx fees.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &third_party_pk,
+            10_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CompoundDelegationRewards {
+                gateway: gateway_key,
+                delegation: delegation_key,
+                // `delegator` is now an UncheckedAccount (not a Signer);
+                // we pass its pubkey purely as a PDA-derivation seed.
+                delegator: delegator_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CompoundDelegationRewards {}.data(),
+        }],
+        Some(&third_party_pk),
+        &[&third_party], // ← signed by third party, NOT the delegator
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("permissionless compound must succeed (audit M-2)");
+
+    // State mutation is identical to the delegator-signed variant.
+    let delegation_account = ctx
+        .banks_client
+        .get_account(delegation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let delegation = Delegation::try_deserialize(&mut delegation_account.data.as_slice()).unwrap();
+    assert_eq!(delegation.amount, delegate_amount + 100_000_000);
+    assert_eq!(delegation.reward_debt, 1_000_000_000_000_000_000u128);
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    assert_eq!(gw.total_delegated_stake, delegate_amount + 100_000_000);
+}
+
+// -----------------------------------------
 // test_close_epoch_happy
 // -----------------------------------------
 
