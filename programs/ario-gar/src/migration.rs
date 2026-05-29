@@ -19,6 +19,19 @@ pub const MIGRATION_DEADLINE: i64 = 1781884800;
 
 /// Check if discriminator matches a known ario-gar account type and return expected SIZE.
 fn known_discriminator(disc: &[u8; 8]) -> Option<usize> {
+    // EpochSettings intentionally excluded (audit M-4, 2026-05-29) —
+    // it's a singleton with its own rotatable `authority: Pubkey` field
+    // (state/mod.rs:758). Allowing import_account to overwrite it would
+    // let a compromised `migration_authority` rotate `EpochSettings.authority`
+    // to a key it controls, and that rotation SURVIVES
+    // `finalize_migration` (the migration deadline only gates this ix,
+    // not subsequent `update_epoch_settings` calls authorized by the
+    // rotated key). Mirrors the ARNS pattern: `ArnsConfig` /
+    // `DemandFactor` are similarly excluded from ario-arns's import
+    // allowlist with the same rationale (see ario-arns/migration.rs:22-25).
+    //
+    // GatewaySettings (also has an `authority: Pubkey` field, state/mod.rs:133)
+    // is already excluded by being absent from this list entirely.
     let checks: &[(&str, usize)] = &[
         ("account:Gateway", Gateway::SIZE),
         ("account:Delegation", Delegation::SIZE),
@@ -26,7 +39,6 @@ fn known_discriminator(disc: &[u8; 8]) -> Option<usize> {
         ("account:WithdrawalCounter", WithdrawalCounter::SIZE),
         ("account:AllowlistEntry", AllowlistEntry::SIZE),
         ("account:RedelegationRecord", RedelegationRecord::SIZE),
-        ("account:EpochSettings", EpochSettings::SIZE),
         ("account:Observation", Observation::SIZE),
         ("account:ObserverLookup", ObserverLookup::SIZE),
     ];
@@ -430,4 +442,56 @@ pub struct MigrateSettingsSupplyCounters<'info> {
     )]
     pub settings: Account<'info, GatewaySettings>,
     pub authority: Signer<'info>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit M-4 (2026-05-29): EpochSettings must NOT be importable.
+    /// Pins the allowlist composition so a future PR can't silently
+    /// re-add it. The discriminator is computed exactly the same way
+    /// `known_discriminator` itself computes it, so this also catches
+    /// any accidental rename of the account type.
+    #[test]
+    fn epoch_settings_excluded_from_import_allowlist() {
+        let h = hash(b"account:EpochSettings");
+        let disc: [u8; 8] = h.to_bytes()[..8].try_into().unwrap();
+        assert!(
+            known_discriminator(&disc).is_none(),
+            "EpochSettings was re-added to the import allowlist — audit M-4 \
+             explicitly excluded it because its `authority` field can be \
+             rotated post-finalize via a re-imported overwrite. Remove it \
+             or document the new mitigation."
+        );
+    }
+
+    /// Belt-and-braces: GatewaySettings (also has `authority: Pubkey`)
+    /// must remain excluded too. It's been excluded forever but a future
+    /// PR could mistakenly include it for "completeness".
+    #[test]
+    fn gateway_settings_excluded_from_import_allowlist() {
+        let h = hash(b"account:GatewaySettings");
+        let disc: [u8; 8] = h.to_bytes()[..8].try_into().unwrap();
+        assert!(
+            known_discriminator(&disc).is_none(),
+            "GatewaySettings has an `authority` field and is intentionally \
+             excluded from migration import. If you're re-adding it, document \
+             the new mitigation against authority-hijack via re-import."
+        );
+    }
+
+    /// Spot-check that the rest of the allowlist still resolves —
+    /// ensures the M-4 exclusion edit didn't accidentally break the
+    /// legitimate types' discriminator lookup.
+    #[test]
+    fn allowlist_smoke_check_includes_gateway() {
+        let h = hash(b"account:Gateway");
+        let disc: [u8; 8] = h.to_bytes()[..8].try_into().unwrap();
+        assert_eq!(
+            known_discriminator(&disc),
+            Some(Gateway::SIZE),
+            "Gateway must still resolve through known_discriminator"
+        );
+    }
 }
