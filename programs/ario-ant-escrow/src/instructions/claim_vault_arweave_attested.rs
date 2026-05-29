@@ -49,10 +49,9 @@ pub fn handler(ctx: Context<ClaimVaultArweaveAttested>, message_nonce: [u8; 32])
         escrow.recipient_pubkey_active(),
     );
 
-    // Verify the Ed25519 attestation. This consults the same
-    // `instructions_sysvar` we use for `vaulted_transfer` introspection
-    // below. Order: Ed25519Program ix at idx-1 of the claim ix;
-    // `vaulted_transfer` may live anywhere.
+    // Verify the Ed25519 attestation. Reads `instructions_sysvar` for
+    // the Ed25519Program native sigverify ix that MUST sit at idx-1 of
+    // the claim ix (the sysvar introspection's sole use post-ADR-022).
     verify_attested_signature(&ctx.accounts.instructions_sysvar, &message)?;
 
     let depositor_key = escrow.depositor;
@@ -168,9 +167,10 @@ pub struct ClaimVaultArweaveAttested<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// Solana `sysvar::instructions` — used for BOTH the Ed25519 sig
-    /// introspection (preceding ix) and the `vaulted_transfer`
-    /// introspection (anywhere in tx).
+    /// Solana `sysvar::instructions` — introspected for the Ed25519
+    /// attestation sigverify ix (MUST sit at idx-1 of this claim ix).
+    /// Sole introspection use post-ADR-022 (the former
+    /// `vaulted_transfer`-sibling check was removed).
     /// CHECK: pinned by address constraint to the sysvar id.
     #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
