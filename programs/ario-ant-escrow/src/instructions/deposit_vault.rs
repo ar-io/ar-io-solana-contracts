@@ -26,10 +26,11 @@ pub const MIN_VAULT_AMOUNT: u64 = 100_000_000;
 ///
 /// When the recipient claims:
 /// - If the vault is still active (clock < vault_end_timestamp), the claim
-///   instruction CPIs into `ario_core::vaulted_transfer` to create a
-///   time-locked vault with the remaining duration.
+///   instruction rejects with `VaultStillLocked` (ADR-022 — the former active
+///   re-lock path was removed; see `docs/RESTORE_ACTIVE_VAULT_RELOCK.md` for
+///   how to revive it via direct CPI if ever needed).
 /// - If the vault has expired, the claim instruction does a liquid SPL
-///   transfer (same as token claim).
+///   transfer to the claimant (same as token claim).
 pub fn handler(
     ctx: Context<DepositVault>,
     asset_id: [u8; 32],

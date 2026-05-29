@@ -2859,6 +2859,118 @@ async fn test_claim_vault_ethereum_active_rejected() {
     // any sibling instruction. (Pre-ADR this returned
     // MissingVaultedTransferInstruction.)
     assert_anchor_error!(result, EscrowError::VaultStillLocked);
+
+    // Belt-and-braces: nothing moved. Atomic-reject implies these, but pin
+    // them so a future refactor that accidentally moves token logic before
+    // the gate fails loudly. Mirrors the assertions in the Arweave variant.
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_acct.is_some() && !escrow_acct.as_ref().unwrap().data.is_empty(),
+        "escrow PDA must remain open after a rejected active claim"
+    );
+    let escrow_bal = get_token_balance(&mut ctx, &escrow_ata.pubkey()).await;
+    assert_eq!(escrow_bal, amount, "escrow tokens must be untouched");
+}
+
+/// Boundary: a vault is claimable when `clock == vault_end_timestamp` (the
+/// on-chain gate is `clock >= vault_end_timestamp`). Pins the `>=` semantics
+/// so a future refactor to `>` would fail this test.
+#[tokio::test]
+async fn test_claim_vault_ethereum_at_unlock_boundary() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let amount = 500_000_000u64;
+    let setup = setup_token_escrow(&mut ctx, amount).await;
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_addr, &setup.mint_kp.pubkey()).await;
+
+    let sk_bytes: [u8; 32] = {
+        let mut b = [0u8; 32];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = ((i as u8).wrapping_mul(13).wrapping_add(3)) | 1;
+        }
+        b
+    };
+    let secret_key = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+    let (_, eth_addr) = sign_ethereum(b"dummy", &secret_key);
+
+    deposit_vault_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400,
+        false,
+        PROTOCOL_ETHEREUM,
+        eth_addr.to_vec(),
+    )
+    .await
+    .expect("deposit_vault should succeed");
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_addr).await;
+    // Warp to EXACTLY vault_end_timestamp (not +1). The on-chain `>=` should
+    // accept; a refactor to `>` would fail this with `VaultStillLocked`.
+    warp_clock_to(&mut ctx, escrow_state.vault_end_timestamp).await;
+
+    let claimant = Keypair::new();
+    let claimant_ata = Keypair::new();
+    let payer_ata = Keypair::new();
+    airdrop(&mut ctx, &claimant.pubkey(), 2_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+    create_token_account(
+        &mut ctx,
+        &payer_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+
+    let msg = build_escrow_canonical(
+        "vault",
+        &setup.asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &eth_addr,
+    );
+    let (signature, _) = sign_ethereum(&msg, &secret_key);
+
+    claim_vault_ethereum_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        &claimant,
+        claimant_ata.pubkey(),
+        &claimant,
+        payer_ata.pubkey(),
+        escrow_state.nonce,
+        signature,
+        vec![],
+    )
+    .await
+    .expect("at vault_end boundary the claim should SUCCEED (>=, not >)");
+
+    // Claimant got the tokens liquid + escrow closed.
+    let claimant_bal = get_token_balance(&mut ctx, &claimant_ata.pubkey()).await;
+    assert_eq!(
+        claimant_bal, amount,
+        "claimant must receive full amount at the boundary"
+    );
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_acct.is_none() || escrow_acct.as_ref().unwrap().data.is_empty(),
+        "escrow PDA should be closed after a successful boundary claim"
+    );
 }
 
 // =========================================
