@@ -1827,6 +1827,162 @@ async fn test_migrate_ant_version() {
     );
 }
 
+#[tokio::test]
+async fn test_migrate_ant_controllers_only_when_config_is_current() {
+    // Audit M-6 (2026-05-29) regression test. Pre-fix, `migrate_ant`'s
+    // version gate checked ONLY config.version and bailed with
+    // AlreadyLatestVersion if config was at the latest. That made
+    // controllers-only migrations unreachable any time
+    // ANT_CONTROLLERS_VERSION was bumped without a parallel
+    // ANT_CONFIG_VERSION bump.
+    //
+    // Today both versions are (1,0,0) so the latent bug doesn't fire,
+    // but the fix is mandatory before the next ANT controllers-only
+    // schema change. This test synthesizes the broken state directly:
+    // config at the current ANT_CONFIG_VERSION (1.0.0), controllers at
+    // the pre-version baseline (0.0.0). With M-6's fix the migration
+    // succeeds and brings controllers to (1,0,0); pre-fix it errors
+    // with AlreadyLatestVersion.
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    pt.add_account(
+        owner.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    // Construct an asset + AntConfig at the CURRENT version + AntControllers
+    // at version 0.0.0. The bootstrap migration arm in
+    // `migrate_controllers_version` stamps (0,0,0) → (1,0,0).
+    let asset2 = Keypair::new();
+    let asset2_data = create_fake_asset_data(&owner.pubkey());
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    ctx.set_account(
+        &asset2.pubkey(),
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(asset2_data.len()),
+            data: asset2_data,
+            owner: MPL_CORE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (config2_key, config2_bump) = config_pda(&asset2.pubkey());
+    let current_config = AntConfig {
+        mint: asset2.pubkey(),
+        name: "Current-Config Old-Controllers".to_string(),
+        ticker: "M6T".to_string(),
+        logo: test_arweave_id(),
+        description: String::new(),
+        keywords: vec![],
+        last_known_owner: owner.pubkey(),
+        bump: config2_bump,
+        version: ANT_CONFIG_VERSION, // already at latest
+    };
+    let mut cfg_data = Vec::new();
+    current_config.try_serialize(&mut cfg_data).unwrap();
+    cfg_data.resize(AntConfig::SIZE, 0);
+    ctx.set_account(
+        &config2_key,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(AntConfig::SIZE),
+            data: cfg_data,
+            owner: ario_ant::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (controllers2_key, controllers2_bump) = controllers_pda(&asset2.pubkey());
+    let stale_controllers = AntControllers {
+        mint: asset2.pubkey(),
+        controllers: vec![],
+        bump: controllers2_bump,
+        version: SchemaVersion::new(0, 0, 0), // below latest — needs migration
+    };
+    let mut ctrl_data = Vec::new();
+    stale_controllers.try_serialize(&mut ctrl_data).unwrap();
+    ctrl_data.resize(AntControllers::SIZE, 0);
+    ctx.set_account(
+        &controllers2_key,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(AntControllers::SIZE),
+            data: ctrl_data,
+            owner: ario_ant::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // M-6: migration MUST succeed because controllers needs migration even
+    // though config is current. Pre-fix this returned AlreadyLatestVersion.
+    let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner).await;
+    assert!(
+        result.is_ok(),
+        "controllers-only migration must succeed when config is already at \
+         the latest version (audit M-6); got: {:?}",
+        result
+    );
+
+    // Verify controllers were actually migrated and config was left alone.
+    let config_after = fetch_config(&mut ctx, &asset2.pubkey()).await;
+    assert_eq!(
+        config_after.version, ANT_CONFIG_VERSION,
+        "config version must be unchanged after a controllers-only migration"
+    );
+    let controllers_after_acc = ctx
+        .banks_client
+        .get_account(controllers2_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let controllers_after =
+        AntControllers::try_deserialize(&mut controllers_after_acc.data.as_slice()).unwrap();
+    assert_eq!(
+        controllers_after.version, ANT_CONTROLLERS_VERSION,
+        "controllers version must be brought to ANT_CONTROLLERS_VERSION"
+    );
+}
+
+#[tokio::test]
+async fn test_migrate_ant_both_current_still_rejects() {
+    // Belt-and-braces for M-6: when BOTH config and controllers are at the
+    // latest, the combined gate must still reject with AlreadyLatestVersion.
+    // The fix relaxed the gate to (EITHER needs migration) — must not
+    // accidentally relax further to "always-succeed".
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    pt.add_account(
+        owner.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let config = fetch_config(&mut ctx, &asset.pubkey()).await;
+    assert_eq!(config.version, ANT_CONFIG_VERSION);
+
+    let result = send_migrate_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    assert_anchor_error!(result, AntError::AlreadyLatestVersion);
+}
+
 // =========================================
 // COVERAGE GAP TESTS
 // =========================================
