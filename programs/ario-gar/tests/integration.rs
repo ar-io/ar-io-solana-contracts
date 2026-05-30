@@ -8035,6 +8035,225 @@ async fn test_compound_delegation_rewards() {
 }
 
 // -----------------------------------------
+// test_distribute_epoch_skips_cleared_registry_slots (audit M-1, 2026-05-29)
+//
+// CodeRabbit pushback on PR #79: add focused non-ignored test coverage
+// for the cleared-slot skip branch in distribute_epoch (mirrors the
+// GAR-009 pattern in tally_weights).
+//
+// Strategy: run the standard scaffold through `create_epoch`, then
+// directly mutate the GatewayRegistry + Epoch zero-copy accounts to
+// inject a state where every active slot is `Pubkey::default()`. With
+// no real gateways, pass 2 produces zero pending distributions →
+// `transfer_amount == 0` → the ario-core CPI is skipped, so this test
+// does NOT need ario-core loaded (which is why all the other
+// distribute_epoch tests are #[ignore]'d).
+//
+// Pre-fix the loop would hit the `registry.gateways[dist_idx].address
+// == gateway.operator` require! on the very first cleared slot and
+// reject the whole tx. Post-fix the loop skips each cleared slot,
+// advances `distribution_index`, and finishes cleanly with
+// `rewards_distributed = 1`.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_distribute_epoch_skips_cleared_registry_slots() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // epoch_duration=86_400s, enabled=true so create_epoch passes the gate
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Warp clock past genesis (100) so create_epoch can build a valid epoch.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // --- Create epoch (real ix; gives us a valid Epoch state to mutate) ---
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // --- Inject the cleared-slot state ---
+    //
+    // Bump registry.count to N so dist_idx iterates through slots, but
+    // leave each slot's address at the default `Pubkey::default()`
+    // (slots are zero-initialized by setup_gar / pre_create_epoch_settings).
+    let cleared_count: u32 = 2;
+    {
+        let reg_acc = ctx
+            .banks_client
+            .get_account(setup.registry_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = reg_acc.data.clone();
+        // GatewayRegistry layout: disc(8) + authority(32) + count(u32 LE @ 40)
+        data[40..44].copy_from_slice(&cleared_count.to_le_bytes());
+        ctx.set_account(
+            &setup.registry_key,
+            &solana_sdk::account::Account {
+                lamports: reg_acc.lamports,
+                data,
+                owner: reg_acc.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    // Mutate the Epoch state so distribute_epoch's guards pass:
+    //   prescriptions_done = 1  (else PrescriptionsNotDone)
+    //   end_timestamp = 0       (already in the past — clock is 200)
+    //   rewards_distributed = 0 (already zero from create_epoch)
+    //   active_gateway_count = cleared_count (so the loop iterates N times)
+    //   distribution_index = 0
+    {
+        let epoch_acc = ctx
+            .banks_client
+            .get_account(epoch_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = epoch_acc.data.clone();
+        // bytemuck::from_bytes_mut on the post-discriminator slice.
+        let epoch_bytes = &mut data[8..8 + std::mem::size_of::<Epoch>()];
+        let epoch: &mut Epoch = bytemuck::from_bytes_mut(epoch_bytes);
+        epoch.end_timestamp = 0;
+        epoch.prescriptions_done = 1;
+        epoch.rewards_distributed = 0;
+        epoch.active_gateway_count = cleared_count;
+        epoch.distribution_index = 0;
+        // Clear reward fields so transfer_amount stays 0 even if a slot somehow processed
+        epoch.per_gateway_reward = 0;
+        epoch.per_observer_reward = 0;
+        epoch.total_eligible_rewards = 0;
+
+        ctx.set_account(
+            &epoch_key,
+            &solana_sdk::account::Account {
+                lamports: epoch_acc.lamports,
+                data,
+                owner: epoch_acc.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    // Derive the ario_config PDA that the address constraint expects.
+    // Uses the placeholder ARIO_CORE_PROGRAM_ID baked into the build —
+    // sufficient for the constraint; no CPI to ario-core actually fires
+    // because all slots are cleared.
+    let (ario_config_pda, _) =
+        Pubkey::find_program_address(&[b"ario_config"], &ario_gar::ARIO_CORE_PROGRAM_ID);
+
+    // Two dummy account_infos for the remaining_accounts slot. The skip
+    // branch fires BEFORE any deserialization, so these accounts are
+    // never actually read — any system-owned address works.
+    let dummy_a = Pubkey::new_unique();
+    let dummy_b = Pubkey::new_unique();
+
+    let mut distribute_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        payer: payer_pk,
+        token_program: spl_token::id(),
+    }
+    .to_account_metas(None);
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(dummy_a, false));
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(dummy_b, false));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: distribute_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    // M-1 assertion: distribute_epoch succeeds despite every registry slot
+    // being Pubkey::default(). Pre-fix this failed with InvalidGatewayAccount
+    // on the first slot because the registry-vs-operator equality check
+    // (now skipped) rejected default vs the dummy account's owner.
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("distribute_epoch must succeed when all registry slots are cleared (audit M-1)");
+
+    // Verify the loop advanced past both cleared slots and finalized the epoch.
+    let epoch_acc = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_acc.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.distribution_index, cleared_count,
+        "distribution_index must equal active_count after iterating past cleared slots"
+    );
+    assert_eq!(
+        epoch.rewards_distributed, 1,
+        "rewards_distributed must be set when dist_idx reaches active_count"
+    );
+}
+
+// -----------------------------------------
 // test_compound_delegation_rewards_permissionless (audit M-2, 2026-05-29)
 //
 // `compound_delegation_rewards` MUST be invokable by any signer — not just
