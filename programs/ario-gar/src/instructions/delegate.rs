@@ -824,5 +824,16 @@ pub struct CompoundDelegationRewards<'info> {
     )]
     pub delegation: Account<'info, Delegation>,
 
-    pub delegator: Signer<'info>,
+    /// CHECK: This is purely a PDA-derivation seed source. The seeds-and-
+    /// constraint pair above pins `delegation.delegator == delegator.key()`,
+    /// which is enforced cryptographically by the PDA derivation itself —
+    /// substituting a different pubkey produces a different Delegation PDA
+    /// that won't match `delegation`. No `Signer` constraint because this
+    /// instruction is permissionless per docs/INVARIANTS.md (audit M-2,
+    /// 2026-05-29): compounding only writes pending → active stake on a
+    /// delegate's own pre-existing balance — no funds move between
+    /// accounts, no authorization is needed. Permissionless invocation
+    /// enables the off-chain monitor's Invariant 1 health check and
+    /// unblocks `finalize_gone` for gateways with dormant pending rewards.
+    pub delegator: UncheckedAccount<'info>,
 }

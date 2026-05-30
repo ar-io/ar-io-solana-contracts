@@ -81,6 +81,19 @@ pub fn distribute_epoch<'info>(
             break;
         }
 
+        // GAR-009 mirror (audit M-1, 2026-05-29): defense-in-depth skip for
+        // any registry slot whose address was cleared. The in-place departure
+        // model keeps slots occupied during the epoch, but `finalize_gone`'s
+        // swap-remove zeroes the tail slot — and `active_count` (snapshotted
+        // at epoch start) can outlive that shrink. Without this skip, the
+        // registry-vs-operator equality check below rejects (Pubkey::default()
+        // ≠ gateway.operator) and wedges the in-flight epoch's distribution.
+        // Mirrors the pattern in `tally_weights` at instructions/epoch.rs:381.
+        if registry.gateways[dist_idx].address == Pubkey::default() {
+            dist_idx += 1;
+            continue;
+        }
+
         require!(
             account_info.owner == ctx.program_id,
             GarError::InvalidGatewayAccount
