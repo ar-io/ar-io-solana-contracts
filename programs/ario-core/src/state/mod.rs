@@ -166,6 +166,53 @@ impl ArioConfig {
         + PUBKEY_SIZE  // gar_program
         + SCHEMA_VERSION_SIZE;
 
+    /// Byte offset of the `gar_program` field within the account's data
+    /// region (counting from byte 0, i.e. including the 8-byte
+    /// discriminator). Used by `admin_set_gar_program`, which operates
+    /// on an `UncheckedAccount` (the typed `Account<T>` load would fail
+    /// on the pre-realloc 226-byte account) and must therefore write at
+    /// a hand-computed offset. **DO NOT compute this as `SIZE - 32`** —
+    /// post-PR #53, `version: SchemaVersion` (3 bytes) is appended
+    /// *after* `gar_program`, so `SIZE - 32` overlaps the version field
+    /// and shifts `gar_program` by 3 bytes. The static_assert below
+    /// keeps this offset in sync with the struct layout at compile
+    /// time: appending a field before `gar_program` will fail the
+    /// build until this constant is also updated.
+    pub const GAR_PROGRAM_OFFSET: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // authority
+        + PUBKEY_SIZE  // mint
+        + PUBKEY_SIZE  // arns_program
+        + PUBKEY_SIZE  // treasury
+        + 8   // total_supply
+        + 8   // protocol_balance
+        + 8   // circulating_supply
+        + 8   // locked_supply
+        + 8   // min_vault_duration
+        + 8   // max_vault_duration
+        + 8   // primary_name_request_expiry
+        + 1   // migration_active
+        + PUBKEY_SIZE  // migration_authority
+        + BUMP_SIZE;
+    // = 226. Followed by gar_program (32) then version (3) → SIZE = 261.
+
+    /// Compile-time assertion: appending or reordering fields before
+    /// `gar_program` (or removing the trailing 3-byte version field)
+    /// must also update `GAR_PROGRAM_OFFSET`. Without this check the
+    /// admin_set_gar_program handler would silently write at the wrong
+    /// offset — the exact regression that produced C-1.
+    ///
+    /// The migration-test build path has additional fields after
+    /// `version`, so SIZE grows but `gar_program` stays at the same
+    /// offset; the assertion uses the production SIZE form via cfg.
+    #[cfg(not(feature = "migration-test"))]
+    const _GAR_PROGRAM_OFFSET_ASSERT: () = {
+        assert!(
+            Self::GAR_PROGRAM_OFFSET + PUBKEY_SIZE + SCHEMA_VERSION_SIZE == Self::SIZE,
+            "ArioConfig::GAR_PROGRAM_OFFSET out of sync with struct layout — \
+             a field was added/reordered before gar_program; update both."
+        );
+    };
+
     #[cfg(feature = "migration-test")]
     pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
         + PUBKEY_SIZE  // authority

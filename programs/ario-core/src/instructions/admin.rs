@@ -261,8 +261,14 @@ pub mod admin_set_gar_program {
         }
 
         {
+            // CRITICAL: write at the canonical offset of `gar_program`,
+            // not `target_size - 32`. Post-PR #53, `SIZE - 32` overlaps
+            // the trailing `version: SchemaVersion` field (3 bytes),
+            // which would clobber both fields on every call — see
+            // ArioConfig::GAR_PROGRAM_OFFSET docstring + the
+            // static_assert that keeps the constant in sync.
             let mut data = config_ai.try_borrow_mut_data()?;
-            let offset = target_size - 32;
+            let offset = ArioConfig::GAR_PROGRAM_OFFSET;
             data[offset..offset + 32].copy_from_slice(&new_gar_program.to_bytes());
         }
 
