@@ -8035,6 +8035,112 @@ async fn test_compound_delegation_rewards() {
 }
 
 // -----------------------------------------
+// test_import_account_rejects_epoch_settings_discriminator (audit M-4, 2026-05-30 follow-up)
+//
+// PR #81 added `epoch_settings_excluded_from_import_allowlist` as a unit test
+// that pins the `known_discriminator` helper returns None for EpochSettings.
+// But the helper returning None doesn't ALONE prove the on-chain
+// `import_account` handler actually rejects — Anchor's account-resolution
+// layer or a future refactor could conceivably bypass it. This test takes
+// the integration path: builds a real `import_account` ix with the
+// EpochSettings discriminator + valid PDA derivation, sends it signed by
+// the migration_authority, and asserts the handler rejects with
+// `InvalidAccountData`.
+//
+// Pre-fix (PR #81): EpochSettings was in the allowlist; this ix would have
+// succeeded and overwritten the EpochSettings account (the post-finalize
+// authority-hijack the audit flagged).
+// Post-fix: rejects at the `known_discriminator` check inside the handler.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_import_account_rejects_epoch_settings_discriminator() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let payer_pk = ctx.payer.pubkey();
+
+    // Pre-setup: GatewaySettings is created in program_test_with_gar with
+    // migration_active=false. Flip it to true so `import_account`'s
+    // `constraint = settings.migration_active` passes. (Without this we'd
+    // get MigrationInactive instead of InvalidAccountData, which would
+    // still prove the ix doesn't accept EpochSettings — but the cleaner
+    // assertion is that the discriminator gate fires, not the active gate.)
+    let (settings_key, _) = settings_pda();
+    let settings_acc = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings_data = settings_acc.data.clone();
+    // migration_active layout: byte at offset 124 per program_test_with_gar
+    // scaffolding (disc(8) + authority(32) + mint(32) + 6×u64(48) + u32(4)
+    // = 124). Flipping to 1 = true.
+    settings_data[124] = 1;
+    // migration_authority at offset 125..157 — flip to ctx.payer so the
+    // `settings.migration_authority == authority.key()` constraint on
+    // import_account is satisfied by ctx.payer's signature below.
+    settings_data[125..157].copy_from_slice(payer_pk.as_ref());
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::Account {
+            lamports: settings_acc.lamports,
+            data: settings_data,
+            owner: settings_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Build the EpochSettings discriminator (same way the handler computes it).
+    use anchor_lang::solana_program::hash::hash;
+    let es_disc = hash(b"account:EpochSettings");
+    let mut data = vec![0u8; 8 + 256];
+    data[..8].copy_from_slice(&es_disc.to_bytes()[..8]);
+
+    // PDA derivation MUST match what the handler computes with the supplied
+    // seeds, else we get InvalidPda before reaching the discriminator check.
+    let seeds: Vec<Vec<u8>> = vec![EPOCH_SETTINGS_SEED.to_vec()];
+    let (es_pda, _bump) = epoch_settings_pda();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::ImportAccount {
+                settings: settings_key,
+                authority: payer_pk, // migration_authority defaults to payer in setup
+                payer: payer_pk,
+                account: es_pda,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::ImportAccount { seeds, data }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    let result = ctx.banks_client.process_transaction(tx).await;
+
+    // M-4 assertion: the handler MUST reject EpochSettings at the
+    // discriminator-allowlist check. Pre-PR #81 this would have SUCCEEDED
+    // and overwritten EpochSettings — the exact post-finalize authority-
+    // hijack the audit flagged.
+    assert_anchor_error!(result, GarError::InvalidAccountData);
+}
+
+// -----------------------------------------
 // test_distribute_epoch_skips_cleared_registry_slots (audit M-1, 2026-05-29)
 //
 // CodeRabbit pushback on PR #79: add focused non-ignored test coverage
