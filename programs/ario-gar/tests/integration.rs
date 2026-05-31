@@ -8068,11 +8068,15 @@ async fn test_import_account_rejects_epoch_settings_discriminator() {
     let payer_pk = ctx.payer.pubkey();
 
     // Pre-setup: GatewaySettings is created in program_test_with_gar with
-    // migration_active=false. Flip it to true so `import_account`'s
-    // `constraint = settings.migration_active` passes. (Without this we'd
-    // get MigrationInactive instead of InvalidAccountData, which would
-    // still prove the ix doesn't accept EpochSettings — but the cleaner
-    // assertion is that the discriminator gate fires, not the active gate.)
+    // migration_active=false + migration_authority=&dummy. Flip both so
+    // `import_account`'s `constraint = settings.migration_active` AND
+    // `settings.migration_authority == authority.key()` constraints pass
+    // — that way we land on the discriminator gate (InvalidAccountData),
+    // which is what M-4 is testing, not MigrationInactive/Unauthorized.
+    //
+    // CodeRabbit nit #84: deserialize the typed struct + mutate + reserialize
+    // (vs. hardcoded byte offsets) so a future GatewaySettings layout change
+    // can't silently break this test.
     let (settings_key, _) = settings_pda();
     let settings_acc = ctx
         .banks_client
@@ -8080,20 +8084,17 @@ async fn test_import_account_rejects_epoch_settings_discriminator() {
         .await
         .unwrap()
         .unwrap();
-    let mut settings_data = settings_acc.data.clone();
-    // migration_active layout: byte at offset 124 per program_test_with_gar
-    // scaffolding (disc(8) + authority(32) + mint(32) + 6×u64(48) + u32(4)
-    // = 124). Flipping to 1 = true.
-    settings_data[124] = 1;
-    // migration_authority at offset 125..157 — flip to ctx.payer so the
-    // `settings.migration_authority == authority.key()` constraint on
-    // import_account is satisfied by ctx.payer's signature below.
-    settings_data[125..157].copy_from_slice(payer_pk.as_ref());
+    let mut settings = GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    settings.migration_active = true;
+    settings.migration_authority = payer_pk;
+    let mut new_data = Vec::with_capacity(settings_acc.data.len());
+    settings.try_serialize(&mut new_data).unwrap();
+    new_data.resize(settings_acc.data.len(), 0); // preserve the existing account size
     ctx.set_account(
         &settings_key,
         &solana_sdk::account::Account {
             lamports: settings_acc.lamports,
-            data: settings_data,
+            data: new_data,
             owner: settings_acc.owner,
             executable: false,
             rent_epoch: 0,
