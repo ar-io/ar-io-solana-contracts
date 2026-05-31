@@ -493,6 +493,32 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
 
 /// Prescribe observers and names for an epoch (single tx, deterministic selection).
 /// Uses weighted roulette from hashchain entropy. Computes per-unit rewards.
+///
+/// # `remaining_accounts` contract
+///
+/// `remaining_accounts` is a **lookup table for the SELECTED observers**, not
+/// the full registry. It MUST contain:
+///   - one `Gateway` PDA per SELECTED observer — at most
+///     `epoch_settings.prescribed_observer_count`, hard-capped at 50 by the
+///     `prescribed_observers: [Pubkey; 50]` state field — in any order, AND
+///   - the `NameRegistry` account as the LAST entry (enables name prescription).
+///
+/// So the upper bound is ~51 accounts regardless of registry size — well under
+/// `MAX_TX_ACCOUNT_LOCKS = 64`. Passing **every** registry gateway (e.g. a
+/// cranker calling `getAllRegistryGatewayPDAs`) blows the lock limit on large
+/// registries and the tx is rejected at pre-flight.
+///
+/// The selection is computed **on-chain** here from `epoch.hashchain` (a frozen
+/// entropy beacon, see `Epoch::hashchain`) and the live
+/// `registry.gateways[0..epoch.active_gateway_count].composite_weight`. Both are
+/// stable once `weights_tallied == 1`, so clients mirror this exact algorithm
+/// off-chain to learn which Gateway PDAs to supply. The canonical client mirror
+/// is `@ar.io/sdk`'s `predictPrescribedObservers`; a standalone Rust reference
+/// lives at `programs/ario-gar/examples/predict_prescribed_observers.rs`.
+///
+/// Supplying FEWER than the selected set (e.g. a gateway left between the
+/// client's read and tx landing) fails with `InvalidGatewayAccount` — the
+/// caller should retry once with a fresh prediction.
 pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Result<()> {
     let epoch_settings = &ctx.accounts.epoch_settings;
     let mut epoch = ctx.accounts.epoch.load_mut()?;
