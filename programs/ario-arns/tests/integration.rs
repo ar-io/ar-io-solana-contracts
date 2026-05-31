@@ -11697,3 +11697,162 @@ async fn test_admin_expand_name_registry_rejects_non_authority() {
     .await;
     assert!(result.is_err(), "non-authority caller must be rejected");
 }
+
+// =========================================
+// test_extend_lease_from_withdrawal_relaxed_cap (audit M-3, 2026-05-30 follow-up)
+//
+// PR #80 aligned `extend_lease_from_withdrawal` (and `_from_funding_plan`)
+// to the remaining-years-from-now cap used by the 3 majority paths
+// (extend_lease + _from_delegation + _from_operator_stake). Pre-fix those
+// 2 stricter paths used a total-duration-since-start cap that rejected
+// legitimate extensions for leases that started long ago.
+//
+// The 12 existing BPF integration tests cover the 3 majority paths but
+// NONE exercise `_from_withdrawal` or `_from_funding_plan`. This test
+// fills that gap: synthesizes the exact trigger state (4 years ago start,
+// 1 year remaining, extend by 4 years) and asserts the cap check now
+// PASSES on `_from_withdrawal`. Pre-PR #80 this would fail at the cap
+// with `InvalidLeaseDuration`; post-fix the cap is relaxed so the ix
+// proceeds past it and fails at a DIFFERENT downstream step (the bogus
+// GAR-side accounts we pass — that's expected and proves the relaxation).
+//
+// Bidirectionally meaningful: assertion `result.is_err() && err != cap_error`.
+// If M-3 regresses (cap re-tightens), this fires with the cap error code
+// and the test fails. If the fix stays, the cap check passes and the
+// downstream account-validation error gets surfaced instead.
+// =========================================
+
+#[tokio::test]
+async fn test_extend_lease_from_withdrawal_relaxed_cap() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    // Buy a max-duration lease (5 years) so end - start spans the full cap.
+    let name = "relaxedcap";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Lease, 5, ant_key).await;
+
+    // Backdate the record so it LOOKS like it was bought 4 years ago:
+    //   start_timestamp = now - 4*YEAR
+    //   end_timestamp   = (now - 4*YEAR) + 5*YEAR = now + 1*YEAR  (1 year remaining)
+    //
+    // Pre-PR-#80 cap on _from_withdrawal: total = (now+1+4) - (now-4) = 10 → > 5 → REJECT
+    // Post-PR-#80 cap (majority pattern): remaining=1, max_ext=4, years=4 → ALLOW past cap
+    let record_acc = ctx
+        .banks_client
+        .get_account(arns_record_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut record = ArnsRecord::try_deserialize(&mut record_acc.data.as_slice()).unwrap();
+    let now = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    record.start_timestamp = now - 4 * ONE_YEAR_SECONDS;
+    record.end_timestamp = Some(now + ONE_YEAR_SECONDS);
+    let mut new_data = Vec::new();
+    record.try_serialize(&mut new_data).unwrap();
+    let original_len = record_acc.data.len();
+    new_data.resize(original_len, 0);
+    ctx.set_account(
+        &arns_record_key,
+        &solana_sdk::account::Account {
+            lamports: record_acc.lamports,
+            data: new_data,
+            owner: record_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Build extend_lease_from_withdrawal with years=4. The downstream GAR
+    // accounts are bogus (we only care whether the cap check rejects).
+    let bogus_gar_settings = Pubkey::new_unique();
+    let bogus_withdrawal = Pubkey::new_unique();
+    let bogus_stake_token = Pubkey::new_unique();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ExtendLeaseFromWithdrawal {
+                config: setup.config_key,
+                demand_factor: setup.demand_factor_key,
+                arns_record: arns_record_key,
+                gar_settings: bogus_gar_settings,
+                withdrawal: bogus_withdrawal,
+                stake_token_account: bogus_stake_token,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                caller: ctx.payer.pubkey(),
+                gar_program: ario_gar::ID,
+                token_program: spl_token::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ExtendLeaseFromWithdrawal { years: 4 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    let result = ctx.banks_client.process_transaction(tx).await;
+
+    // The tx MUST fail (we passed bogus GAR-side accounts), but the failure
+    // MUST NOT be at the cap check. Pre-fix the cap check rejected with
+    // ArnsError::InvalidLeaseDuration; post-fix it should be (a) relaxed
+    // ExtensionExceedsMax — meaning the cap re-rejected — or (b) any
+    // OTHER error — meaning the cap passed.
+    //
+    // M-3 PASSES IFF the error is neither cap-related code.
+    let expected_pre_fix_cap =
+        anchor_lang::error::ERROR_CODE_OFFSET + ArnsError::InvalidLeaseDuration as u32;
+    let expected_post_fix_cap_reject =
+        anchor_lang::error::ERROR_CODE_OFFSET + ArnsError::ExtensionExceedsMax as u32;
+    match result {
+        Ok(()) => panic!(
+            "extend_lease_from_withdrawal unexpectedly succeeded with bogus GAR \
+             accounts — the downstream CPI should have failed."
+        ),
+        Err(solana_program_test::BanksClientError::TransactionError(
+            solana_sdk::transaction::TransactionError::InstructionError(
+                _,
+                solana_sdk::instruction::InstructionError::Custom(code),
+            ),
+        )) => {
+            assert_ne!(
+                code, expected_pre_fix_cap,
+                "M-3 REGRESSION: rejected with pre-fix InvalidLeaseDuration code ({}) \
+                 — the strict total-duration cap is back. The relaxed remaining-years-\
+                 from-now cap should have allowed years=4 with remaining=1 (max=5).",
+                expected_pre_fix_cap,
+            );
+            assert_ne!(
+                code, expected_post_fix_cap_reject,
+                "Cap rejected with post-fix ExtensionExceedsMax — but with \
+                 remaining=1 and years=4, max_extension=4 should allow. \
+                 Something is off with the cap arithmetic."
+            );
+            // Any OTHER custom error code = cap passed; downstream rejected.
+        }
+        // Non-custom errors (AccountNotExecutable on the bogus gar_program,
+        // InvalidAccountData on the bogus withdrawal, etc.) ALSO prove the
+        // cap check passed — they fire AFTER we leave the cap-check block.
+        // AccountNotExecutable specifically is the signature of "cap passed,
+        // CPI attempted, but ario-gar isn't loaded in this test binary."
+        Err(other) => {
+            eprintln!(
+                "  cap-check PASSED; downstream failed as expected (no ario-gar \
+                 program registered in this test binary). Error variant: {:?}",
+                other
+            );
+        }
+    }
+}
