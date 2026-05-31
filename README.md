@@ -101,7 +101,7 @@ edge exists.
 | Rust (BPF)          | `1.79.0`   | bundled inside `cargo-build-sbf`; Cargo.lock must stay parseable by its Cargo 1.79 (see note below). |
 | Solana (Agave) CLI  | `2.1.0`    | newer 2.x releases drop Cargo 1.79 manifest support |
 | Anchor              | `0.31.1`   | `avm install 0.31.1 && avm use 0.31.1` |
-| [Surfpool](https://github.com/solana-foundation/surfpool) | `1.1+` | local validator with mainnet-style SVM gates |
+| [Surfpool](https://github.com/solana-foundation/surfpool) | `1.2.x` | local validator with mainnet-style SVM gates. **Use `1.2.x` specifically** — `1.1.x` lacks `--skip-blockhash-check` (added in 1.2.0, used by `scripts/start-localnet.sh`); `1.3.x` changed `--rpc-port` → `--port` (script not yet adapted). |
 | `cargo-fuzz` *(optional)* | latest | for the escrow signature-verifier fuzz targets |
 
 `Cargo.toml` pins several workspace deps (`solana-*=2.1.0`,
