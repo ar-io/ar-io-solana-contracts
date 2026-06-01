@@ -351,19 +351,20 @@ Gateway weight only affects observer selection probability. All passing gateways
 |----------|-------|
 | Parameters that match exactly | **56+** |
 | HIGH severity discrepancies | **3** (#1, #5, #6) |
-| MEDIUM severity discrepancies | **2** (#4, #7) |
+| MEDIUM severity discrepancies | **1** (#4) |
 | LOW / informational | **6** (#8-#13) |
 | Resolved | **2** (#2 — RNP formula; #3 — primary name fee) |
+| Code fix planned | **2** (#6 — disable delegation; #7 — deferred reward share) |
 
 ### Actionable Items — Resolve by Updating Whitepaper or Code
 
-| # | Issue | Recommended Resolution |
-|---|-------|----------------------|
-| 1 | MAX_CONTROLLERS: WP=10, Code=4 | Update WP to say 4 |
-| ~~2~~ | ~~RNP formula~~ | **RESOLVED** — code updated to WP formula `50 - 49*(elapsed/duration)` |
-| ~~3~~ | ~~Primary name fee ignores purchase type~~ | **RESOLVED** — code now charges the permabuy rate (1.0 ARIO × DF) for permabuy primary names |
-| 4 | Undername max length: WP=51, Code=61 | Update WP to say 61 |
-| 5 | Protected exit vault not expeditable | Update WP §6.6 to clarify only excess stake is expeditable |
-| 6 | Disabling delegation doesn't auto-withdraw | Update WP §6.3 to describe pull-based delegate exit model |
-| 7 | Gateway settings apply immediately, not next epoch | Update WP §6.3 to remove "following epoch" claim |
-| 8 | 8 chosen names not enforced on-chain | Informational — clarify in WP that chosen names are off-chain |
+| # | Issue | Resolution | Plan |
+|---|-------|------------|------|
+| 1 | MAX_CONTROLLERS: WP=10, Code=4 | Update WP to say 4 | — |
+| ~~2~~ | ~~RNP formula~~ | **RESOLVED** — code updated | `FIX_PLANS.md` #2 |
+| ~~3~~ | ~~Primary name fee ignores purchase type~~ | **RESOLVED** — code updated | `FIX_PLANS.md` #3 |
+| 4 | Undername max length: WP ambiguous, Code=61 | No action — WP and Lua both consistent with 61 | — |
+| 5 | Protected exit vault not expeditable | Update WP §6.6 — code is correct (BD-102) | — |
+| 6 | Disabling delegation doesn't auto-withdraw | **Fix code** — new `claim_delegate_from_disabled_gateway` + 30-day cooldown | `FIX_PLANS.md` #6 |
+| 7 | Gateway settings apply immediately | **Fix code** — defer `delegate_reward_share_ratio` via pending field | `FIX_PLANS.md` #7 |
+| 8 | 8 chosen names not enforced on-chain | Informational — off-chain observer norm | — |
