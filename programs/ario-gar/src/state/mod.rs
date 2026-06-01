@@ -848,6 +848,16 @@ pub struct Epoch {
     pub total_composite_weight_hi: u64,
 
     // --- Hashchain for deterministic randomness ---
+    /// Deterministic entropy beacon. Written **exactly once**, in
+    /// `create_epoch` via `load_init()` (`epoch.rs`), and read-only
+    /// thereafter — `tally_weights`, `prescribe_epoch`, `distribute_epoch`,
+    /// `close_epoch`, and every admin/migration path leave it untouched
+    /// (verified: the only write in the crate is `epoch.hashchain = …` in
+    /// `create_epoch`). This stability between `weights_tallied == 1` and
+    /// `prescribe_epoch` is what lets a client mirror the observer-selection
+    /// roulette off-chain to know which Gateway PDAs to pass as
+    /// `remaining_accounts`. See `@ar.io/sdk`'s `predictPrescribedObservers`
+    /// helper and `programs/ario-gar/examples/predict_prescribed_observers.rs`.
     pub hashchain: [u8; 32],
 
     // --- u32 fields ---
