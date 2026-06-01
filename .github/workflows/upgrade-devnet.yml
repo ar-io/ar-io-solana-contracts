@@ -5,7 +5,7 @@ name: Upgrade (devnet)
 #
 # Upgrade-only model: CI holds exactly one secret (the upgrade authority
 # keypair).  It cannot mint new program IDs — those live in
-# program-ids/devnet.json and are managed offline.
+# program-ids/staging.json and are managed offline.
 #
 # Required GitHub environment: "devnet"
 #   Secrets:
@@ -83,7 +83,7 @@ jobs:
           AUTHORITY_KEY_JSON: ${{ secrets.DEVNET_AUTHORITY_KEY_JSON }}
           DEPLOY_CLUSTER: ${{ vars.DEVNET_RPC_URL || 'https://api.devnet.solana.com' }}
           BUILD_NETWORK: devnet
-          PROGRAM_IDS_PATH: program-ids/devnet.json
+          PROGRAM_IDS_PATH: program-ids/staging.json
           SKIP_AIRDROP: "1"
         run: bash scripts/devnet-deploy.sh
 
@@ -107,15 +107,15 @@ jobs:
           path: release/ar-io-solana-contracts-${{ steps.ver.outputs.version }}.tar.gz
           retention-days: 90
 
-      - name: Commit & push refreshed program-ids/devnet.json
+      - name: Commit & push refreshed program-ids/staging.json
         run: |
-          if git diff --quiet program-ids/devnet.json; then
-            echo "program-ids/devnet.json unchanged"
+          if git diff --quiet program-ids/staging.json; then
+            echo "program-ids/staging.json unchanged"
             exit 0
           fi
           git config user.name "ar-io-ci[bot]"
           git config user.email "ci@ar.io"
-          git add program-ids/devnet.json
+          git add program-ids/staging.json
           git commit -m "chore(devnet): publish program-ids @ ${{ steps.ver.outputs.version }}"
           git push origin HEAD:develop
 
