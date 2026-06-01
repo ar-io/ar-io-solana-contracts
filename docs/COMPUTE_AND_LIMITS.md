@@ -293,7 +293,8 @@ stays at minimum for 7 consecutive periods, the entire fee table is permanently 
 | `ArioConfig::DEFAULT_MIN_VAULT_DURATION` | 1,209,600 | 14 days |
 | `ArioConfig::DEFAULT_MAX_VAULT_DURATION` | 6,307,200,000 | 200 years |
 | `ArioConfig::MIN_VAULT_SIZE` | 100,000,000 | 100 ARIO |
-| `ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE` | 200,000 | 0.2 ARIO |
+| `ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_LEASE` | 200,000 | 0.2 ARIO (lease names) |
+| `ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY` | 1,000,000 | 1.0 ARIO (permabuy names) |
 | `PrimaryNameRequest::MAX_NAME_LENGTH` | 63 | Characters |
 
 ---

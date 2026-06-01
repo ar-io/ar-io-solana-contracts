@@ -248,11 +248,23 @@ impl ArioConfig {
     /// Matches Lua: constants.MIN_VAULT_SIZE = 100 ARIO
     pub const MIN_VAULT_SIZE: u64 = 100_000_000;
 
-    /// M1: Base fee for primary name requests (mARIO).
-    /// Matches Lua: baseFeeForNameLength(51) * UNDERNAME_LEASE_FEE_PERCENTAGE
-    /// = 200_000_000 * 0.001 = 200_000 mARIO (0.2 ARIO) at demand_factor=1.0
+    /// Base fee for primary name requests on a **leased** ArNS name (mARIO).
+    /// Whitepaper §9.3/§12.3: equal to the fee for a single undername on a
+    /// 51-char name of equivalent purchase type.
+    /// = baseFeeForNameLength(51) * UNDERNAME_LEASE_FEE_PERCENTAGE
+    /// = 200_000_000 * 0.001 = 200_000 mARIO (0.2 ARIO) at demand_factor=1.0.
     /// Demand factor is applied by reading the ArNS DemandFactor via remaining_accounts.
-    pub const PRIMARY_NAME_REQUEST_BASE_FEE: u64 = 200_000;
+    pub const PRIMARY_NAME_REQUEST_BASE_FEE_LEASE: u64 = 200_000;
+
+    /// Base fee for primary name requests on a **permabuy** ArNS name (mARIO).
+    /// Whitepaper §9.3/§12.3: a permabuy primary name costs the permabuy
+    /// undername rate (5x the lease rate).
+    /// = baseFeeForNameLength(51) * UNDERNAME_PERMABUY_FEE_PERCENTAGE
+    /// = 200_000_000 * 0.005 = 1_000_000 mARIO (1.0 ARIO) at demand_factor=1.0.
+    /// See WHITEPAPER_COMPARISON.md discrepancy #3. NOTE: diverges from the
+    /// Lua source (BD-031), which uses the lease rate unconditionally; the
+    /// v3.0.0 whitepaper is canonical here.
+    pub const PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY: u64 = 1_000_000;
 }
 
 // =========================================

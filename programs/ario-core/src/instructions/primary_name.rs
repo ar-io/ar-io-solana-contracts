@@ -161,6 +161,33 @@ fn verify_arns_record_active(arns_record_info: &AccountInfo, current_timestamp: 
     Ok(())
 }
 
+/// Read the `purchase_type` byte (0 = Lease, 1 = Permabuy) from a validated
+/// ArnsRecord account. Used to pick the purchase-type-aware primary-name fee
+/// (WHITEPAPER_COMPARISON.md discrepancy #3). Callers MUST run
+/// `validate_arns_record_exists` first — that verifies ownership, PDA, and
+/// the discriminator, so this only needs a length guard before indexing.
+/// Layout: disc(8) + name_hash(32) + owner(32) + ant(32) + purchase_type(1).
+fn read_arns_purchase_type(arns_record_info: &AccountInfo) -> Result<u8> {
+    let data = arns_record_info.try_borrow_data()?;
+    let purchase_type_offset: usize = 8 + 32 + 32 + 32; // 104
+    require!(
+        data.len() > purchase_type_offset,
+        ArioError::InvalidAccountState
+    );
+    Ok(data[purchase_type_offset])
+}
+
+/// Resolve the base primary-name request fee (mARIO, pre-demand-factor) from
+/// an ArnsRecord's purchase type: permabuy names pay 5x the lease rate per
+/// the whitepaper. See `read_arns_purchase_type`.
+fn primary_name_base_fee(arns_record_info: &AccountInfo) -> Result<u64> {
+    Ok(if read_arns_purchase_type(arns_record_info)? == 1 {
+        ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY
+    } else {
+        ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_LEASE
+    })
+}
+
 /// Read demand factor from an account info, erroring if the account is invalid.
 /// Callers MUST pass the correct DemandFactor PDA from ario-arns.
 fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result<u64> {
@@ -415,8 +442,11 @@ pub mod request_primary_name {
         require!(remaining.len() > 1, ArioError::InvalidParameter);
         let demand_factor = read_demand_factor(&remaining[1], &config.arns_program)?;
 
+        // Fee varies by purchase type (WHITEPAPER_COMPARISON.md #3): permabuy
+        // names pay 5x the lease rate.
+        let base_fee = primary_name_base_fee(arns_record_info)?;
         let fee = u64::try_from(
-            (ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE as u128)
+            (base_fee as u128)
                 .checked_mul(demand_factor as u128)
                 .ok_or(ArioError::ArithmeticOverflow)?
                 .checked_div(1_000_000u128) // DEMAND_FACTOR_SCALE
@@ -540,9 +570,11 @@ pub mod request_and_set_primary_name {
         require!(remaining.len() > 1, ArioError::InvalidParameter);
         let demand_factor = read_demand_factor(&remaining[1], &config.arns_program)?;
 
-        // Charge fee
+        // Charge fee — varies by purchase type (WHITEPAPER_COMPARISON.md #3):
+        // permabuy names pay 5x the lease rate.
+        let base_fee = primary_name_base_fee(arns_record_info)?;
         let fee = u64::try_from(
-            (ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE as u128)
+            (base_fee as u128)
                 .checked_mul(demand_factor as u128)
                 .ok_or(ArioError::ArithmeticOverflow)?
                 .checked_div(1_000_000u128)
@@ -1333,8 +1365,11 @@ pub mod request_primary_name_from_funding_plan {
         )?;
         let demand_factor = read_demand_factor(&validation_accounts[1], &config.arns_program)?;
 
+        // Fee varies by purchase type (WHITEPAPER_COMPARISON.md #3): permabuy
+        // names pay 5x the lease rate.
+        let base_fee = primary_name_base_fee(&validation_accounts[0])?;
         let fee = u64::try_from(
-            (ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE as u128)
+            (base_fee as u128)
                 .checked_mul(demand_factor as u128)
                 .ok_or(ArioError::ArithmeticOverflow)?
                 .checked_div(1_000_000u128)
@@ -1463,8 +1498,11 @@ pub mod request_and_set_primary_name_from_funding_plan {
 
         let demand_factor = read_demand_factor(&validation_accounts[1], &config.arns_program)?;
 
+        // Fee varies by purchase type (WHITEPAPER_COMPARISON.md #3): permabuy
+        // names pay 5x the lease rate.
+        let base_fee = primary_name_base_fee(arns_record_info)?;
         let fee = u64::try_from(
-            (ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE as u128)
+            (base_fee as u128)
                 .checked_mul(demand_factor as u128)
                 .ok_or(ArioError::ArithmeticOverflow)?
                 .checked_div(1_000_000u128)

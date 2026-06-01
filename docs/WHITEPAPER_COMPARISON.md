@@ -194,19 +194,26 @@ eliminated because the minimum in-window multiplier is now 1x.
 
 ---
 
-### 3. Primary Name Fee — Code doesn't vary by purchase type
+### 3. Primary Name Fee — RESOLVED
 
-**Severity: MEDIUM** — permabuy primary name fee is undercharged vs whitepaper
+**Status: FIXED** — the fee now varies by purchase type, matching the whitepaper
 
-| | Whitepaper (§9.3 / §12.3) | Code |
+| | Whitepaper (§9.3 / §12.3) | Code (primary_name.rs) |
 |--|-----------|------|
-| Spec | "Equal to the fee for a single undername on a 51-char name **of equivalent purchase type**" | Fixed `PRIMARY_NAME_REQUEST_BASE_FEE = 200,000` mARIO × DF |
-| Lease primary name | 200 ARIO × 0.1% × DF = **0.2 ARIO × DF** | **0.2 ARIO × DF** |
-| Permabuy primary name | 200 ARIO × 0.5% × DF = **1.0 ARIO × DF** | **0.2 ARIO × DF** |
+| Spec | "Equal to the fee for a single undername on a 51-char name **of equivalent purchase type**" | `PRIMARY_NAME_REQUEST_BASE_FEE_{LEASE,PERMABUY}` × DF, selected from the record's `purchase_type` |
+| Lease primary name | 200 ARIO × 0.1% × DF = **0.2 ARIO × DF** | **0.2 ARIO × DF** (200,000 mARIO) |
+| Permabuy primary name | 200 ARIO × 0.5% × DF = **1.0 ARIO × DF** | **1.0 ARIO × DF** (1,000,000 mARIO) |
 
-The code always charges the lease-equivalent rate (0.2 ARIO × DF) regardless of whether the name is a lease or permabuy. The whitepaper says the fee should be 5x higher for permabuy names (1.0 ARIO × DF). Code comment explicitly derives the constant from the lease formula only.
+The single `PRIMARY_NAME_REQUEST_BASE_FEE = 200,000` constant was split into
+`PRIMARY_NAME_REQUEST_BASE_FEE_LEASE = 200,000` and
+`PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY = 1,000,000`. All 4 primary-name request
+handlers now read the `purchase_type` byte (offset 104) from the ArnsRecord and
+charge the permabuy rate (5x) for permabuy names, matching the whitepaper's
+"equivalent purchase type" requirement.
 
-**Mitigating context:** The Lua source also uses `UNDERNAME_LEASE_FEE_PERCENTAGE` unconditionally for primary name requests (per BD-031). So both Lua and Solana diverge from a strict reading of the whitepaper.
+**Note on Lua divergence:** the Lua source uses `UNDERNAME_LEASE_FEE_PERCENTAGE`
+unconditionally for primary name requests (per BD-031). This fix intentionally
+diverges from Lua to follow the v3.0.0 whitepaper, which is canonical here.
 
 ---
 
@@ -344,9 +351,9 @@ Gateway weight only affects observer selection probability. All passing gateways
 |----------|-------|
 | Parameters that match exactly | **56+** |
 | HIGH severity discrepancies | **3** (#1, #5, #6) |
-| MEDIUM severity discrepancies | **3** (#3, #4, #7) |
+| MEDIUM severity discrepancies | **2** (#4, #7) |
 | LOW / informational | **6** (#8-#13) |
-| Resolved | **1** (#2 — RNP formula fixed) |
+| Resolved | **2** (#2 — RNP formula; #3 — primary name fee) |
 
 ### Actionable Items — Resolve by Updating Whitepaper or Code
 
@@ -354,7 +361,7 @@ Gateway weight only affects observer selection probability. All passing gateways
 |---|-------|----------------------|
 | 1 | MAX_CONTROLLERS: WP=10, Code=4 | Update WP to say 4 |
 | ~~2~~ | ~~RNP formula~~ | **RESOLVED** — code updated to WP formula `50 - 49*(elapsed/duration)` |
-| 3 | Primary name fee ignores purchase type | Update WP to match Lua/Solana behavior, or add purchase-type-aware fee |
+| ~~3~~ | ~~Primary name fee ignores purchase type~~ | **RESOLVED** — code now charges the permabuy rate (1.0 ARIO × DF) for permabuy primary names |
 | 4 | Undername max length: WP=51, Code=61 | Update WP to say 61 |
 | 5 | Protected exit vault not expeditable | Update WP §6.6 to clarify only excess stake is expeditable |
 | 6 | Disabling delegation doesn't auto-withdraw | Update WP §6.3 to describe pull-based delegate exit model |
