@@ -26,6 +26,14 @@ fn known_discriminator(disc: &[u8; 8]) -> Option<usize> {
         ("account:VaultCounter", VaultCounter::SIZE),
         ("account:PrimaryName", PrimaryName::SIZE),
         ("account:PrimaryNameRequest", PrimaryNameRequest::SIZE),
+        // Reverse (name -> owner) lookup record. Migrated via import_account
+        // alongside the forward PrimaryName; both phase5-user-state and the
+        // backfill-primary-name-reverse tool emit it. Omitting it here made
+        // import_account reject every reverse record (InvalidAccountData 6041),
+        // which would also break later set_primary_name / approve_primary_name
+        // (they take the reverse PDA as a mut account). No authority field, so
+        // no overwrite-hijack risk that warrants the config-style exclusion.
+        ("account:PrimaryNameReverse", PrimaryNameReverse::SIZE),
     ];
     for (name, size) in checks {
         let h = hash(name.as_bytes());
