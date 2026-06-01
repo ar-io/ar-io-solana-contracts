@@ -597,14 +597,19 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
     // deserializations. Storing prefix sums as u64 (not u128) is safe: each sum
     // is bounded by the total composite weight, which is bounded by total
     // staked ARIO (≤ ~10^15 mARIO × tenure factor) — orders of magnitude below
-    // u64::MAX (~1.8×10^19). `saturating_add` is a belt-and-suspenders guard;
-    // it cannot trigger at any realistic stake level. The roulette modulus is
+    // u64::MAX (~1.8×10^19). We use `checked_add` (not `saturating_add`) so the
+    // unreachable-in-practice overflow fails the instruction deterministically
+    // rather than silently flattening the prefix tail — a saturated prefix would
+    // clamp total_weight and make some positive-weight gateways unselectable,
+    // breaking the byte-identical-selection guarantee. The roulette modulus is
     // still computed in u128 (see `roulette_select_indices`), so selection is
     // byte-identical to a u128 prefix.
     let mut prefix: Vec<u64> = Vec::with_capacity(active_count);
     let mut running: u64 = 0;
     for i in 0..active_count {
-        running = running.saturating_add(registry.gateways[i].composite_weight);
+        running = running
+            .checked_add(registry.gateways[i].composite_weight)
+            .ok_or(GarError::ArithmeticOverflow)?;
         prefix.push(running);
     }
 
