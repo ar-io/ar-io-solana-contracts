@@ -8035,6 +8035,528 @@ async fn test_compound_delegation_rewards() {
 }
 
 // -----------------------------------------
+// test_import_account_rejects_epoch_settings_discriminator (audit M-4, 2026-05-30 follow-up)
+//
+// PR #81 added `epoch_settings_excluded_from_import_allowlist` as a unit test
+// that pins the `known_discriminator` helper returns None for EpochSettings.
+// But the helper returning None doesn't ALONE prove the on-chain
+// `import_account` handler actually rejects — Anchor's account-resolution
+// layer or a future refactor could conceivably bypass it. This test takes
+// the integration path: builds a real `import_account` ix with the
+// EpochSettings discriminator + valid PDA derivation, sends it signed by
+// the migration_authority, and asserts the handler rejects with
+// `InvalidAccountData`.
+//
+// Pre-fix (PR #81): EpochSettings was in the allowlist; this ix would have
+// succeeded and overwritten the EpochSettings account (the post-finalize
+// authority-hijack the audit flagged).
+// Post-fix: rejects at the `known_discriminator` check inside the handler.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_import_account_rejects_epoch_settings_discriminator() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let payer_pk = ctx.payer.pubkey();
+
+    // Pre-setup: GatewaySettings is created in program_test_with_gar with
+    // migration_active=false + migration_authority=&dummy. Flip both so
+    // `import_account`'s `constraint = settings.migration_active` AND
+    // `settings.migration_authority == authority.key()` constraints pass
+    // — that way we land on the discriminator gate (InvalidAccountData),
+    // which is what M-4 is testing, not MigrationInactive/Unauthorized.
+    //
+    // CodeRabbit nit #84: deserialize the typed struct + mutate + reserialize
+    // (vs. hardcoded byte offsets) so a future GatewaySettings layout change
+    // can't silently break this test.
+    let (settings_key, _) = settings_pda();
+    let settings_acc = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings = GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    settings.migration_active = true;
+    settings.migration_authority = payer_pk;
+    let mut new_data = Vec::with_capacity(settings_acc.data.len());
+    settings.try_serialize(&mut new_data).unwrap();
+    new_data.resize(settings_acc.data.len(), 0); // preserve the existing account size
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::Account {
+            lamports: settings_acc.lamports,
+            data: new_data,
+            owner: settings_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Build the EpochSettings discriminator (same way the handler computes it).
+    use anchor_lang::solana_program::hash::hash;
+    let es_disc = hash(b"account:EpochSettings");
+    let mut data = vec![0u8; 8 + 256];
+    data[..8].copy_from_slice(&es_disc.to_bytes()[..8]);
+
+    // PDA derivation MUST match what the handler computes with the supplied
+    // seeds, else we get InvalidPda before reaching the discriminator check.
+    let seeds: Vec<Vec<u8>> = vec![EPOCH_SETTINGS_SEED.to_vec()];
+    let (es_pda, _bump) = epoch_settings_pda();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::ImportAccount {
+                settings: settings_key,
+                authority: payer_pk, // migration_authority defaults to payer in setup
+                payer: payer_pk,
+                account: es_pda,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::ImportAccount { seeds, data }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    let result = ctx.banks_client.process_transaction(tx).await;
+
+    // M-4 assertion: the handler MUST reject EpochSettings at the
+    // discriminator-allowlist check. Pre-PR #81 this would have SUCCEEDED
+    // and overwritten EpochSettings — the exact post-finalize authority-
+    // hijack the audit flagged.
+    assert_anchor_error!(result, GarError::InvalidAccountData);
+}
+
+// -----------------------------------------
+// test_distribute_epoch_skips_cleared_registry_slots (audit M-1, 2026-05-29)
+//
+// CodeRabbit pushback on PR #79: add focused non-ignored test coverage
+// for the cleared-slot skip branch in distribute_epoch (mirrors the
+// GAR-009 pattern in tally_weights).
+//
+// Strategy: run the standard scaffold through `create_epoch`, then
+// directly mutate the GatewayRegistry + Epoch zero-copy accounts to
+// inject a state where every active slot is `Pubkey::default()`. With
+// no real gateways, pass 2 produces zero pending distributions →
+// `transfer_amount == 0` → the ario-core CPI is skipped, so this test
+// does NOT need ario-core loaded (which is why all the other
+// distribute_epoch tests are #[ignore]'d).
+//
+// Pre-fix the loop would hit the `registry.gateways[dist_idx].address
+// == gateway.operator` require! on the very first cleared slot and
+// reject the whole tx. Post-fix the loop skips each cleared slot,
+// advances `distribution_index`, and finishes cleanly with
+// `rewards_distributed = 1`.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_distribute_epoch_skips_cleared_registry_slots() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // epoch_duration=86_400s, enabled=true so create_epoch passes the gate
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Warp clock past genesis (100) so create_epoch can build a valid epoch.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // --- Create epoch (real ix; gives us a valid Epoch state to mutate) ---
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // --- Inject the cleared-slot state ---
+    //
+    // Bump registry.count to N so dist_idx iterates through slots, but
+    // leave each slot's address at the default `Pubkey::default()`
+    // (slots are zero-initialized by setup_gar / pre_create_epoch_settings).
+    let cleared_count: u32 = 2;
+    {
+        let reg_acc = ctx
+            .banks_client
+            .get_account(setup.registry_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = reg_acc.data.clone();
+        // GatewayRegistry layout: disc(8) + authority(32) + count(u32 LE @ 40)
+        data[40..44].copy_from_slice(&cleared_count.to_le_bytes());
+        ctx.set_account(
+            &setup.registry_key,
+            &solana_sdk::account::Account {
+                lamports: reg_acc.lamports,
+                data,
+                owner: reg_acc.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    // Mutate the Epoch state so distribute_epoch's guards pass:
+    //   prescriptions_done = 1  (else PrescriptionsNotDone)
+    //   end_timestamp = 0       (already in the past — clock is 200)
+    //   rewards_distributed = 0 (already zero from create_epoch)
+    //   active_gateway_count = cleared_count (so the loop iterates N times)
+    //   distribution_index = 0
+    {
+        let epoch_acc = ctx
+            .banks_client
+            .get_account(epoch_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = epoch_acc.data.clone();
+        // bytemuck::from_bytes_mut on the post-discriminator slice.
+        let epoch_bytes = &mut data[8..8 + std::mem::size_of::<Epoch>()];
+        let epoch: &mut Epoch = bytemuck::from_bytes_mut(epoch_bytes);
+        epoch.end_timestamp = 0;
+        epoch.prescriptions_done = 1;
+        epoch.rewards_distributed = 0;
+        epoch.active_gateway_count = cleared_count;
+        epoch.distribution_index = 0;
+        // Clear reward fields so transfer_amount stays 0 even if a slot somehow processed
+        epoch.per_gateway_reward = 0;
+        epoch.per_observer_reward = 0;
+        epoch.total_eligible_rewards = 0;
+
+        ctx.set_account(
+            &epoch_key,
+            &solana_sdk::account::Account {
+                lamports: epoch_acc.lamports,
+                data,
+                owner: epoch_acc.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    // Derive the ario_config PDA that the address constraint expects.
+    // Uses the placeholder ARIO_CORE_PROGRAM_ID baked into the build —
+    // sufficient for the constraint; no CPI to ario-core actually fires
+    // because all slots are cleared.
+    let (ario_config_pda, _) =
+        Pubkey::find_program_address(&[b"ario_config"], &ario_gar::ARIO_CORE_PROGRAM_ID);
+
+    // Two dummy account_infos for the remaining_accounts slot. The skip
+    // branch fires BEFORE any deserialization, so these accounts are
+    // never actually read — any system-owned address works.
+    let dummy_a = Pubkey::new_unique();
+    let dummy_b = Pubkey::new_unique();
+
+    let mut distribute_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        payer: payer_pk,
+        token_program: spl_token::id(),
+    }
+    .to_account_metas(None);
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(dummy_a, false));
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(dummy_b, false));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: distribute_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    // M-1 assertion: distribute_epoch succeeds despite every registry slot
+    // being Pubkey::default(). Pre-fix this failed with InvalidGatewayAccount
+    // on the first slot because the registry-vs-operator equality check
+    // (now skipped) rejected default vs the dummy account's owner.
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("distribute_epoch must succeed when all registry slots are cleared (audit M-1)");
+
+    // Verify the loop advanced past both cleared slots and finalized the epoch.
+    let epoch_acc = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_acc.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.distribution_index, cleared_count,
+        "distribution_index must equal active_count after iterating past cleared slots"
+    );
+    assert_eq!(
+        epoch.rewards_distributed, 1,
+        "rewards_distributed must be set when dist_idx reaches active_count"
+    );
+}
+
+// -----------------------------------------
+// test_compound_delegation_rewards_permissionless (audit M-2, 2026-05-29)
+//
+// `compound_delegation_rewards` MUST be invokable by any signer — not just
+// the delegator themselves. INVARIANTS.md describes the ix as
+// "permissionless" because compounding only moves a delegate's pending
+// rewards into their active stake on their OWN balance; no funds move
+// between accounts and no authorization is required. Pre-this-fix the
+// account struct required `delegator: Signer<'info>`, contradicting the
+// documented model and blocking (a) the off-chain monitor's Invariant 1
+// health check and (b) `finalize_gone` for gateways with dormant pending
+// delegate rewards.
+//
+// This test pins the new behavior: a third-party signer (not the
+// delegator) calls compound on the delegator's behalf and the
+// instruction succeeds with the same state mutation.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_compound_delegation_rewards_permissionless() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Set up a real delegator (the holder of the Delegation PDA).
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(
+        &mut ctx,
+        &delegator_token,
+        &setup.mint.pubkey(),
+        &delegator_pk,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let delegate_amount = 100_000_000u64;
+    let (delegation_key, _) = delegation_pda(&payer_pk, &delegator_pk);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake {
+                amount: delegate_amount,
+            }
+            .data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Inject pending reward (same simulation as test_compound_delegation_rewards).
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    gw.cumulative_reward_per_token = 1_000_000_000_000_000_000u128; // 1e18
+    let mut new_data = Vec::new();
+    gw.try_serialize(&mut new_data).unwrap();
+    let original_len = gw_account.data.len();
+    new_data.resize(original_len, 0);
+    ctx.set_account(
+        &gateway_key,
+        &solana_sdk::account::Account {
+            lamports: gw_account.lamports,
+            data: new_data,
+            owner: gw_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // ---- The permissionless invocation ----
+    // A THIRD-PARTY caller — not the delegator — invokes compound on the
+    // delegator's behalf. The `delegator` ACCOUNT in the metas is still the
+    // delegator's pubkey (it's a PDA-derivation source bound by the seeds
+    // constraint), but it is NOT a signer here. Pre-this-fix this fails
+    // with `MissingRequiredSignature`; post-fix it succeeds.
+    let third_party = Keypair::new();
+    let third_party_pk = third_party.pubkey();
+    // Fund the third party so they can pay tx fees.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &third_party_pk,
+            10_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CompoundDelegationRewards {
+                gateway: gateway_key,
+                delegation: delegation_key,
+                // `delegator` is now an UncheckedAccount (not a Signer);
+                // we pass its pubkey purely as a PDA-derivation seed.
+                delegator: delegator_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CompoundDelegationRewards {}.data(),
+        }],
+        Some(&third_party_pk),
+        &[&third_party], // ← signed by third party, NOT the delegator
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("permissionless compound must succeed (audit M-2)");
+
+    // State mutation is identical to the delegator-signed variant.
+    let delegation_account = ctx
+        .banks_client
+        .get_account(delegation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let delegation = Delegation::try_deserialize(&mut delegation_account.data.as_slice()).unwrap();
+    assert_eq!(delegation.amount, delegate_amount + 100_000_000);
+    assert_eq!(delegation.reward_debt, 1_000_000_000_000_000_000u128);
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    assert_eq!(gw.total_delegated_stake, delegate_amount + 100_000_000);
+}
+
+// -----------------------------------------
 // test_close_epoch_happy
 // -----------------------------------------
 
@@ -23081,4 +23603,380 @@ async fn test_migrate_observation_realloc() {
     assert_eq!(obs.epoch_index, epoch_index);
     assert_eq!(obs.observer, observer.pubkey());
     assert_eq!(obs.gateway_count, 10);
+}
+
+// =========================================
+// Codex 2026-05-28: mid-epoch leave bias regression
+// =========================================
+//
+// Sets up three gateways in registry slots [small1, big_leaver, small2] where
+// `big_leaver` carries ~100x the composite weight of either small gateway.
+// After `tally_weights` accumulates the full pre-leave total into
+// `epoch.total_composite_weight`, `big_leaver` calls `leave_network`. That
+// zeroes its registry slot's `composite_weight` in place but does not
+// decrement the epoch total.
+//
+// Pre-fix `prescribe_epoch` sampled `random_value % stale_total` and the
+// "if !found" fallback attributed every dead-range hit (~99% of the
+// random_value space at 100x ratio) to the LAST non-zero slot — collapsing
+// observer selection onto `small2` and yielding `observer_count == 1` with
+// overwhelming probability across the 30-iteration roulette.
+//
+// Post-fix `prescribe_epoch` recomputes `total_weight` as a live walk of
+// current registry composite_weights, eliminating the dead range and the
+// fallback. With weights `[small1, 0, small2]` and balanced live total,
+// both surviving slots are selected and `observer_count == 2`.
+#[tokio::test]
+async fn test_prescribe_unbiased_after_mid_epoch_leave() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+
+    let big_op = Keypair::new();
+    let small2_op = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    for op in [&big_op, &small2_op] {
+        pt.add_account(
+            op.pubkey(),
+            solana_sdk::account::Account {
+                lamports: 50_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund the protocol token account so create_epoch reports non-zero
+    // total_eligible_rewards (otherwise reward calc is trivially zero and
+    // the test doesn't exercise the bias surface).
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Warp clock to 0 so all three gateways join BEFORE epoch.start_timestamp
+    // (set to 100 by pre_create_epoch_settings genesis_timestamp). Otherwise
+    // tally_weights would zero their effective_composite (SHOULD-13).
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    // Three gateways — registry slots fill in join order.
+    let payer_pk = ctx.payer.pubkey();
+    let small_stake = 20_000_000_000u64; // 20k ARIO (min_operator_stake)
+    let big_stake = 2_000_000_000_000u64; // 2M ARIO → ~100x stake_weight
+
+    // Slot 0: payer (small1).
+    let gw_small1_key = join_gateway(&mut ctx, &setup, small_stake).await;
+
+    // Slot 1: big_op (big_leaver). Mint enough to its ATA, fund SOL above.
+    let big_token = Keypair::new();
+    create_token_account(&mut ctx, &big_token, &setup.mint.pubkey(), &big_op.pubkey()).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &big_token.pubkey(),
+        &setup.mint_authority,
+        // 2x stake to ensure the join succeeds and leave_network's
+        // exit-vault rent overhead is covered.
+        big_stake.saturating_mul(2),
+    )
+    .await;
+    let gw_big_key =
+        join_gateway_with_operator(&mut ctx, &setup, &big_op, &big_token.pubkey(), big_stake).await;
+
+    // Slot 2: small2_op (accomplice / "last non-zero slot" in pre-fix fallback).
+    let small2_token = Keypair::new();
+    create_token_account(
+        &mut ctx,
+        &small2_token,
+        &setup.mint.pubkey(),
+        &small2_op.pubkey(),
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &small2_token.pubkey(),
+        &setup.mint_authority,
+        small_stake.saturating_mul(2),
+    )
+    .await;
+    let gw_small2_key = join_gateway_with_operator(
+        &mut ctx,
+        &setup,
+        &small2_op,
+        &small2_token.pubkey(),
+        small_stake,
+    )
+    .await;
+
+    // Warp past epoch.start (= 100) and pin slot so the hashchain is
+    // reproducible across test runs.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // create_epoch — active_gateway_count = 3.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally_weights — populates composite_weight for all 3 slots and
+    // accumulates the full pre-leave total into epoch.total_composite_weight.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gw_small1_key,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(gw_big_key, false));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gw_small2_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Snapshot the post-tally weights so we can prove (a) big_leaver
+    // dominates and (b) epoch.total_composite_weight reflects all three
+    // contributions — the exact precondition for the stale-total bias.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    let small1_weight = registry.gateways[0].composite_weight;
+    let big_weight = registry.gateways[1].composite_weight;
+    let small2_weight = registry.gateways[2].composite_weight;
+    assert!(
+        big_weight >= small1_weight.saturating_mul(50)
+            && big_weight >= small2_weight.saturating_mul(50),
+        "test setup invariant: big_leaver weight ({big_weight}) must dominate \
+         small1 ({small1_weight}) and small2 ({small2_weight}) by ≥50x so the \
+         bias surface is large enough to discriminate"
+    );
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let stale_total = epoch.total_composite_weight();
+    assert_eq!(
+        stale_total,
+        small1_weight as u128 + big_weight as u128 + small2_weight as u128,
+        "tally must accumulate every Joined slot's composite_weight"
+    );
+
+    // leave_network on big_leaver — between tally and prescribe. Zeroes its
+    // registry slot composite_weight in place; epoch.total_composite_weight
+    // stays at `stale_total` per gateway.rs::leave_network comment.
+    let (big_wd_counter, _) = withdrawal_counter_pda(&big_op.pubkey());
+    let (big_wd, _) = withdrawal_pda(&big_op.pubkey(), 0);
+    let (big_excess_wd, _) = withdrawal_pda(&big_op.pubkey(), 1);
+    let mut leave_accounts = ario_gar::accounts::LeaveNetwork {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_pda().0,
+        registry: setup.registry_key,
+        gateway: gw_big_key,
+        withdrawal_counter: big_wd_counter,
+        withdrawal: big_wd,
+        excess_withdrawal: Some(big_excess_wd),
+        operator: big_op.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let (big_observer_lookup, _) = observer_lookup_pda(&big_op.pubkey());
+    leave_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        big_observer_lookup,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: leave_accounts,
+            data: ario_gar::instruction::LeaveNetwork {}.data(),
+        }],
+        Some(&big_op.pubkey()),
+        &[&big_op],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Confirm the bias precondition: slot 1's composite_weight is now 0 but
+    // epoch.total_composite_weight is still the stale pre-leave total.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[1].composite_weight, 0,
+        "leave_network must zero the leaver's slot weight"
+    );
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.total_composite_weight(),
+        stale_total,
+        "leave_network must NOT decrement epoch.total_composite_weight \
+         (the snapshot the bias bug relied on)"
+    );
+
+    // prescribe_epoch — pass only the two SURVIVING gateway PDAs in
+    // remaining_accounts. Post-fix the live recompute samples modulo
+    // small1_weight + small2_weight, so both must be selected
+    // (observer_count == 2). Pre-fix the stale modulus + fallback would
+    // collapse selection onto small2 (last non-zero slot) with
+    // overwhelming probability, leaving observer_count == 1 and failing
+    // remaining_accounts validation (the unmatched gw_small1_key would be
+    // re-interpreted as a NameRegistry and fail the owner check).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gw_small1_key,
+        false,
+    ));
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gw_small2_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.prescriptions_done, 1,
+        "prescribe_epoch must flip prescriptions_done"
+    );
+    assert_eq!(
+        epoch.observer_count, 2,
+        "both surviving gateways must be selected; pre-fix the bias would \
+         collapse selection onto small2 and yield observer_count == 1"
+    );
+
+    let prescribed: std::collections::HashSet<Pubkey> = epoch.prescribed_observer_gateways
+        [..epoch.observer_count as usize]
+        .iter()
+        .copied()
+        .collect();
+    assert!(
+        prescribed.contains(&payer_pk),
+        "small1 (payer) must be prescribed — pre-fix the bias would leave it \
+         out with ~99.5% probability across the 30-iteration roulette"
+    );
+    assert!(
+        prescribed.contains(&small2_op.pubkey()),
+        "small2 must be prescribed"
+    );
+    assert!(
+        !prescribed.contains(&big_op.pubkey()),
+        "leaver (big_op) must never appear in prescribed_observer_gateways"
+    );
 }

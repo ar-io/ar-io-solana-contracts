@@ -89,6 +89,41 @@ pub const GATEWAY_OPERATOR_DISCOUNT_PCT: u64 = 200_000;
 /// Number of entries in the genesis fee table (indices 0..=50)
 pub const NUM_NAME_LENGTH_FEES: usize = 51;
 
+/// Metaplex Core program ID.
+///
+/// ario-arns is MPL-agnostic per ADR-016 (no `mpl-core` crate dependency, no
+/// `UpdatePluginV1` CPI), but `reassign_name` / `release_name` still authorize
+/// against the *current* ANT NFT holder by reading the asset account's owner
+/// bytes directly. A raw read needs neither the crate nor a CPI, so it stays
+/// ADR-016-compatible. Used as the expected `ant_asset.owner` in those handlers.
+pub const MPL_CORE_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
+
+/// Read the `owner` field from a Metaplex Core asset account's raw data.
+///
+/// Verified against the mpl-core v1.8.0 `AssetV1` layout:
+/// - byte 0: `Key` (u8) = 1 for `AssetV1`
+/// - bytes 1..33: `Owner` (Pubkey, 32 bytes)
+/// - byte 33+: `UpdateAuthority` (varies — not needed here)
+///
+/// A local copy of `ario_ant::read_mpl_core_owner` so ario-arns takes no
+/// dependency on ario-ant. Callers MUST first assert the account is owned by
+/// [`MPL_CORE_PROGRAM_ID`] (via an Anchor `constraint`) — this function only
+/// parses the layout, it does not verify the account's program owner.
+///
+/// WARNING: hardcodes the MPL Core `AssetV1` byte layout; there is no
+/// compile-time verification because mpl-core is not a Cargo dependency. If
+/// Metaplex Core changes the `AssetV1` layout, update this in lockstep with
+/// `ario_ant::read_mpl_core_owner`.
+pub fn read_mpl_core_owner(data: &[u8]) -> Result<Pubkey> {
+    require!(data.len() >= 33, crate::error::ArnsError::InvalidAntAsset);
+    require!(data[0] == 1, crate::error::ArnsError::InvalidAntAsset);
+    let owner_bytes: [u8; 32] = data[1..33]
+        .try_into()
+        .map_err(|_| crate::error::ArnsError::InvalidAntAsset)?;
+    Ok(Pubkey::from(owner_bytes))
+}
+
 // =========================================
 // SIZING CONSTANTS
 // =========================================
@@ -399,8 +434,8 @@ impl DemandFactor {
 ///   - undername_limit:       122 (2)
 ///   - purchase_price:        124 (8)
 ///   - bump:                  132 (1)
-///   - version:               133 (3)
-///   - name (variable-length): 136 (4 + ≤51)
+///   - name (variable-length): 133 (4 + ≤51)
+///   - version:               (after name; variable offset, byte-end)
 #[account]
 pub struct ArnsRecord {
     /// SHA256 hash of lowercase name (used for PDA derivation)
@@ -425,12 +460,16 @@ pub struct ArnsRecord {
     pub purchase_price: u64,
     /// PDA bump
     pub bump: u8,
-    /// Schema version for forward-compatible migrations.
-    pub version: SchemaVersion,
     /// The name string (max 51 chars, original casing preserved).
-    /// Variable-length — must remain the last field so all preceding
-    /// fields stay at fixed byte offsets for memcmp filtering.
+    /// Variable-length. The memcmp-filtered fixed fields (`owner` @40,
+    /// `ant` @72, …) all precede it, so their offsets stay stable.
     pub name: String,
+    /// Schema version for forward-compatible migrations. MUST be the
+    /// byte-end (last) field: it follows the variable-length `name` so a
+    /// pre-versioning record can be grown + zero-filled and read as
+    /// {0,0,0} → bootstrap. Reordered here from before `name` (which made
+    /// old records unloadable). See `schema_migration::grow_account`.
+    pub version: SchemaVersion,
 }
 
 impl ArnsRecord {
@@ -791,6 +830,42 @@ impl RegistryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================
+    // Metaplex Core AssetV1 owner-read tests
+    // (mirrors ario_ant::read_mpl_core_owner unit tests; BD-106)
+    // =========================================
+
+    #[test]
+    fn read_mpl_core_owner_valid_asset() {
+        let mut data = vec![0u8; 33];
+        data[0] = 1; // Key::AssetV1
+        data[1..33].copy_from_slice(&[7u8; 32]);
+        assert_eq!(read_mpl_core_owner(&data).unwrap(), Pubkey::from([7u8; 32]));
+    }
+
+    #[test]
+    fn read_mpl_core_owner_rejects_wrong_key() {
+        let mut data = vec![0u8; 33];
+        data[0] = 0; // not AssetV1
+        assert!(read_mpl_core_owner(&data).is_err());
+        data[0] = 2; // HashedAssetV1
+        assert!(read_mpl_core_owner(&data).is_err());
+    }
+
+    #[test]
+    fn read_mpl_core_owner_rejects_short_data() {
+        assert!(read_mpl_core_owner(&[1u8; 32]).is_err()); // 32 < 33
+        assert!(read_mpl_core_owner(&[]).is_err());
+    }
+
+    #[test]
+    fn read_mpl_core_owner_ignores_trailing_data() {
+        let mut data = vec![0u8; 64]; // UpdateAuthority etc. trail the owner
+        data[0] = 1;
+        data[1..33].copy_from_slice(&[9u8; 32]);
+        assert_eq!(read_mpl_core_owner(&data).unwrap(), Pubkey::from([9u8; 32]));
+    }
 
     // =========================================
     // 3C. Demand Factor Tests

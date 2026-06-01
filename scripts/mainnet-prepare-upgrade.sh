@@ -99,8 +99,10 @@ buffer_authority_pubkey() {
   fi
 }
 
-# Refuse on dirty test attestor.
-"$REPO_ROOT/scripts/check-attestor-pubkey.sh" --strict
+# Refuse unless ATTESTOR_PUBKEY is not the test key AND matches the mainnet
+# key pinned in program-ids/mainnet.json. This blocks shipping the devnet
+# attestor key to mainnet; pin the mainnet attestor pubkey there first.
+"$REPO_ROOT/scripts/check-attestor-pubkey.sh" --strict --cluster mainnet
 
 # Build with mainnet feature flags.
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then

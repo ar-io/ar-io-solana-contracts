@@ -228,6 +228,25 @@ changes are NOT backward-compatible — see "ArioConfig" in the
 schema-evolution checklist in [`docs/DECISIONS.md`](docs/DECISIONS.md)
 before modifying.
 
+### Schema versioning & `migrate_*` (ADR-020)
+
+`version: SchemaVersion` is **append-only and at the byte-end** of every
+borsh `#[account]` (after any variable-length field); new fields append at
+the end or carve from a `_reserved` tail. **Never reorder** an existing
+field post-launch. `migrate_*` instructions MUST use the
+**grow-then-deserialize** pattern (`schema_migration::grow_account` +
+`write_account` on an `UncheckedAccount`), NOT a typed `Account<T>` +
+`realloc` — Anchor deserializes the new layout *before* `realloc` runs, so a
+pre-version (shorter) account hits Borsh EOF (`AccountDidNotDeserialize`,
+3003) and the migration is unreachable. Serialize back via `write_account`'s
+temp-buffer copy, never `try_serialize(&mut *data)` (it advances and
+truncates the account). New migration tests must build a **genuine
+pre-version** account (old SIZE, no version bytes), not a full-size one with
+`version={0,0,0}`. Exception: `ario-ant-escrow` uses fixed-SIZE
+`_reserved`-absorbs accounts (no realloc ever) and keeps typed `Account<T>`;
+if a future escrow field exceeds `_reserved`, convert it to
+grow-then-deserialize. See [`docs/adrs/0020-…`](docs/adrs/0020-schema-migration-grow-then-deserialize.md).
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool
@@ -313,6 +332,18 @@ FAST=1 ./scripts/test-integration.sh ario-arns          # skip rebuild
 #   cp programs/ario-ant-escrow/tests/fixtures/mpl_core.so target/deploy/
 #   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test --features devnet-shrunk \
 #     -p ario-arns --test integration
+#
+# ESCROW ONLY: the `claim_*_attested` tests sign with the deterministic
+# test attestor key, which lives behind the opt-in
+# `unsafe-allow-test-attestor-pubkey` feature (kept OUT of escrow's
+# default features so it can never reach a deploy artifact — see
+# programs/ario-ant-escrow/Cargo.toml). Add it to BOTH the .so build and
+# the `cargo test` invocation (cargo applies it only to escrow):
+#   cargo build-sbf --features devnet-shrunk,unsafe-allow-test-attestor-pubkey
+#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test \
+#     --features devnet-shrunk,unsafe-allow-test-attestor-pubkey \
+#     -p ario-ant-escrow --test integration
+# The wrapper (test-integration.sh) does this automatically.
 
 # Devnet deploy (idempotent — re-runs upgrade against the same program IDs)
 bash scripts/devnet-deploy.sh

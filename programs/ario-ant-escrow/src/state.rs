@@ -84,37 +84,37 @@ pub const ED25519_PROGRAM_ID: Pubkey =
 /// `ar-io/ar-io-solana-attestor` repo's `README.md` § "Key rotation"
 /// for the runbook.
 ///
-/// The current value is the **deterministic test pubkey** derived from
-/// Ed25519 secret seed `[1u8; 32]` — known to integration tests and to
-/// nobody else. Before any devnet/mainnet deploy:
-///   1. Clone `ar-io/ar-io-solana-attestor`, then run `yarn keygen`.
-///   2. Replace this constant with the printed `ATTESTOR_PUBKEY_BASE58`.
-///   3. Provision the corresponding `ATTESTOR_SECRET_BASE58` to the
-///      running service's secret manager.
-///   4. Rebuild and deploy.
+/// The value below (`CKgG3xMKEzd2gWEZTvyrukdZHYb4hwyeTsBMeh8w9mkW`) is the
+/// **production devnet** attestor pubkey — NOT a test placeholder. Its
+/// secret is held by the running `ar-io/ar-io-solana-attestor` service.
 ///
-/// Using a deterministic-derivable test value (rather than a true
-/// placeholder like the system program ID) is intentional: it lets
-/// integration tests construct valid Ed25519Program ixs without
-/// further plumbing.
+/// Per-cluster keys: this constant is the same across `network-devnet` and
+/// `network-mainnet` builds (only the canonical-message network string is
+/// feature-gated). A **mainnet deploy MUST first replace this with the
+/// dedicated mainnet attestor pubkey** — mainnet must not inherit the
+/// devnet key. `scripts/check-attestor-pubkey.sh --cluster <name>` pins the
+/// compiled value to `program-ids/<cluster>.json`'s `attestor_pubkey` and
+/// fails the deploy on a mismatch (or if the cluster's key isn't pinned
+/// yet). Rotation = a `BPFLoaderUpgradeable` upgrade swapping this constant;
+/// see the `ar-io/ar-io-solana-attestor` repo's `README.md` § "Key rotation".
 ///
-/// All `claim_*_attested` instructions match the Ed25519Program ix
-/// signer against this constant via `verify::attested::verify_attested_signature`.
+/// All `claim_*_attested` instructions match the Ed25519Program ix signer
+/// against this constant via `verify::attested::verify_attested_signature`.
 ///
-/// **Build-mode swap:** the `unsafe-allow-test-attestor-pubkey` feature
-/// (enabled in `default = [...]`) substitutes the deterministic test
-/// pubkey derived from seed `[1u8; 32]`, so integration tests can
-/// construct valid Ed25519Program ixs from a known secret. Real-network
-/// builds disable this default and fall back to the production pubkey
-/// below.
+/// **Build-mode swap (tests only):** the `unsafe-allow-test-attestor-pubkey`
+/// feature — deliberately **NOT in `default`** (see Cargo.toml) — substitutes
+/// the deterministic test pubkey (seed `[1u8; 32]`) so integration tests can
+/// sign with a known secret. Real-network builds never enable it and use the
+/// production pubkey below.
 #[cfg(not(feature = "unsafe-allow-test-attestor-pubkey"))]
 pub const ATTESTOR_PUBKEY: Pubkey =
     solana_program::pubkey!("CKgG3xMKEzd2gWEZTvyrukdZHYb4hwyeTsBMeh8w9mkW");
 
 /// Test-build override of `ATTESTOR_PUBKEY` — the deterministic test
-/// pubkey (seed `[1u8; 32]`). Compiled when `unsafe-allow-test-attestor-pubkey`
-/// is enabled (default features). Real-network builds drop the default and
-/// pick up the prod constant above instead.
+/// pubkey (seed `[1u8; 32]`). Compiled only when the opt-in
+/// `unsafe-allow-test-attestor-pubkey` feature is enabled (NOT in `default`;
+/// tests pass it explicitly). Real-network builds never enable it and use
+/// the prod constant above instead.
 #[cfg(feature = "unsafe-allow-test-attestor-pubkey")]
 pub const ATTESTOR_PUBKEY: Pubkey =
     solana_program::pubkey::Pubkey::new_from_array(TEST_ATTESTOR_PUBKEY_BYTES);
@@ -319,8 +319,11 @@ pub struct EscrowToken {
     /// For vault escrows: the unix timestamp at which the vault unlocks.
     /// Zero for liquid token escrows.
     pub vault_end_timestamp: i64,
-    /// For vault escrows: whether the vault is revocable.
-    /// False for liquid token escrows.
+    /// Reserved. Always `false`: `deposit_vault` rejects `revocable=true` and
+    /// claim re-locks are always non-revocable (the escrow has no field for a
+    /// legitimate revoker, so a revocable re-lock could only be controlled by
+    /// the unbound claim-tx payer — a theft vector). Kept for layout/ABI
+    /// stability. See ADR-021. (Also `false` for liquid token escrows.)
     pub vault_revocable: bool,
     /// Reserved for future fields.
     /// Shrunk from 32 to 30 to absorb the SchemaVersion expansion (u8→3 bytes).

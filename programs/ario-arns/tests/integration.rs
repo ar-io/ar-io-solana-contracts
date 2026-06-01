@@ -760,6 +760,7 @@ async fn setup_arns(ctx: &mut ProgramTestContext) -> ArnsSetup {
                     treasury: protocol_token.pubkey(),
                     period_zero_start_timestamp: TEST_PERIOD_ZERO_START,
                     migration_authority: ctx.payer.pubkey(),
+                    initial_demand_factor: 1_000_000, // DEMAND_FACTOR_SCALE (1.0)
                 },
             }
             .data(),
@@ -1081,17 +1082,18 @@ async fn test_reassign_name() {
     );
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Reassign to new ANT (pass new ant_asset as remaining account)
+    // Reassign to new ANT. `ant_asset` is the CURRENT asset (record.ant) and
+    // authorizes the caller as its present holder; `new_ant` is just the
+    // instruction arg the record gets repointed to.
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let mut accounts = ario_arns::accounts::ReassignName {
+    let accounts = ario_arns::accounts::ReassignName {
         config: config_pda().0,
         arns_record: arns_record_key,
+        ant_asset: ant_key,
         caller: ctx.payer.pubkey(),
         system_program: system_program::id(),
     }
     .to_account_metas(None);
-    // Add the new ANT asset as a remaining account (read-only)
-    accounts.push(AccountMeta::new_readonly(new_ant, false));
 
     let tx = Transaction::new_signed_with_payer(
         &[Instruction {
@@ -1505,6 +1507,7 @@ async fn test_release_name() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -1585,6 +1588,7 @@ async fn test_release_name_lease_fails() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -1641,6 +1645,7 @@ async fn test_release_name_not_ant_holder() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: other_user.pubkey(),
                 system_program: system_program::id(),
             }
@@ -1680,6 +1685,7 @@ async fn test_buy_returned_name() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -1852,6 +1858,7 @@ async fn test_buy_returned_name_high_premium() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -2165,14 +2172,14 @@ async fn test_reassign_name_not_ant_holder() {
 
     // Other user tries to reassign — should fail because they don't hold the ANT NFT
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let mut accounts = ario_arns::accounts::ReassignName {
+    let accounts = ario_arns::accounts::ReassignName {
         config: config_pda().0,
         arns_record: arns_record_key,
+        ant_asset: ant_key,
         caller: other_user.pubkey(),
         system_program: system_program::id(),
     }
     .to_account_metas(None);
-    accounts.push(AccountMeta::new_readonly(new_ant, false));
 
     let tx = Transaction::new_signed_with_payer(
         &[Instruction {
@@ -2186,6 +2193,421 @@ async fn test_reassign_name_not_ant_holder() {
     );
     let result = ctx.banks_client.process_transaction(tx).await;
     assert_anchor_error!(result, ArnsError::NotAntHolder);
+}
+
+// ============================================================================
+// Codex finding (2026-05) — reassign_name / release_name must authorize against
+// the CURRENT Metaplex Core ANT holder, NOT the stale `ArnsRecord.owner` (set
+// once at buy_name and never updated). The ADR-016 reshape briefly regressed
+// this to `caller == record.owner`, letting a prior buyer who sold the ANT keep
+// reassign/release authority forever while the new holder could never get it.
+// See BD-095 / BD-106.
+// ============================================================================
+
+/// reassign: stale `record.owner` (== the original buyer) must NOT retain
+/// authority after the ANT is transferred away.
+#[tokio::test]
+async fn test_reassign_name_rejects_stale_record_owner_after_transfer() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let new_ant = Keypair::new().pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "stalereassign";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    // record.owner is now ctx.payer. Sell the ANT to a different holder.
+    let payer = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let new_holder = Keypair::new();
+    transfer_test_ant(&mut ctx, ant_key, &payer, new_holder.pubkey()).await;
+
+    // ctx.payer == record.owner but is NO LONGER the ANT holder → must fail.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let accounts = ario_arns::accounts::ReassignName {
+        config: config_pda().0,
+        arns_record: arns_record_key,
+        ant_asset: ant_key,
+        caller: ctx.payer.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data: ario_arns::instruction::ReassignName { new_ant }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::NotAntHolder);
+}
+
+/// reassign: the CURRENT ANT holder (≠ stale `record.owner`) CAN reassign.
+#[tokio::test]
+async fn test_reassign_name_current_holder_succeeds() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let new_ant_keypair = Keypair::new();
+    let new_ant = new_ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    mint_test_ant(&mut ctx, &new_ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "freshreassign";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    // Transfer the ANT to a new holder and fund them with SOL for fees.
+    let payer = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let new_holder = Keypair::new();
+    transfer_test_ant(&mut ctx, ant_key, &payer, new_holder.pubkey()).await;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_holder.pubkey(),
+            1_000_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    // new_holder != record.owner but IS the ANT holder → succeeds.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let accounts = ario_arns::accounts::ReassignName {
+        config: config_pda().0,
+        arns_record: arns_record_key,
+        ant_asset: ant_key,
+        caller: new_holder.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data: ario_arns::instruction::ReassignName { new_ant }.data(),
+        }],
+        Some(&new_holder.pubkey()),
+        &[&new_holder],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let record_account = ctx
+        .banks_client
+        .get_account(arns_record_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let record = ArnsRecord::try_deserialize(&mut record_account.data.as_slice()).unwrap();
+    assert_eq!(record.ant, new_ant);
+    // The stale owner field is intentionally left untouched (informational only).
+    assert_eq!(record.owner, ctx.payer.pubkey());
+}
+
+/// release: stale `record.owner` must NOT retain authority after transfer.
+#[tokio::test]
+async fn test_release_name_rejects_stale_record_owner_after_transfer() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "stalerelease";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let payer = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let new_holder = Keypair::new();
+    transfer_test_ant(&mut ctx, ant_key, &payer, new_holder.pubkey()).await;
+
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: ant_key,
+                caller: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::NotAntHolder);
+}
+
+/// release: the CURRENT ANT holder (≠ stale `record.owner`) CAN release.
+#[tokio::test]
+async fn test_release_name_current_holder_succeeds() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "freshrelease";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    // Transfer the ANT to a new holder and fund them (release inits a
+    // ReturnedName PDA paid by the caller, plus the tx fee).
+    let payer = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let new_holder = Keypair::new();
+    transfer_test_ant(&mut ctx, ant_key, &payer, new_holder.pubkey()).await;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_holder.pubkey(),
+            1_000_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: ant_key,
+                caller: new_holder.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&new_holder.pubkey()),
+        &[&new_holder],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Record closed; ReturnedName created with the new holder as initiator.
+    assert!(ctx
+        .banks_client
+        .get_account(arns_record_key)
+        .await
+        .unwrap()
+        .is_none());
+    let returned_account = ctx
+        .banks_client
+        .get_account(returned_name_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let returned = ReturnedName::try_deserialize(&mut returned_account.data.as_slice()).unwrap();
+    assert_eq!(returned.initiator, new_holder.pubkey());
+}
+
+// `ant_asset` binding/ownership constraints (CodeRabbit PR #73). The
+// authorization reads the holder from `ant_asset`, so `ant_asset` is pinned by
+// account constraints to `arns_record.ant` AND to MPL Core ownership — both
+// emit `InvalidAntAsset` (NOT `NotAntHolder`: the account constraints fail
+// during Accounts validation, before the handler's holder check runs). These
+// guard against a caller swapping in a *different* ANT they happen to hold, or
+// a spoofed non-MPL account, to satisfy the holder check against the wrong key.
+
+/// reassign: passing an unrelated ANT (≠ `record.ant`) as `ant_asset` — even
+/// one the caller legitimately holds — is rejected.
+#[tokio::test]
+async fn test_reassign_name_rejects_wrong_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let other_ant_keypair = Keypair::new();
+    let other_ant = other_ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    mint_test_ant(&mut ctx, &other_ant_keypair).await; // caller holds this too
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "wrongasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let accounts = ario_arns::accounts::ReassignName {
+        config: config_pda().0,
+        arns_record: arns_record_key,
+        ant_asset: other_ant, // != record.ant (which is ant_key)
+        caller: ctx.payer.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data: ario_arns::instruction::ReassignName {
+                new_ant: Keypair::new().pubkey(),
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
+/// reassign: passing a non-MPL account (a random, non-existent pubkey) as
+/// `ant_asset` is rejected.
+#[tokio::test]
+async fn test_reassign_name_rejects_non_mpl_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "nonmplasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let accounts = ario_arns::accounts::ReassignName {
+        config: config_pda().0,
+        arns_record: arns_record_key,
+        ant_asset: Keypair::new().pubkey(), // not an MPL Core asset
+        caller: ctx.payer.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts,
+            data: ario_arns::instruction::ReassignName {
+                new_ant: Keypair::new().pubkey(),
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
+/// release: passing an unrelated ANT (≠ `record.ant`) as `ant_asset` is rejected.
+#[tokio::test]
+async fn test_release_name_rejects_wrong_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let other_ant_keypair = Keypair::new();
+    let other_ant = other_ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    mint_test_ant(&mut ctx, &other_ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "wrongrelasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: other_ant, // != record.ant
+                caller: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
+}
+
+/// release: passing a non-MPL account as `ant_asset` is rejected.
+#[tokio::test]
+async fn test_release_name_rejects_non_mpl_ant_asset() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "nonmplrelasset";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: Keypair::new().pubkey(), // not an MPL Core asset
+                caller: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::InvalidAntAsset);
 }
 
 // (deleted obsolete test `test_name_management_after_nft_transfer` — exercised the
@@ -2431,6 +2853,7 @@ async fn test_prune_returned_names() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -2911,6 +3334,7 @@ async fn test_buy_name_returned_active() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -3004,6 +3428,7 @@ async fn test_buy_returned_name_revenue_split() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -4092,6 +4517,7 @@ async fn test_prune_returned_names_multiple() {
                 arns_record: arns1,
                 returned_name: returned1,
                 name_registry: registry_key,
+                ant_asset: ant_key1,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -4114,6 +4540,7 @@ async fn test_prune_returned_names_multiple() {
                 arns_record: arns2,
                 returned_name: returned2,
                 name_registry: registry_key,
+                ant_asset: ant_key2,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -5116,6 +5543,7 @@ async fn test_buy_returned_name_as_lease() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -6302,6 +6730,7 @@ mod fund_from_stake {
                     arns_record: arns_record_key,
                     returned_name: returned_name_key,
                     name_registry: registry_key,
+                    ant_asset: ant_key,
                     caller: buyer_pk,
                     system_program: system_program::id(),
                 }
@@ -6815,6 +7244,7 @@ mod fund_from_stake {
                     arns_record: arns_record_key,
                     returned_name: returned_name_key,
                     name_registry: registry_key,
+                    ant_asset: ant_key,
                     caller: buyer_pk,
                     system_program: system_program::id(),
                 }
@@ -7382,6 +7812,7 @@ mod fund_from_stake {
                         treasury: treasury.pubkey(),
                         period_zero_start_timestamp: TEST_PERIOD_ZERO_START,
                         migration_authority: payer_pk,
+                        initial_demand_factor: 1_000_000, // DEMAND_FACTOR_SCALE (1.0)
                     },
                 }
                 .data(),
@@ -9740,14 +10171,14 @@ async fn test_reassign_name_rejects_no_op() {
 
     // Try to reassign to the SAME ANT — must fail.
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let mut accounts = ario_arns::accounts::ReassignName {
+    let accounts = ario_arns::accounts::ReassignName {
         config: config_pda().0,
         arns_record: arns_record_key,
+        ant_asset: ant_key,
         caller: ctx.payer.pubkey(),
         system_program: system_program::id(),
     }
     .to_account_metas(None);
-    accounts.push(AccountMeta::new_readonly(ant_key, false));
 
     let tx = Transaction::new_signed_with_payer(
         &[Instruction {
@@ -10335,14 +10766,14 @@ async fn test_reassign_name_preserves_old_asset_ant_program_trait() {
     // keep its ANT Program override even as its ArNS-name traits are
     // wiped.
     let (arns_record_key, _) = arns_record_pda(name);
-    let mut accounts = ario_arns::accounts::ReassignName {
+    let accounts = ario_arns::accounts::ReassignName {
         config: config_pda().0,
         arns_record: arns_record_key,
+        ant_asset: old_ant,
         caller: ctx.payer.pubkey(),
         system_program: system_program::id(),
     }
     .to_account_metas(None);
-    accounts.push(AccountMeta::new_readonly(new_ant, false));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -10405,6 +10836,7 @@ async fn test_release_name_preserves_ant_program_trait() {
                 arns_record: arns_record_key,
                 returned_name: returned_key,
                 name_registry: registry_key,
+                ant_asset: ant_key,
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -10884,14 +11316,14 @@ async fn test_reassign_name_emits_event() {
     .await;
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let mut accounts = ario_arns::accounts::ReassignName {
+    let accounts = ario_arns::accounts::ReassignName {
         config: config_pda().0,
         arns_record: arns_record_key,
+        ant_asset: ant_keypair.pubkey(),
         caller: ctx.payer.pubkey(),
         system_program: system_program::id(),
     }
     .to_account_metas(None);
-    accounts.push(AccountMeta::new_readonly(new_ant, false));
 
     let tx = Transaction::new_signed_with_payer(
         &[Instruction {
@@ -10951,6 +11383,7 @@ async fn test_release_name_emits_event() {
                 arns_record: arns_record_key,
                 returned_name: returned_name_key,
                 name_registry: name_registry_key(),
+                ant_asset: ant_keypair.pubkey(),
                 caller: ctx.payer.pubkey(),
                 system_program: system_program::id(),
             }
@@ -11263,4 +11696,163 @@ async fn test_admin_expand_name_registry_rejects_non_authority() {
     )
     .await;
     assert!(result.is_err(), "non-authority caller must be rejected");
+}
+
+// =========================================
+// test_extend_lease_from_withdrawal_relaxed_cap (audit M-3, 2026-05-30 follow-up)
+//
+// PR #80 aligned `extend_lease_from_withdrawal` (and `_from_funding_plan`)
+// to the remaining-years-from-now cap used by the 3 majority paths
+// (extend_lease + _from_delegation + _from_operator_stake). Pre-fix those
+// 2 stricter paths used a total-duration-since-start cap that rejected
+// legitimate extensions for leases that started long ago.
+//
+// The 12 existing BPF integration tests cover the 3 majority paths but
+// NONE exercise `_from_withdrawal` or `_from_funding_plan`. This test
+// fills that gap: synthesizes the exact trigger state (4 years ago start,
+// 1 year remaining, extend by 4 years) and asserts the cap check now
+// PASSES on `_from_withdrawal`. Pre-PR #80 this would fail at the cap
+// with `InvalidLeaseDuration`; post-fix the cap is relaxed so the ix
+// proceeds past it and fails at a DIFFERENT downstream step (the bogus
+// GAR-side accounts we pass — that's expected and proves the relaxation).
+//
+// Bidirectionally meaningful: assertion `result.is_err() && err != cap_error`.
+// If M-3 regresses (cap re-tightens), this fires with the cap error code
+// and the test fails. If the fix stays, the cap check passes and the
+// downstream account-validation error gets surfaced instead.
+// =========================================
+
+#[tokio::test]
+async fn test_extend_lease_from_withdrawal_relaxed_cap() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    // Buy a max-duration lease (5 years) so end - start spans the full cap.
+    let name = "relaxedcap";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Lease, 5, ant_key).await;
+
+    // Backdate the record so it LOOKS like it was bought 4 years ago:
+    //   start_timestamp = now - 4*YEAR
+    //   end_timestamp   = (now - 4*YEAR) + 5*YEAR = now + 1*YEAR  (1 year remaining)
+    //
+    // Pre-PR-#80 cap on _from_withdrawal: total = (now+1+4) - (now-4) = 10 → > 5 → REJECT
+    // Post-PR-#80 cap (majority pattern): remaining=1, max_ext=4, years=4 → ALLOW past cap
+    let record_acc = ctx
+        .banks_client
+        .get_account(arns_record_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut record = ArnsRecord::try_deserialize(&mut record_acc.data.as_slice()).unwrap();
+    let now = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    record.start_timestamp = now - 4 * ONE_YEAR_SECONDS;
+    record.end_timestamp = Some(now + ONE_YEAR_SECONDS);
+    let mut new_data = Vec::new();
+    record.try_serialize(&mut new_data).unwrap();
+    let original_len = record_acc.data.len();
+    new_data.resize(original_len, 0);
+    ctx.set_account(
+        &arns_record_key,
+        &solana_sdk::account::Account {
+            lamports: record_acc.lamports,
+            data: new_data,
+            owner: record_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Build extend_lease_from_withdrawal with years=4. The downstream GAR
+    // accounts are bogus (we only care whether the cap check rejects).
+    let bogus_gar_settings = Pubkey::new_unique();
+    let bogus_withdrawal = Pubkey::new_unique();
+    let bogus_stake_token = Pubkey::new_unique();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ExtendLeaseFromWithdrawal {
+                config: setup.config_key,
+                demand_factor: setup.demand_factor_key,
+                arns_record: arns_record_key,
+                gar_settings: bogus_gar_settings,
+                withdrawal: bogus_withdrawal,
+                stake_token_account: bogus_stake_token,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                caller: ctx.payer.pubkey(),
+                gar_program: ario_gar::ID,
+                token_program: spl_token::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ExtendLeaseFromWithdrawal { years: 4 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    let result = ctx.banks_client.process_transaction(tx).await;
+
+    // The tx MUST fail (we passed bogus GAR-side accounts), but the failure
+    // MUST NOT be at the cap check. Pre-fix the cap check rejected with
+    // ArnsError::InvalidLeaseDuration; post-fix it should be (a) relaxed
+    // ExtensionExceedsMax — meaning the cap re-rejected — or (b) any
+    // OTHER error — meaning the cap passed.
+    //
+    // M-3 PASSES IFF the error is neither cap-related code.
+    let expected_pre_fix_cap =
+        anchor_lang::error::ERROR_CODE_OFFSET + ArnsError::InvalidLeaseDuration as u32;
+    let expected_post_fix_cap_reject =
+        anchor_lang::error::ERROR_CODE_OFFSET + ArnsError::ExtensionExceedsMax as u32;
+    match result {
+        Ok(()) => panic!(
+            "extend_lease_from_withdrawal unexpectedly succeeded with bogus GAR \
+             accounts — the downstream CPI should have failed."
+        ),
+        Err(solana_program_test::BanksClientError::TransactionError(
+            solana_sdk::transaction::TransactionError::InstructionError(
+                _,
+                solana_sdk::instruction::InstructionError::Custom(code),
+            ),
+        )) => {
+            assert_ne!(
+                code, expected_pre_fix_cap,
+                "M-3 REGRESSION: rejected with pre-fix InvalidLeaseDuration code ({}) \
+                 — the strict total-duration cap is back. The relaxed remaining-years-\
+                 from-now cap should have allowed years=4 with remaining=1 (max=5).",
+                expected_pre_fix_cap,
+            );
+            assert_ne!(
+                code, expected_post_fix_cap_reject,
+                "Cap rejected with post-fix ExtensionExceedsMax — but with \
+                 remaining=1 and years=4, max_extension=4 should allow. \
+                 Something is off with the cap arithmetic."
+            );
+            // Any OTHER custom error code = cap passed; downstream rejected.
+        }
+        // Non-custom errors (AccountNotExecutable on the bogus gar_program,
+        // InvalidAccountData on the bogus withdrawal, etc.) ALSO prove the
+        // cap check passed — they fire AFTER we leave the cap-check block.
+        // AccountNotExecutable specifically is the signature of "cap passed,
+        // CPI attempted, but ario-gar isn't loaded in this test binary."
+        Err(other) => {
+            eprintln!(
+                "  cap-check PASSED; downstream failed as expected (no ario-gar \
+                 program registered in this test binary). Error variant: {:?}",
+                other
+            );
+        }
+    }
 }

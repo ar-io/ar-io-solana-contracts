@@ -94,8 +94,8 @@ jobs:
             exit 1
           fi
 
-      - name: Check attestor pubkey (strict — blocks test key)
-        run: bash scripts/check-attestor-pubkey.sh --strict
+      - name: Check attestor pubkey (strict — blocks test key + devnet key on mainnet)
+        run: bash scripts/check-attestor-pubkey.sh --strict --cluster mainnet
 
       - name: Build (mainnet feature flags)
         run: |

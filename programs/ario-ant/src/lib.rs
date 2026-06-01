@@ -684,24 +684,64 @@ pub mod ario_ant {
     /// because their cardinality is unbounded and cannot fit in a single tx.
     pub fn migrate_ant(ctx: Context<AntMigration>) -> Result<()> {
         let asset_key = ctx.accounts.asset.key();
+        let payer = ctx.accounts.payer.to_account_info();
+        let system_program = ctx.accounts.system_program.to_account_info();
 
-        let config = &mut ctx.accounts.ant_config;
+        // Grow-then-deserialize each account (see schema_migration::grow_account).
+        // grow_account is idempotent when the account is already at target
+        // size (early-return inside the helper), so calling both before the
+        // version gate doesn't waste rent for fully-migrated ANTs.
+        let config_info = ctx.accounts.ant_config.to_account_info();
+        schema_migration::grow_account(&config_info, &payer, &system_program, AntConfig::SIZE)?;
+        let mut config: AntConfig = {
+            let data = config_info.try_borrow_data()?;
+            AntConfig::try_deserialize(&mut &data[..])?
+        };
+
+        let controllers_info = ctx.accounts.ant_controllers.to_account_info();
+        schema_migration::grow_account(
+            &controllers_info,
+            &payer,
+            &system_program,
+            AntControllers::SIZE,
+        )?;
+        let mut controllers: AntControllers = {
+            let data = controllers_info.try_borrow_data()?;
+            AntControllers::try_deserialize(&mut &data[..])?
+        };
+
+        // Per-account version gates (audit M-6, 2026-05-29). Pre-fix,
+        // `require!(config.version < ANT_CONFIG_VERSION, ...)` bailed
+        // BEFORE the controllers check, so controllers-only migrations
+        // became unreachable any time `ANT_CONTROLLERS_VERSION` was
+        // bumped without a parallel `ANT_CONFIG_VERSION` bump. Today
+        // both versions are (1,0,0) so the bug is latent — but the
+        // first future controllers-only schema change would have
+        // produced ANTs with up-to-date config and stale controllers
+        // that this ix could never reach. The split gate below makes
+        // migrate_ant succeed iff EITHER account needs migration.
+        let config_needs_migrate = config.version < ANT_CONFIG_VERSION;
+        let controllers_needs_migrate = controllers.version < ANT_CONTROLLERS_VERSION;
         require!(
-            config.version < ANT_CONFIG_VERSION,
+            config_needs_migrate || controllers_needs_migrate,
             AntError::AlreadyLatestVersion
         );
-        schema_migration::migrate_config_version(config)?;
-        msg!(
-            "ANT {} config migrated to {}.{}.{}",
-            asset_key,
-            config.version.major,
-            config.version.minor,
-            config.version.patch,
-        );
 
-        let controllers = &mut ctx.accounts.ant_controllers;
-        if controllers.version < ANT_CONTROLLERS_VERSION {
-            schema_migration::migrate_controllers_version(controllers)?;
+        if config_needs_migrate {
+            schema_migration::migrate_config_version(&mut config)?;
+            schema_migration::write_account(&config_info, &config)?;
+            msg!(
+                "ANT {} config migrated to {}.{}.{}",
+                asset_key,
+                config.version.major,
+                config.version.minor,
+                config.version.patch,
+            );
+        }
+
+        if controllers_needs_migrate {
+            schema_migration::migrate_controllers_version(&mut controllers)?;
+            schema_migration::write_account(&controllers_info, &controllers)?;
             msg!(
                 "ANT {} controllers migrated to {}.{}.{}",
                 asset_key,
@@ -719,12 +759,23 @@ pub mod ario_ant {
     /// migrating; callers can derive which records exist via `getProgramAccounts`
     /// filtered on `ANT_RECORD_SEED`.
     pub fn migrate_ant_record(ctx: Context<AntMigrationRecord>, undername: String) -> Result<()> {
-        let record = &mut ctx.accounts.record;
+        let info = ctx.accounts.record.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AntRecord::SIZE,
+        )?;
+        let mut record: AntRecord = {
+            let data = info.try_borrow_data()?;
+            AntRecord::try_deserialize(&mut &data[..])?
+        };
         require!(
             record.version < ANT_RECORD_VERSION,
             AntError::AlreadyLatestVersion
         );
-        schema_migration::migrate_record_version(record)?;
+        schema_migration::migrate_record_version(&mut record)?;
+        schema_migration::write_account(&info, &record)?;
         msg!(
             "ANT {} record '{}' migrated to {}.{}.{}",
             ctx.accounts.asset.key(),
@@ -744,12 +795,23 @@ pub mod ario_ant {
         ctx: Context<AntMigrationRecordMetadata>,
         undername: String,
     ) -> Result<()> {
-        let metadata = &mut ctx.accounts.record_metadata;
+        let info = ctx.accounts.record_metadata.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AntRecordMetadata::SIZE,
+        )?;
+        let mut metadata: AntRecordMetadata = {
+            let data = info.try_borrow_data()?;
+            AntRecordMetadata::try_deserialize(&mut &data[..])?
+        };
         require!(
             metadata.version < ANT_RECORD_METADATA_VERSION,
             AntError::AlreadyLatestVersion
         );
-        schema_migration::migrate_record_metadata_version(metadata)?;
+        schema_migration::migrate_record_metadata_version(&mut metadata)?;
+        schema_migration::write_account(&info, &metadata)?;
         msg!(
             "ANT {} record metadata '{}' migrated to {}.{}.{}",
             ctx.accounts.asset.key(),
@@ -767,12 +829,23 @@ pub mod ario_ant {
 
     /// Migrate the singleton `AntMigrationConfig` account to the latest schema.
     pub fn migrate_ant_migration_config(ctx: Context<AntMigrationConfigMigration>) -> Result<()> {
-        let config = &mut ctx.accounts.migration_config;
+        let info = ctx.accounts.migration_config.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AntMigrationConfig::SIZE,
+        )?;
+        let mut config: AntMigrationConfig = {
+            let data = info.try_borrow_data()?;
+            AntMigrationConfig::try_deserialize(&mut &data[..])?
+        };
         require!(
             config.version < ANT_MIGRATION_CONFIG_VERSION,
             AntError::AlreadyLatestVersion
         );
-        schema_migration::migrate_migration_config_version(config)?;
+        schema_migration::migrate_migration_config_version(&mut config)?;
+        schema_migration::write_account(&info, &config)?;
         msg!(
             "AntMigrationConfig migrated to {}.{}.{}",
             config.version.major,
@@ -784,12 +857,23 @@ pub mod ario_ant {
 
     /// Migrate a user's `AclConfig` account to the latest schema.
     pub fn migrate_acl_config(ctx: Context<AclConfigMigration>) -> Result<()> {
-        let config = &mut ctx.accounts.acl_config;
+        let info = ctx.accounts.acl_config.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AclConfig::SIZE,
+        )?;
+        let mut config: AclConfig = {
+            let data = info.try_borrow_data()?;
+            AclConfig::try_deserialize(&mut &data[..])?
+        };
         require!(
             config.version < ACL_CONFIG_VERSION,
             AntError::AlreadyLatestVersion
         );
-        schema_migration::migrate_acl_config_version(config)?;
+        schema_migration::migrate_acl_config_version(&mut config)?;
+        schema_migration::write_account(&info, &config)?;
         msg!(
             "AclConfig for {} migrated to {}.{}.{}",
             config.user,
@@ -802,12 +886,36 @@ pub mod ario_ant {
 
     /// Migrate a user's `AclPage` account to the latest schema.
     pub fn migrate_acl_page(ctx: Context<AclPageMigration>, page_idx: u64) -> Result<()> {
-        let page = &mut ctx.accounts.acl_page;
+        let info = ctx.accounts.acl_page.to_account_info();
+        // AclPage is variable-length (entries: Vec) — its on-chain size is not
+        // a fixed const, so we can't grow to a known SIZE. A pre-version page
+        // is exactly SCHEMA_VERSION_SIZE bytes short (missing the trailing
+        // `version`) and can't be deserialized until grown. Detect that by
+        // attempting the deserialize; on EOF, grow by exactly the version
+        // field and retry. (A versioned page deserializes fine → no grow.)
+        let needs_grow = {
+            let data = info.try_borrow_data()?;
+            AclPage::try_deserialize(&mut &data[..]).is_err()
+        };
+        if needs_grow {
+            let new_size = info.data_len() + SCHEMA_VERSION_SIZE;
+            schema_migration::grow_account(
+                &info,
+                &ctx.accounts.payer.to_account_info(),
+                &ctx.accounts.system_program.to_account_info(),
+                new_size,
+            )?;
+        }
+        let mut page: AclPage = {
+            let data = info.try_borrow_data()?;
+            AclPage::try_deserialize(&mut &data[..])?
+        };
         require!(
             page.version < ACL_PAGE_VERSION,
             AntError::AlreadyLatestVersion
         );
-        schema_migration::migrate_acl_page_version(page)?;
+        schema_migration::migrate_acl_page_version(&mut page)?;
+        schema_migration::write_account(&info, &page)?;
         msg!(
             "AclPage {} for {} migrated to {}.{}.{}",
             page_idx,
@@ -1374,26 +1482,39 @@ pub mod ario_ant {
         let mut closed_records: u32 = 0;
         let mut closed_metadata: u32 = 0;
         let authority_info = ctx.accounts.authority.to_account_info();
+        let asset_key = asset.key();
         for acct in ctx.remaining_accounts.iter() {
             // Per-account discriminator dispatch — close whichever PDA
-            // type this happens to be. Authority-mode trusts the caller
-            // to pass legitimate per-ANT PDAs; the Anchor close pattern
-            // refunds to the authority regardless.
+            // type this happens to be. Each record is bound to the asset
+            // being cleaned (see the mint check below); within that, the
+            // Anchor close pattern refunds to the authority.
             if acct.data_is_empty() {
                 continue;
             }
-            // Clone the 8-byte discriminator out so the data borrow drops
-            // before we call `close_account_to_authority` (which mutates
-            // the account's data again).
-            let disc: [u8; 8] = {
+            // Read the 8-byte discriminator AND the record's `mint` field
+            // (bytes 8..40 — the first field on both AntRecord and
+            // AntRecordMetadata) in one borrow, then drop it before
+            // `close_account_to_authority` mutates the account's data.
+            let (disc, record_mint): ([u8; 8], Pubkey) = {
                 let data = acct.try_borrow_data()?;
-                if data.len() < 8 {
+                if data.len() < 40 {
                     continue;
                 }
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&data[0..8]);
-                buf
+                let mut disc = [0u8; 8];
+                disc.copy_from_slice(&data[0..8]);
+                let mut mint = [0u8; 32];
+                mint.copy_from_slice(&data[8..40]);
+                (disc, Pubkey::new_from_array(mint))
             };
+            if disc == AntRecord::DISCRIMINATOR || disc == AntRecordMetadata::DISCRIMINATOR {
+                // Defense-in-depth: bind every closed record to the asset
+                // being cleaned up. The auth gate already restricts this ix
+                // to the migration authority; this stops that authority from
+                // accidentally passing (and thereby closing + draining the
+                // rent of) a live record belonging to a DIFFERENT asset —
+                // e.g. via a tooling bug that mixes up account lists.
+                require_keys_eq!(record_mint, asset_key, AntError::OrphanRecordAssetMismatch);
+            }
             if disc == AntRecord::DISCRIMINATOR {
                 close_account_to_authority(acct, &authority_info)?;
                 closed_records += 1;
@@ -1985,25 +2106,23 @@ pub struct AntMigration<'info> {
     )]
     pub asset: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
-        bump = ant_config.bump,
-        realloc = AntConfig::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub ant_config: Account<'info, AntConfig>,
+    pub ant_config: UncheckedAccount<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
-        bump = ant_controllers.bump,
-        realloc = AntControllers::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub ant_controllers: Account<'info, AntControllers>,
+    pub ant_controllers: UncheckedAccount<'info>,
 
     /// Anyone can pay to migrate any ANT (permissionless)
     #[account(mut)]
@@ -2013,6 +2132,7 @@ pub struct AntMigration<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(undername: String)]
 pub struct AntMigrationRecord<'info> {
     /// CHECK: Metaplex Core asset — validates the record belongs to a real ANT.
     #[account(
@@ -2020,15 +2140,14 @@ pub struct AntMigrationRecord<'info> {
     )]
     pub asset: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
-        seeds = [ANT_RECORD_SEED, asset.key().as_ref(), &hash_undername(&record.undername)],
-        bump = record.bump,
-        realloc = AntRecord::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        seeds = [ANT_RECORD_SEED, asset.key().as_ref(), &hash_undername(&undername)],
+        bump,
     )]
-    pub record: Account<'info, AntRecord>,
+    pub record: UncheckedAccount<'info>,
 
     /// Anyone can pay to migrate any ANT record (permissionless)
     #[account(mut)]
@@ -2046,15 +2165,14 @@ pub struct AntMigrationRecordMetadata<'info> {
     )]
     pub asset: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ANT_RECORD_META_SEED, asset.key().as_ref(), &hash_undername(&undername)],
-        bump = record_metadata.bump,
-        realloc = AntRecordMetadata::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub record_metadata: Account<'info, AntRecordMetadata>,
+    pub record_metadata: UncheckedAccount<'info>,
 
     /// Anyone can pay to migrate any ANT record metadata (permissionless)
     #[account(mut)]
@@ -2065,15 +2183,14 @@ pub struct AntMigrationRecordMetadata<'info> {
 
 #[derive(Accounts)]
 pub struct AntMigrationConfigMigration<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ANT_MIGRATION_CONFIG_SEED],
-        bump = migration_config.bump,
-        realloc = AntMigrationConfig::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub migration_config: Account<'info, AntMigrationConfig>,
+    pub migration_config: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -2086,15 +2203,14 @@ pub struct AclConfigMigration<'info> {
     /// CHECK: the user whose ACL this is
     pub user: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ACL_CONFIG_SEED, user.key().as_ref()],
-        bump = acl_config.bump,
-        realloc = AclConfig::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub acl_config: Account<'info, AclConfig>,
+    pub acl_config: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -2108,15 +2224,14 @@ pub struct AclPageMigration<'info> {
     /// CHECK: the user whose ACL page this is
     pub user: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ACL_PAGE_SEED, user.key().as_ref(), &page_idx.to_le_bytes()],
-        bump = acl_page.bump,
-        realloc = AclPage::size_for(acl_page.entries.len()),
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub acl_page: Account<'info, AclPage>,
+    pub acl_page: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

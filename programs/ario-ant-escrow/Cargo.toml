@@ -49,20 +49,30 @@ network-devnet = []
 # provisioning a real attestor key. Real-network builds (mainnet,
 # devnet) are blocked at compile time by `state.rs` from shipping
 # this test value unless this feature is also explicitly enabled.
-# **NEVER set this on a real-network build.** Default-on for tests so
-# the `cargo test` flow Just Works; default deploy paths
-# (`anchor build`, `cargo build-sbf`) opt out via
-# `--no-default-features --features network-mainnet` (or
-# `network-devnet`).
+# **NEVER set this on a real-network build, and it is deliberately NOT in
+# `default`** — see the SECURITY note on `default` below. Test and localnet
+# flows opt in explicitly:
+#   cargo test -p ario-ant-escrow --features unsafe-allow-test-attestor-pubkey
+# The BPF integration suite wires it in for you (`scripts/test-integration.sh`
+# rebuilds escrow alone with this feature). Note: a workspace-level
+# `cargo build-sbf --features unsafe-allow-test-attestor-pubkey` is rejected by
+# cargo-build-sbf 2.1.0 ("none of the selected packages contains these
+# features") unless every member declares it — scope it to escrow with
+# `--manifest-path programs/ario-ant-escrow/Cargo.toml`.
 unsafe-allow-test-attestor-pubkey = []
-# Default flips to unsafe-allow-test-attestor-pubkey for non-SBF
-# builds (`cargo check`, `cargo test`) so the test attestor seed
-# `[1u8; 32]` works out of the box. SBF deploys must opt out of the
-# default and pick a real network explicitly via
-# `cargo build-sbf --no-default-features --features network-mainnet`
-# (or network-devnet) — `build-sbf.sh` does this for us.
 migration-test = []
-default = ["network-mainnet", "unsafe-allow-test-attestor-pubkey"]
+# SECURITY: `default` MUST NOT include `unsafe-allow-test-attestor-pubkey`.
+# That feature swaps `ATTESTOR_PUBKEY` to the deterministic test key (public
+# seed `[1u8; 32]`) AND disables the state.rs const-eval guard. The deploy
+# pipeline builds escrow via plain `anchor build` (default features); shipping
+# the unsafe flag in `default` would bake a publicly-forgeable attestor key
+# into every released/staged `.so` while both guardrails (the const-eval guard
+# and `scripts/check-attestor-pubkey.sh`) stay silent. Keep the test key
+# strictly opt-in. `network-mainnet` is the default network; devnet/mainnet
+# release builds override it via `--no-default-features --features
+# network-devnet` (or `network-mainnet`) as needed. `check-attestor-pubkey.sh
+# --strict` fails the build if this line ever regains the unsafe flag.
+default = ["network-mainnet"]
 
 [dependencies]
 anchor-lang.workspace = true

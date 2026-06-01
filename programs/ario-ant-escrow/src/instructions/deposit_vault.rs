@@ -26,10 +26,11 @@ pub const MIN_VAULT_AMOUNT: u64 = 100_000_000;
 ///
 /// When the recipient claims:
 /// - If the vault is still active (clock < vault_end_timestamp), the claim
-///   instruction CPIs into `ario_core::vaulted_transfer` to create a
-///   time-locked vault with the remaining duration.
+///   instruction rejects with `VaultStillLocked` (ADR-022 — the former active
+///   re-lock path was removed; see `docs/RESTORE_ACTIVE_VAULT_RELOCK.md` for
+///   how to revive it via direct CPI if ever needed).
 /// - If the vault has expired, the claim instruction does a liquid SPL
-///   transfer (same as token claim).
+///   transfer to the claimant (same as token claim).
 pub fn handler(
     ctx: Context<DepositVault>,
     asset_id: [u8; 32],
@@ -48,6 +49,12 @@ pub fn handler(
         lock_duration_seconds >= MIN_VAULT_LOCK_DURATION,
         EscrowError::VaultDurationTooShort
     );
+    // Revocable vaults are not supported by the escrow: it has no field for
+    // the legitimate revoker, so a revocable re-lock on claim could only
+    // assign control to the unbound claim-tx payer (theft). Reject the flag
+    // at the source so the field is never set to an unhonorable value.
+    // `escrow.vault_revocable` therefore stays `false`. See ADR-021.
+    require!(!revocable, EscrowError::RevocableVaultUnsupported);
 
     let (protocol, expected_len) =
         validated_protocol_and_len(recipient_protocol, recipient_pubkey.len()).ok_or_else(

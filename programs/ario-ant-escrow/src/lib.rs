@@ -37,7 +37,6 @@ pub mod instructions;
 pub mod mpl_core_cpi;
 pub mod schema_migration;
 pub mod state;
-pub mod vault_introspect;
 pub mod verify;
 
 pub use events::{
@@ -213,15 +212,12 @@ pub mod ario_ant_escrow {
 
     /// Release escrowed vault tokens to `claimant` using an off-chain
     /// RSA-PSS attestation re-signed with Ed25519 by the AR.IO attestor
-    /// service. If the vault is still active, this ix releases tokens
-    /// to `payer_token_account` and requires a sibling
-    /// `ario_core::vaulted_transfer` ix in the same tx; if expired,
-    /// transfers liquid to `claimant_token_account`.
-    /// The transaction must include an Ed25519Program native sigverify
-    /// ix immediately preceding this one (introspected via sysvar);
-    /// for the active-vault path it must ALSO include a sibling
-    /// `ario_core::vaulted_transfer` ix anywhere in the tx. See
-    /// `instructions/claim_vault_arweave_attested.rs`.
+    /// service. Vaults are claimable **only after `vault_end_timestamp`**;
+    /// while still locked, this ix rejects with `VaultStillLocked`
+    /// (ADR-022 — the former active re-lock path was removed). The
+    /// transaction must include an Ed25519Program native sigverify ix
+    /// immediately preceding this one (introspected via
+    /// `instructions_sysvar`). See `instructions/claim_vault_arweave_attested.rs`.
     pub fn claim_vault_arweave_attested(
         ctx: Context<ClaimVaultArweaveAttested>,
         message_nonce: [u8; 32],
@@ -230,8 +226,10 @@ pub mod ario_ant_escrow {
     }
 
     /// Release escrowed vault tokens to `claimant` after on-chain
-    /// ECDSA secp256k1 + EIP-191 verification (Ethereum path). Same
-    /// active/expired branching as `claim_vault_arweave_attested`.
+    /// ECDSA secp256k1 + EIP-191 verification (Ethereum path). Vaults
+    /// are claimable only after `vault_end_timestamp` (post-ADR-022 the
+    /// active re-lock path was removed); still-locked claims reject
+    /// with `VaultStillLocked`.
     pub fn claim_vault_ethereum(
         ctx: Context<ClaimVaultEthereum>,
         message_nonce: [u8; 32],

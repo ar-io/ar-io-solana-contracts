@@ -78,12 +78,23 @@ PROGRAMS=(
 # declare_id!() (anchor keys sync only handles the macro itself).
 # Entry: <pubkey-source-keypair>:<file>:<placeholder>
 #
-# Currently empty — the prior `epoch.rs` hardcoded ArNS ID was eliminated
-# by storing arns_program_id in GatewaySettings (set at initialize time).
-# See refactor/gar-arns-program-id-in-settings. New entries should be
-# added here only as a last resort; prefer storing the value in on-chain
-# state.
-EXTRA_HARDCODED=()
+# Prefer storing program IDs in on-chain state (see the `arns_program_id`
+# field on `GatewaySettings` for the canonical pattern) rather than
+# adding entries here. Entries here exist only when the cross-program
+# target must be pinned at COMPILE TIME (compile-time `address = ...`
+# constraints on a typed `Account<>`, etc.) and on-chain storage isn't
+# viable.
+#
+# ario-gar pins `ARIO_CORE_PROGRAM_ID` as a `pub const` in lib.rs
+# (single-line, `#[rustfmt::skip]`-tagged) to use as the `address = ...`
+# on the `ario_core_program` account in the `release_treasury_to_recipient`
+# hand-rolled invoke_signed CPI (see CLAUDE.md "Treasury release CPI").
+# Without this entry the placeholder could ship to a real cluster and
+# only fail at runtime on the first epoch distribution with
+# `InvalidProgramId`. Audit M-5 (2026-05-29).
+EXTRA_HARDCODED=(
+  "target/deploy/ario_core-keypair.json:programs/ario-gar/src/lib.rs:ARioCoreProgramXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+)
 # `${arr[@]}` errors under `set -u` for empty arrays on bash 3.x (macOS).
 # All loops use the `${EXTRA_HARDCODED[@]+"${EXTRA_HARDCODED[@]}"}` guard
 # below to expand to nothing when empty rather than tripping the unbound

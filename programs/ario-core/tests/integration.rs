@@ -11521,3 +11521,253 @@ async fn test_admin_repair_config_rejects_non_authority() {
     let result = ctx.banks_client.process_transaction(tx).await;
     assert_anchor_error!(result, ArioError::Unauthorized);
 }
+
+// =========================================
+// admin_set_gar_program: round-trip + version preservation (C-1 regression)
+// =========================================
+//
+// These tests pin the C-1 fix: the handler must write `gar_program` at the
+// canonical offset (`ArioConfig::GAR_PROGRAM_OFFSET`), NOT at `SIZE - 32`.
+// Pre-fix, post-PR #53, the latter offset overlapped the trailing 3-byte
+// `version` field — every call corrupted both the first 3 bytes of
+// gar_program AND the entire version field.
+
+#[tokio::test]
+async fn test_admin_set_gar_program_round_trips_full_pubkey() {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    create_mint(&mut ctx, &mint, &mint_authority.pubkey()).await;
+
+    let (config_key, _) = config_pda();
+    let treasury = Keypair::new();
+    create_token_account(&mut ctx, &treasury, &mint.pubkey(), &config_key).await;
+    initialize_config(&mut ctx, &mint.pubkey(), &treasury.pubkey()).await;
+
+    // Baseline: gar_program is default; version is canonical.
+    let pre_acc = ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let pre = ArioConfig::try_deserialize(&mut pre_acc.data.as_slice()).unwrap();
+    assert_eq!(pre.gar_program, Pubkey::default());
+    let canonical_version = pre.version;
+
+    let new_gar = Pubkey::new_unique();
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: ario_core::accounts::AdminSetGarProgram {
+                config: config_key,
+                authority: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_core::instruction::AdminSetGarProgram {
+                new_gar_program: new_gar,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let post_acc = ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let post = ArioConfig::try_deserialize(&mut post_acc.data.as_slice()).unwrap();
+    assert_eq!(
+        post.gar_program, new_gar,
+        "gar_program must round-trip exactly; if this fails, C-1 has regressed \
+         (the handler wrote at SIZE-32 instead of GAR_PROGRAM_OFFSET)"
+    );
+    assert_eq!(
+        post.version, canonical_version,
+        "version field must be preserved; if this fails, C-1 has regressed \
+         (the handler clobbered version with the last 3 bytes of new_gar_program)"
+    );
+    assert_eq!(post.authority, pre.authority);
+    assert_eq!(post.mint, pre.mint);
+    assert_eq!(post.treasury, pre.treasury);
+    assert_eq!(post.total_supply, pre.total_supply);
+    assert_eq!(post.migration_active, pre.migration_active);
+}
+
+#[tokio::test]
+async fn test_admin_set_gar_program_idempotent_re_run_preserves_version() {
+    // The handler has an idempotent "rewrite if already-grown" branch.
+    // Pre-fix, the second call further corrupted the field (the
+    // "preserved" first 3 bytes were poisoned with the previous call's
+    // bytes). Two sequential calls must both round-trip cleanly.
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    create_mint(&mut ctx, &mint, &mint_authority.pubkey()).await;
+
+    let (config_key, _) = config_pda();
+    let treasury = Keypair::new();
+    create_token_account(&mut ctx, &treasury, &mint.pubkey(), &config_key).await;
+    initialize_config(&mut ctx, &mint.pubkey(), &treasury.pubkey()).await;
+
+    let pre_acc = ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let canonical_version = ArioConfig::try_deserialize(&mut pre_acc.data.as_slice())
+        .unwrap()
+        .version;
+
+    let payer_pk = ctx.payer.pubkey();
+
+    let gar_1 = Pubkey::new_unique();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx_1 = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: ario_core::accounts::AdminSetGarProgram {
+                config: config_key,
+                authority: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_core::instruction::AdminSetGarProgram {
+                new_gar_program: gar_1,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx_1).await.unwrap();
+
+    let mid = ArioConfig::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(config_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(mid.gar_program, gar_1, "first set must round-trip");
+    assert_eq!(
+        mid.version, canonical_version,
+        "first set must preserve version"
+    );
+
+    // Advance slot so the second tx gets a fresh blockhash and isn't deduped.
+    ctx.warp_to_slot(ctx.banks_client.get_root_slot().await.unwrap() + 2)
+        .unwrap();
+    let gar_2 = Pubkey::new_unique();
+    let blockhash_2 = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx_2 = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: ario_core::accounts::AdminSetGarProgram {
+                config: config_key,
+                authority: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_core::instruction::AdminSetGarProgram {
+                new_gar_program: gar_2,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash_2,
+    );
+    ctx.banks_client.process_transaction(tx_2).await.unwrap();
+
+    let post = ArioConfig::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(config_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        post.gar_program, gar_2,
+        "second set (idempotent rewrite) must round-trip — pre-fix the \
+         first 3 bytes carried over from call 1, corrupting gar_program"
+    );
+    assert_eq!(
+        post.version, canonical_version,
+        "version must survive the idempotent rewrite path"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_set_gar_program_rejects_non_authority() {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    create_mint(&mut ctx, &mint, &mint_authority.pubkey()).await;
+
+    let (config_key, _) = config_pda();
+    let treasury = Keypair::new();
+    create_token_account(&mut ctx, &treasury, &mint.pubkey(), &config_key).await;
+    initialize_config(&mut ctx, &mint.pubkey(), &treasury.pubkey()).await;
+
+    let imposter = Keypair::new();
+    let payer_pk = ctx.payer.pubkey();
+    let fund_blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &imposter.pubkey(),
+            10_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        fund_blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: ario_core::accounts::AdminSetGarProgram {
+                config: config_key,
+                authority: imposter.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_core::instruction::AdminSetGarProgram {
+                new_gar_program: Pubkey::new_unique(),
+            }
+            .data(),
+        }],
+        Some(&imposter.pubkey()),
+        &[&imposter],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArioError::Unauthorized);
+}

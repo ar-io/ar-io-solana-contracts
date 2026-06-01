@@ -417,12 +417,23 @@ pub mod ario_arns {
     /// Migrate an `ArnsConfig` PDA to the latest schema version.
     /// Permissionless — anyone can pay the realloc rent.
     pub fn migrate_arns_config(ctx: Context<MigrateArnsConfig>) -> Result<()> {
-        let config = &mut ctx.accounts.config;
+        let info = ctx.accounts.config.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ArnsConfig::SIZE,
+        )?;
+        let mut config: state::ArnsConfig = {
+            let data = info.try_borrow_data()?;
+            state::ArnsConfig::try_deserialize(&mut &data[..])?
+        };
         require!(
             config.version < ARNS_CONFIG_VERSION,
             error::ArnsError::AlreadyLatestVersion
         );
-        schema_migration::migrate_arns_config_version(config)?;
+        schema_migration::migrate_arns_config_version(&mut config)?;
+        schema_migration::write_account(&info, &config)?;
         msg!(
             "ArnsConfig migrated to {}.{}.{}",
             config.version.major,
@@ -435,12 +446,23 @@ pub mod ario_arns {
     /// Migrate a `DemandFactor` PDA to the latest schema version.
     /// Permissionless — anyone can pay the realloc rent.
     pub fn migrate_demand_factor(ctx: Context<MigrateDemandFactor>) -> Result<()> {
-        let demand_factor = &mut ctx.accounts.demand_factor;
+        let info = ctx.accounts.demand_factor.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::DemandFactor::SIZE,
+        )?;
+        let mut demand_factor: state::DemandFactor = {
+            let data = info.try_borrow_data()?;
+            state::DemandFactor::try_deserialize(&mut &data[..])?
+        };
         require!(
             demand_factor.version < DEMAND_FACTOR_VERSION,
             error::ArnsError::AlreadyLatestVersion
         );
-        schema_migration::migrate_demand_factor_version(demand_factor)?;
+        schema_migration::migrate_demand_factor_version(&mut demand_factor)?;
+        schema_migration::write_account(&info, &demand_factor)?;
         msg!(
             "DemandFactor migrated to {}.{}.{}",
             demand_factor.version.major,
@@ -454,12 +476,40 @@ pub mod ario_arns {
     /// Permissionless — anyone can pay the realloc rent. Call once per
     /// name that needs migrating.
     pub fn migrate_arns_record(ctx: Context<MigrateArnsRecord>) -> Result<()> {
-        let record = &mut ctx.accounts.record;
+        let info = ctx.accounts.record.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ArnsRecord::SIZE,
+        )?;
+        let mut record: state::ArnsRecord = {
+            let data = info.try_borrow_data()?;
+            state::ArnsRecord::try_deserialize(&mut &data[..])?
+        };
+        // Seed derives from stored `name_hash`, readable only after
+        // deserialize — validate the PDA here (realloc already required
+        // program ownership; try_deserialize checked the discriminator).
+        let expected = Pubkey::create_program_address(
+            &[
+                state::ARNS_RECORD_SEED,
+                record.name_hash.as_ref(),
+                &[record.bump],
+            ],
+            &crate::ID,
+        )
+        .map_err(|_| error!(anchor_lang::error::ErrorCode::ConstraintSeeds))?;
+        require_keys_eq!(
+            info.key(),
+            expected,
+            anchor_lang::error::ErrorCode::ConstraintSeeds
+        );
         require!(
             record.version < ARNS_RECORD_VERSION,
             error::ArnsError::AlreadyLatestVersion
         );
-        schema_migration::migrate_arns_record_version(record)?;
+        schema_migration::migrate_arns_record_version(&mut record)?;
+        schema_migration::write_account(&info, &record)?;
         msg!(
             "ArnsRecord '{}' migrated to {}.{}.{}",
             record.name,
@@ -473,12 +523,40 @@ pub mod ario_arns {
     /// Migrate a single `ReturnedName` PDA to the latest schema version.
     /// Permissionless — anyone can pay the realloc rent.
     pub fn migrate_returned_name(ctx: Context<MigrateReturnedName>) -> Result<()> {
-        let returned_name = &mut ctx.accounts.returned_name;
+        let info = ctx.accounts.returned_name.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ReturnedName::SIZE,
+        )?;
+        let mut returned_name: state::ReturnedName = {
+            let data = info.try_borrow_data()?;
+            state::ReturnedName::try_deserialize(&mut &data[..])?
+        };
+        // Seed derives from stored `name_hash`, readable only after
+        // deserialize — validate the PDA here (realloc already required
+        // program ownership; try_deserialize checked the discriminator).
+        let expected = Pubkey::create_program_address(
+            &[
+                state::RETURNED_NAME_SEED,
+                returned_name.name_hash.as_ref(),
+                &[returned_name.bump],
+            ],
+            &crate::ID,
+        )
+        .map_err(|_| error!(anchor_lang::error::ErrorCode::ConstraintSeeds))?;
+        require_keys_eq!(
+            info.key(),
+            expected,
+            anchor_lang::error::ErrorCode::ConstraintSeeds
+        );
         require!(
             returned_name.version < RETURNED_NAME_VERSION,
             error::ArnsError::AlreadyLatestVersion
         );
-        schema_migration::migrate_returned_name_version(returned_name)?;
+        schema_migration::migrate_returned_name_version(&mut returned_name)?;
+        schema_migration::write_account(&info, &returned_name)?;
         msg!(
             "ReturnedName '{}' migrated to {}.{}.{}",
             returned_name.name,
@@ -492,12 +570,23 @@ pub mod ario_arns {
     /// Migrate a single `ReservedName` PDA to the latest schema version.
     /// Permissionless — anyone can pay the realloc rent.
     pub fn migrate_reserved_name(ctx: Context<MigrateReservedName>, name: String) -> Result<()> {
-        let reserved_name = &mut ctx.accounts.reserved_name;
+        let info = ctx.accounts.reserved_name.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ReservedName::SIZE,
+        )?;
+        let mut reserved_name: state::ReservedName = {
+            let data = info.try_borrow_data()?;
+            state::ReservedName::try_deserialize(&mut &data[..])?
+        };
         require!(
             reserved_name.version < RESERVED_NAME_VERSION,
             error::ArnsError::AlreadyLatestVersion
         );
-        schema_migration::migrate_reserved_name_version(reserved_name)?;
+        schema_migration::migrate_reserved_name_version(&mut reserved_name)?;
+        schema_migration::write_account(&info, &reserved_name)?;
         msg!(
             "ReservedName '{}' migrated to {}.{}.{}",
             name,
@@ -542,15 +631,14 @@ pub mod ario_arns {
 
 #[derive(Accounts)]
 pub struct MigrateArnsConfig<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize).
     #[account(
         mut,
         seeds = [state::ARNS_CONFIG_SEED],
-        bump = config.bump,
-        realloc = state::ArnsConfig::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub config: Account<'info, state::ArnsConfig>,
+    pub config: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -558,15 +646,14 @@ pub struct MigrateArnsConfig<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateDemandFactor<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize).
     #[account(
         mut,
         seeds = [state::DEMAND_FACTOR_SEED],
-        bump = demand_factor.bump,
-        realloc = state::DemandFactor::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub demand_factor: Account<'info, state::DemandFactor>,
+    pub demand_factor: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -574,15 +661,10 @@ pub struct MigrateDemandFactor<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateArnsRecord<'info> {
-    #[account(
-        mut,
-        seeds = [state::ARNS_RECORD_SEED, record.name_hash.as_ref()],
-        bump = record.bump,
-        realloc = state::ArnsRecord::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
-    )]
-    pub record: Account<'info, state::ArnsRecord>,
+    /// CHECK: data-derived PDA (seed = stored name_hash) validated in the
+    /// handler after grow-then-deserialize.
+    #[account(mut)]
+    pub record: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -590,15 +672,10 @@ pub struct MigrateArnsRecord<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateReturnedName<'info> {
-    #[account(
-        mut,
-        seeds = [state::RETURNED_NAME_SEED, returned_name.name_hash.as_ref()],
-        bump = returned_name.bump,
-        realloc = state::ReturnedName::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
-    )]
-    pub returned_name: Account<'info, state::ReturnedName>,
+    /// CHECK: data-derived PDA (seed = stored name_hash) validated in the
+    /// handler after grow-then-deserialize.
+    #[account(mut)]
+    pub returned_name: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -607,15 +684,14 @@ pub struct MigrateReturnedName<'info> {
 #[derive(Accounts)]
 #[instruction(name: String)]
 pub struct MigrateReservedName<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize).
     #[account(
         mut,
         seeds = [state::RESERVED_NAME_SEED, &crate::pricing::hash_name(&name)],
-        bump = reserved_name.bump,
-        realloc = state::ReservedName::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub reserved_name: Account<'info, state::ReservedName>,
+    pub reserved_name: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -632,6 +708,11 @@ pub struct InitializeArnsParams {
     pub treasury: Pubkey,
     pub period_zero_start_timestamp: i64,
     pub migration_authority: Pubkey,
+    /// Genesis demand factor (RATE_SCALE fixed-point, `DEMAND_FACTOR_SCALE`
+    /// = 1.0). The migration seeds this to AO's live value (~9.8) so ArNS
+    /// pricing matches the source network at cutover instead of resetting
+    /// to 1.0. Must be `>= DEMAND_FACTOR_MIN`.
+    pub initial_demand_factor: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]

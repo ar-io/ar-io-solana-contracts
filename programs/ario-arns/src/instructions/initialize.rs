@@ -30,9 +30,17 @@ pub fn handler(ctx: Context<InitializeArns>, params: InitializeArnsParams) -> Re
     config.bump = ctx.bumps.config;
     config.version = ARNS_CONFIG_VERSION;
 
-    // Initialize demand factor with genesis fees
+    // Initialize demand factor with genesis fees. The genesis factor is a
+    // parameter (not hardcoded to 1.0) so the migration can seed AO's live
+    // value (~9.8) — ArNS pricing must match the source network at cutover.
+    // Floor at DEMAND_FACTOR_MIN so we never initialize below the protocol
+    // minimum.
+    require!(
+        params.initial_demand_factor >= DEMAND_FACTOR_MIN,
+        ArnsError::InvalidParameter
+    );
     let demand = &mut ctx.accounts.demand_factor;
-    demand.current_demand_factor = DEMAND_FACTOR_SCALE;
+    demand.current_demand_factor = params.initial_demand_factor;
     demand.current_period = 1;
     demand.purchases_this_period = 0;
     demand.revenue_this_period = 0;

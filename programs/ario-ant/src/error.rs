@@ -183,4 +183,11 @@ pub enum AntError {
     /// Arithmetic overflow during manual account-close lamport math.
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
+
+    /// `admin_close_orphaned_ant_state`: a record passed in
+    /// `remaining_accounts` does not belong to the asset being cleaned up
+    /// (its stored `mint` != `asset.key()`). Closing it would destroy an
+    /// unrelated ANT's live state and refund its rent here, so we refuse.
+    #[msg("Orphan-cleanup record does not belong to the supplied asset")]
+    OrphanRecordAssetMismatch,
 }

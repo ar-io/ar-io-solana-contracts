@@ -313,14 +313,19 @@ pub mod reassign_name {
         let record = &ctx.accounts.arns_record;
         let config = &ctx.accounts.config;
 
-        // ADR-016 reshape: ario-arns is MPL-agnostic and can no longer read
-        // the ANT's NFT holder. Authorization simplifies to caller ==
-        // record.owner (the buyer who registered the name; set at buy_name
-        // time). NFT-holder-changes-confer-reassign-authority semantics live
-        // in the SDK-composed flow (ant.transfer → claim-name → reassign),
-        // not on-chain in ario-arns. See BD-100.
+        // Authorize against the CURRENT Metaplex Core NFT holder of the ANT
+        // this name is bound to (`record.ant`), NOT the stale `record.owner`
+        // (set once at buy_name and never updated). The ADR-016 "MPL-agnostic"
+        // reshape briefly regressed this to `caller == record.owner`, which
+        // let a prior buyer who sold/transferred the ANT keep reassign
+        // authority forever while the new holder could never obtain it
+        // (Codex finding, 2026-05; BD-095 / BD-106). Reading the asset's owner
+        // bytes directly needs no mpl-core crate and no CPI, so it stays
+        // ADR-016-compatible. `ant_asset` is constrained to `record.ant` and
+        // to MPL Core ownership in the ReassignName accounts struct.
+        let ant_owner = read_mpl_core_owner(&ctx.accounts.ant_asset.try_borrow_data()?)?;
         require!(
-            ctx.accounts.caller.key() == record.owner,
+            ctx.accounts.caller.key() == ant_owner,
             ArnsError::NotAntHolder
         );
 
@@ -374,10 +379,13 @@ pub mod release_name {
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
 
-        // ADR-016 reshape: ario-arns is MPL-agnostic. Authorization simplifies
-        // to caller == record.owner; see reassign_name comment + BD-100.
+        // Authorize against the CURRENT Metaplex Core NFT holder of `record.ant`,
+        // not the stale `record.owner`. See the reassign_name comment above
+        // (Codex finding, 2026-05; BD-095 / BD-106). `ant_asset` is constrained
+        // to `record.ant` and to MPL Core ownership in the ReleaseName struct.
+        let ant_owner = read_mpl_core_owner(&ctx.accounts.ant_asset.try_borrow_data()?)?;
         require!(
-            ctx.accounts.caller.key() == record.owner,
+            ctx.accounts.caller.key() == ant_owner,
             ArnsError::NotAntHolder
         );
 
@@ -593,6 +601,18 @@ pub struct ReassignName<'info> {
     )]
     pub arns_record: Account<'info, ArnsRecord>,
 
+    /// The Metaplex Core asset (NFT) this name is currently bound to. The
+    /// handler authorizes the reassign against its *current* owner — pinned
+    /// to `arns_record.ant` (the ANT being reassigned away from) and to MPL
+    /// Core ownership so a spoofed account can't forge the holder check.
+    /// CHECK: validated by the constraints below; owner bytes read via
+    /// `read_mpl_core_owner`.
+    #[account(
+        constraint = ant_asset.key() == arns_record.ant @ ArnsError::InvalidAntAsset,
+        constraint = ant_asset.owner == &MPL_CORE_PROGRAM_ID @ ArnsError::InvalidAntAsset,
+    )]
+    pub ant_asset: AccountInfo<'info>,
+
     #[account(mut)]
     pub caller: Signer<'info>,
 
@@ -629,6 +649,16 @@ pub struct ReleaseName<'info> {
     /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
     pub name_registry: AccountInfo<'info>,
+
+    /// The Metaplex Core asset (NFT) this name is bound to. The handler
+    /// authorizes the release against its *current* owner — pinned to
+    /// `arns_record.ant` and to MPL Core ownership. CHECK: validated by the
+    /// constraints below; owner bytes read via `read_mpl_core_owner`.
+    #[account(
+        constraint = ant_asset.key() == arns_record.ant @ ArnsError::InvalidAntAsset,
+        constraint = ant_asset.owner == &MPL_CORE_PROGRAM_ID @ ArnsError::InvalidAntAsset,
+    )]
+    pub ant_asset: AccountInfo<'info>,
 
     #[account(mut)]
     pub caller: Signer<'info>,
