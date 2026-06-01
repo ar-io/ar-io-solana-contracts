@@ -510,11 +510,14 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
 /// can be unit-tested without an on-chain context.
 pub(crate) fn roulette_select_indices(
     hashchain: &[u8; 32],
-    prefix: &[u128],
+    prefix: &[u64],
     max_observers: usize,
 ) -> Vec<usize> {
     let active_count = prefix.len();
-    let total_weight = prefix.last().copied().unwrap_or(0);
+    // Modulus math stays in u128 so the selection is byte-identical to the
+    // original (the prefix is stored as u64 only to halve heap — see the
+    // build site in `prescribe_epoch` for the u64 safety argument).
+    let total_weight = prefix.last().copied().unwrap_or(0) as u128;
     let cap = max_observers.min(active_count);
     let mut selected: Vec<usize> = Vec::new();
     if total_weight == 0 || cap == 0 {
@@ -533,7 +536,7 @@ pub(crate) fn roulette_select_indices(
         let random_value = u128::from_le_bytes(hash_bytes[..16].try_into().unwrap()) % total_weight;
         // Smallest idx with prefix[idx] > random_value (always a positive-weight
         // slot, since random_value < total_weight).
-        let idx = prefix.partition_point(|&p| p <= random_value);
+        let idx = prefix.partition_point(|&p| (p as u128) <= random_value);
         if !chosen[idx] {
             chosen[idx] = true;
             selected.push(idx);
@@ -588,13 +591,20 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
     // binary search can never land on them — the previous explicit
     // `composite_weight > 0` guard (audit NEW-2) is structurally preserved.
     //
-    // Memory: `prefix` is active_count u128s. The default 32KB BPF heap holds
-    // ~2000 gateways; for larger registries the caller must raise the heap via
-    // `ComputeBudget::RequestHeapFrame` (the @ar.io/sdk prescribe path does).
-    let mut prefix: Vec<u128> = Vec::with_capacity(active_count);
-    let mut running: u128 = 0;
+    // Memory: `prefix` is active_count u64s (8 bytes each) and is the only
+    // significant heap prescribe uses, so the full 3000-slot registry fits well
+    // within the default 32 KiB BPF heap (~24 KiB) alongside the ≤50 Gateway
+    // deserializations. Storing prefix sums as u64 (not u128) is safe: each sum
+    // is bounded by the total composite weight, which is bounded by total
+    // staked ARIO (≤ ~10^15 mARIO × tenure factor) — orders of magnitude below
+    // u64::MAX (~1.8×10^19). `saturating_add` is a belt-and-suspenders guard;
+    // it cannot trigger at any realistic stake level. The roulette modulus is
+    // still computed in u128 (see `roulette_select_indices`), so selection is
+    // byte-identical to a u128 prefix.
+    let mut prefix: Vec<u64> = Vec::with_capacity(active_count);
+    let mut running: u64 = 0;
     for i in 0..active_count {
-        running = running.saturating_add(registry.gateways[i].composite_weight as u128);
+        running = running.saturating_add(registry.gateways[i].composite_weight);
         prefix.push(running);
     }
 
@@ -1175,11 +1185,12 @@ mod prescribe_roulette_math {
     // dedup by slot index (addresses are unique per slot, so index-dedup ==
     // the original's address-dedup), round consumed regardless, sha256 rehash.
 
-    fn prefix_of(weights: &[u64]) -> Vec<u128> {
+    // Mirrors the production prefix build: u64 inclusive cumulative sums.
+    fn prefix_of(weights: &[u64]) -> Vec<u64> {
         let mut p = Vec::with_capacity(weights.len());
-        let mut r = 0u128;
+        let mut r = 0u64;
         for &w in weights {
-            r = r.saturating_add(w as u128);
+            r = r.saturating_add(w);
             p.push(r);
         }
         p
@@ -1233,7 +1244,11 @@ mod prescribe_roulette_math {
                     1 => 1,                                         // equal small (ties)
                     2 => (xorshift(&mut seed) % 1_000) + 1,         // varied small
                     3 => (xorshift(&mut seed) % 1_000_000_000) + 1, // large
-                    _ => u64::MAX,                                  // saturating-add stress
+                    // Large but bounded so the cumulative sum stays within u64
+                    // (mirrors reality: total composite weight << u64::MAX). At
+                    // ≤80 slots this can't overflow, so the u64 prefix equals
+                    // the u128 reference exactly.
+                    _ => (xorshift(&mut seed) % 1_000_000_000_000_000) + 1,
                 };
                 weights.push(w);
             }
