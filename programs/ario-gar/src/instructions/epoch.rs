@@ -497,24 +497,36 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
 /// # `remaining_accounts` contract
 ///
 /// `remaining_accounts` is a **lookup table for the SELECTED observers**, not
-/// the full registry. It MUST contain:
+/// the full registry. It contains:
 ///   - one `Gateway` PDA per SELECTED observer — at most
 ///     `epoch_settings.prescribed_observer_count`, hard-capped at 50 by the
-///     `prescribed_observers: [Pubkey; 50]` state field — in any order, AND
-///   - the `NameRegistry` account as the LAST entry (enables name prescription).
+///     `prescribed_observers: [Pubkey; 50]` state field — in any order (each is
+///     resolved by PDA, so position is not significant); and
+///   - OPTIONALLY, the `NameRegistry` account as the LAST entry. It is NOT
+///     required: if `remaining_accounts` is exactly the selected Gateway PDAs,
+///     the name-prescription leg is skipped and the epoch is still marked
+///     prescribed. When supplied it MUST be last, since the handler reads
+///     `remaining_accounts.last()` for it.
 ///
-/// So the upper bound is ~51 accounts regardless of registry size — well under
-/// `MAX_TX_ACCOUNT_LOCKS = 64`. Passing **every** registry gateway (e.g. a
-/// cranker calling `getAllRegistryGatewayPDAs`) blows the lock limit on large
-/// registries and the tx is rejected at pre-flight.
+/// So the upper bound is ~51 accounts regardless of registry size. That is well
+/// under `MAX_TX_ACCOUNT_LOCKS = 64`, but 50 account keys still exceed the
+/// 1232-byte transaction-size limit, so callers submit prescribe as a v0 tx
+/// compressed against an Address Lookup Table (see `@ar.io/sdk`). Passing
+/// **every** registry gateway (e.g. a cranker calling
+/// `getAllRegistryGatewayPDAs`) blows both limits on large registries and the
+/// tx is rejected at pre-flight.
 ///
-/// The selection is computed **on-chain** here from `epoch.hashchain` (a frozen
-/// entropy beacon, see `Epoch::hashchain`) and the live
-/// `registry.gateways[0..epoch.active_gateway_count].composite_weight`. Both are
-/// stable once `weights_tallied == 1`, so clients mirror this exact algorithm
-/// off-chain to learn which Gateway PDAs to supply. The canonical client mirror
-/// is `@ar.io/sdk`'s `predictPrescribedObservers`; a standalone Rust reference
-/// lives at `programs/ario-gar/examples/predict_prescribed_observers.rs`.
+/// The selection is computed **on-chain** here from `epoch.hashchain` and the
+/// *live* `registry.gateways[0..epoch.active_gateway_count].composite_weight`.
+/// Only `epoch.hashchain` is frozen (written once at `create_epoch`, see
+/// `Epoch::hashchain`); the registry weights are read LIVE and CAN change after
+/// `weights_tallied == 1` — a gateway that leaves zeroes its slot (see the
+/// live-total rationale below). Clients mirror this exact algorithm off-chain to
+/// learn which Gateway PDAs to supply, and MUST re-read the registry weights
+/// when building the transaction rather than caching a tally-time snapshot. The
+/// canonical client mirror is `@ar.io/sdk`'s `predictPrescribedObservers`; a
+/// standalone Rust reference lives at
+/// `programs/ario-gar/examples/predict_prescribed_observers.rs`.
 ///
 /// Supplying FEWER than the selected set (e.g. a gateway left between the
 /// client's read and tx landing) fails with `InvalidGatewayAccount` — the
