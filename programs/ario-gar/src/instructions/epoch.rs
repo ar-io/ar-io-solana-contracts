@@ -491,6 +491,58 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
     Ok(())
 }
 
+/// Weighted-roulette observer selection over a prefix-sum array of live
+/// composite weights. Returns the selected slot indices in selection order
+/// (at most `min(max_observers, prefix.len())`).
+///
+/// `prefix[i]` MUST be the inclusive cumulative sum of `composite_weight`
+/// through slot `i` (so `prefix.last()` is the live total weight). For each
+/// draw, the smallest index `idx` with `prefix[idx] > random_value` is the slot
+/// the equivalent linear cumulative walk would stop on — because `prefix` is
+/// non-decreasing and only rises at positive-weight slots, `idx` always has
+/// positive weight, and zero-weight slots can never be selected. Duplicates are
+/// rejected by slot index (addresses are unique per slot, so index-dedup ==
+/// address-dedup), but each draw still consumes a round — identical to the
+/// prior linear implementation. O(prefix.len() build by caller + K*log N).
+///
+/// This produces a byte-for-byte identical selected set to the original linear
+/// walk; see `selection_equivalence` test below. Kept as a free function so it
+/// can be unit-tested without an on-chain context.
+pub(crate) fn roulette_select_indices(
+    hashchain: &[u8; 32],
+    prefix: &[u128],
+    max_observers: usize,
+) -> Vec<usize> {
+    let active_count = prefix.len();
+    let total_weight = prefix.last().copied().unwrap_or(0);
+    let cap = max_observers.min(active_count);
+    let mut selected: Vec<usize> = Vec::new();
+    if total_weight == 0 || cap == 0 {
+        return selected;
+    }
+
+    let mut chosen = vec![false; active_count];
+    // GAR-019: 10x round budget so heavy equal-weight ties still reach the
+    // configured observer count before giving up.
+    let mut hash = anchor_lang::solana_program::hash::hash(hashchain);
+    for _ in 0..cap * 10 {
+        if selected.len() >= cap {
+            break;
+        }
+        let hash_bytes = hash.to_bytes();
+        let random_value = u128::from_le_bytes(hash_bytes[..16].try_into().unwrap()) % total_weight;
+        // Smallest idx with prefix[idx] > random_value (always a positive-weight
+        // slot, since random_value < total_weight).
+        let idx = prefix.partition_point(|&p| p <= random_value);
+        if !chosen[idx] {
+            chosen[idx] = true;
+            selected.push(idx);
+        }
+        hash = anchor_lang::solana_program::hash::hash(&hash.to_bytes());
+    }
+    selected
+}
+
 /// Prescribe observers and names for an epoch (single tx, deterministic selection).
 /// Uses weighted roulette from hashchain entropy. Computes per-unit rewards.
 pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Result<()> {
@@ -520,9 +572,30 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
     // ~`leaver_weight / total` selection share regardless of its own weight
     // (Codex 2026-05-28 finding). The live recompute eliminates the dead
     // range entirely, so no fallback is needed.
-    let mut total_weight: u128 = 0;
+    // Build a prefix-sum array of the *live* registry weights once, then run
+    // the weighted roulette via `roulette_select_indices` (binary search per
+    // draw + O(1) slot-index dedup) instead of re-walking the registry each
+    // round. The selected set is byte-for-byte identical to the prior linear
+    // cumulative walk (verified by the equivalence test in this file), but the
+    // cost drops from O(K * active_count) to O(active_count + K*log(active_count)).
+    // This keeps prescribe under Solana's 1.4M-CU ceiling at large gateway
+    // counts — with the linear walk it exceeded 1.4M at ~667 gateways
+    // (audit 2026-06).
+    //
+    // `prefix[i]` is the inclusive cumulative sum of composite_weight through
+    // slot i, so `prefix.last()` is the live total. Zero-weight slots
+    // (Leaving gateways / late-joiners) leave the cumulative flat, so the
+    // binary search can never land on them — the previous explicit
+    // `composite_weight > 0` guard (audit NEW-2) is structurally preserved.
+    //
+    // Memory: `prefix` is active_count u128s. The default 32KB BPF heap holds
+    // ~2000 gateways; for larger registries the caller must raise the heap via
+    // `ComputeBudget::RequestHeapFrame` (the @ar.io/sdk prescribe path does).
+    let mut prefix: Vec<u128> = Vec::with_capacity(active_count);
+    let mut running: u128 = 0;
     for i in 0..active_count {
-        total_weight = total_weight.saturating_add(registry.gateways[i].composite_weight as u128);
+        running = running.saturating_add(registry.gateways[i].composite_weight as u128);
+        prefix.push(running);
     }
 
     let max_observers = std::cmp::min(
@@ -530,48 +603,12 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
         active_count,
     );
 
-    let mut hash = anchor_lang::solana_program::hash::hash(&epoch.hashchain);
-    let mut selected_count = 0usize;
-
-    if total_weight > 0 && active_count > 0 {
-        // GAR-019: Use 10x multiplier to reduce chance of selecting fewer observers
-        // than configured when there are many equal-weight gateways
-        for _ in 0..max_observers * 10 {
-            if selected_count >= max_observers {
-                break;
-            }
-
-            let hash_bytes = hash.to_bytes();
-            let random_value =
-                u128::from_le_bytes(hash_bytes[..16].try_into().unwrap()) % total_weight;
-
-            // Walk registry, accumulate weight. Slots with composite_weight==0
-            // (Leaving gateways, late-joiners) contribute zero to the cumulative
-            // sum, so the random pointer cannot land inside their range. The
-            // `slot.composite_weight > 0` guard rejects any zero-weight slot
-            // that a future change might surface here (audit NEW-2).
-            //
-            // With `total_weight` computed live above, every `random_value` in
-            // `[0, total_weight)` lands inside an actual non-zero slot — there
-            // is no "off the end" case to fall back from.
-            let mut cumulative: u128 = 0;
-            for i in 0..active_count {
-                let slot = &registry.gateways[i];
-                cumulative += slot.composite_weight as u128;
-                if cumulative > random_value && slot.composite_weight > 0 {
-                    // Check if already selected
-                    if !epoch.prescribed_observer_gateways[..selected_count].contains(&slot.address)
-                    {
-                        epoch.prescribed_observer_gateways[selected_count] = slot.address;
-                        epoch.prescribed_observers[selected_count] = slot.address;
-                        selected_count += 1;
-                    }
-                    break;
-                }
-            }
-
-            hash = anchor_lang::solana_program::hash::hash(&hash.to_bytes());
-        }
+    let selected_indices = roulette_select_indices(&epoch.hashchain, &prefix, max_observers);
+    let selected_count = selected_indices.len();
+    for (out_i, &slot_idx) in selected_indices.iter().enumerate() {
+        let address = registry.gateways[slot_idx].address;
+        epoch.prescribed_observer_gateways[out_i] = address;
+        epoch.prescribed_observers[out_i] = address;
     }
     epoch.observer_count = selected_count as u8;
 
@@ -1125,6 +1162,113 @@ mod prescribe_roulette_math {
         for rv in 0..live_total(&weights) {
             let pick = roulette_select(&weights, rv).unwrap();
             assert_ne!(pick, 2, "tail leaver (zero weight) must not be selected");
+        }
+    }
+
+    // ----- prefix-sum + binary-search selection equivalence (CU optimization,
+    // audit 2026-06) -----
+    //
+    // `roulette_select_indices` (the production selection) must produce a
+    // byte-for-byte identical selected set to the original linear algorithm for
+    // ANY (hashchain, weights, K). `linear_select_indices` below replays the
+    // ORIGINAL full algorithm — K*10 rounds, per-draw linear `roulette_select`,
+    // dedup by slot index (addresses are unique per slot, so index-dedup ==
+    // the original's address-dedup), round consumed regardless, sha256 rehash.
+
+    fn prefix_of(weights: &[u64]) -> Vec<u128> {
+        let mut p = Vec::with_capacity(weights.len());
+        let mut r = 0u128;
+        for &w in weights {
+            r = r.saturating_add(w as u128);
+            p.push(r);
+        }
+        p
+    }
+
+    fn linear_select_indices(
+        hashchain: &[u8; 32],
+        weights: &[u64],
+        max_observers: usize,
+    ) -> Vec<usize> {
+        let total = live_total(weights);
+        let cap = max_observers.min(weights.len());
+        let mut selected: Vec<usize> = Vec::new();
+        if total == 0 || cap == 0 {
+            return selected;
+        }
+        let mut hash = anchor_lang::solana_program::hash::hash(hashchain);
+        for _ in 0..cap * 10 {
+            if selected.len() >= cap {
+                break;
+            }
+            let rv = u128::from_le_bytes(hash.to_bytes()[..16].try_into().unwrap()) % total;
+            if let Some(idx) = roulette_select(weights, rv) {
+                if !selected.contains(&idx) {
+                    selected.push(idx);
+                }
+            }
+            hash = anchor_lang::solana_program::hash::hash(&hash.to_bytes());
+        }
+        selected
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn selection_equivalence_optimized_matches_linear() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for case in 0..1000u64 {
+            let n = (xorshift(&mut seed) % 80 + 1) as usize;
+            let mut weights = Vec::with_capacity(n);
+            for _ in 0..n {
+                let w = match xorshift(&mut seed) % 5 {
+                    0 => 0u64,                                      // zero-weight slot
+                    1 => 1,                                         // equal small (ties)
+                    2 => (xorshift(&mut seed) % 1_000) + 1,         // varied small
+                    3 => (xorshift(&mut seed) % 1_000_000_000) + 1, // large
+                    _ => u64::MAX,                                  // saturating-add stress
+                };
+                weights.push(w);
+            }
+            let mut hc = [0u8; 32];
+            for b in hc.iter_mut() {
+                *b = (xorshift(&mut seed) & 0xff) as u8;
+            }
+            let k = (xorshift(&mut seed) % (n as u64 + 5)) as usize;
+
+            let opt = super::roulette_select_indices(&hc, &prefix_of(&weights), k);
+            let lin = linear_select_indices(&hc, &weights, k);
+            assert_eq!(opt, lin, "case {case}: k={k} weights={weights:?}");
+        }
+    }
+
+    #[test]
+    fn selection_equivalence_edge_cases() {
+        let hc = [7u8; 32];
+        let cases: &[(Vec<u64>, usize)] = &[
+            (vec![], 5),
+            (vec![0, 0, 0], 2),
+            (vec![100], 1),
+            (vec![100], 5),
+            (vec![1, 1, 1, 1, 1], 3),
+            (vec![1_000_000, 1, 1], 2), // dominant slot, anti-dup stress
+            (vec![0, 50, 0, 50, 0, 25], 3), // interleaved zero-weight slots
+            (vec![10, 20, 30, 40], 10), // K > active_count
+            (vec![5, 5, 5], 0),         // K == 0
+        ];
+        for (weights, k) in cases {
+            assert_eq!(
+                super::roulette_select_indices(&hc, &prefix_of(weights), *k),
+                linear_select_indices(&hc, weights, *k),
+                "edge weights={weights:?} k={k}",
+            );
         }
     }
 }
