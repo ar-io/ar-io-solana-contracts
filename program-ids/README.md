@@ -6,7 +6,7 @@ files at build time so they don't have to hard-code addresses.
 
 | File           | Cluster        | Source of truth | Updated by |
 |----------------|----------------|-----------------|------------|
-| `devnet.json`  | devnet         | `scripts/devnet-deploy.sh` | `release-devnet` workflow on every merge to `develop` (commit + push) |
+| `staging.json`  | devnet (staging) | `scripts/devnet-deploy.sh` | `release-devnet` workflow on every merge to `develop` (commit + push) |
 | `mainnet.json` | mainnet-beta   | original mainnet deploy + Squads multisig upgrades | manual PR on the rare occasion a program is redeployed at a new ID |
 | `localnet.json` *(optional)* | localnet | `scripts/start-localnet.sh` writes `localnet/out/localnet.env`; consumers read that instead | not committed |
 
@@ -68,7 +68,7 @@ files at build time so they don't have to hard-code addresses.
   always resolves to a known program ID set.
 * Devnet is volatile but predictable: the `release-devnet` workflow
   deploys *upgrades* against the same program IDs (`solana program
-  deploy --program-id`), so `devnet.json` only changes when an ID is
+  deploy --program-id`), so `staging.json` only changes when an ID is
   intentionally rotated.
 * Mainnet IDs are baked into `declare_id!()` — a CI step checks that
   `programs/<crate>/src/lib.rs` matches `mainnet.json` before any
@@ -78,11 +78,11 @@ files at build time so they don't have to hard-code addresses.
 
 ```ts
 // SDK example
-import devnet from '@ar.io/solana-contracts/program-ids/devnet.json';
-const arioCore = devnet.programs.ario_core;
+import staging from '@ar.io/solana-contracts/program-ids/staging.json';
+const arioCore = staging.programs.ario_core;
 ```
 
 ```bash
 # Shell tooling
-jq -r .programs.ario_core program-ids/devnet.json
+jq -r .programs.ario_core program-ids/staging.json
 ```

@@ -39,7 +39,7 @@
 #                              # patch source declare_id!() from
 #                              # program-ids/<cluster>.json (path read from
 #                              # PROGRAM_IDS_PATH env var, default
-#                              # program-ids/devnet.json), build, restore
+#                              # program-ids/staging.json), build, restore
 #                              # source on EXIT. Used by CI flows that don't
 #                              # have program keypair files (the deploy
 #                              # authority is the only key in CI; program IDs
@@ -213,7 +213,7 @@ restore_keys() {
 # subsequent deploy attempt for those programs would have to come from a
 # maintainer laptop with the program keypair, not CI.
 sync_from_manifest() {
-  local manifest="${PROGRAM_IDS_PATH:-program-ids/devnet.json}"
+  local manifest="${PROGRAM_IDS_PATH:-program-ids/staging.json}"
   command -v jq >/dev/null 2>&1 || {
     echo "jq required for --sync-from-manifest" >&2
     exit 1

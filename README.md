@@ -40,7 +40,7 @@ edge exists.
 ## Status
 
 * **Devnet**: deployed by CI on every merge to `develop`. Program IDs
-  pinned in [`program-ids/devnet.json`](program-ids/devnet.json).
+  pinned in [`program-ids/staging.json`](program-ids/staging.json).
 * **Mainnet**: upgrades staged by CI on every merge to `main`, executed
   by the AR.IO Squads multisig. Program IDs pinned in
   [`program-ids/mainnet.json`](program-ids/mainnet.json).
@@ -58,7 +58,7 @@ edge exists.
 ├── localnet/
 │   └── surfpool-svm-features.sh # canonical Surfpool feature gate list
 ├── program-ids/                 # per-cluster program ID manifests (committed)
-│   ├── devnet.json
+│   ├── staging.json
 │   └── mainnet.json
 ├── programs/
 │   ├── ario-core/
@@ -179,7 +179,7 @@ feature branch ─PR─▶ develop ─PR─▶ main
   full test suite, IDL ABI stability check, escrow fuzz smoke) before
   the PR is mergeable.
 * Merging to `develop` triggers `upgrade-devnet.yml`: full build, deploy
-  to devnet, refresh `program-ids/devnet.json` (auto-committed back to
+  to devnet, refresh `program-ids/staging.json` (auto-committed back to
   `develop`), and publish a versioned release tarball with IDLs + .so +
   keypairs so downstream clients can update or run their own Surfpool.
 * Cutting a mainnet release happens by opening a `develop → main` PR.
@@ -263,7 +263,7 @@ deploys (a manual operator action — see below).
    workflow will not produce a keypair file in `target/deploy/`,
    `~/.config/solana/`, or anywhere else on the runner.
 3. Runs `scripts/devnet-deploy.sh`:
-   1. Reads `program-ids/devnet.json` for the live program IDs.
+   1. Reads `program-ids/staging.json` for the live program IDs.
    2. Calls `bash build-sbf.sh --sync-from-manifest`, which patches each
       program's `declare_id!()` in source from the manifest, builds the
       `.so` files, then restores source on EXIT. The `.so`s in
@@ -274,10 +274,10 @@ deploys (a manual operator action — see below).
       `vars.DEVNET_RPC_URL`, signed by the in-memory authority key.
       Programs with `null` entries (today `ario_ant_escrow`) are
       skipped — first deploys never happen in CI.
-   4. Updates `program-ids/devnet.json` with the new `deployer` and
+   4. Updates `program-ids/staging.json` with the new `deployer` and
       per-program `deployed_at` timestamps. `.programs` is **never**
       overwritten by CI.
-4. Auto-commits & pushes `program-ids/devnet.json` if it changed.
+4. Auto-commits & pushes `program-ids/staging.json` if it changed.
 5. Runs `scripts/package-release.sh` and uploads
    `release/ar-io-solana-contracts-devnet-<ts>-<sha>.tar.gz` as both a
    workflow artifact and a GitHub pre-release.
@@ -288,7 +288,7 @@ The bundle includes:
   entry)
 * `so/*.so` — compiled BPF binaries (same set)
 * `program-ids.json` — same content as the in-repo
-  `program-ids/devnet.json`
+  `program-ids/staging.json`
 * `VERSION` — version, cluster, git SHA, build timestamp, toolchain
   versions
 * `SHA256SUMS` — checksums
@@ -343,7 +343,7 @@ land on devnet (today: only `ario_ant_escrow`):
    solana program set-upgrade-authority <new_program_id> \
      --new-upgrade-authority <DEVNET_AUTHORITY_PUBKEY>
    ```
-5. Add the resulting program ID to `program-ids/devnet.json` under
+5. Add the resulting program ID to `program-ids/staging.json` under
    `.programs.<name>` and commit. CI will pick it up automatically on
    the next merge to `develop`.
 

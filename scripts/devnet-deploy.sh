@@ -4,12 +4,12 @@
 # ============================================================
 #
 # Builds the AR.IO programs from source, syncs declare_id!() values from
-# the committed program-ids/devnet.json manifest, and pushes upgrades
+# the committed program-ids/staging.json manifest, and pushes upgrades
 # against the existing on-chain program IDs. Idempotent across runs;
 # leaves on-chain state untouched.
 #
 # THIS SCRIPT NEVER MINTS NEW PROGRAM IDS. It only does upgrades against
-# IDs that are already populated in program-ids/devnet.json. The single
+# IDs that are already populated in program-ids/staging.json. The single
 # secret in CI is the upgrade authority keypair (DEVNET_AUTHORITY_KEY_JSON);
 # program keypairs live in the original deployer's offline custody and
 # are only needed for first deploys.
@@ -29,7 +29,7 @@
 #     other programs:
 #        solana program set-upgrade-authority <new_program_id> \
 #          --new-upgrade-authority <DEVNET_AUTHORITY_PUBKEY>
-#   * Add the resulting program ID to program-ids/devnet.json and commit.
+#   * Add the resulting program ID to program-ids/staging.json and commit.
 #   * Subsequent upgrades will then flow through this script automatically
 #     (DEPLOY_ORDER is derived from the manifest).
 #
@@ -62,7 +62,7 @@
 #                                                     #    on ario-ant-escrow)
 #   SKIP_BUILD=1                                      # reuse target/deploy/*.so
 #   SKIP_AIRDROP=1                                    # don't request devnet SOL
-#   PROGRAM_IDS_PATH="program-ids/devnet.json"        # input manifest
+#   PROGRAM_IDS_PATH="program-ids/staging.json"        # input manifest
 #                                                       (program IDs are READ
 #                                                       from here, never
 #                                                       overwritten)
@@ -85,7 +85,7 @@ DEPLOY_CLUSTER="${DEPLOY_CLUSTER:-https://api.devnet.solana.com}"
 AUTHORITY_KEY_JSON="${AUTHORITY_KEY_JSON:-}"
 AUTHORITY_KEYPAIR="${AUTHORITY_KEYPAIR:-target/deploy/devnet-authority-keypair.json}"
 BUILD_NETWORK="${BUILD_NETWORK:-devnet}"
-PROGRAM_IDS_PATH="${PROGRAM_IDS_PATH:-program-ids/devnet.json}"
+PROGRAM_IDS_PATH="${PROGRAM_IDS_PATH:-program-ids/staging.json}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -175,7 +175,7 @@ fi
 # Build DEPLOY_ORDER from the manifest. Programs whose .programs.<name>
 # entry is null are skipped — their first deploy must happen offline. This
 # means ario_ant_escrow is naturally excluded today; the moment its first
-# deploy lands and the resulting ID is committed to program-ids/devnet.json,
+# deploy lands and the resulting ID is committed to program-ids/staging.json,
 # it'll start flowing through CI without any code change here.
 #
 # Order matters for runtime CPI dependencies (ario-arns CPIs into ario-gar;
@@ -217,7 +217,7 @@ fi
 step 3 "Build (BUILD_NETWORK=$BUILD_NETWORK; sync declare_id!() from manifest)"
 # ------------------------------------------------------------
 # build-sbf.sh --sync-from-manifest patches each program's declare_id!()
-# in source to match program-ids/devnet.json, builds the BPF artifacts,
+# in source to match program-ids/staging.json, builds the BPF artifacts,
 # then restores source on EXIT. The .so files in target/deploy/ have the
 # correct (live) program IDs baked in; the source tree is unchanged.
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then

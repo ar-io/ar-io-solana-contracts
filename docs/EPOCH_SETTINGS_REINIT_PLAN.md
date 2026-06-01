@@ -205,9 +205,10 @@ continuously.
   fine. Lifecycle stops at `submit_observation` anyway (synthetic
   operators have no signing keys); the cranker can't close it. Reset
   will create Epoch 1 fresh under the new params.
-- Existing `program-ids/devnet.json` program IDs unchanged.
-- Migration authority unchanged
-  (`FkkABY7WLYpET8jKdbknCArYab44M88TkjmJmut8TcRF`).
+- Existing `program-ids/staging.json` program IDs unchanged.
+- Upgrade authority: `2J8x7uqw5XtzqkVoPWJkWJR7fGH8HFqABcSK9iUKHxBF` (all five programs).
+- Migration authority: set at `initialize` time (config PDAs not yet
+  created on staging as of 2026-06-01).
 
 ## Open questions to confirm at execution time
 

@@ -6,7 +6,7 @@ first; this file is the working notes / institutional memory layer that
 agents need to avoid common mistakes.
 
 > **Connecting to deployed clusters?** Program IDs and the ARIO mint
-> live in [`program-ids/devnet.json`](program-ids/devnet.json) and
+> live in [`program-ids/staging.json`](program-ids/staging.json) and
 > [`program-ids/mainnet.json`](program-ids/mainnet.json). The on-chain
 > `declare_id!()` literals only match a real keypair after the relevant
 > deploy workflow has run — fresh checkouts of `develop` carry placeholder

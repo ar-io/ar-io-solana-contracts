@@ -404,5 +404,5 @@ escrow / claim flows) lives in the
 [`solana-ar-io`](https://github.com/ar-io/solana-ar-io) repository under
 `migration/`. This repo is contracts-only — point migration tooling at a
 local Surfpool (via `bash scripts/start-localnet.sh`) or at the published
-devnet program IDs (see `program-ids/devnet.json`) when you need an
+devnet program IDs (see `program-ids/staging.json`) when you need an
 end-to-end run.
