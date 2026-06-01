@@ -163,13 +163,20 @@ pub fn calculate_permabuy_fee(base_fee: u64, demand_factor: u64) -> Result<u64> 
 
 /// Calculate the premium cost for purchasing a returned name.
 ///
-/// The premium decays linearly from `RETURNED_NAME_MAX_MULTIPLIER` down to 1x
-/// over `RETURNED_NAME_DURATION_SECONDS`. If the full duration has elapsed,
-/// the name costs the base registration fee with no premium.
+/// The premium decays linearly from `RETURNED_NAME_MAX_MULTIPLIER` (50x) down
+/// to 1x over `RETURNED_NAME_DURATION_SECONDS` (14 days), matching the
+/// whitepaper formula (§12.3): `RNP = 50 − (49/14) × t` where t is in days.
 ///
-/// - `pct_remaining = (duration - elapsed) / duration` (in SCALE)
-/// - `multiplier = MAX_MULTIPLIER * pct_remaining` (in SCALE)
-/// - `cost = registration_fee * multiplier / SCALE`
+/// Integer form:
+/// - `multiplier = (MAX × duration − (MAX−1) × elapsed) × SCALE / duration`
+/// - `cost = registration_fee × multiplier / SCALE`
+///
+/// At t=0 the multiplier is 50×SCALE → cost = 50 × registration_fee.
+/// At t=duration the multiplier is 1×SCALE → cost = registration_fee (1x).
+/// The premium never drops below 1x during the window, eliminating the
+/// boundary discontinuity that existed in the prior `50×remaining/duration`
+/// formula (which reached 0x at t=duration and required a guard + caused a
+/// dead zone where `require!(token_cost > 0)` rejected purchases).
 pub fn calculate_returned_name_premium(
     registration_fee: u64,
     returned_at: i64,
@@ -184,20 +191,27 @@ pub fn calculate_returned_name_premium(
     }
 
     let scale = DEMAND_FACTOR_SCALE as u128;
-    let remaining = (duration - elapsed) as u128;
     let dur = duration as u128;
+    let el = elapsed as u128;
+    let max_mult = RETURNED_NAME_MAX_MULTIPLIER as u128;
 
-    // pct_remaining in SCALE units
-    let pct_remaining = remaining
+    // multiplier = (MAX * duration - (MAX - 1) * elapsed) * SCALE / duration
+    // At elapsed=0: (50*dur) * SCALE / dur = 50*SCALE
+    // At elapsed=dur: (50*dur - 49*dur) * SCALE / dur = 1*SCALE
+    let numerator = max_mult
+        .checked_mul(dur)
+        .ok_or(ArnsError::ArithmeticOverflow)?
+        .checked_sub(
+            (max_mult - 1)
+                .checked_mul(el)
+                .ok_or(ArnsError::ArithmeticOverflow)?,
+        )
+        .ok_or(ArnsError::ArithmeticOverflow)?;
+
+    let multiplier = numerator
         .checked_mul(scale)
         .ok_or(ArnsError::ArithmeticOverflow)?
         .checked_div(dur)
-        .ok_or(ArnsError::ArithmeticOverflow)?;
-
-    // multiplier in SCALE units
-    let max_mult = RETURNED_NAME_MAX_MULTIPLIER as u128;
-    let multiplier = max_mult
-        .checked_mul(pct_remaining)
         .ok_or(ArnsError::ArithmeticOverflow)?;
 
     // cost = registration_fee * multiplier / SCALE
@@ -463,12 +477,13 @@ mod tests {
 
     #[test]
     fn test_returned_name_premium_halfway() {
-        // elapsed = 7 days, pct_remaining = 0.5, multiplier = 25x
-        // cost = 1000 * 25 = 25000
+        // elapsed = 7 days (half of 14-day window)
+        // WP formula: multiplier = 50 - 49*(7/14) = 50 - 24.5 = 25.5
+        // cost = 1000 * 25.5 = 25500
         let returned_at = 0i64;
         let current = 7 * 86_400;
         let cost = calculate_returned_name_premium(1000, returned_at, current).unwrap();
-        assert_eq!(cost, 25000);
+        assert_eq!(cost, 25500);
     }
 
     #[test]
@@ -634,30 +649,29 @@ mod tests {
 
     #[test]
     fn premium_at_25pct() {
-        // 3.5 days = 302_400 seconds elapsed
-        // pct_remaining = (1_209_600 - 302_400) / 1_209_600 = 907_200 / 1_209_600 = 0.75
-        // multiplier = 50 * 0.75 = 37.5
-        // cost = 1000 * 37.5 = 37_500
+        // 3.5 days = 302_400 seconds elapsed (25% of window)
+        // WP formula: multiplier = 50 - 49*(302_400/1_209_600) = 50 - 49*0.25 = 50 - 12.25 = 37.75
+        // cost = 1000 * 37.75 = 37_750
         let cost = calculate_returned_name_premium(1000, 0, 302_400).unwrap();
-        assert_eq!(cost, 37500);
+        assert_eq!(cost, 37750);
     }
 
     #[test]
     fn premium_at_75pct() {
-        // 10.5 days = 907_200 seconds elapsed
-        // pct_remaining = (1_209_600 - 907_200) / 1_209_600 = 302_400 / 1_209_600 = 0.25
-        // multiplier = 50 * 0.25 = 12.5
-        // cost = 1000 * 12.5 = 12_500
+        // 10.5 days = 907_200 seconds elapsed (75% of window)
+        // WP formula: multiplier = 50 - 49*(907_200/1_209_600) = 50 - 49*0.75 = 50 - 36.75 = 13.25
+        // cost = 1000 * 13.25 = 13_250
         let cost = calculate_returned_name_premium(1000, 0, 907_200).unwrap();
-        assert_eq!(cost, 12500);
+        assert_eq!(cost, 13250);
     }
 
     #[test]
     fn premium_at_1_second() {
         // 1 second elapsed
-        // pct_remaining = (1_209_600 - 1) / 1_209_600 ≈ 0.999999
-        // multiplier = 50 * 0.999999 ≈ 49.99
-        // cost ≈ 1000 * 49.99 ≈ 49_995
+        // WP formula: multiplier = (50*1_209_600 - 49*1) * 1_000_000 / 1_209_600
+        //           = (60_480_000 - 49) * 1_000_000 / 1_209_600
+        //           ≈ 49.999_959... * 1_000_000 ≈ 49_999_959
+        // cost = 1000 * 49_999_959 / 1_000_000 = 49_999
         let cost = calculate_returned_name_premium(1000, 0, 1).unwrap();
         // Should be very close to 50_000 but slightly less
         assert!(cost >= 49_900 && cost <= 50_000);
@@ -674,15 +688,13 @@ mod tests {
     #[test]
     fn premium_near_end() {
         // 13.5 days = 1_166_400 seconds elapsed (out of 1_209_600 total)
-        // pct_remaining = (1_209_600 - 1_166_400) / 1_209_600 = 43_200 / 1_209_600 ≈ 0.035714
-        // multiplier = 50 * 0.035714 ≈ 1.7857
-        // cost = 1000 * 1.7857 ≈ 1785
+        // WP formula: multiplier = 50 - 49*(1_166_400/1_209_600) = 50 - 49*0.964286 = 50 - 47.25 = 2.75
+        // Integer: numerator = 50*1_209_600 - 49*1_166_400 = 60_480_000 - 57_153_600 = 3_326_400
+        // multiplier = 3_326_400 * 1_000_000 / 1_209_600 = 2_750_000
+        // cost = 1000 * 2_750_000 / 1_000_000 = 2750
         let elapsed = (13.5 * 86_400.0) as i64; // 1_166_400
         let cost = calculate_returned_name_premium(1000, 0, elapsed).unwrap();
-        // pct_remaining = 43200 * 1_000_000 / 1_209_600 = 35714 (truncated)
-        // multiplier = 50 * 35714 = 1_785_700
-        // cost = 1000 * 1_785_700 / 1_000_000 = 1785
-        assert_eq!(cost, 1785);
+        assert_eq!(cost, 2750);
     }
 
     #[test]
@@ -690,6 +702,33 @@ mod tests {
         // 15 days elapsed (past 14-day window) => no premium, returns base fee
         let cost = calculate_returned_name_premium(5000, 0, 15 * 86_400).unwrap();
         assert_eq!(cost, 5000);
+    }
+
+    #[test]
+    fn premium_at_last_second_never_zero() {
+        // At elapsed = duration - 1, the WP formula still yields >= registration_fee.
+        // This is the dead-zone fix: the old formula (50 * remaining / dur) would
+        // yield 0 here because remaining=1, 50*1*SCALE/dur truncates to 0.
+        // WP formula: (50*dur - 49*(dur-1)) * SCALE / dur = (dur + 49) * SCALE / dur
+        //   = (1_209_600 + 49) * 1_000_000 / 1_209_600 = 1_209_649 * 1_000_000 / 1_209_600
+        //   ≈ 1_000_040 (just above 1x SCALE)
+        // cost = 1000 * 1_000_040 / 1_000_000 = 1000
+        let duration = RETURNED_NAME_DURATION_SECONDS;
+        let cost = calculate_returned_name_premium(1000, 0, duration - 1).unwrap();
+        assert!(
+            cost >= 1000,
+            "At elapsed=duration-1, cost ({}) must be >= registration_fee (1000)",
+            cost
+        );
+        // Also verify it's never 0
+        assert!(cost > 0, "Premium must never be 0 during the window");
+    }
+
+    #[test]
+    fn premium_at_exact_duration_equals_base() {
+        // At elapsed = duration exactly, the guard returns registration_fee
+        let cost = calculate_returned_name_premium(1000, 0, RETURNED_NAME_DURATION_SECONDS).unwrap();
+        assert_eq!(cost, 1000);
     }
 
     #[test]
