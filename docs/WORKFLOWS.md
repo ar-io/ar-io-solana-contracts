@@ -267,7 +267,7 @@ otherwise), computed by ario-core from two canonical `ario_ant` accounts — the
 asset (MPL-agnostic, ADR-016). See BD-097 (mechanism) and BD-109 (the
 canonical-`ario_ant`-only / BYO-ANT limitation).
 
-```
+```text
 Undername delegate (AntRecord.owner = alice, set by the current ANT holder)
  │
  │  request_and_set_primary_name("alice_company")
