@@ -70,7 +70,7 @@ pub fn handler(ctx: Context<InitializeArns>, params: InitializeArnsParams) -> Re
 }
 
 /// Grow the NameRegistry PDA in ≤10KB steps per transaction (see ario-gar `create_gateway_registry`).
-/// Initial size targets `INITIAL_CAPACITY` slots (50K mainnet, 200 devnet-shrunk).
+/// Initial size targets `INITIAL_CAPACITY` slots (50K, all clusters).
 /// Post-deploy growth uses `admin_expand_name_registry`.
 pub fn create_name_registry(ctx: Context<CreateNameRegistry>) -> Result<()> {
     let target: usize = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
@@ -161,45 +161,6 @@ fn write_name_registry_header(reg: &AccountInfo, authority: Pubkey) -> Result<()
     let disc = hash(b"account:NameRegistry");
     data[..8].copy_from_slice(&disc.to_bytes()[..8]);
     data[8..40].copy_from_slice(authority.as_ref());
-    Ok(())
-}
-
-/// Shrink the `NameRegistry` PDA to fit `target_capacity` slots, refunding
-/// the rent diff to the authority. With ADR-020's dynamic-capacity layout
-/// this ix is parameterized: the caller picks any target ≥ current
-/// `header.count` (refuses otherwise to avoid data loss).
-///
-/// Authority-gated AND `migration_active`-gated. Inert after mainnet
-/// `finalize_migration`.
-pub fn admin_shrink_name_registry(
-    ctx: Context<AdminShrinkNameRegistry>,
-    target_capacity: u32,
-) -> Result<()> {
-    let name_registry = &ctx.accounts.name_registry;
-    let target = NameRegistry::bytes_for_capacity(target_capacity as usize);
-
-    let current_len = name_registry.data_len();
-    require!(current_len > target, ArnsError::RegistryAlreadyShrunk);
-
-    {
-        let data = name_registry.try_borrow_data()?;
-        let count = try_name_registry_header(&data)?.count;
-        require!(count <= target_capacity, ArnsError::ShrinkWouldLoseData);
-    }
-
-    name_registry.realloc(target, false)?;
-
-    let new_minimum = Rent::get()?.minimum_balance(target);
-    let refund = name_registry.lamports().saturating_sub(new_minimum);
-    **name_registry.try_borrow_mut_lamports()? -= refund;
-    **ctx.accounts.authority.try_borrow_mut_lamports()? += refund;
-
-    msg!(
-        "NameRegistry shrunk: {} -> {} bytes, refunded {} lamports",
-        current_len,
-        target,
-        refund
-    );
     Ok(())
 }
 
@@ -314,27 +275,6 @@ pub struct CreateNameRegistry<'info> {
     pub authority: Signer<'info>,
 
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct AdminShrinkNameRegistry<'info> {
-    /// Authority gate via `has_one`, migration-window gate via
-    /// `migration_active`. Inert post `finalize_migration`.
-    #[account(
-        seeds = [ARNS_CONFIG_SEED],
-        bump = config.bump,
-        has_one = authority @ crate::error::ArnsError::Unauthorized,
-        constraint = config.migration_active @ crate::error::ArnsError::MigrationInactive,
-    )]
-    pub config: Account<'info, ArnsConfig>,
-
-    /// CHECK: variable-size NameRegistry (ADR-020 dynamic-capacity).
-    /// PDA seed check ensures we only touch the canonical registry.
-    #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]

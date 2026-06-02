@@ -278,15 +278,10 @@ impl GatewaySlot {
 /// PDA: ["gateway_registry"]
 /// NOTE: Uses zero-copy for performance with large gateway counts.
 ///
-/// **Capacity is build-time configurable.** Production builds use 3,000
-/// slots (~168 KB on-chain, ~1.17 SOL rent). Devnet/testnet smoke-test
-/// builds enable `--features devnet-shrunk` to compile with 30 slots
-/// (~1.7 KB, ~0.012 SOL rent), avoiding ~57 SOL of stranded rent across
-/// the registries when smoke-testing capacity isn't needed. The on-chain
-/// account size MUST match the binary's expectation (Anchor zero-copy
-/// requires exact size match); deploying a `devnet-shrunk` binary against
-/// an account allocated for production size will panic on every
-/// `AccountLoader::load()`, and vice versa.
+/// Fixed capacity of 3,000 slots (~168 KB on-chain, ~1.17 SOL rent). The
+/// on-chain account size MUST match the binary's expectation (Anchor zero-copy
+/// requires an exact size match), so this is a compile-time constant across all
+/// clusters — staging and mainnet both use full size.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct GatewayRegistry {
@@ -294,10 +289,7 @@ pub struct GatewayRegistry {
     pub authority: Pubkey,
     pub count: u32,
     pub _padding: [u8; 4],
-    #[cfg(not(feature = "devnet-shrunk"))]
     pub gateways: [GatewaySlot; 3000],
-    #[cfg(feature = "devnet-shrunk")]
-    pub gateways: [GatewaySlot; 30],
     pub version_bytes: [u8; 3],
     pub _padding2: [u8; 5],
 }
@@ -306,10 +298,7 @@ impl GatewayRegistry {
     /// 32 (authority) + 4 (count) + 4 (_padding) + 56 (GatewaySlot) * MAX_GATEWAYS
     /// + 3 (version_bytes) + 5 (_padding2).
     pub const SIZE: usize = 32 + 4 + 4 + (56 * Self::MAX_GATEWAYS) + 3 + 5;
-    #[cfg(not(feature = "devnet-shrunk"))]
     pub const MAX_GATEWAYS: usize = 3000;
-    #[cfg(feature = "devnet-shrunk")]
-    pub const MAX_GATEWAYS: usize = 30;
 }
 
 // =========================================
@@ -911,10 +900,7 @@ pub struct Epoch {
     pub observations_closed: u8,
 
     // --- Failure tallies (u16 per gateway slot — sized to GatewayRegistry::MAX_GATEWAYS) ---
-    #[cfg(not(feature = "devnet-shrunk"))]
     pub failure_counts: [u16; 3000],
-    #[cfg(feature = "devnet-shrunk")]
-    pub failure_counts: [u16; 30],
 
     // --- Embedded prescriptions ---
     /// Observer addresses (the observer_address from Gateway, used to verify signer)
@@ -1377,17 +1363,8 @@ mod tests {
 
     #[test]
     fn epoch_size_correct() {
-        #[cfg(not(feature = "devnet-shrunk"))]
-        {
-            // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
-            assert_eq!(Epoch::SIZE, 9400);
-        }
-        #[cfg(feature = "devnet-shrunk")]
-        {
-            // 9*8 + 32 + 3*4 + 8*1 + 30*2 + 50*32*2 + 2*32 + 7 + 5 = 3460,
-            // padded to next u64 boundary = 3464.
-            assert_eq!(Epoch::SIZE, 3464);
-        }
+        // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
+        assert_eq!(Epoch::SIZE, 9400);
     }
 
     // =========================================
@@ -1770,10 +1747,7 @@ mod tests {
 
     #[test]
     fn gateway_registry_size_correct() {
-        #[cfg(not(feature = "devnet-shrunk"))]
         assert_eq!(GatewayRegistry::SIZE, 168_048);
-        #[cfg(feature = "devnet-shrunk")]
-        assert_eq!(GatewayRegistry::SIZE, 1_728);
     }
 
     // =========================================

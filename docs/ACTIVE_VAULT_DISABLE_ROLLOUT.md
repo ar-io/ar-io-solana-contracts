@@ -93,7 +93,7 @@ Dropping `payer_token_account` is an ABI change to the two claim ixs, so order:
 - [x] 4a. Restoration playbook + code-comment breadcrumbs — **#75 open** (this PR; CI green)
 - [x] 4b. Bump `clients/ts/package.json` to `0.4.0` so the release workflow is
       one-click (no version-override input needed). The next `Release clients/ts (npm)`
-      run with `cluster: staging` (or `devnet`) publishes `@ar.io/solana-contracts@0.4.0`
+      run with `cluster: staging` publishes `@ar.io/solana-contracts@0.4.0`
       under that dist-tag — that publish unblocks the SDK + frontend drafts.
 - [ ] 5. SDK draft (ar-io-sdk#640) — *blocked: bump dep to the published version, push.*
 - [ ] 6. Frontend draft (ar-io-solana-escrow-app#2) — *blocked: chained on (5).*

@@ -302,12 +302,14 @@ pub enum GarError {
     InvalidExcessWithdrawalPda,
 
     // =========================================
-    // ADMIN SHRINK (devnet-shrunk recovery)
+    // RESERVED — formerly admin-shrink (registry recovery), removed when
+    // `devnet-shrunk` was retired. Kept (unused) to preserve GarError codes
+    // so downstream decoders (cranker/observer) don't shift. Do NOT reuse.
     // =========================================
-    #[msg("Registry account is already at or below the target shrunk size")]
+    #[msg("Reserved (formerly RegistryAlreadyShrunk)")]
     RegistryAlreadyShrunk,
 
-    #[msg("Shrinking would truncate populated registry slot data")]
+    #[msg("Reserved (formerly ShrinkWouldLoseData)")]
     ShrinkWouldLoseData,
 
     // =========================================

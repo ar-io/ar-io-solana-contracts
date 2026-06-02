@@ -328,9 +328,9 @@ FAST=1 ./scripts/test-integration.sh ario-arns          # skip rebuild
 # skipping the wrapper). Requires `target/deploy/<prog>.so` aligned
 # with the source `declare_id!()` value. If you ran build-sbf.sh --sync
 # the .so is mismatched; rebuild with plain `cargo build-sbf`:
-#   cargo build-sbf --features devnet-shrunk
+#   cargo build-sbf
 #   cp programs/ario-ant-escrow/tests/fixtures/mpl_core.so target/deploy/
-#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test --features devnet-shrunk \
+#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test \
 #     -p ario-arns --test integration
 #
 # ESCROW ONLY: the `claim_*_attested` tests sign with the deterministic
@@ -339,9 +339,9 @@ FAST=1 ./scripts/test-integration.sh ario-arns          # skip rebuild
 # default features so it can never reach a deploy artifact — see
 # programs/ario-ant-escrow/Cargo.toml). Add it to BOTH the .so build and
 # the `cargo test` invocation (cargo applies it only to escrow):
-#   cargo build-sbf --features devnet-shrunk,unsafe-allow-test-attestor-pubkey
+#   cargo build-sbf --features unsafe-allow-test-attestor-pubkey
 #   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test \
-#     --features devnet-shrunk,unsafe-allow-test-attestor-pubkey \
+#     --features unsafe-allow-test-attestor-pubkey \
 #     -p ario-ant-escrow --test integration
 # The wrapper (test-integration.sh) does this automatically.
 

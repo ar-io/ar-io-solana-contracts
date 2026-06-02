@@ -94,7 +94,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-021 | Escrow Vault Re-locks Are Non-Revocable | accepted | [`0021-escrow-vault-relocks-non-revocable.md`](0021-escrow-vault-relocks-non-revocable.md) |
 | ADR-022 | Disable the Escrow Active-Vault Re-lock Path | accepted | [`0022-escrow-disable-active-vault-relock.md`](0022-escrow-disable-active-vault-relock.md) |
 | ADR-023 | `prescribe_epoch` Roulette Modulus Is the Live Registry Sum | accepted | [`0023-prescribe-live-total-weight.md`](0023-prescribe-live-total-weight.md) |
-| ADR-024 | _(reserved — "retire devnet-shrunk" PR #93, lands separately)_ | — | — |
+| ADR-024 | Retire `devnet-shrunk`, Standardize Full-Size Registries | accepted | [`0024-retire-devnet-shrunk-standardize-full-size-registries.md`](0024-retire-devnet-shrunk-standardize-full-size-registries.md) |
 | ADR-025 | Delegate Reward Share Is Keyed Off the Tally Snapshot, Not Live Delegated Stake | accepted | [`0025-delegate-share-keyed-off-tally-snapshot.md`](0025-delegate-share-keyed-off-tally-snapshot.md) |
 
 ### Numbering anomalies

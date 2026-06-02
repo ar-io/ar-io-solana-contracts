@@ -51,18 +51,6 @@ pub mod ario_arns {
         instructions::initialize::create_name_registry(ctx)
     }
 
-    /// Recovery-only: shrink an over-sized NameRegistry back to the
-    /// current binary's expected size and refund rent to authority.
-    /// Used when switching build modes (e.g. production → devnet-shrunk)
-    /// Shrink the NameRegistry to `target_capacity` slots (ADR-020).
-    /// Authority + `migration_active` gated. Refunds rent to authority.
-    pub fn admin_shrink_name_registry(
-        ctx: Context<AdminShrinkNameRegistry>,
-        target_capacity: u32,
-    ) -> Result<()> {
-        instructions::initialize::admin_shrink_name_registry(ctx, target_capacity)
-    }
-
     /// Expand the NameRegistry to `target_capacity` slots (ADR-020).
     /// Pays the rent diff from authority. Reallocs ≤10KB per call — caller
     /// invokes multiple times until the on-chain account reaches
