@@ -727,7 +727,8 @@ mod tests {
     #[test]
     fn premium_at_exact_duration_equals_base() {
         // At elapsed = duration exactly, the guard returns registration_fee
-        let cost = calculate_returned_name_premium(1000, 0, RETURNED_NAME_DURATION_SECONDS).unwrap();
+        let cost =
+            calculate_returned_name_premium(1000, 0, RETURNED_NAME_DURATION_SECONDS).unwrap();
         assert_eq!(cost, 1000);
     }
 
