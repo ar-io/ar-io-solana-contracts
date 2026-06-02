@@ -296,6 +296,98 @@ pub fn claim_delegate_from_leaving_gateway(
     Ok(())
 }
 
+/// Permissionless claim of a delegate's stake from a gateway that has DISABLED
+/// delegation (Fix #6 / WP §6.3).
+///
+/// On AO/Lua, turning off `allow_delegated_staking` auto-withdraws every
+/// delegate. Solana can't iterate delegate PDAs in a single tx, so this mirrors
+/// `claim_delegate_from_leaving_gateway` as a permissionless crank: anyone moves
+/// a delegate's stake into the delegate's OWN withdrawal vault (PDA-seeded by
+/// `delegator.key()`), so the caller can't redirect it. The operator cannot
+/// re-enable delegation until every delegate has been cranked out
+/// (`gateway.total_delegated_stake == 0`) AND the cooldown has elapsed — both
+/// enforced in `update_gateway_settings`. Unlike the leaving variant the gateway
+/// stays Joined/active; the gate is `!allow_delegated_staking`.
+pub fn claim_delegate_from_disabled_gateway(
+    ctx: Context<ClaimDelegateFromDisabledGateway>,
+) -> Result<()> {
+    let clock = Clock::get()?;
+    let gateway = &mut ctx.accounts.gateway;
+    let delegation = &mut ctx.accounts.delegation;
+
+    // Delegation must be disabled on this gateway (also enforced by the account
+    // context constraint; kept here as defense-in-depth).
+    require!(
+        !gateway.settings.allow_delegated_staking,
+        GarError::DelegationNotDisabled
+    );
+
+    // Settle pending rewards before claiming
+    settle_delegate_rewards(gateway, delegation);
+
+    let amount = delegation.amount;
+    require!(amount > 0, GarError::InvalidAmount);
+
+    // Create withdrawal for delegate
+    let withdrawal = &mut ctx.accounts.withdrawal;
+    let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.delegator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
+
+    withdrawal.owner = ctx.accounts.delegator.key();
+    withdrawal.withdrawal_id = counter.next_id;
+    withdrawal.gateway = gateway.operator;
+    withdrawal.amount = amount;
+    withdrawal.created_at = clock.unix_timestamp;
+    // Same configurable lock as withdraw_delegation / the leaving variant.
+    withdrawal.available_at = clock
+        .unix_timestamp
+        .checked_add(ctx.accounts.settings.withdrawal_period)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    withdrawal.is_delegate = true;
+    withdrawal.is_exit_vault = false;
+    withdrawal.is_protected = false;
+    withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
+
+    counter.next_id = counter
+        .next_id
+        .checked_add(1)
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    // Zero out delegation and reduce gateway totals
+    gateway.total_delegated_stake = gateway.total_delegated_stake.saturating_sub(amount);
+    delegation.amount = 0;
+
+    emit!(DelegationEvent {
+        delegator: ctx.accounts.delegator.key(),
+        gateway: gateway.operator,
+        amount: 0,
+        total: 0,
+        timestamp: clock.unix_timestamp,
+    });
+
+    // Supply counter: delegated stake moved to withdrawal
+    let settings = &mut ctx.accounts.settings;
+    settings.total_delegated = settings.total_delegated.saturating_sub(amount);
+    settings.total_withdrawn = settings
+        .total_withdrawn
+        .checked_add(amount)
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    msg!(
+        "Delegate {} claimed {} from gateway {} with delegation disabled",
+        ctx.accounts.delegator.key(),
+        amount,
+        gateway.operator
+    );
+
+    Ok(())
+}
+
 /// Redelegate stake from one gateway to another (F17)
 /// Fee = min(10% * redelegation_count, 60%) — first is free, resets every 7 days
 /// Fee goes to protocol. Net amount moves to target delegation.
@@ -726,6 +818,66 @@ pub struct ClaimDelegateFromLeavingGateway<'info> {
     /// Pays for the rent on the withdrawal counter (`init_if_needed`) and
     /// the withdrawal vault (`init`). Typically the cranker. Permissionless:
     /// any signer who's willing to cover ~0.003 SOL of rent can crank this.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Accounts for `claim_delegate_from_disabled_gateway` (Fix #6). Identical to
+/// `ClaimDelegateFromLeavingGateway` except the gateway gate is
+/// `!allow_delegated_staking` (the gateway is still Joined, not Leaving).
+#[derive(Accounts)]
+pub struct ClaimDelegateFromDisabledGateway<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, gateway.operator.as_ref()],
+        bump = gateway.bump,
+        constraint = !gateway.settings.allow_delegated_staking @ GarError::DelegationNotDisabled,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    #[account(
+        mut,
+        seeds = [DELEGATION_SEED, gateway.operator.as_ref(), delegator.key().as_ref()],
+        bump = delegation.bump,
+        constraint = delegation.delegator == delegator.key() @ GarError::NotDelegator,
+        constraint = delegation.amount > 0 @ GarError::InvalidAmount,
+    )]
+    pub delegation: Account<'info, Delegation>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = WithdrawalCounter::SIZE,
+        seeds = [WITHDRAWAL_COUNTER_SEED, delegator.key().as_ref()],
+        bump,
+    )]
+    pub withdrawal_counter: Account<'info, WithdrawalCounter>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = Withdrawal::SIZE,
+        seeds = [WITHDRAWAL_SEED, delegator.key().as_ref(), &withdrawal_counter.next_id.to_le_bytes()],
+        bump,
+    )]
+    pub withdrawal: Account<'info, Withdrawal>,
+
+    /// CHECK: the delegator's pubkey is bound by the delegation PDA seeds
+    /// (re-derived above); no signature required — the caller cannot redirect
+    /// anyone's stake by substituting a different pubkey here.
+    pub delegator: AccountInfo<'info>,
+
+    /// Pays rent on the withdrawal counter (`init_if_needed`) and vault
+    /// (`init`). Permissionless cranker.
     #[account(mut)]
     pub payer: Signer<'info>,
 

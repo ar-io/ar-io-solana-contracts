@@ -91,6 +91,9 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
         delegate_reward_share_ratio: params.delegate_reward_share_ratio as u16 * 100,
         min_delegation_amount: min_delegation,
         allowlist_enabled: false,
+        // No pending ratio change and delegation not disabled at join time.
+        pending_delegate_reward_share_ratio: None,
+        delegation_disabled_at: None,
     };
     // M3: Observer address (client passes operator key for default)
     gateway.observer_address = params.observer_address;
@@ -440,6 +443,39 @@ pub fn update_gateway_settings(
         fields_changed |= GATEWAY_SETTINGS_FIELD_NOTE;
     }
     if let Some(allow_delegated_staking) = params.allow_delegated_staking {
+        // Fix #6 (WP §6.3): read the OLD value once, branch on the transition,
+        // then write the new value. Disabling starts a cooldown and requires
+        // delegates to be cranked out (claim_delegate_from_disabled_gateway);
+        // re-enabling is gated on zero remaining delegates + cooldown elapsed.
+        let was_enabled = gateway.settings.allow_delegated_staking;
+        if !allow_delegated_staking && was_enabled {
+            // Disabling: record the timestamp that starts the re-enable cooldown.
+            // Existing delegates are NOT auto-withdrawn (no single-tx PDA scan on
+            // Solana, BD-024); the cranker moves them to withdrawal vaults via
+            // claim_delegate_from_disabled_gateway.
+            gateway.settings.delegation_disabled_at = Some(Clock::get()?.unix_timestamp);
+        } else if allow_delegated_staking && !was_enabled {
+            // Re-enabling: require all delegates withdrawn AND the cooldown
+            // elapsed, so an operator can't dump delegates then immediately
+            // re-recruit (toggle churn).
+            require!(
+                gateway.total_delegated_stake == 0,
+                GarError::DelegatesStillActive
+            );
+            if let Some(disabled_at) = gateway.settings.delegation_disabled_at {
+                // Cooldown mirrors the delegate withdrawal lock
+                // (`settings.withdrawal_period`) so the admin_set_withdrawal_period
+                // lever applies consistently to both the vaults and this gate.
+                require!(
+                    Clock::get()?.unix_timestamp
+                        >= disabled_at
+                            .checked_add(ctx.accounts.settings.withdrawal_period)
+                            .ok_or(GarError::ArithmeticOverflow)?,
+                    GarError::DelegationCooldownActive
+                );
+            }
+            gateway.settings.delegation_disabled_at = None;
+        }
         gateway.settings.allow_delegated_staking = allow_delegated_staking;
         fields_changed |= GATEWAY_SETTINGS_FIELD_ALLOW_DELEGATED_STAKING;
     }
@@ -450,7 +486,12 @@ pub fn update_gateway_settings(
             (ratio as u16) * 100 <= MAX_DELEGATE_REWARD_SHARE,
             GarError::InvalidRewardShare
         );
-        gateway.settings.delegate_reward_share_ratio = ratio as u16 * 100;
+        // Fix #7 (WP §6.3): do NOT apply immediately — stage the change so it
+        // takes effect at the next `tally_weights` (start of the following
+        // epoch). This stops an operator front-running `distribute_epoch` to
+        // change their reward split mid-epoch. The active
+        // `delegate_reward_share_ratio` is untouched until tally applies pending.
+        gateway.settings.pending_delegate_reward_share_ratio = Some(ratio as u16 * 100);
         fields_changed |= GATEWAY_SETTINGS_FIELD_DELEGATE_REWARD_SHARE_RATIO;
     }
     if let Some(min_stake) = params.min_delegate_stake {

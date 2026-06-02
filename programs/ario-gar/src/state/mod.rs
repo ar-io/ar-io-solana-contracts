@@ -111,7 +111,12 @@ pub const GATEWAY_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 #[cfg(feature = "migration-test")]
 pub const GATEWAY_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
 pub const GATEWAY_REGISTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
-pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+// 1.1.0: GatewaySettings2 gained `pending_delegate_reward_share_ratio` (Fix #7)
+// and `delegation_disabled_at` (Fix #6). Because GatewaySettings2 sits mid-struct
+// inside Gateway, this is NOT an in-place grow-then-deserialize migration — see
+// `schema_migration::migrate_gateway_version`. Existing pre-1.1.0 accounts are
+// recreated (devnet/staging full redeploy), not migrated.
+pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
 pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
@@ -417,10 +422,26 @@ pub struct GatewaySettings2 {
     /// When true, only delegates on the allowlist (or existing stakers) can delegate
     /// Matches Lua: allowedDelegatesLookup ~= nil
     pub allowlist_enabled: bool,
+    /// Fix #7 (WP §6.3): a `delegate_reward_share_ratio` change requested via
+    /// `update_gateway_settings` during an epoch is staged here and applied at
+    /// the next `tally_weights` (start of the following epoch), so an operator
+    /// can't front-run `distribute_epoch` to change their reward split. `None`
+    /// when no change is pending. Stored in basis points (0-10000), same scale
+    /// as `delegate_reward_share_ratio`.
+    pub pending_delegate_reward_share_ratio: Option<u16>,
+    /// Fix #6 (WP §6.3): timestamp (seconds) when the operator disabled
+    /// `allow_delegated_staking`. Starts the cooldown that blocks re-enabling
+    /// until all delegates have been withdrawn AND `settings.withdrawal_period`
+    /// has elapsed. `None` when delegation is enabled (or was never disabled).
+    pub delegation_disabled_at: Option<i64>,
 }
 
 impl GatewaySettings2 {
-    pub const SIZE: usize = 1 + 2 + 8 + 1;
+    // 1 (allow_delegated_staking) + 2 (delegate_reward_share_ratio)
+    // + 8 (min_delegation_amount) + 1 (allowlist_enabled)
+    // + 3 (pending_delegate_reward_share_ratio: Option<u16>, max)
+    // + 9 (delegation_disabled_at: Option<i64>, max)
+    pub const SIZE: usize = 1 + 2 + 8 + 1 + 3 + 9;
 }
 
 /// Gateway weights for epoch observer selection and reward distribution
@@ -1325,7 +1346,9 @@ mod tests {
     #[test]
     fn gateway_settings2_size_correct() {
         // 1 + 2 + 8 + 1 = 12 (auto_stake removed in cfc7a8b)
-        assert_eq!(GatewaySettings2::SIZE, 12);
+        // + 3 (pending_delegate_reward_share_ratio: Option<u16>, Fix #7)
+        // + 9 (delegation_disabled_at: Option<i64>, Fix #6) = 24
+        assert_eq!(GatewaySettings2::SIZE, 24);
     }
 
     #[test]
@@ -1634,6 +1657,8 @@ mod tests {
                 delegate_reward_share_ratio: 500,
                 min_delegation_amount: 10_000_000,
                 allowlist_enabled: false,
+                pending_delegate_reward_share_ratio: None,
+                delegation_disabled_at: None,
             },
             registry_index: RegistryIndex::default(),
             observer_address: Pubkey::default(),
@@ -1679,6 +1704,8 @@ mod tests {
                 delegate_reward_share_ratio: 500,
                 min_delegation_amount: 10_000_000,
                 allowlist_enabled: false,
+                pending_delegate_reward_share_ratio: None,
+                delegation_disabled_at: None,
             },
             registry_index: RegistryIndex::default(),
             observer_address: Pubkey::default(),
@@ -1909,6 +1936,10 @@ mod tests {
                 delegate_reward_share_ratio: 0,
                 min_delegation_amount: 0,
                 allowlist_enabled: false,
+                // Some(_) so these Options serialize to their max width
+                // (3 and 9 bytes), matching the SIZE upper-bound formula.
+                pending_delegate_reward_share_ratio: Some(0),
+                delegation_disabled_at: Some(0),
             },
             registry_index: RegistryIndex::default(),
             observer_address: Pubkey::default(),

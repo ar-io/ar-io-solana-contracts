@@ -248,29 +248,47 @@ The whitepaper's claim that the minimum stake exit vault "is eligible for expedi
 
 ---
 
-### 6. Disabling Delegation — WP says auto-withdraws all delegates, code does not
+### 6. Disabling Delegation — RESOLVED
 
-**Severity: HIGH** — fundamental behavioral difference
+**Status: FIXED** — disabling delegation now forces delegates out and gates re-enable
 
 | | Whitepaper (§6.3) | Code |
 |--|-----------|------|
-| Claim | "If a gateway has delegated stakers and disables 'allow delegated staking,' **all delegates will have their tokens withdrawn**, reducing the gateway's total delegated stake to 0." | `update_gateway_settings` simply flips the boolean. No iteration, no auto-withdrawal. |
+| Disable effect | "all delegates will have their tokens withdrawn, reducing total delegated stake to 0" | Permissionless `claim_delegate_from_disabled_gateway` cranks each delegate into a withdrawal vault (Solana can't iterate PDAs in one tx) |
+| Re-enable guard | "cannot re-enable until all previous delegates have been withdrawn" | Re-enable requires `total_delegated_stake == 0` **and** a cooldown (`withdrawal_period`) since the disable timestamp |
 
-On Solana, iterating all delegate PDAs in a single transaction is architecturally infeasible (no global table scan). The code only blocks **new** delegations when the toggle is off. Existing delegations remain untouched — delegates must individually call `decrease_delegate_stake`. Documented in BD-024 (pull-based model).
+Because Solana can't iterate all delegate PDAs in a single transaction, the
+Lua "auto-withdraw all" becomes a permissionless cranking pattern (mirrors
+`claim_delegate_from_leaving_gateway`). `update_gateway_settings` records
+`delegation_disabled_at` when delegation is turned off; anyone can then crank
+`claim_delegate_from_disabled_gateway` per delegate to move stake into 30-day
+withdrawal vaults. Re-enabling is blocked until every delegate is cleared
+(`total_delegated_stake == 0`) **and** the cooldown has elapsed, preventing
+the operator from dumping delegates and immediately re-recruiting. Both new
+fields live on `GatewaySettings2` (schema 1.1.0). See FIX_PLANS.md "Fix #6".
 
-**Corollary:** The whitepaper also states "The gateway cannot re-enable delegated staking until all previous delegates have been withdrawn." The code has **no such guard** — the operator can freely toggle the boolean regardless of outstanding delegations.
+This supersedes the earlier BD-024 pull-based-model note for the disable path.
 
 ---
 
-### 7. Gateway Setting Changes — WP says deferred to next epoch, code applies immediately
+### 7. Gateway Setting Changes — RESOLVED (for `delegate_reward_share_ratio`)
 
-**Severity: MEDIUM** — affects staking economics within an epoch
+**Status: FIXED** — the reward-split change is now deferred to the next epoch
 
 | | Whitepaper (§6.3) | Code |
 |--|-----------|------|
-| Claim | "any changes made by a gateway to its delegated stake settings during an epoch **go into effect the following epoch**" | `update_gateway_settings` applies all changes immediately to the `Gateway` account. No pending/staging mechanism. |
+| `delegate_reward_share_ratio` | "changes go into effect the following epoch" | Staged in `pending_delegate_reward_share_ratio`; applied at the next `tally_weights` (epoch start), before `distribute_epoch` reads it |
+| `allow_delegated_staking` | (per-tx gate) | Immediate — see #6; deferring would let delegates keep joining after the operator decided to stop |
+| `min_delegation_amount` | (per-tx gate) | Immediate — a per-transaction minimum, no economic front-run vector |
 
-There is no `pending_settings`, no `effective_epoch`, and no next-epoch deferral in the code. When `allow_delegated_staking`, `delegate_reward_share_ratio`, or `min_delegation_amount` are changed, they take effect on the very next transaction that reads those fields.
+The economically-sensitive setting — `delegate_reward_share_ratio` — is now
+deferred so an operator can't front-run `distribute_epoch` to change their
+reward split mid-epoch. `update_gateway_settings` writes the new value to
+`pending_delegate_reward_share_ratio` (on `GatewaySettings2`, schema 1.1.0);
+`tally_weights` applies pending→active at the start of the next epoch, and
+`distribute_epoch` reads the now-epoch-stable active value. The other two
+delegation settings stay immediate by design (they're per-transaction gates,
+not epoch-economic levers). See FIX_PLANS.md "Fix #7".
 
 ---
 
@@ -350,11 +368,10 @@ Gateway weight only affects observer selection probability. All passing gateways
 | Category | Count |
 |----------|-------|
 | Parameters that match exactly | **56+** |
-| HIGH severity discrepancies | **3** (#1, #5, #6) |
+| HIGH severity discrepancies | **2** (#1, #5) |
 | MEDIUM severity discrepancies | **1** (#4) |
 | LOW / informational | **6** (#8-#13) |
-| Resolved | **2** (#2 — RNP formula; #3 — primary name fee) |
-| Code fix planned | **2** (#6 — disable delegation; #7 — deferred reward share) |
+| Resolved | **4** (#2 — RNP formula; #3 — primary name fee; #6 — disable delegation; #7 — deferred reward-share ratio) |
 
 ### Actionable Items — Resolve by Updating Whitepaper or Code
 
@@ -365,6 +382,6 @@ Gateway weight only affects observer selection probability. All passing gateways
 | ~~3~~ | ~~Primary name fee ignores purchase type~~ | **RESOLVED** — code updated | `FIX_PLANS.md` #3 |
 | 4 | Undername max length: WP ambiguous, Code=61 | No action — WP and Lua both consistent with 61 | — |
 | 5 | Protected exit vault not expeditable | Update WP §6.6 — code is correct (BD-102) | — |
-| 6 | Disabling delegation doesn't auto-withdraw | **Fix code** — new `claim_delegate_from_disabled_gateway` + 30-day cooldown | `FIX_PLANS.md` #6 |
-| 7 | Gateway settings apply immediately | **Fix code** — defer `delegate_reward_share_ratio` via pending field | `FIX_PLANS.md` #7 |
+| ~~6~~ | ~~Disabling delegation doesn't auto-withdraw~~ | **RESOLVED** — `claim_delegate_from_disabled_gateway` + zero-stake/cooldown re-enable guard | `FIX_PLANS.md` #6 |
+| ~~7~~ | ~~Gateway settings apply immediately~~ | **RESOLVED** — `delegate_reward_share_ratio` deferred to next epoch via tally | `FIX_PLANS.md` #7 |
 | 8 | 8 chosen names not enforced on-chain | Informational — off-chain observer norm | — |

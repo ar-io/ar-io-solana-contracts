@@ -193,6 +193,14 @@ spec for v3.0.0.
 
 ## Fix #7 — Defer `delegate_reward_share_ratio` to Next Epoch
 
+> **Status: IMPLEMENTED** (bundled with Fix #6). As-built deviations from the
+> plan below: the field `pending_delegate_reward_share_ratio` was added to
+> **`GatewaySettings2`** (the `gateway.settings` sub-struct), not as a top-level
+> `Gateway` field. Schema bumped `GATEWAY_VERSION` 1.0.0 → 1.1.0. Because
+> `GatewaySettings2` is mid-struct, there is **no in-place migration** — devnet/
+> staging are fully redeployed (pre-mainnet), so `migrate_gateway` does not
+> handle 1.0.0 → 1.1.0. Tally application + tests as described.
+
 **Problem:** `update_gateway_settings` applies `delegate_reward_share_ratio`
 immediately. An operator can front-run `distribute_epoch` to change their
 reward split. Whitepaper says delegation settings take effect next epoch.
@@ -355,6 +363,16 @@ set, falling back to `settings`, and label it appropriately.
 ---
 
 ## Fix #6 — Disable Delegation Forces Delegate Withdrawal + 30-Day Cooldown
+
+> **Status: IMPLEMENTED** (bundled with Fix #7). As-built deviations: the field
+> `delegation_disabled_at` lives on **`GatewaySettings2`** (not top-level
+> `Gateway`). The re-enable cooldown compares against
+> **`settings.withdrawal_period`** (the configurable lever), not the
+> `WITHDRAWAL_LOCK_PERIOD` const, so it stays consistent with the delegate vault
+> lock. New errors `DelegatesStillActive`, `DelegationCooldownActive`,
+> `DelegationNotDisabled` are **appended at the end of `GarError`** to keep
+> existing error codes stable. No in-place migration (full redeploy). New
+> instruction + 8 integration tests in `ario-gar`.
 
 **Problem:** On AO/Lua, disabling `allow_delegated_staking` auto-withdraws all
 delegates and blocks re-enabling for 30 days. On Solana, the toggle just flips a

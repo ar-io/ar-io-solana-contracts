@@ -125,6 +125,19 @@ pub fn migrate_gateway_settings_version(account: &mut GatewaySettings) -> Result
 }
 
 /// Walk a `Gateway` account from its current version to `GATEWAY_VERSION`.
+///
+/// NOTE: there is intentionally **no 1.0.0 → 1.1.0 arm**. The 1.1.0 bump added
+/// fields to `GatewaySettings2`, which is embedded MID-struct inside `Gateway`
+/// (before `registry_index`, `observer_address`, `cumulative_reward_per_token`,
+/// `bump`, `version`). The grow-then-deserialize pattern this module uses only
+/// works for fields appended at the byte-end (so the zeroed tail reads as the
+/// new trailing field); a mid-struct insertion shifts every subsequent field
+/// and would be misread. A correct in-place migration would require reading the
+/// old layout via a shadow struct. Since 1.1.0 ships pre-mainnet with a full
+/// devnet/staging redeploy, pre-1.1.0 gateways are **recreated, not migrated** —
+/// so `migrate_gateway` deliberately refuses 1.0.0 accounts (the `_` arm). If a
+/// future field is appended at the byte-end (after `version` moves), restore the
+/// normal arm pattern here.
 #[allow(
     clippy::never_loop,
     clippy::while_immutable_condition,
