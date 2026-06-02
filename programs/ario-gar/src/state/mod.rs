@@ -255,7 +255,17 @@ pub struct GatewaySlot {
     pub composite_weight: u64, // 8 bytes
     pub start_timestamp: i64,  // 8 bytes
     pub status: u8,            // 1 byte (see STATUS_* constants)
-    pub _padding: [u8; 7],     // 7 bytes (align struct to 8 bytes)
+    /// 1 = this gateway carried delegated stake when its weight was tallied
+    /// for the in-flight epoch; 0 = none. Written by `tally_weights`, read by
+    /// `distribute_epoch` to decide whether the delegate reward share is
+    /// carved out — independent of the *live* `total_delegated_stake` at
+    /// distribution time. This closes the reward-theft race where an operator
+    /// disables delegation and cranks every delegate into a withdrawal vault
+    /// between tally and distribution (dropping live delegated stake to 0) to
+    /// redirect the delegate share into operator_stake. See ADR-025 / BD-111.
+    /// Carved from former `_padding` — `GatewaySlot::SIZE` is unchanged.
+    pub delegated_at_tally: u8, // 1 byte
+    pub _padding: [u8; 6],     // 6 bytes (align struct to 8 bytes)
 }
 
 impl GatewaySlot {

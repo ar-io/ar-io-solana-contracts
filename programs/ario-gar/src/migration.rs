@@ -188,7 +188,10 @@ pub fn import_registry_entry_handler(
         composite_weight: weight,
         start_timestamp,
         status: GatewaySlot::STATUS_JOINED,
-        _padding: [0; 7],
+        // Set correctly at the first live tally_weights; imported gateways
+        // aren't mid-epoch at migration time.
+        delegated_at_tally: 0,
+        _padding: [0; 6],
     };
     registry.count += 1;
 

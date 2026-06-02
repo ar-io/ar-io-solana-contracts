@@ -380,6 +380,7 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
         // all referencing epochs have closed. Kept as belt-and-braces.
         if registry.gateways[idx].address == Pubkey::default() {
             registry.gateways[idx].composite_weight = 0;
+            registry.gateways[idx].delegated_at_tally = 0;
             epoch.tally_index += 1;
             continue;
         }
@@ -418,6 +419,7 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
         // need to write the gateway PDA here.
         if gateway.status != GatewayStatus::Joined {
             registry.gateways[idx].composite_weight = 0;
+            registry.gateways[idx].delegated_at_tally = 0;
             drop(gateway_data);
             epoch.tally_index += 1;
             continue;
@@ -445,6 +447,15 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
 
         // Cache composite weight in registry slot
         registry.gateways[idx].composite_weight = effective_composite;
+
+        // Snapshot whether delegated stake contributed to this weight. The
+        // delegate reward split at distribution is decided from THIS flag, not
+        // from the live `total_delegated_stake` — so an operator can't disable
+        // delegation and crank delegates out post-tally to steal their share
+        // (ADR-025 / BD-111). Tied to `effective_composite`: a gateway that
+        // joined after epoch start (composite 0) earns nothing, so its flag is
+        // irrelevant, but we record the true delegated-stake state regardless.
+        registry.gateways[idx].delegated_at_tally = u8::from(gateway.total_delegated_stake > 0);
 
         // Accumulate total
         epoch.add_composite_weight(effective_composite);
