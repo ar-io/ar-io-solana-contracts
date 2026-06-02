@@ -120,7 +120,8 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
         composite_weight: 0,
         start_timestamp: gateway.start_timestamp,
         status: GatewaySlot::STATUS_JOINED,
-        _padding: [0; 7],
+        delegated_at_tally: 0,
+        _padding: [0; 6],
     };
     registry.count = registry
         .count
@@ -1214,7 +1215,8 @@ pub fn finalize_gone<'info>(ctx: Context<'_, '_, 'info, 'info, FinalizeGone<'inf
         composite_weight: 0,
         start_timestamp: 0,
         status: GatewaySlot::STATUS_JOINED,
-        _padding: [0; 7],
+        delegated_at_tally: 0,
+        _padding: [0; 6],
     };
     registry.count = registry.count.saturating_sub(1);
 
