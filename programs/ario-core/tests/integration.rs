@@ -8302,6 +8302,214 @@ async fn test_primary_name_ignores_stale_record_lro_uses_antconfig() {
     assert_eq!(pn.name, full);
 }
 
+/// Create a fresh keypair funded with SOL + an ARIO token account holding
+/// balance, so it can both sign and pay the primary-name fee. Returns
+/// (signer, token_account_pubkey).
+async fn funded_signer_with_tokens(
+    ctx: &mut ProgramTestContext,
+    mint_pk: &solana_sdk::pubkey::Pubkey,
+    mint_authority: &Keypair,
+) -> (Keypair, solana_sdk::pubkey::Pubkey) {
+    let signer = Keypair::new();
+    fund_signer(ctx, &signer.pubkey(), 2_000_000_000).await;
+    let token = Keypair::new();
+    create_token_account(ctx, &token, mint_pk, &signer.pubkey()).await;
+    mint_tokens(ctx, mint_pk, &token.pubkey(), mint_authority, 10_000_000).await;
+    (signer, token.pubkey())
+}
+
+// -----------------------------------------------------------------
+// EXPLICIT PER-RECORD DELEGATE FRESHNESS (second Codex report)
+// `read_ant_record_owner` honors an explicit `AntRecord.owner` delegate
+// ONLY when the record is reconciled with the current ANT owner
+// (`last_reconciled_owner == AntConfig.last_known_owner`), mirroring
+// ario-ant's H-7 clear-on-transfer.
+// -----------------------------------------------------------------
+
+/// A STALE explicit delegate (set under the previous holder, record not yet
+/// reconciled after the ANT transferred) must NOT authorize primary-name
+/// ops; the current ANT owner must. Direct regression for the second
+/// Codex report.
+#[tokio::test]
+async fn test_primary_name_stale_explicit_delegate_rejected() {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+    let setup = undername_test_setup(&mut ctx).await;
+    let payer_pk = ctx.payer.pubkey();
+
+    let base_name = "delegbase";
+    let undername = "delegun";
+    let full = format!("{}_{}", undername, base_name);
+
+    let ant_asset_key = install_ant_asset(&mut ctx, &Pubkey::new_unique()).await;
+    let arns_pda = install_arns_record(
+        &mut ctx,
+        &setup.arns_program_id,
+        base_name,
+        &Pubkey::new_unique(),
+        &ant_asset_key,
+    )
+    .await;
+    let demand_factor_pda = install_demand_factor(&mut ctx, &setup.arns_program_id).await;
+
+    let (old_delegate, old_delegate_token) =
+        funded_signer_with_tokens(&mut ctx, &setup.mint_pk, &setup.mint_authority).await;
+    let (new_owner, new_owner_token) =
+        funded_signer_with_tokens(&mut ctx, &setup.mint_pk, &setup.mint_authority).await;
+
+    // old_owner: the holder who delegated the undername, before transfer.
+    let old_owner = Pubkey::new_unique();
+
+    // AntRecord: explicit delegate = old_delegate, last_reconciled_owner =
+    // old_owner — i.e. STALE relative to the post-transfer AntConfig below.
+    let ant_record_pda = install_ant_record_with_lro(
+        &mut ctx,
+        &ant_asset_key,
+        undername,
+        Some(old_delegate.pubkey()),
+        old_owner,
+    )
+    .await;
+    // AntConfig.last_known_owner = new_owner (post wrapped-transfer).
+    let ant_config = install_ant_config(&mut ctx, &ant_asset_key, &new_owner.pubkey()).await;
+
+    // --- Attempt 1: stale delegate — MUST BE REJECTED ---
+    let (pn_d, rev_d) = primary_name_pdas(&old_delegate.pubkey(), &full);
+    let metas_d = build_request_and_set_metas(
+        &setup.config_key,
+        &pn_d,
+        &rev_d,
+        &old_delegate_token,
+        &setup.protocol_token,
+        &old_delegate.pubkey(),
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_config],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx_d = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: metas_d,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: full.clone(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(&full),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &old_delegate],
+        bh,
+    );
+    let res_d = ctx.banks_client.process_transaction(tx_d).await;
+    assert_anchor_error!(res_d, ArioError::NotAntHolder);
+
+    // --- Attempt 2: current ANT owner — MUST SUCCEED ---
+    let (pn_n, rev_n) = primary_name_pdas(&new_owner.pubkey(), &full);
+    let metas_n = build_request_and_set_metas(
+        &setup.config_key,
+        &pn_n,
+        &rev_n,
+        &new_owner_token,
+        &setup.protocol_token,
+        &new_owner.pubkey(),
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_config],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx_n = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: metas_n,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: full.clone(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(&full),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &new_owner],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx_n).await.unwrap();
+    let pn_acct = ctx.banks_client.get_account(pn_n).await.unwrap().unwrap();
+    let pn = PrimaryName::try_deserialize(&mut pn_acct.data.as_slice()).unwrap();
+    assert_eq!(pn.owner, new_owner.pubkey());
+}
+
+/// Companion: a FRESH explicit delegate (`last_reconciled_owner ==
+/// AntConfig.last_known_owner`) — a genuine per-undername delegation set by
+/// the current holder — IS honored even though the delegate is not the ANT
+/// owner. Proves the freshness gate doesn't over-reject legitimate delegates.
+#[tokio::test]
+async fn test_primary_name_fresh_explicit_delegate_authorized() {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+    let setup = undername_test_setup(&mut ctx).await;
+    let payer_pk = ctx.payer.pubkey();
+
+    let base_name = "freshbase";
+    let undername = "freshun";
+    let full = format!("{}_{}", undername, base_name);
+
+    let current_owner = Pubkey::new_unique();
+    let ant_asset_key = install_ant_asset(&mut ctx, &current_owner).await;
+    let arns_pda = install_arns_record(
+        &mut ctx,
+        &setup.arns_program_id,
+        base_name,
+        &Pubkey::new_unique(),
+        &ant_asset_key,
+    )
+    .await;
+    let demand_factor_pda = install_demand_factor(&mut ctx, &setup.arns_program_id).await;
+
+    let (delegate, delegate_token) =
+        funded_signer_with_tokens(&mut ctx, &setup.mint_pk, &setup.mint_authority).await;
+
+    // FRESH: last_reconciled_owner == AntConfig.last_known_owner == current_owner,
+    // and the current holder delegated this undername to `delegate`.
+    let ant_record_pda = install_ant_record_with_lro(
+        &mut ctx,
+        &ant_asset_key,
+        undername,
+        Some(delegate.pubkey()),
+        current_owner,
+    )
+    .await;
+    let ant_config = install_ant_config(&mut ctx, &ant_asset_key, &current_owner).await;
+
+    let (pn_key, rev_key) = primary_name_pdas(&delegate.pubkey(), &full);
+    let metas = build_request_and_set_metas(
+        &setup.config_key,
+        &pn_key,
+        &rev_key,
+        &delegate_token,
+        &setup.protocol_token,
+        &delegate.pubkey(),
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_config],
+    );
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: metas,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: full.clone(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(&full),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &delegate],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let pn_acct = ctx.banks_client.get_account(pn_key).await.unwrap().unwrap();
+    let pn = PrimaryName::try_deserialize(&mut pn_acct.data.as_slice()).unwrap();
+    assert_eq!(pn.owner, delegate.pubkey());
+}
+
 // -----------------------------------------------------------------
 // 1. Undername owner can set primary name (instant path).
 // -----------------------------------------------------------------

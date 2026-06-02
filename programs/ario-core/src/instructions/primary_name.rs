@@ -218,34 +218,38 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
 /// pass `ario_ant::ID`, so the canonical-only constraint is operationally
 /// transparent today.
 ///
-/// Returns the **effective owner** of an `AntRecord`:
-///   * `owner` field if `Some(_)` (explicit per-record delegate),
-///   * `AntConfig.last_known_owner` otherwise — the **ANT-level** owner
-///     snapshot read from the `AntConfig` PDA passed as `ant_config_info`.
+/// Returns the **effective owner** of an `AntRecord`, mirroring
+/// `ario_ant`'s own reconciliation invariant. Let
+/// `lko = AntConfig.last_known_owner` (the ANT-level current-owner snapshot
+/// read from `ant_config_info`) and `lro = AntRecord.last_reconciled_owner`:
+///   * record STALE (`lro != lko`): return `lko`. The NFT changed hands
+///     since the record was last reconciled, so BOTH the per-record `owner`
+///     delegate and `lro` are stale — ignore them and authorize only the
+///     current ANT owner.
+///   * record FRESH (`lro == lko`): return the explicit per-record `owner`
+///     delegate if `Some(_)`, else `lko`.
 ///
-/// Why the ANT-level fallback (security): `ario_ant` initializes records
-/// with `owner = None` (the spawn flow sets no delegate — the NFT holder
-/// is the implicit owner). ario-core is MPL-agnostic per ADR-016 and
-/// can't read the live NFT owner, so it must trust an owner snapshot
-/// maintained by the ANT program. The **right** snapshot is
-/// `AntConfig.last_known_owner`, which `ario_ant::transfer` updates
-/// atomically on every wrapped transfer (and `reconcile` refreshes
-/// permissionlessly after a direct MPL transfer).
+/// Why (security): ario-core is MPL-agnostic per ADR-016 and can't read the
+/// live NFT owner, so it must trust the ANT program's snapshots.
+/// `AntConfig.last_known_owner` is updated atomically by `ario_ant::transfer`
+/// on every wrapped transfer (and `reconcile` refreshes it permissionlessly
+/// after a direct MPL transfer). `ario_ant`'s H-7 logic clears a record's
+/// `owner` delegate whenever `lro != lko` on the next touch, so gating on
+/// `lro == lko` is exactly ario-ant's own freshness test, applied read-only.
 ///
-/// The earlier version of this helper fell back to the per-record
-/// `AntRecord.last_reconciled_owner`, which is the WRONG granularity:
-/// the wrapped `transfer` ix updates `AntConfig.last_known_owner` but
-/// touches no `AntRecord`, so every record's `last_reconciled_owner`
-/// stayed stale until a later per-record op reconciled it. That left a
-/// window where the **previous** NFT holder retained authority to set,
-/// approve, or remove primary-name / reverse records on a name they no
-/// longer controlled (and undername records were never reachable by the
-/// transfer at all). Reading `AntConfig.last_known_owner` closes that
-/// window uniformly for `@` and every undername. The only residual
-/// staleness is after a *direct* (non-wrapped) MPL transfer, until the
-/// permissionless `ario_ant::reconcile` runs — the same irreducible
-/// window the rest of the protocol already has, and identical for the
-/// `@` record and undernames.
+/// This closes two stale-authorization windows that an NFT transfer opens
+/// before any `ario_ant` op reconciles the specific record:
+///   1. the **implicit** owner (`owner = None`): the previous version fell
+///      back to the per-record `lro`, which the wrapped `transfer` never
+///      updates (it touches no `AntRecord`), so the previous holder kept
+///      authority on `@` and every undername;
+///   2. the **explicit** stale delegate (`owner = Some(old_delegate)`): a
+///      per-undername delegation set under the previous holder, not yet
+///      cleared by `ario_ant`.
+/// The only residual staleness is after a *direct* (non-wrapped) MPL
+/// transfer, until the permissionless `ario_ant::reconcile` refreshes
+/// `lko` — the same irreducible window the rest of the protocol already
+/// has, identical for `@` and undernames.
 ///
 /// Borsh layout (mirrors `ario_ant::state::AntRecord` — keep in sync with
 /// `programs/ario-ant/src/state.rs`):
@@ -257,23 +261,23 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
 ///   4     ttl_seconds: u32
 ///   1+[4] priority: Option<u32> (0x00 = None, 0x01 + u32 = Some)
 ///   1+[32] owner: Option<Pubkey> (0x00 = None, 0x01 + 32 bytes = Some)
-///   32    last_reconciled_owner: Pubkey — NOT read here (see
-///         `read_ant_config_last_known_owner` for the real fallback)
+///   32    last_reconciled_owner: Pubkey — read for the freshness gate
 ///   1     bump — not read here
 ///
-/// This helper parses the `AntRecord` only up to and including `owner`;
-/// the implicit-owner fallback is sourced from the `AntConfig` PDA via
-/// `read_ant_config_last_known_owner`. The layout-pin test
-/// `test_ant_record_layout_parse_pin` exercises this parser end-to-end.
-/// If `AntRecord` field order changes before `owner` (inclusive), that
-/// test fails — refresh this helper and its comment.
+/// This helper parses the `AntRecord` up to and including
+/// `last_reconciled_owner`, and reads `last_known_owner` from the
+/// `AntConfig` PDA via `read_ant_config_last_known_owner`. The layout-pin
+/// test `test_ant_record_layout_parse_pin` exercises this parser
+/// end-to-end. If `AntRecord` field order changes before
+/// `last_reconciled_owner` (inclusive), that test fails — refresh this
+/// helper and its comment.
 ///
 /// Conformance: third-party ANT programs MUST keep AntRecord's prefix
 /// (mint, undername, target, target_protocol, ttl_seconds, priority,
-/// owner) byte-compatible with the canonical `ario_ant`, AND maintain an
-/// `AntConfig` PDA with a byte-compatible `last_known_owner` (see
-/// `read_ant_config_last_known_owner`). Anything else makes them
-/// invisible to ario-core's BD-097 path.
+/// owner, last_reconciled_owner) byte-compatible with the canonical
+/// `ario_ant`, AND maintain an `AntConfig` PDA with a byte-compatible
+/// `last_known_owner` (see `read_ant_config_last_known_owner`). Anything
+/// else makes them invisible to ario-core's BD-097 path.
 fn read_ant_record_owner(
     ant_record_info: &AccountInfo,
     ant_config_info: &AccountInfo,
@@ -382,8 +386,8 @@ fn read_ant_record_owner(
 
     // owner: Option<Pubkey> — explicit per-record delegate.
     require!(data.len() > offset, ArioError::InvalidAccountState);
-    let explicit_owner = if data[offset] == 0 {
-        None
+    let (explicit_owner, owner_size) = if data[offset] == 0 {
+        (None, 1usize)
     } else {
         let owner_end = offset
             .checked_add(1)
@@ -392,18 +396,46 @@ fn read_ant_record_owner(
         require!(data.len() >= owner_end, ArioError::InvalidAccountState);
         let owner = Pubkey::try_from(&data[offset + 1..offset + 33])
             .map_err(|_| error!(ArioError::InvalidAccountState))?;
-        Some(owner)
+        (Some(owner), 33usize)
     };
+    offset = offset
+        .checked_add(owner_size)
+        .ok_or(ArioError::InvalidAccountState)?;
 
-    // Effective owner. An explicit per-record delegate (`owner = Some`)
-    // takes precedence; otherwise fall back to the ANT-level
-    // `AntConfig.last_known_owner` snapshot — NOT the per-record
-    // `last_reconciled_owner`, which goes stale after a wrapped transfer
-    // and reopens the previous-holder authorization window. See the
-    // helper doc-comment above.
-    match explicit_owner {
-        Some(owner) => Ok(owner),
-        None => read_ant_config_last_known_owner(ant_config_info, ant_mint, ant_program),
+    // last_reconciled_owner: Pubkey — the ANT owner at the record's last
+    // `ario_ant` reconciliation. A record is FRESH iff this equals the
+    // ANT-level `AntConfig.last_known_owner`; if they differ the record is
+    // stale (the NFT transferred and no `ario_ant` op has touched this
+    // record yet), and per `ario_ant`'s own H-7 logic its `owner` delegate
+    // would be cleared on the next touch.
+    let lro_end = offset
+        .checked_add(32)
+        .ok_or(ArioError::InvalidAccountState)?;
+    require!(data.len() >= lro_end, ArioError::InvalidAccountState);
+    let last_reconciled_owner = Pubkey::try_from(&data[offset..lro_end])
+        .map_err(|_| error!(ArioError::InvalidAccountState))?;
+
+    // The ANT-level current-owner snapshot, kept fresh by `ario_ant::transfer`.
+    let last_known_owner =
+        read_ant_config_last_known_owner(ant_config_info, ant_mint, ant_program)?;
+
+    // Effective owner, mirroring `ario_ant`'s reconciliation invariant:
+    //
+    //   * If the record is STALE (`last_reconciled_owner != last_known_owner`),
+    //     the NFT has changed hands since the record was last reconciled.
+    //     Ignore BOTH the per-record `owner` delegate (set under the old
+    //     holder — `ario_ant` will clear it on next touch) AND the stale
+    //     `last_reconciled_owner`; authorize only the current ANT owner.
+    //     This closes the stale-delegate AND stale-implicit-owner windows
+    //     uniformly, WITHOUT ario-core reading the MPL Core asset (ADR-016).
+    //
+    //   * If the record is FRESH, honor an explicit `owner` delegate (a
+    //     genuine per-undername delegation set by the current holder), else
+    //     fall back to the current ANT owner.
+    if last_reconciled_owner != last_known_owner {
+        Ok(last_known_owner)
+    } else {
+        Ok(explicit_owner.unwrap_or(last_known_owner))
     }
 }
 
@@ -1247,8 +1279,10 @@ pub struct RemovePrimaryNameForBaseName<'info> {
     #[account(mut, constraint = original_owner.key() == primary_name.owner @ ArioError::InvalidParameter)]
     pub original_owner: UncheckedAccount<'info>,
 
-    /// The ANT NFT holder (must hold the Metaplex Core asset for the ArNS name — validated in handler).
-    /// Client must pass ArnsRecord as remaining_accounts[0] and ANT asset as remaining_accounts[1].
+    /// The ANT NFT holder (authorized as the effective AntRecord owner for
+    /// the base name's `@` undername — validated in handler).
+    /// Client must pass remaining_accounts: [0] ArnsRecord PDA,
+    /// [1] AntRecord PDA (`@`), [2] AntConfig PDA (ANT-level owner snapshot).
     #[account(mut)]
     pub name_owner: Signer<'info>,
 }
@@ -1806,7 +1840,9 @@ pub struct RequestAndSetPrimaryNameFromFundingPlan<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     // Remaining accounts layout (after fixed accounts above):
-    //   1. validation_account_count: ArnsRecord + DemandFactor (2 accounts)
+    //   1. validation_account_count: ArnsRecord + DemandFactor + AntRecord
+    //      + AntConfig (4 accounts) — the AntRecord/AntConfig pair drives
+    //      effective-owner authorization (see `read_ant_record_owner`).
     //   2. Per source (in `sources` declaration order):
     //        - Balance:        0 slots
     //        - Delegation:     2 slots [gateway_pda, delegation_pda]

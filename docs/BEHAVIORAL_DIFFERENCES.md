@@ -202,7 +202,7 @@ These differences arise from design decisions about how to represent AO construc
 | | |
 |---|---|
 | **Lua Behavior** | `primaryNames.createPrimaryNameRequest` checks if `record.processId == initiator`. If so, it calls `primaryNames.setPrimaryNameFromRequest` immediately (auto-approve). Otherwise, it stores a request for asynchronous approval. This is a single function with a conditional branch. |
-| **Solana Behavior** | Two separate instructions: (1) `request_primary_name` — always creates a PrimaryNameRequest PDA for asynchronous approval. (2) `request_and_set_primary_name` — verifies the caller is the ANT NFT holder (reads Metaplex Core asset via `remaining_accounts[2]`) and sets the primary name immediately (no request PDA created). Both charge the same fee (base_fee * demand_factor). |
+| **Solana Behavior** | Two separate instructions: (1) `request_primary_name` — always creates a PrimaryNameRequest PDA for asynchronous approval. (2) `request_and_set_primary_name` — authorizes the caller as the effective ANT owner for the name's undername (`@` for base names): the explicit per-record `AntRecord.owner` delegate if set, else the ANT-level `AntConfig.last_known_owner` snapshot — both read from canonical `ario_ant` PDAs passed as `remaining_accounts` `[2]` (AntRecord) + `[3]` (AntConfig), not the Metaplex Core asset directly (see BD-097/BD-109). Sets the primary name immediately (no request PDA created). Both charge the same fee (base_fee * demand_factor). |
 | **Rationale** | Solana requires different account contexts for the two paths. `request_and_set_primary_name` needs PrimaryName + PrimaryNameReverse init, while `request_primary_name` needs PrimaryNameRequest init. Separating them avoids paying for unused account allocations. Authorization via ANT NFT holder matches Lua's `record.processId == initiator` semantics (see BD-095). |
 
 ### BD-031: Primary Name Request Fee — Implemented (2026-05-04)
@@ -600,7 +600,7 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | | |
 |---|---|
 | **Lua Behavior** | `primaryNames.approvePrimaryNameRequest`: only `record.processId == from` can approve — the ArNS record's process ID (ANT) must match the approver. |
-| **Solana Behavior** | `approve_primary_name`, `request_and_set_primary_name`, and `remove_primary_name_for_base_name` all require the signer to be the ANT NFT holder (reads Metaplex Core asset from `remaining_accounts`). The `ArnsRecord.owner` field is not checked for authorization. |
+| **Solana Behavior** | `approve_primary_name`, `request_and_set_primary_name`, and `remove_primary_name_for_base_name` authorize the signer as the effective ANT owner resolved from **canonical `ario_ant` state**, not the Metaplex Core asset directly (ario-core is MPL-agnostic per ADR-016). `read_ant_record_owner` / `read_ant_config_last_known_owner` are hard-pinned to `ario_ant::ID` and return: the explicit per-record `AntRecord.owner` delegate **only when the record is reconciled** (`last_reconciled_owner == AntConfig.last_known_owner`), otherwise the ANT-level `AntConfig.last_known_owner`. The `ArnsRecord.owner` field is not checked. See BD-097 (layout + freshness gate) and BD-109 (the canonical-only / BYO-ANT limitation). |
 | **Rationale** | Matches Lua semantics where `record.processId` (the ANT) is the sole authority. On Solana, ANTs are Metaplex Core NFTs, so "holding the ANT" means being the NFT holder. This ensures name authority transfers naturally when the ANT is sold on a marketplace. See BD-095 for the broader ArNS auth model. |
 
 ### BD-093: ArNS Name Validation — Lowercase Enforcement
@@ -641,12 +641,12 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | | |
 |---|---|
 | **Lua Behavior** | Only the ANT process owner could create/approve a primary name request (per BD-092). Undername records had no separate owner concept — there was just the ANT's process ID. |
-| **Solana Behavior** | `request_and_set_primary_name` and `approve_primary_name` accept either the ANT NFT holder (existing path) **or** the `AntRecord.owner` for that undername, when the requested name is an undername (contains `_`). Base names still require ANT-holder auth. The fallback branch reads `remaining_accounts[3]` (request_and_set) / `remaining_accounts[2]` (approve) as the `AntRecord` PDA, validates owner program + PDA derivation + discriminator + Borsh layout, and requires `Some(owner) == initiator`. Lazy reconciliation in ario-ant clears `AntRecord.owner` whenever the NFT is observed to have transferred, so a stale record owner can never override a new ANT holder. |
-| **Rationale** | Solana ANTs introduce a new actor — the per-undername record owner — distinct from the AO model where the ANT process was the sole authority. Letting the record owner set a primary name for *their* undername without going through the ANT holder lets undername delegations be useful for personal naming (e.g. an ANT holder grants `alice_company.ar` to Alice; Alice can claim that as her primary name without contacting the holder for every request). Always-pass policy in the SDK (`requestPrimaryName` always supplies the AntRecord PDA for undernames) avoids an extra RPC fetch to detect NFT ownership; ANT-holder callers simply ignore the slot. See ADR coverage in `PLAN_undername_primary_name.md`. |
+| **Solana Behavior** | `request_and_set_primary_name`, `approve_primary_name`, and `remove_primary_name_for_base_name` authorize the **effective owner** of the name's `AntRecord` (the `@` record for base names, the undername record otherwise), computed by `read_ant_record_owner` from two canonical `ario_ant` accounts: the `AntRecord` PDA (`remaining_accounts[2]` for request_and_set, `[1]` for approve/remove) and the `AntConfig` PDA (`[3]` / `[2]`). Both are validated (owner program == `ario_ant::ID`, PDA derivation, discriminator, Borsh layout). The effective owner mirrors ario-ant's reconciliation invariant: if the record is **stale** (`AntRecord.last_reconciled_owner != AntConfig.last_known_owner`, i.e. the NFT transferred and no ario-ant op has touched this record yet) it is `AntConfig.last_known_owner` (the current ANT owner) — the stale per-record `owner` delegate and stale `last_reconciled_owner` are both ignored; if the record is **reconciled**, it is the explicit `AntRecord.owner` delegate when set, else `AntConfig.last_known_owner`. So a former delegate (or former holder) can never override the current ANT owner once the wrapped `ario_ant::transfer` has run. |
+| **Rationale** | Solana ANTs introduce a new actor — the per-undername record owner — distinct from the AO model where the ANT process was the sole authority. Letting a *reconciled* record owner set a primary name for *their* undername without going through the ANT holder lets undername delegations be useful for personal naming (e.g. an ANT holder grants `alice_company.ar` to Alice; Alice can claim that as her primary name without contacting the holder for every request). The freshness gate (`last_reconciled_owner == last_known_owner`) is exactly ario-ant's own H-7 clear-on-transfer test applied read-only, closing the post-transfer stale-delegate and stale-implicit-owner windows without ario-core reading the MPL Core asset (ADR-016). `AntConfig.last_known_owner` — not the per-record `last_reconciled_owner` — is the implicit-owner source because the wrapped `transfer` updates the former immediately but touches no `AntRecord`. See BD-109 for the canonical-`ario_ant`-only (BYO-ANT) limitation. Always-pass policy in the SDK supplies the AntRecord + AntConfig PDAs for the relevant name; ANT-holder callers are covered by the same path. See `PLAN_undername_primary_name.md`. |
 
 ---
 
-### BD-097: Stake-Funded ArNS Variants Defer Trait Sync
+### BD-110: Stake-Funded ArNS Variants Defer Trait Sync
 
 | | |
 |---|---|
@@ -798,7 +798,7 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | Primary Name Authorization | 2 (BD-097, BD-109) |
 | ANT Program Routing | 1 (BD-100) |
 | Cranker Protocol | 1 (BD-101) |
-| **Total** | **76** |
+| **Total** | **77** |
 
 ---
 
