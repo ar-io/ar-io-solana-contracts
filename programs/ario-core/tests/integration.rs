@@ -972,7 +972,10 @@ fn build_ant_config_data(
     push_str(&mut data, "test");
     push_str(&mut data, "ant");
     data.extend_from_slice(last_known_owner.as_ref()); // last_known_owner
-    data.push(253); // bump
+                                                       // canonical mint-specific bump (not parsed by ario-core, but keeps the
+                                                       // fixture internally consistent with its PDA).
+    let (_, bump) = Pubkey::find_program_address(&[b"ant_config", mint.as_ref()], &ario_ant::ID);
+    data.push(bump); // bump
     data.extend_from_slice(&[1, 0, 0]); // version 1.0.0 — not parsed
     data
 }
