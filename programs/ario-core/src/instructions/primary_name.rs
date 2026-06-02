@@ -283,6 +283,18 @@ fn read_ant_record_owner(
 ) -> Result<Pubkey> {
     // SECURITY: pin to the canonical ARIO-ANT program. See helper
     // doc-comment above for the spoofing attack this closes.
+    //
+    // BYO-ANT LIMITATION (BD-109): this pin — plus the `ario_ant`-specific
+    // `AntConfig` PDA read in `read_ant_config_last_known_owner` — means the
+    // primary-name flows (request_and_set / approve / remove_for_base_name
+    // and the _from_funding_plan variant) are canonical-ANT-only. A
+    // third-party "bring your own" ANT program (named via the asset's
+    // `ANT Program` Attributes trait, BD-100) cannot drive these flows; nor
+    // can it drive ario-arns reassign/release, which read the MPL Core owner
+    // directly (BD-106). BD-100's pluggable routing applies to READ paths
+    // only today. Lifting this requires resolving the asset's `ANT Program`
+    // trait here and routing owner-resolution to that program's
+    // byte-compatible AntRecord/AntConfig snapshot — an ADR-016 follow-up.
     require!(*ant_program == ario_ant::ID, ArioError::InvalidAccountState);
 
     require!(
