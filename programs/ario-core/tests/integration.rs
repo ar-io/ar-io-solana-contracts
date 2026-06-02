@@ -961,6 +961,19 @@ async fn install_ant_asset(
     nft_owner: &solana_sdk::pubkey::Pubkey,
 ) -> solana_sdk::pubkey::Pubkey {
     let key = Pubkey::new_unique();
+    install_ant_asset_at(ctx, &key, nft_owner).await;
+    key
+}
+
+/// Helper: install an ANT Metaplex Core asset (AssetV1) at a SPECIFIC address
+/// with the given live NFT owner. The security fix to `read_ant_record_owner`
+/// requires the asset's key to equal the ANT mint, so callers that wire an
+/// AntRecord (PDA seeded by the mint) must install the asset at that mint.
+async fn install_ant_asset_at(
+    ctx: &mut ProgramTestContext,
+    key: &solana_sdk::pubkey::Pubkey,
+    nft_owner: &solana_sdk::pubkey::Pubkey,
+) {
     let data = build_mpl_core_asset_data(nft_owner);
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let account = solana_sdk::account::Account {
@@ -970,8 +983,7 @@ async fn install_ant_asset(
         executable: false,
         rent_epoch: 0,
     };
-    ctx.set_account(&key, &account.into());
-    key
+    ctx.set_account(key, &account.into());
 }
 
 /// Helper: install an ArNS record (Permabuy) for `name` with the given record_owner and ANT.
@@ -1083,6 +1095,15 @@ async fn inject_arns_accounts(
     // as the recorded owner. This is what the reshaped handlers authenticate
     // against (caller == AntRecord.owner) for base-name primary names.
     let ant_record_at_at = install_ant_record(ctx, &ant_mint_key, "@", Some(*nft_holder)).await;
+
+    // Install the Metaplex Core asset (AssetV1) AT the ant mint address with
+    // `nft_holder` as the live NFT owner. The security fix to
+    // `read_ant_record_owner` reads the CURRENT NFT holder live from this
+    // asset for `owner = None` records; it requires the asset's key to equal
+    // the ant mint, so we install it at `ant_mint_key`. For `owner = Some(_)`
+    // records the asset is never read but the handlers' length checks still
+    // require it to be present at the asset slot.
+    install_ant_asset_at(ctx, &ant_mint_key, nft_holder).await;
 
     (
         arns_record_pda,
@@ -1559,8 +1580,9 @@ async fn test_primary_name_uniqueness() {
 
     let name = "testname";
 
-    // Inject fake ArNS record owned by user A (payer)
-    let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+    // Inject fake ArNS record owned by user A (payer). `ant_record_at` is the
+    // AntRecord at "@"; `ant_mint_key` is the MPL asset slot.
+    let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await;
 
     // User A: RequestAndSetPrimaryName for "testname"
@@ -1592,7 +1614,11 @@ async fn test_primary_name_uniqueness() {
         false,
     ));
     account_metas_a.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key,
+        ant_record_at,
+        false,
+    ));
+    account_metas_a.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -1644,7 +1670,7 @@ async fn test_primary_name_uniqueness() {
     .await;
 
     // Update ArNS record to be owned by user B
-    let (arns_record_pda_b, demand_factor_pda_b, ant_asset_key_b, _) =
+    let (arns_record_pda_b, demand_factor_pda_b, ant_record_at_b, ant_mint_key_b) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &user_b.pubkey()).await;
 
     let (primary_name_key_b, _) = Pubkey::find_program_address(
@@ -1672,7 +1698,11 @@ async fn test_primary_name_uniqueness() {
         false,
     ));
     account_metas_b.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key_b,
+        ant_record_at_b,
+        false,
+    ));
+    account_metas_b.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key_b,
         false,
     ));
 
@@ -2596,8 +2626,10 @@ async fn test_approve_primary_name() {
     );
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Inject ArNS record with ANT owned by name_owner (NOT the payer/initiator)
-    let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+    // Inject ArNS record with ANT owned by name_owner (NOT the payer/initiator).
+    // `ant_record_at` is the AntRecord PDA at "@"; `ant_mint_key` doubles as the
+    // MPL asset address (the asset slot the security fix requires).
+    let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &name_owner.pubkey()).await;
 
     // Step 1: Create a PrimaryNameRequest (from payer as initiator)
@@ -2665,7 +2697,11 @@ async fn test_approve_primary_name() {
         false,
     ));
     approve_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key,
+        ant_record_at,
+        false,
+    ));
+    approve_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -2766,7 +2802,7 @@ async fn test_approve_primary_name_expired() {
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
     // Inject ArNS record with ANT owned by name_owner
-    let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+    let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &name_owner.pubkey()).await;
 
     // Create a PrimaryNameRequest
@@ -2843,7 +2879,11 @@ async fn test_approve_primary_name_expired() {
         false,
     ));
     approve_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key,
+        ant_record_at,
+        false,
+    ));
+    approve_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -2899,7 +2939,7 @@ async fn test_remove_primary_name() {
     let name = "testname";
 
     // Inject ArNS record owned by payer (so we can use RequestAndSetPrimaryName)
-    let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+    let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await;
 
     // Set primary name via RequestAndSetPrimaryName (auto-approve since payer holds the ANT)
@@ -2931,7 +2971,11 @@ async fn test_remove_primary_name() {
         false,
     ));
     set_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key,
+        ant_record_at,
+        false,
+    ));
+    set_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -3079,6 +3123,9 @@ async fn test_remove_primary_name_for_base_name() {
         ant_record_alice,
         false,
     ));
+    set_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint, false,
+    ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -3129,6 +3176,9 @@ async fn test_remove_primary_name_for_base_name() {
     remove_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         ant_record_at_at,
         false,
+    ));
+    remove_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint, false,
     ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -3745,7 +3795,7 @@ async fn test_request_and_set_primary_name() {
     let name = "myarnsname";
 
     // Inject ArNS record with ANT owned by payer (so auto-approve works via ANT holder)
-    let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+    let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await;
 
     // Record balances before
@@ -3781,7 +3831,11 @@ async fn test_request_and_set_primary_name() {
         false,
     ));
     account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key,
+        ant_record_at,
+        false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -4579,7 +4633,7 @@ async fn test_request_and_set_primary_name_not_owner() {
 
     // Inject ArNS record with ANT owned by a DIFFERENT pubkey (not the payer/initiator)
     let other_owner = Pubkey::new_unique();
-    let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+    let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &other_owner).await;
 
     let (primary_name_key, _) =
@@ -4610,7 +4664,11 @@ async fn test_request_and_set_primary_name_not_owner() {
         false,
     ));
     account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
-        ant_asset_key,
+        ant_record_at,
+        false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -4759,6 +4817,13 @@ async fn test_request_and_set_primary_name_rejects_non_canonical_ant_program() {
     ));
     account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         fake_ant_record_pda,
+        false,
+    ));
+    // Asset slot (security fix). The canonical-lockdown require! fires before
+    // the asset is read, so any account here is fine; we pass the real asset
+    // installed at the ant mint to keep the meta well-formed.
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_key,
         false,
     ));
 
@@ -5420,6 +5485,9 @@ async fn test_remove_primary_name_for_base_name_different_owner() {
         ant_record_alice,
         false,
     ));
+    set_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint, false,
+    ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -5459,7 +5527,7 @@ async fn test_remove_primary_name_for_base_name_different_owner() {
     // Re-inject ArNS record with ANT owned by User B (new ANT holder).
     // Helper installs AntRecord at "@" with name_owner as owner — that's
     // who RemovePrimaryNameForBaseName authorizes against.
-    let (arns_record_pda_b, _, ant_record_b_at_at, _) =
+    let (arns_record_pda_b, _, ant_record_b_at_at, ant_mint_b) =
         inject_arns_accounts(&mut ctx, &arns_program_id, base_name, &name_owner.pubkey()).await;
 
     // User B (new base-name owner) calls RemovePrimaryNameForBaseName
@@ -5478,6 +5546,9 @@ async fn test_remove_primary_name_for_base_name_different_owner() {
     remove_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         ant_record_b_at_at,
         false,
+    ));
+    remove_account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint_b, false,
     ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -6141,8 +6212,11 @@ async fn test_approve_primary_name_not_owner_no_ant() {
 
     // AntRecord at "@" with record_owner as the recorded owner. name_owner
     // is the caller — not record_owner — so the auth check fails with
-    // NotAntHolder.
+    // NotAntHolder. The asset slot (security fix) is required to be present;
+    // owner=Some means it's never read, but install it at the ant mint so the
+    // meta is well-formed.
     let ant_record_pda = install_ant_record(&mut ctx, &ant_mint, "@", Some(record_owner)).await;
+    install_ant_asset_at(&mut ctx, &ant_mint, &record_owner).await;
 
     let mut approve_metas = ario_core::accounts::ApprovePrimaryName {
         config: config_key,
@@ -6161,6 +6235,9 @@ async fn test_approve_primary_name_not_owner_no_ant() {
     approve_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         ant_record_pda,
         false,
+    ));
+    approve_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint, false,
     ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -7907,6 +7984,7 @@ async fn test_ant_record_layout_parse_pin() {
             .await,
             demand_factor_pda,
             ant_record_pda,
+            ant_asset_key,
         ],
     );
 
@@ -7978,7 +8056,7 @@ async fn test_undername_owner_can_set_primary_name_instant() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, ant_record_pda],
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8095,6 +8173,10 @@ async fn test_undername_owner_can_approve_own_request() {
         ant_record_pda,
         false,
     ));
+    approve_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_asset_key,
+        false,
+    ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -8168,7 +8250,7 @@ async fn test_non_owner_non_holder_rejected() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, ant_record_pda],
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8233,7 +8315,7 @@ async fn test_undername_without_record_owner_rejected() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, ant_record_pda],
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8253,19 +8335,19 @@ async fn test_undername_without_record_owner_rejected() {
         blockhash,
     );
     let result = ctx.banks_client.process_transaction(tx).await;
-    // owner=None + last_reconciled_owner=Pubkey::default() (helper default
-    // for tests that aren't exercising the fallback path). The effective
-    // owner resolves to Pubkey::default(), which doesn't match the
-    // caller, so the handler returns NotAntHolder.
+    // owner=None → authority resolves to the CURRENT NFT holder read live
+    // from the MPL asset (nft_holder here), which doesn't match the caller
+    // (payer), so the handler returns NotAntHolder.
     assert_anchor_error!(result, ArioError::NotAntHolder);
 }
 
 // -----------------------------------------------------------------
-// 6b. owner=None + last_reconciled_owner=caller must succeed.
+// 6b. owner=None + live MPL asset owner == caller must succeed.
 //     Canonical post-spawn state: `ario_ant::init_ant` writes
-//     `record.owner = None` and `record.last_reconciled_owner =
-//     <NFT holder>`. Before this was wired through, every fresh
-//     spawn-then-setPrimaryName flow failed with NotAntHolder.
+//     `record.owner = None`; the security fix resolves the effective
+//     owner from the live Metaplex Core NFT holder (NOT the cached
+//     last_reconciled_owner). Here the caller holds the NFT, so the
+//     spawn-then-setPrimaryName flow succeeds.
 // -----------------------------------------------------------------
 #[tokio::test]
 async fn test_undername_owner_none_last_reconciled_caller_succeeds() {
@@ -8302,7 +8384,7 @@ async fn test_undername_owner_none_last_reconciled_caller_succeeds() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, ant_record_pda],
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8375,7 +8457,7 @@ async fn test_wrong_undername_record_rejected() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, wrong_record_pda],
+        &[arns_pda, demand_factor_pda, wrong_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8440,7 +8522,7 @@ async fn test_record_owner_cleared_after_ant_transfer() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, ant_record_pda],
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8462,6 +8544,183 @@ async fn test_record_owner_cleared_after_ant_transfer() {
     let result = ctx.banks_client.process_transaction(tx).await;
     // ADR-016 reshape: cleared owner (None) → NotAntHolder.
     assert_anchor_error!(result, ArioError::NotAntHolder);
+}
+
+// -----------------------------------------------------------------
+// SECURITY REGRESSION: stale last_reconciled_owner must NOT authorize.
+//
+// Before the fix, `read_ant_record_owner` fell back to the AntRecord's
+// cached `last_reconciled_owner` for `owner = None` (root "@") records.
+// That snapshot goes stale after an ANT NFT sale (the wrapped `transfer`
+// updates AntConfig.last_known_owner, not each per-record LRO), so the
+// PREVIOUS holder retained primary-name authority indefinitely.
+//
+// The fix reads the CURRENT NFT holder live from the Metaplex Core asset
+// and ignores the LRO entirely. This test models the post-sale state:
+//   - AntRecord: owner = None, last_reconciled_owner = OLD_HOLDER (stale)
+//   - MPL asset (at the ant mint): owner = NEW_HOLDER (the live buyer)
+// and asserts:
+//   1. OLD_HOLDER (the stale LRO) is REJECTED with NotAntHolder.
+//      (Pre-fix this would have SUCCEEDED — the bug being closed.)
+//   2. NEW_HOLDER (the live asset owner) SUCCEEDS.
+// Bidirectionally meaningful: fails before the fix, passes after.
+// -----------------------------------------------------------------
+#[tokio::test]
+async fn test_primary_name_rejects_stale_previous_holder() {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = undername_test_setup(&mut ctx).await;
+
+    let base_name = "salebase";
+    let undername = "blog";
+    let full = format!("{}_{}", undername, base_name);
+
+    // The ANT was sold: NEW_HOLDER now holds the NFT; OLD_HOLDER is the
+    // pre-sale holder still recorded in the (stale) last_reconciled_owner.
+    let old_holder = Keypair::new();
+    let new_holder = Keypair::new();
+    fund_signer(&mut ctx, &old_holder.pubkey(), 2_000_000_000).await;
+    fund_signer(&mut ctx, &new_holder.pubkey(), 2_000_000_000).await;
+
+    // Each holder needs its own ARIO token account (owned by the holder,
+    // matching config.mint) to pass the `initiator_token_account` constraints
+    // and pay the request fee.
+    let old_token = Keypair::new();
+    let new_token = Keypair::new();
+    create_token_account(&mut ctx, &old_token, &setup.mint_pk, &old_holder.pubkey()).await;
+    create_token_account(&mut ctx, &new_token, &setup.mint_pk, &new_holder.pubkey()).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint_pk,
+        &old_token.pubkey(),
+        &setup.mint_authority,
+        10_000_000,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint_pk,
+        &new_token.pubkey(),
+        &setup.mint_authority,
+        10_000_000,
+    )
+    .await;
+
+    // MPL asset installed AT the ant mint with the LIVE owner = NEW_HOLDER.
+    let ant_asset_key = install_ant_asset(&mut ctx, &new_holder.pubkey()).await;
+    let arns_pda = install_arns_record(
+        &mut ctx,
+        &setup.arns_program_id,
+        base_name,
+        &Pubkey::new_unique(),
+        &ant_asset_key,
+    )
+    .await;
+    let demand_factor_pda = install_demand_factor(&mut ctx, &setup.arns_program_id).await;
+    // Canonical post-sale record: owner = None, but the stale LRO still
+    // points at OLD_HOLDER. The buggy implementation trusted this LRO.
+    let ant_record_pda = install_ant_record_with_lro(
+        &mut ctx,
+        &ant_asset_key,
+        undername,
+        None,
+        old_holder.pubkey(),
+    )
+    .await;
+
+    // --- 1. OLD_HOLDER (stale LRO) must be REJECTED. ---
+    let (old_primary_key, old_reverse_key) = primary_name_pdas(&old_holder.pubkey(), &full);
+    let mut old_metas = ario_core::accounts::RequestAndSetPrimaryName {
+        config: setup.config_key,
+        primary_name: old_primary_key,
+        primary_name_reverse: old_reverse_key,
+        initiator_token_account: old_token.pubkey(),
+        protocol_token_account: setup.protocol_token,
+        initiator: old_holder.pubkey(),
+        token_program: spl_token::id(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    for r in [arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key] {
+        old_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(r, false));
+    }
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: old_metas,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: full.clone(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(&full),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&old_holder.pubkey()),
+        &[&old_holder],
+        blockhash,
+    );
+    let old_result = ctx.banks_client.process_transaction(tx).await;
+    // The crux of the fix: the stale previous holder is locked out.
+    assert_anchor_error!(old_result, ArioError::NotAntHolder);
+    // No PrimaryName PDA was created for the stale holder.
+    assert!(
+        ctx.banks_client
+            .get_account(old_primary_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "stale previous holder must not have set a primary name"
+    );
+
+    // --- 2. NEW_HOLDER (live asset owner) must SUCCEED. ---
+    let (new_primary_key, new_reverse_key) = primary_name_pdas(&new_holder.pubkey(), &full);
+    let mut new_metas = ario_core::accounts::RequestAndSetPrimaryName {
+        config: setup.config_key,
+        primary_name: new_primary_key,
+        primary_name_reverse: new_reverse_key,
+        initiator_token_account: new_token.pubkey(),
+        protocol_token_account: setup.protocol_token,
+        initiator: new_holder.pubkey(),
+        token_program: spl_token::id(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    for r in [arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key] {
+        new_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(r, false));
+    }
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: new_metas,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: full.clone(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(&full),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&new_holder.pubkey()),
+        &[&new_holder],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let pn_account = ctx
+        .banks_client
+        .get_account(new_primary_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let pn = PrimaryName::try_deserialize(&mut pn_account.data.as_slice()).unwrap();
+    assert_eq!(
+        pn.owner,
+        new_holder.pubkey(),
+        "live NFT holder should own the primary name"
+    );
+    assert_eq!(pn.name, full);
 }
 
 // -----------------------------------------------------------------
@@ -8501,7 +8760,7 @@ async fn test_base_name_non_holder_rejected() {
         &setup.initiator_token,
         &setup.protocol_token,
         &payer_pk,
-        &[arns_pda, demand_factor_pda, ant_record_pda],
+        &[arns_pda, demand_factor_pda, ant_record_pda, ant_asset_key],
     );
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -8678,7 +8937,7 @@ async fn test_approve_undername_non_owner_non_holder_rejected() {
         &payer_pk,
         &approver,
         &full,
-        &[arns_pda, ant_record_pda],
+        &[arns_pda, ant_record_pda, ant_asset_key],
     )
     .await;
     assert_anchor_error!(result, ArioError::NotAntHolder);
@@ -8726,7 +8985,7 @@ async fn test_approve_undername_without_record_owner_rejected() {
         &payer_pk,
         &approver,
         &full,
-        &[arns_pda, ant_record_pda],
+        &[arns_pda, ant_record_pda, ant_asset_key],
     )
     .await;
     assert_anchor_error!(result, ArioError::NotAntHolder);
@@ -8781,7 +9040,7 @@ async fn test_approve_wrong_undername_record_rejected() {
         &payer_pk,
         &approver,
         &full,
-        &[arns_pda, wrong_record_pda],
+        &[arns_pda, wrong_record_pda, ant_asset_key],
     )
     .await;
     assert_anchor_error!(result, ArioError::InvalidAccountState);
@@ -8831,7 +9090,7 @@ async fn test_approve_record_owner_cleared_after_ant_transfer() {
         &payer_pk,
         &stale_owner,
         &full,
-        &[arns_pda, ant_record_pda],
+        &[arns_pda, ant_record_pda, ant_asset_key],
     )
     .await;
     assert_anchor_error!(result, ArioError::NotAntHolder);
@@ -8878,7 +9137,7 @@ async fn test_approve_base_name_non_holder_rejected() {
         &payer_pk,
         &approver,
         base_name,
-        &[arns_pda, ant_record_pda],
+        &[arns_pda, ant_record_pda, ant_asset_key],
     )
     .await;
     assert_anchor_error!(result, ArioError::NotAntHolder);
@@ -9719,7 +9978,7 @@ mod fund_from_funding_plan {
         // ArnsRecord + DemandFactor + ANT asset (ant.owner == payer_pk so the
         // auto-approve condition triggers in request_and_set).
         let name = "myname";
-        let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
+        let (arns_record_pda, demand_factor_pda, ant_record_at, ant_mint_key) =
             super::inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await;
 
         // Plan: 2 delegations, 100k each → 200k mARIO fee at demand_factor=1.0.
@@ -9751,7 +10010,8 @@ mod fund_from_funding_plan {
             system_program: system_program::id(),
         }
         .to_account_metas(None);
-        // Validation accounts: ArnsRecord, DemandFactor, ant_asset (3 entries).
+        // Validation accounts: ArnsRecord, DemandFactor, AntRecord, ANT MPL
+        // asset (4 entries — the security fix added the asset slot).
         accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
             arns_record_pda,
             false,
@@ -9761,7 +10021,11 @@ mod fund_from_funding_plan {
             false,
         ));
         accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
-            ant_asset_key,
+            ant_record_at,
+            false,
+        ));
+        accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+            ant_mint_key,
             false,
         ));
         // Per-source slots (2 dels × [gw, del]).
@@ -9779,7 +10043,7 @@ mod fund_from_funding_plan {
                     name: name.to_string(),
                     reverse_lookup_hash: name_hash_full,
                     sources: vec![fp_delegation(pay_per), fp_delegation(pay_per)],
-                    validation_account_count: 3,
+                    validation_account_count: 4,
                     residue_vault_count: 0,
                     ant_program_id: ario_ant::ID,
                 }
@@ -10755,6 +11019,9 @@ async fn test_remove_primary_name_for_base_name_emits_event_caller_neq_owner() {
         ant_record_alice,
         false,
     ));
+    set_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint, false,
+    ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -10812,6 +11079,9 @@ async fn test_remove_primary_name_for_base_name_emits_event_caller_neq_owner() {
     remove_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         ant_record_at_at,
         false,
+    ));
+    remove_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_mint, false,
     ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
