@@ -827,6 +827,21 @@ fn build_arns_record_data(
     data
 }
 
+/// Like `build_arns_record_data` (Permabuy) but with an explicit `purchase_type`
+/// byte at its canonical offset (104) — used to exercise the fail-closed fee
+/// path for unknown / future PurchaseType variants.
+fn build_arns_record_data_typed(
+    name: &str,
+    owner: &solana_sdk::pubkey::Pubkey,
+    ant: &solana_sdk::pubkey::Pubkey,
+    purchase_type: u8,
+) -> Vec<u8> {
+    let mut data = build_arns_record_data(name, owner, ant);
+    // disc(8) + name_hash(32) + owner(32) + ant(32) = 104
+    data[8 + 32 + 32 + 32] = purchase_type;
+    data
+}
+
 /// Helper: build fake DemandFactor account data
 fn build_demand_factor_data() -> Vec<u8> {
     let df_disc = solana_sdk::hash::hash(b"account:DemandFactor");
@@ -5387,6 +5402,108 @@ async fn test_request_primary_name_permabuy_fee() {
     assert_request_primary_name_fee("permabuyfeename", true, 1_000_000).await;
 }
 
+#[tokio::test]
+async fn test_request_primary_name_rejects_unknown_purchase_type() {
+    // A record whose purchase_type byte is neither Lease(0) nor Permabuy(1) —
+    // corruption or a future ario-arns variant. The fee path must FAIL CLOSED
+    // (InvalidAccountState) rather than silently charging the cheaper lease rate.
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    create_mint(&mut ctx, &mint, &mint_authority.pubkey()).await;
+    let payer_pk = ctx.payer.pubkey();
+    let initiator_token = Keypair::new();
+    create_token_account(&mut ctx, &initiator_token, &mint.pubkey(), &payer_pk).await;
+    mint_tokens(
+        &mut ctx,
+        &mint.pubkey(),
+        &initiator_token.pubkey(),
+        &mint_authority,
+        10_000_000,
+    )
+    .await;
+    let protocol_token = Keypair::new();
+    create_token_account(&mut ctx, &protocol_token, &mint.pubkey(), &payer_pk).await;
+    let (config_key, arns_program_id) =
+        initialize_config(&mut ctx, &mint.pubkey(), &protocol_token.pubkey()).await;
+
+    let name = "weirdtype";
+    let name_hash = solana_sdk::hash::hash(name.as_bytes());
+    let (arns_record_pda, _) =
+        Pubkey::find_program_address(&[b"arns_record", name_hash.as_ref()], &arns_program_id);
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    // purchase_type = 2 (unknown). Still passes validate_arns_record_exists
+    // (non-0 is treated as always-active), so the failure is the fee fail-closed.
+    let arns_data = build_arns_record_data_typed(name, &payer_pk, &Pubkey::new_unique(), 2);
+    ctx.set_account(
+        &arns_record_pda,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(arns_data.len()),
+            data: arns_data,
+            owner: arns_program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+    let (demand_factor_pda, _) =
+        Pubkey::find_program_address(&[b"demand_factor"], &arns_program_id);
+    let df_data = build_demand_factor_data();
+    ctx.set_account(
+        &demand_factor_pda,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(df_data.len()),
+            data: df_data,
+            owner: arns_program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (request_key, _) = Pubkey::find_program_address(
+        &[PRIMARY_NAME_REQUEST_SEED, payer_pk.as_ref()],
+        &ario_core::ID,
+    );
+    let mut account_metas = ario_core::accounts::RequestPrimaryName {
+        config: config_key,
+        request: request_key,
+        initiator_token_account: initiator_token.pubkey(),
+        protocol_token_account: protocol_token.pubkey(),
+        initiator: payer_pk,
+        token_program: spl_token::id(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        arns_record_pda,
+        false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        demand_factor_pda,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: account_metas,
+            data: ario_core::instruction::RequestPrimaryName {
+                name: name.to_string(),
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArioError::InvalidAccountState);
+}
+
 /// Shared body for the `request_and_set_primary_name` fee tests: injects an
 /// ArnsRecord of the requested purchase type (with ant + AntRecord owned by the
 /// initiator), runs the combined handler, and asserts the fee charged.
@@ -5416,11 +5533,14 @@ async fn assert_request_and_set_primary_name_fee(name: &str, permabuy: bool, exp
     let (config_key, arns_program_id) =
         initialize_config(&mut ctx, &mint.pubkey(), &protocol_token.pubkey()).await;
 
-    let (arns_record_pda, demand_factor_pda, ant_record_pda, _) = if permabuy {
+    let (arns_record_pda, demand_factor_pda, ant_record_pda, ant_mint) = if permabuy {
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await
     } else {
         inject_arns_accounts_active_lease(&mut ctx, &arns_program_id, name, &payer_pk).await
     };
+    // PR #91: request_and_set reads remaining_accounts[3] = AntConfig PDA for the
+    // last-known-owner fallback. The initiator owns this name.
+    let ant_config = install_ant_config(&mut ctx, &ant_mint, &payer_pk).await;
 
     let initiator_before = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
     let protocol_before = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
@@ -5455,6 +5575,9 @@ async fn assert_request_and_set_primary_name_fee(name: &str, permabuy: bool, exp
     account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         ant_record_pda,
         false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_config, false,
     ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();

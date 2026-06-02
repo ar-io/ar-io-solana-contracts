@@ -380,7 +380,7 @@ Gateway weight only affects observer selection probability. All passing gateways
 | 1 | MAX_CONTROLLERS: WP=10, Code=4 | Update WP to say 4 | — |
 | ~~2~~ | ~~RNP formula~~ | **RESOLVED** — code updated | `FIX_PLANS.md` #2 |
 | ~~3~~ | ~~Primary name fee ignores purchase type~~ | **RESOLVED** — code updated | `FIX_PLANS.md` #3 |
-| 4 | Undername max length: WP ambiguous, Code=61 | No action — WP and Lua both consistent with 61 | — |
+| 4 | Undername max length: WP=51, Code=61 | Update WP to 61 (code follows Lua `MAX_UNDERNAME_LENGTH`) | — |
 | 5 | Protected exit vault not expeditable | Update WP §6.6 — code is correct (BD-102) | — |
 | ~~6~~ | ~~Disabling delegation doesn't auto-withdraw~~ | **RESOLVED** — `claim_delegate_from_disabled_gateway` + zero-stake/cooldown re-enable guard | `FIX_PLANS.md` #6 |
 | ~~7~~ | ~~Gateway settings apply immediately~~ | **RESOLVED** — `delegate_reward_share_ratio` deferred to next epoch via tally | `FIX_PLANS.md` #7 |
