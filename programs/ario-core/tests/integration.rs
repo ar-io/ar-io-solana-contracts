@@ -938,6 +938,69 @@ async fn install_ant_record_with_lro(
     pda
 }
 
+fn ant_config_pda(mint: &solana_sdk::pubkey::Pubkey) -> solana_sdk::pubkey::Pubkey {
+    Pubkey::find_program_address(&[b"ant_config", mint.as_ref()], &ario_ant::ID).0
+}
+
+/// Helper: build a Borsh-serialized AntConfig blob matching
+/// `ario_ant::state::AntConfig`. Mirrors the layout walked by
+/// `read_ant_config_last_known_owner` in
+/// `programs/ario-core/src/instructions/primary_name.rs` — the ANT-level
+/// owner snapshot ario-core uses as the implicit-owner fallback when an
+/// AntRecord has `owner = None`. If you change one, change both.
+///
+/// The variable-length string/keyword fields are deliberately non-trivial
+/// (and keywords non-empty) so the parser's Vec<String> loop is exercised.
+fn build_ant_config_data(
+    mint: &solana_sdk::pubkey::Pubkey,
+    last_known_owner: &solana_sdk::pubkey::Pubkey,
+) -> Vec<u8> {
+    fn push_str(data: &mut Vec<u8>, s: &str) {
+        data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        data.extend_from_slice(s.as_bytes());
+    }
+    let mut data = Vec::new();
+    let disc = solana_sdk::hash::hash(b"account:AntConfig");
+    data.extend_from_slice(&disc.to_bytes()[..8]);
+    data.extend_from_slice(mint.as_ref()); // mint: 32 bytes
+    push_str(&mut data, "Test ANT"); // name
+    push_str(&mut data, "ANT"); // ticker
+    push_str(&mut data, &"l".repeat(43)); // logo (Arweave-shape placeholder)
+    push_str(&mut data, "an ant for tests"); // description
+                                             // keywords: Vec<String> with two entries.
+    data.extend_from_slice(&2u32.to_le_bytes());
+    push_str(&mut data, "test");
+    push_str(&mut data, "ant");
+    data.extend_from_slice(last_known_owner.as_ref()); // last_known_owner
+    data.push(253); // bump
+    data.extend_from_slice(&[1, 0, 0]); // version 1.0.0 — not parsed
+    data
+}
+
+/// Install an AntConfig PDA whose `last_known_owner` is `last_known_owner`.
+/// Use for tests exercising the `owner=None → AntConfig.last_known_owner`
+/// fallback in `ario_core::read_ant_record_owner`. For tests that set an
+/// explicit per-record `owner = Some(_)`, the config contents are not read
+/// (the explicit delegate wins), but the account must still be present.
+async fn install_ant_config(
+    ctx: &mut ProgramTestContext,
+    mint: &solana_sdk::pubkey::Pubkey,
+    last_known_owner: &solana_sdk::pubkey::Pubkey,
+) -> solana_sdk::pubkey::Pubkey {
+    let pda = ant_config_pda(mint);
+    let data = build_ant_config_data(mint, last_known_owner);
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let account = solana_sdk::account::Account {
+        lamports: rent.minimum_balance(data.len()),
+        data,
+        owner: ario_ant::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(&pda, &account.into());
+    pda
+}
+
 /// Helper: fund a fresh signer with SOL so they can pay rent for init_if_needed PDAs.
 async fn fund_signer(
     ctx: &mut ProgramTestContext,

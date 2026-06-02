@@ -219,19 +219,33 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
 /// transparent today.
 ///
 /// Returns the **effective owner** of an `AntRecord`:
-///   * `owner` field if `Some(_)` (explicit delegate),
-///   * `last_reconciled_owner` otherwise (canonical NFT-owner snapshot
-///     written at spawn and refreshed on every owner-reconciling ix in
-///     `ario_ant`).
+///   * `owner` field if `Some(_)` (explicit per-record delegate),
+///   * `AntConfig.last_known_owner` otherwise — the **ANT-level** owner
+///     snapshot read from the `AntConfig` PDA passed as `ant_config_info`.
 ///
-/// Why fall back: `ario_ant` initializes new records with `owner = None`
-/// (the spawn flow doesn't set a delegate — the NFT holder is the
-/// implicit owner). ario-core is MPL-agnostic per ADR-016 and can't
-/// read the NFT owner directly, so it relies on `last_reconciled_owner`
-/// as the canonical snapshot. Authorization through this helper stays
-/// stale-after-NFT-transfer until someone in `ario_ant` (set_record,
-/// transfer_record, reconcile) refreshes it — same staleness window
-/// every other ARIO-core/ARIO-ant interaction already has.
+/// Why the ANT-level fallback (security): `ario_ant` initializes records
+/// with `owner = None` (the spawn flow sets no delegate — the NFT holder
+/// is the implicit owner). ario-core is MPL-agnostic per ADR-016 and
+/// can't read the live NFT owner, so it must trust an owner snapshot
+/// maintained by the ANT program. The **right** snapshot is
+/// `AntConfig.last_known_owner`, which `ario_ant::transfer` updates
+/// atomically on every wrapped transfer (and `reconcile` refreshes
+/// permissionlessly after a direct MPL transfer).
+///
+/// The earlier version of this helper fell back to the per-record
+/// `AntRecord.last_reconciled_owner`, which is the WRONG granularity:
+/// the wrapped `transfer` ix updates `AntConfig.last_known_owner` but
+/// touches no `AntRecord`, so every record's `last_reconciled_owner`
+/// stayed stale until a later per-record op reconciled it. That left a
+/// window where the **previous** NFT holder retained authority to set,
+/// approve, or remove primary-name / reverse records on a name they no
+/// longer controlled (and undername records were never reachable by the
+/// transfer at all). Reading `AntConfig.last_known_owner` closes that
+/// window uniformly for `@` and every undername. The only residual
+/// staleness is after a *direct* (non-wrapped) MPL transfer, until the
+/// permissionless `ario_ant::reconcile` runs — the same irreducible
+/// window the rest of the protocol already has, and identical for the
+/// `@` record and undernames.
 ///
 /// Borsh layout (mirrors `ario_ant::state::AntRecord` — keep in sync with
 /// `programs/ario-ant/src/state.rs`):
@@ -243,25 +257,26 @@ fn read_demand_factor(df_info: &AccountInfo, arns_program_id: &Pubkey) -> Result
 ///   4     ttl_seconds: u32
 ///   1+[4] priority: Option<u32> (0x00 = None, 0x01 + u32 = Some)
 ///   1+[32] owner: Option<Pubkey> (0x00 = None, 0x01 + 32 bytes = Some)
-///   32    last_reconciled_owner: Pubkey
+///   32    last_reconciled_owner: Pubkey — NOT read here (see
+///         `read_ant_config_last_known_owner` for the real fallback)
 ///   1     bump — not read here
 ///
-/// The layout-pin test `test_ant_record_layout_parse_pin` exercises this
-/// parser end-to-end. If `AntRecord` field order changes before
-/// `last_reconciled_owner` (inclusive), that test fails — refresh this
-/// helper and its comment.
+/// This helper parses the `AntRecord` only up to and including `owner`;
+/// the implicit-owner fallback is sourced from the `AntConfig` PDA via
+/// `read_ant_config_last_known_owner`. The layout-pin test
+/// `test_ant_record_layout_parse_pin` exercises this parser end-to-end.
+/// If `AntRecord` field order changes before `owner` (inclusive), that
+/// test fails — refresh this helper and its comment.
 ///
 /// Conformance: third-party ANT programs MUST keep AntRecord's prefix
 /// (mint, undername, target, target_protocol, ttl_seconds, priority,
-/// owner, last_reconciled_owner) byte-compatible with the canonical
-/// `ario_ant`. Anything else makes them invisible to ario-core's BD-097
-/// path. The `last_reconciled_owner` requirement is new in this fix;
-/// previously the conformance contract stopped at `owner` but the helper
-/// required `record.owner == Some(signer)` — which blocked every
-/// canonical spawn-then-setPrimaryName flow because spawns leave
-/// `owner = None`.
+/// owner) byte-compatible with the canonical `ario_ant`, AND maintain an
+/// `AntConfig` PDA with a byte-compatible `last_known_owner` (see
+/// `read_ant_config_last_known_owner`). Anything else makes them
+/// invisible to ario-core's BD-097 path.
 fn read_ant_record_owner(
     ant_record_info: &AccountInfo,
+    ant_config_info: &AccountInfo,
     ant_mint: &Pubkey,
     undername: &str,
     ant_program: &Pubkey,
@@ -353,10 +368,10 @@ fn read_ant_record_owner(
         .checked_add(priority_size)
         .ok_or(ArioError::InvalidAccountState)?;
 
-    // owner: Option<Pubkey>
+    // owner: Option<Pubkey> — explicit per-record delegate.
     require!(data.len() > offset, ArioError::InvalidAccountState);
-    let (explicit_owner, owner_size) = if data[offset] == 0 {
-        (None, 1usize)
+    let explicit_owner = if data[offset] == 0 {
+        None
     } else {
         let owner_end = offset
             .checked_add(1)
@@ -365,24 +380,133 @@ fn read_ant_record_owner(
         require!(data.len() >= owner_end, ArioError::InvalidAccountState);
         let owner = Pubkey::try_from(&data[offset + 1..offset + 33])
             .map_err(|_| error!(ArioError::InvalidAccountState))?;
-        (Some(owner), 33usize)
+        Some(owner)
     };
-    offset = offset
-        .checked_add(owner_size)
-        .ok_or(ArioError::InvalidAccountState)?;
 
-    // last_reconciled_owner: Pubkey — used as the implicit owner fallback
-    // when `owner` is `None` (canonical at-spawn state). Set by every
-    // owner-reconciling ix in `ario_ant`; stale only until the next such
-    // ix runs against this record after an NFT transfer.
-    let lro_end = offset
+    // Effective owner. An explicit per-record delegate (`owner = Some`)
+    // takes precedence; otherwise fall back to the ANT-level
+    // `AntConfig.last_known_owner` snapshot — NOT the per-record
+    // `last_reconciled_owner`, which goes stale after a wrapped transfer
+    // and reopens the previous-holder authorization window. See the
+    // helper doc-comment above.
+    match explicit_owner {
+        Some(owner) => Ok(owner),
+        None => read_ant_config_last_known_owner(ant_config_info, ant_mint, ant_program),
+    }
+}
+
+/// Skip a borsh `String` (u32 LE length prefix + UTF-8 bytes) starting at
+/// `offset`, returning the offset just past it. Bounds-checked.
+fn skip_borsh_string(data: &[u8], offset: usize) -> Result<usize> {
+    let len_end = offset
+        .checked_add(4)
+        .ok_or(ArioError::InvalidAccountState)?;
+    require!(data.len() >= len_end, ArioError::InvalidAccountState);
+    let len = u32::from_le_bytes(
+        data[offset..len_end]
+            .try_into()
+            .map_err(|_| ArioError::InvalidAccountState)?,
+    ) as usize;
+    len_end
+        .checked_add(len)
+        .ok_or_else(|| error!(ArioError::InvalidAccountState))
+}
+
+/// Read `last_known_owner` from an `AntConfig` PDA in the canonical
+/// ARIO-ANT program (`ario_ant::ID`).
+///
+/// This is the **ANT-level** owner snapshot — one per NFT mint, not per
+/// undername record. `ario_ant::transfer` updates it atomically on every
+/// wrapped transfer, and the permissionless `ario_ant::reconcile`
+/// refreshes it after a direct (non-wrapped) MPL transfer. It is the
+/// correct implicit-owner source for primary-name authorization: the
+/// per-record `AntRecord.last_reconciled_owner` is only refreshed by
+/// per-record ops and therefore lags ownership after a transfer (the
+/// stale-authorization bug this fallback was rewritten to close).
+///
+/// SECURITY: `ant_program` MUST equal `ario_ant::ID`; the PDA, owner, and
+/// discriminator are all validated, mirroring `read_ant_record_owner`.
+///
+/// Borsh layout (mirrors `ario_ant::state::AntConfig` — keep in sync with
+/// `programs/ario-ant/src/state.rs`):
+///   8     discriminator: hash("account:AntConfig")[..8]
+///   32    mint: Pubkey
+///   4+N   name: String
+///   4+N   ticker: String
+///   4+N   logo: String
+///   4+N   description: String
+///   4+Σ   keywords: Vec<String> (u32 count, then each u32 len + bytes)
+///   32    last_known_owner: Pubkey   <-- returned
+///   1     bump — not read here
+///   3     version: SchemaVersion — not read here
+///
+/// The layout-pin test `test_ant_config_layout_parse_pin` exercises this
+/// parser end-to-end. If `AntConfig` field order changes before
+/// `last_known_owner` (inclusive), that test fails — refresh this helper.
+fn read_ant_config_last_known_owner(
+    ant_config_info: &AccountInfo,
+    ant_mint: &Pubkey,
+    ant_program: &Pubkey,
+) -> Result<Pubkey> {
+    // SECURITY: pin to the canonical ARIO-ANT program (same rationale as
+    // read_ant_record_owner — defends against a program-id spoof).
+    require!(*ant_program == ario_ant::ID, ArioError::InvalidAccountState);
+
+    require!(
+        ant_config_info.owner == ant_program,
+        ArioError::InvalidAccountState
+    );
+
+    let (expected_pda, _) =
+        Pubkey::find_program_address(&[b"ant_config", ant_mint.as_ref()], ant_program);
+    require!(
+        ant_config_info.key() == expected_pda,
+        ArioError::InvalidAccountState
+    );
+
+    require!(
+        !ant_config_info.data_is_empty(),
+        ArioError::InvalidAccountState
+    );
+    let data = ant_config_info
+        .try_borrow_data()
+        .map_err(|_| error!(ArioError::InvalidAccountState))?;
+    require!(data.len() >= 8, ArioError::InvalidAccountState);
+    let expected_disc = anchor_lang::solana_program::hash::hash(b"account:AntConfig");
+    require!(
+        data[..8] == expected_disc.to_bytes()[..8],
+        ArioError::InvalidAccountState
+    );
+
+    // disc(8) + mint(32)
+    let mut offset = 40usize;
+
+    // name, ticker, logo, description: 4 borsh Strings.
+    for _ in 0..4 {
+        offset = skip_borsh_string(&data, offset)?;
+    }
+
+    // keywords: Vec<String> — u32 count, then each String.
+    let count_end = offset
+        .checked_add(4)
+        .ok_or(ArioError::InvalidAccountState)?;
+    require!(data.len() >= count_end, ArioError::InvalidAccountState);
+    let kw_count = u32::from_le_bytes(
+        data[offset..count_end]
+            .try_into()
+            .map_err(|_| ArioError::InvalidAccountState)?,
+    ) as usize;
+    offset = count_end;
+    for _ in 0..kw_count {
+        offset = skip_borsh_string(&data, offset)?;
+    }
+
+    // last_known_owner: Pubkey.
+    let owner_end = offset
         .checked_add(32)
         .ok_or(ArioError::InvalidAccountState)?;
-    require!(data.len() >= lro_end, ArioError::InvalidAccountState);
-    let last_reconciled_owner = Pubkey::try_from(&data[offset..lro_end])
-        .map_err(|_| error!(ArioError::InvalidAccountState))?;
-
-    Ok(explicit_owner.unwrap_or(last_reconciled_owner))
+    require!(data.len() >= owner_end, ArioError::InvalidAccountState);
+    Pubkey::try_from(&data[offset..owner_end]).map_err(|_| error!(ArioError::InvalidAccountState))
 }
 
 pub mod request_primary_name {
@@ -530,10 +654,19 @@ pub mod request_and_set_primary_name {
         // "@" sentinel which the canonical ario-ant creates at mint time).
         // ADR-016 pluggability via the asset's `ANT Program` attribute is
         // tracked as a follow-up that must add MPL Core asset parsing.
-        require!(remaining.len() > 2, ArioError::UndernameRecordOwnerRequired);
+        // remaining: [0] ArnsRecord, [1] DemandFactor, [2] AntRecord PDA,
+        // [3] AntConfig PDA (the ANT-level owner snapshot — see
+        // `read_ant_config_last_known_owner`).
+        require!(remaining.len() > 3, ArioError::UndernameRecordOwnerRequired);
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let initiator_key = ctx.accounts.initiator.key();
-        let record_owner = read_ant_record_owner(&remaining[2], &ant, undername, &ant_program_id)?;
+        let record_owner = read_ant_record_owner(
+            &remaining[2],
+            &remaining[3],
+            &ant,
+            undername,
+            &ant_program_id,
+        )?;
         require!(record_owner == initiator_key, ArioError::NotAntHolder);
 
         // Read demand factor from remaining_accounts[1] (mandatory)
@@ -680,10 +813,17 @@ pub mod approve_primary_name {
         // program. The canonical lockdown closes that loop. The undername
         // part of the name selects which AntRecord (the canonical ario-ant
         // uses "@" for base names).
-        require!(remaining.len() > 1, ArioError::UndernameRecordOwnerRequired);
+        // remaining: [0] ArnsRecord, [1] AntRecord PDA, [2] AntConfig PDA.
+        require!(remaining.len() > 2, ArioError::UndernameRecordOwnerRequired);
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let approver_key = ctx.accounts.name_owner.key();
-        let record_owner = read_ant_record_owner(&remaining[1], &ant, undername, &ant_program_id)?;
+        let record_owner = read_ant_record_owner(
+            &remaining[1],
+            &remaining[2],
+            &ant,
+            undername,
+            &ant_program_id,
+        )?;
         require!(record_owner == approver_key, ArioError::NotAntHolder);
 
         // CORE-008: If user already has a primary name set to a DIFFERENT name,
@@ -860,9 +1000,11 @@ pub mod remove_primary_name_for_base_name {
         // fact `find_program_address` runs under whatever program the
         // caller supplies, so an attacker-deployed program would still
         // satisfy the seed check).
-        require!(remaining.len() > 1, ArioError::UndernameRecordOwnerRequired);
+        // remaining: [0] ArnsRecord, [1] AntRecord PDA, [2] AntConfig PDA.
+        require!(remaining.len() > 2, ArioError::UndernameRecordOwnerRequired);
         let caller_key = ctx.accounts.name_owner.key();
-        let record_owner = read_ant_record_owner(&remaining[1], &ant, "@", &ant_program_id)?;
+        let record_owner =
+            read_ant_record_owner(&remaining[1], &remaining[2], &ant, "@", &ant_program_id)?;
         require!(record_owner == caller_key, ArioError::NotAntHolder);
 
         // Base-name override path: caller != owner (the base-name holder
@@ -976,7 +1118,8 @@ pub struct ApprovePrimaryName<'info> {
     pub primary_name_reverse: Account<'info, PrimaryNameReverse>,
 
     /// Name owner — must be the ANT NFT holder (Metaplex Core asset).
-    /// Client must pass ArnsRecord as remaining_accounts[0] and ANT asset as remaining_accounts[1].
+    /// Client must pass remaining_accounts: [0] ArnsRecord PDA,
+    /// [1] AntRecord PDA, [2] AntConfig PDA (ANT-level owner snapshot).
     #[account(mut)]
     pub name_owner: Signer<'info>,
 
@@ -1419,10 +1562,11 @@ pub mod request_and_set_primary_name_from_funding_plan {
         let (validation_accounts, funding_source_accounts) = ctx.remaining_accounts.split_at(split);
 
         // ADR-016 reshape: validation layout is
-        //   [0] ArnsRecord, [1] DemandFactor, [2] AntRecord PDA.
+        //   [0] ArnsRecord, [1] DemandFactor, [2] AntRecord PDA,
+        //   [3] AntConfig PDA (ANT-level owner snapshot).
         // Authorization is "caller is the AntRecord.owner for this name"
         // (with the "@" sentinel for base names).
-        require!(validation_accounts.len() >= 3, ArioError::InvalidParameter);
+        require!(validation_accounts.len() >= 4, ArioError::InvalidParameter);
         let arns_record_info = &validation_accounts[0];
 
         let arns_program_id = config.arns_program;
@@ -1457,8 +1601,13 @@ pub mod request_and_set_primary_name_from_funding_plan {
 
         let undername = if parts.len() == 2 { parts[0] } else { "@" };
         let initiator_key = ctx.accounts.initiator.key();
-        let record_owner =
-            read_ant_record_owner(&validation_accounts[2], &ant, undername, &ant_program_id)?;
+        let record_owner = read_ant_record_owner(
+            &validation_accounts[2],
+            &validation_accounts[3],
+            &ant,
+            undername,
+            &ant_program_id,
+        )?;
         require!(record_owner == initiator_key, ArioError::NotAntHolder);
 
         let demand_factor = read_demand_factor(&validation_accounts[1], &config.arns_program)?;
