@@ -10674,7 +10674,18 @@ async fn test_update_gateway_settings_all_fields() {
     assert!(matches!(gateway.protocol, Protocol::Http));
     assert_eq!(gateway.properties, valid_arweave_id);
     assert!(!gateway.settings.allow_delegated_staking);
-    assert_eq!(gateway.settings.delegate_reward_share_ratio, 5000); // 50 * 100
+    // Fix #7 (WP §6.3): the delegate_reward_share_ratio change is DEFERRED —
+    // the active value is unchanged (still the join value 10*100=1000) and the
+    // request is staged in `pending_delegate_reward_share_ratio` until the next
+    // tally_weights applies it.
+    assert_eq!(gateway.settings.delegate_reward_share_ratio, 1000);
+    assert_eq!(
+        gateway.settings.pending_delegate_reward_share_ratio,
+        Some(5000) // 50 * 100, staged for next epoch
+    );
+    // Fix #6 (WP §6.3): flipping allow_delegated_staking true→false records the
+    // disable timestamp that starts the re-enable cooldown.
+    assert!(gateway.settings.delegation_disabled_at.is_some());
     assert_eq!(gateway.settings.min_delegation_amount, 20_000_000);
 }
 
@@ -23979,4 +23990,716 @@ async fn test_prescribe_unbiased_after_mid_epoch_leave() {
         !prescribed.contains(&big_op.pubkey()),
         "leaver (big_op) must never appear in prescribed_observer_gateways"
     );
+}
+
+// ==========================================================================
+// Fix #6 (disable delegation → forced withdrawal + cooldown) and
+// Fix #7 (defer delegate_reward_share_ratio to next epoch). WP §6.3.
+// ==========================================================================
+
+/// Fund a fresh delegator (SOL + tokens) and delegate `amount` to `gateway_key`.
+/// Returns the delegator keypair and the delegation PDA.
+async fn f6_fund_and_delegate(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_operator: &Pubkey,
+    gateway_key: &Pubkey,
+    amount: u64,
+) -> (Keypair, Pubkey) {
+    let payer_pk = ctx.payer.pubkey();
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(ctx, &delegator_token, &setup.mint.pubkey(), &delegator_pk).await;
+    mint_tokens(
+        ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let (delegation_key, _) = delegation_pda(gateway_operator, &delegator_pk);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: *gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake { amount }.data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    (delegator, delegation_key)
+}
+
+/// Operator-only update of `allow_delegated_staking` (all other params None).
+/// Returns the raw tx result so callers can assert success or a specific error.
+async fn f6_set_allow_delegation(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: &Pubkey,
+    allow: bool,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewaySettings {
+                settings: setup.settings_key,
+                gateway: *gateway_key,
+                operator: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewaySettings {
+                params: ario_gar::UpdateGatewayParams {
+                    label: None,
+                    fqdn: None,
+                    port: None,
+                    protocol: None,
+                    properties: None,
+                    note: None,
+                    allow_delegated_staking: Some(allow),
+                    delegate_reward_share_ratio: None,
+                    min_delegate_stake: None,
+                },
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// Crank `claim_delegate_from_disabled_gateway` for `delegator`, paid by `payer`
+/// (use a third party to exercise the permissionless path). Returns the result.
+async fn f6_claim_disabled(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: &Pubkey,
+    delegation_key: &Pubkey,
+    delegator_pk: &Pubkey,
+    payer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let (counter_key, _) = withdrawal_counter_pda(delegator_pk);
+    let (withdrawal_key, _) = withdrawal_pda(delegator_pk, 0);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::ClaimDelegateFromDisabledGateway {
+                settings: setup.settings_key,
+                gateway: *gateway_key,
+                delegation: *delegation_key,
+                withdrawal_counter: counter_key,
+                withdrawal: withdrawal_key,
+                delegator: *delegator_pk,
+                payer: payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::ClaimDelegateFromDisabledGateway {}.data(),
+        }],
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn f6_read_gateway(ctx: &mut ProgramTestContext, gateway_key: &Pubkey) -> Gateway {
+    let acct = ctx
+        .banks_client
+        .get_account(*gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap()
+}
+
+#[tokio::test]
+async fn test_claim_delegate_from_disabled_gateway() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    let delegate_amount = 20_000_000_000u64;
+    let (delegator, delegation_key) = f6_fund_and_delegate(
+        &mut ctx,
+        &setup,
+        &operator_pk,
+        &gateway_key,
+        delegate_amount,
+    )
+    .await;
+    let delegator_pk = delegator.pubkey();
+
+    // Operator disables delegation.
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+
+    // Crank the delegate out (delegate pays its own rent here).
+    f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &delegator,
+    )
+    .await
+    .unwrap();
+
+    // Withdrawal vault created with the full stake and the 30-day delegate lock.
+    let (withdrawal_key, _) = withdrawal_pda(&delegator_pk, 0);
+    let w_acct = ctx
+        .banks_client
+        .get_account(withdrawal_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let withdrawal = Withdrawal::try_deserialize(&mut w_acct.data.as_slice()).unwrap();
+    assert_eq!(withdrawal.owner, delegator_pk);
+    assert_eq!(withdrawal.amount, delegate_amount);
+    assert!(withdrawal.is_delegate);
+    assert!(!withdrawal.is_exit_vault);
+    assert!(!withdrawal.is_protected);
+    assert_eq!(withdrawal.available_at, withdrawal.created_at + 2_592_000);
+
+    // Delegation zeroed; gateway total decremented to 0.
+    let d_acct = ctx
+        .banks_client
+        .get_account(delegation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let delegation = Delegation::try_deserialize(&mut d_acct.data.as_slice()).unwrap();
+    assert_eq!(delegation.amount, 0);
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.total_delegated_stake, 0);
+    // Gateway stays Joined (only delegation was disabled).
+    assert!(matches!(gw.status, GatewayStatus::Joined));
+}
+
+#[tokio::test]
+async fn test_claim_delegate_from_disabled_gateway_permissionless() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (delegator, delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+    let delegator_pk = delegator.pubkey();
+
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+
+    // A third party (not the delegate, not the operator) cranks the claim.
+    let cranker = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &operator_pk,
+            &cranker.pubkey(),
+            1_000_000_000,
+        )],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &cranker,
+    )
+    .await
+    .unwrap();
+
+    // Stake still routes to the delegate's own vault, not the cranker.
+    let (withdrawal_key, _) = withdrawal_pda(&delegator_pk, 0);
+    let w_acct = ctx
+        .banks_client
+        .get_account(withdrawal_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let withdrawal = Withdrawal::try_deserialize(&mut w_acct.data.as_slice()).unwrap();
+    assert_eq!(withdrawal.owner, delegator_pk);
+    assert_eq!(withdrawal.amount, 20_000_000_000);
+}
+
+#[tokio::test]
+async fn test_claim_delegate_from_disabled_gateway_rejects_when_enabled() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (delegator, delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+    let delegator_pk = delegator.pubkey();
+
+    // Delegation still ENABLED → claim must be rejected.
+    let result = f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &delegator,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::DelegationNotDisabled);
+}
+
+#[tokio::test]
+async fn test_disable_delegation_records_timestamp() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    // Joined with delegation enabled → disabled_at is None.
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert!(gw.settings.allow_delegated_staking);
+    assert!(gw.settings.delegation_disabled_at.is_none());
+
+    // Set a deterministic clock so we can assert the recorded timestamp.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 5_000;
+    ctx.set_sysvar(&clock);
+
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert!(!gw.settings.allow_delegated_staking);
+    assert_eq!(gw.settings.delegation_disabled_at, Some(5_000));
+
+    // Re-enabling (no delegates, cooldown elapsed) clears the timestamp.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 5_000 + 2_592_000;
+    ctx.set_sysvar(&clock);
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, true)
+        .await
+        .unwrap();
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert!(gw.settings.allow_delegated_staking);
+    assert!(gw.settings.delegation_disabled_at.is_none());
+}
+
+#[tokio::test]
+async fn test_reenable_delegation_rejects_with_remaining_delegates() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (_delegator, _delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+
+    // Disable, but DO NOT crank the delegate out → stake remains.
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+
+    let result = f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, true).await;
+    assert_anchor_error!(result, GarError::DelegatesStillActive);
+}
+
+#[tokio::test]
+async fn test_reenable_delegation_requires_cooldown() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (delegator, delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+    let delegator_pk = delegator.pubkey();
+
+    // Disable; the timestamp is recorded.
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+    assert!(f6_read_gateway(&mut ctx, &gateway_key)
+        .await
+        .settings
+        .delegation_disabled_at
+        .is_some());
+
+    // Crank the only delegate out → total_delegated_stake == 0.
+    f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &delegator,
+    )
+    .await
+    .unwrap();
+
+    // Key assertion: even with every delegate cleared, re-enabling is STILL
+    // blocked by the 30-day cooldown until it elapses. (The cooldown-elapsed →
+    // re-enable-succeeds-and-clears path is covered by
+    // test_disable_delegation_records_timestamp, which warps past the window.)
+    let result = f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, true).await;
+    assert_anchor_error!(result, GarError::DelegationCooldownActive);
+}
+
+/// Fix #7: update with a new ratio stages it (active unchanged); a second update
+/// overwrites the pending value (last write wins) before any tally applies it.
+#[tokio::test]
+async fn test_delegate_reward_share_ratio_pending_overwrite() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator_pk = ctx.payer.pubkey();
+
+    let send_ratio = |ratio: u8| ario_gar::instruction::UpdateGatewaySettings {
+        params: ario_gar::UpdateGatewayParams {
+            label: None,
+            fqdn: None,
+            port: None,
+            protocol: None,
+            properties: None,
+            note: None,
+            allow_delegated_staking: None,
+            delegate_reward_share_ratio: Some(ratio),
+            min_delegate_stake: None,
+        },
+    };
+
+    for ratio in [30u8, 70u8] {
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::UpdateGatewaySettings {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    operator: operator_pk,
+                }
+                .to_account_metas(None),
+                data: send_ratio(ratio).data(),
+            }],
+            Some(&operator_pk),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    // Active value never moved (still join value 10 * 100 = 1000).
+    assert_eq!(gw.settings.delegate_reward_share_ratio, 1000);
+    // Last write wins in the pending slot: 70 * 100 = 7000.
+    assert_eq!(gw.settings.pending_delegate_reward_share_ratio, Some(7000));
+}
+
+/// Fix #7: a deferred ratio change is applied at the next tally_weights, which
+/// runs at the start of the epoch before distribute_epoch reads the value.
+#[tokio::test]
+async fn test_delegate_reward_share_ratio_applied_at_tally() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000,
+    )
+    .await;
+
+    // Join at t=0 so the gateway is active for epoch 0 (starts at 100).
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator_pk = ctx.payer.pubkey();
+
+    // Stage a ratio change (50 → 5000 bps). Active stays at the join value.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewaySettings {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                operator: operator_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewaySettings {
+                params: ario_gar::UpdateGatewayParams {
+                    label: None,
+                    fqdn: None,
+                    port: None,
+                    protocol: None,
+                    properties: None,
+                    note: None,
+                    allow_delegated_staking: None,
+                    delegate_reward_share_ratio: Some(50),
+                    min_delegate_stake: None,
+                },
+            }
+            .data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.settings.delegate_reward_share_ratio, 1000); // active unchanged
+    assert_eq!(gw.settings.pending_delegate_reward_share_ratio, Some(5000));
+
+    // Warp to epoch start, create epoch, run tally.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: operator_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: operator_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Tally applied pending → active and cleared the pending slot.
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.settings.delegate_reward_share_ratio, 5000);
+    assert_eq!(gw.settings.pending_delegate_reward_share_ratio, None);
 }

@@ -3725,7 +3725,8 @@ async fn test_request_and_set_primary_name() {
     let payer_pk = ctx.payer.pubkey();
     let initiator_token = Keypair::new();
     create_token_account(&mut ctx, &initiator_token, &mint.pubkey(), &payer_pk).await;
-    // Fund with enough for fee: PRIMARY_NAME_REQUEST_BASE_FEE = 200_000 mARIO at demand_factor=1.0
+    // Fund with enough for the permabuy fee:
+    // PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY = 1_000_000 mARIO at demand_factor=1.0
     mint_tokens(
         &mut ctx,
         &mint.pubkey(),
@@ -3840,8 +3841,10 @@ async fn test_request_and_set_primary_name() {
     );
     assert_eq!(reverse_data.name, name, "Reverse lookup name should match");
 
-    // Verify: Fee was charged (200_000 mARIO at demand_factor=1.0)
-    let expected_fee = 200_000u64; // PRIMARY_NAME_REQUEST_BASE_FEE * 1.0
+    // Verify: Fee was charged. This name is a Permabuy record (see
+    // build_arns_record_data), so the permabuy rate applies: 1_000_000 mARIO
+    // at demand_factor=1.0 (WHITEPAPER_COMPARISON.md #3).
+    let expected_fee = 1_000_000u64; // PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY * 1.0
     let initiator_balance_after = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
     let protocol_balance_after = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
     assert_eq!(
@@ -5060,6 +5063,333 @@ async fn test_request_primary_name_lease_within_grace() {
         request_account.is_some(),
         "Request should be created for lease within grace period"
     );
+}
+
+// -----------------------------------------------------------------
+// Purchase-type-aware primary-name fee (WHITEPAPER_COMPARISON.md #3)
+// -----------------------------------------------------------------
+// Lease primary names pay PRIMARY_NAME_REQUEST_BASE_FEE_LEASE (0.2 ARIO × DF);
+// permabuy primary names pay PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY
+// (1.0 ARIO × DF). The handler selects the rate from the ArnsRecord
+// purchase_type byte at offset 104.
+
+/// Like `inject_arns_accounts`, but installs an **active lease** ArnsRecord
+/// (purchase_type = Lease at offset 104, end_timestamp 100 years out) with the
+/// ant mint populated and an AntRecord("@") owned by `nft_holder`. Returns
+/// (arns_record_pda, demand_factor_pda, ant_record_pda, ant_mint_key).
+async fn inject_arns_accounts_active_lease(
+    ctx: &mut ProgramTestContext,
+    arns_program_id: &Pubkey,
+    name: &str,
+    nft_holder: &solana_sdk::pubkey::Pubkey,
+) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let ant_mint_key = Pubkey::new_unique();
+    let name_hash = solana_sdk::hash::hash(name.as_bytes());
+    let (arns_record_pda, _) =
+        Pubkey::find_program_address(&[b"arns_record", name_hash.as_ref()], arns_program_id);
+
+    // Canonical layout with purchase_type = Lease (0) at offset 104 and the ant
+    // mint populated so the _and_set handler can resolve the AntRecord owner.
+    let arns_disc = solana_sdk::hash::hash(b"account:ArnsRecord");
+    let mut arns_data = arns_disc.as_ref()[..8].to_vec();
+    arns_data.extend_from_slice(name_hash.as_ref()); // name_hash: 32
+    arns_data.extend_from_slice(nft_holder.as_ref()); // owner: 32
+    arns_data.extend_from_slice(ant_mint_key.as_ref()); // ant: 32
+    arns_data.push(0); // purchase_type = Lease (offset 104)
+    arns_data.extend_from_slice(&0i64.to_le_bytes()); // start_timestamp: 8
+    arns_data.push(1); // end_timestamp = Some
+    arns_data.extend_from_slice(&(100i64 * 365 * 86_400).to_le_bytes()); // end_timestamp: 8
+    arns_data.extend_from_slice(&10u16.to_le_bytes()); // undername_limit: 2
+    arns_data.extend_from_slice(&0u64.to_le_bytes()); // purchase_price: 8
+    arns_data.push(0); // bump: 1
+    arns_data.extend_from_slice(&(name.len() as u32).to_le_bytes()); // name len: 4
+    arns_data.extend_from_slice(name.as_bytes()); // name bytes
+    ctx.set_account(
+        &arns_record_pda,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(arns_data.len()),
+            data: arns_data,
+            owner: *arns_program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (demand_factor_pda, _) = Pubkey::find_program_address(&[b"demand_factor"], arns_program_id);
+    let df_data = build_demand_factor_data();
+    ctx.set_account(
+        &demand_factor_pda,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(df_data.len()),
+            data: df_data,
+            owner: *arns_program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let ant_record_at_at = install_ant_record(ctx, &ant_mint_key, "@", Some(*nft_holder)).await;
+    (
+        arns_record_pda,
+        demand_factor_pda,
+        ant_record_at_at,
+        ant_mint_key,
+    )
+}
+
+/// Shared body for the `request_primary_name` fee tests: injects an ArnsRecord
+/// of the requested purchase type + DemandFactor(1.0), runs the handler, and
+/// asserts the fee charged to the initiator and credited to the treasury.
+async fn assert_request_primary_name_fee(name: &str, permabuy: bool, expected_fee: u64) {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    create_mint(&mut ctx, &mint, &mint_authority.pubkey()).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let initiator_token = Keypair::new();
+    create_token_account(&mut ctx, &initiator_token, &mint.pubkey(), &payer_pk).await;
+    mint_tokens(
+        &mut ctx,
+        &mint.pubkey(),
+        &initiator_token.pubkey(),
+        &mint_authority,
+        10_000_000,
+    )
+    .await;
+
+    let protocol_token = Keypair::new();
+    create_token_account(&mut ctx, &protocol_token, &mint.pubkey(), &payer_pk).await;
+
+    let (config_key, arns_program_id) =
+        initialize_config(&mut ctx, &mint.pubkey(), &protocol_token.pubkey()).await;
+
+    // Inject the ArnsRecord of the requested purchase type. request_primary_name
+    // (site 1) reads only the ArnsRecord + DemandFactor — no AntRecord needed.
+    let name_hash = solana_sdk::hash::hash(name.as_bytes());
+    let (arns_record_pda, _) =
+        Pubkey::find_program_address(&[b"arns_record", name_hash.as_ref()], &arns_program_id);
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let arns_data = if permabuy {
+        build_arns_record_data(name, &payer_pk, &Pubkey::new_unique())
+    } else {
+        // Active lease ending 100 years out (never expired at the test clock).
+        build_arns_record_data_lease(name, &payer_pk, 0, 100 * 365 * 86_400)
+    };
+    ctx.set_account(
+        &arns_record_pda,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(arns_data.len()),
+            data: arns_data,
+            owner: arns_program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (demand_factor_pda, _) =
+        Pubkey::find_program_address(&[b"demand_factor"], &arns_program_id);
+    let df_data = build_demand_factor_data();
+    ctx.set_account(
+        &demand_factor_pda,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(df_data.len()),
+            data: df_data,
+            owner: arns_program_id,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let initiator_before = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
+    let protocol_before = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
+
+    let (request_key, _) = Pubkey::find_program_address(
+        &[PRIMARY_NAME_REQUEST_SEED, payer_pk.as_ref()],
+        &ario_core::ID,
+    );
+    let mut account_metas = ario_core::accounts::RequestPrimaryName {
+        config: config_key,
+        request: request_key,
+        initiator_token_account: initiator_token.pubkey(),
+        protocol_token_account: protocol_token.pubkey(),
+        initiator: payer_pk,
+        token_program: spl_token::id(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        arns_record_pda,
+        false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        demand_factor_pda,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: account_metas,
+            data: ario_core::instruction::RequestPrimaryName {
+                name: name.to_string(),
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let initiator_after = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
+    let protocol_after = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
+    let kind = if permabuy { "permabuy" } else { "lease" };
+    assert_eq!(
+        initiator_before - initiator_after,
+        expected_fee,
+        "initiator should be charged the {kind} primary-name fee"
+    );
+    assert_eq!(
+        protocol_after - protocol_before,
+        expected_fee,
+        "treasury should receive the {kind} primary-name fee"
+    );
+}
+
+#[tokio::test]
+async fn test_request_primary_name_lease_fee() {
+    // Lease record → PRIMARY_NAME_REQUEST_BASE_FEE_LEASE × DF(1.0) = 200_000.
+    assert_request_primary_name_fee("leasefeename", false, 200_000).await;
+}
+
+#[tokio::test]
+async fn test_request_primary_name_permabuy_fee() {
+    // Permabuy record → PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY × DF(1.0) = 1_000_000.
+    assert_request_primary_name_fee("permabuyfeename", true, 1_000_000).await;
+}
+
+/// Shared body for the `request_and_set_primary_name` fee tests: injects an
+/// ArnsRecord of the requested purchase type (with ant + AntRecord owned by the
+/// initiator), runs the combined handler, and asserts the fee charged.
+async fn assert_request_and_set_primary_name_fee(name: &str, permabuy: bool, expected_fee: u64) {
+    let mut pt = program_test();
+    let mut ctx = pt.start_with_context().await;
+
+    let mint = Keypair::new();
+    let mint_authority = Keypair::new();
+    create_mint(&mut ctx, &mint, &mint_authority.pubkey()).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let initiator_token = Keypair::new();
+    create_token_account(&mut ctx, &initiator_token, &mint.pubkey(), &payer_pk).await;
+    mint_tokens(
+        &mut ctx,
+        &mint.pubkey(),
+        &initiator_token.pubkey(),
+        &mint_authority,
+        10_000_000,
+    )
+    .await;
+
+    let protocol_token = Keypair::new();
+    create_token_account(&mut ctx, &protocol_token, &mint.pubkey(), &payer_pk).await;
+
+    let (config_key, arns_program_id) =
+        initialize_config(&mut ctx, &mint.pubkey(), &protocol_token.pubkey()).await;
+
+    let (arns_record_pda, demand_factor_pda, ant_record_pda, _) = if permabuy {
+        inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await
+    } else {
+        inject_arns_accounts_active_lease(&mut ctx, &arns_program_id, name, &payer_pk).await
+    };
+
+    let initiator_before = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
+    let protocol_before = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
+
+    let (primary_name_key, _) =
+        Pubkey::find_program_address(&[PRIMARY_NAME_SEED, payer_pk.as_ref()], &ario_core::ID);
+    let name_hash = solana_sdk::hash::hash(name.to_lowercase().as_bytes());
+    let (reverse_key, _) = Pubkey::find_program_address(
+        &[PRIMARY_NAME_REVERSE_SEED, name_hash.as_ref()],
+        &ario_core::ID,
+    );
+
+    let mut account_metas = ario_core::accounts::RequestAndSetPrimaryName {
+        config: config_key,
+        primary_name: primary_name_key,
+        primary_name_reverse: reverse_key,
+        initiator_token_account: initiator_token.pubkey(),
+        protocol_token_account: protocol_token.pubkey(),
+        initiator: payer_pk,
+        token_program: spl_token::id(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        arns_record_pda,
+        false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        demand_factor_pda,
+        false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_record_pda,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_core::ID,
+            accounts: account_metas,
+            data: ario_core::instruction::RequestAndSetPrimaryName {
+                name: name.to_string(),
+                reverse_lookup_hash: primary_reverse_lookup_hash(name),
+                ant_program_id: ario_ant::ID,
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let initiator_after = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
+    let protocol_after = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
+    let kind = if permabuy { "permabuy" } else { "lease" };
+    assert_eq!(
+        initiator_before - initiator_after,
+        expected_fee,
+        "initiator should be charged the {kind} primary-name fee"
+    );
+    assert_eq!(
+        protocol_after - protocol_before,
+        expected_fee,
+        "treasury should receive the {kind} primary-name fee"
+    );
+}
+
+#[tokio::test]
+async fn test_request_and_set_primary_name_lease_fee() {
+    // Lease record → 200_000 mARIO at DF(1.0).
+    assert_request_and_set_primary_name_fee("leaseandsetfee", false, 200_000).await;
+}
+
+#[tokio::test]
+async fn test_request_and_set_primary_name_permabuy_fee() {
+    // Permabuy record → 1_000_000 mARIO at DF(1.0).
+    assert_request_and_set_primary_name_fee("permabuyandsetfee", true, 1_000_000).await;
 }
 
 // -----------------------------------------
@@ -9517,14 +9847,23 @@ mod fund_from_funding_plan {
         let (arns_record_pda, _) =
             Pubkey::find_program_address(&[b"arns_record", name_hash.as_ref()], &arns_program_id);
         let arns_disc = solana_sdk::hash::hash(b"account:ArnsRecord");
+        // Canonical ArnsRecord layout so purchase_type lands at offset 104:
+        // disc(8) + name_hash(32) + owner(32) + ant(32) + purchase_type(1)
+        // + start_ts(8) + end_ts(1+8) + undername_limit(2) + purchase_price(8)
+        // + bump(1) + name(4+N). Permabuy → fee = 1_000_000 (WHITEPAPER #3).
         let mut arns_data = arns_disc.as_ref()[..8].to_vec();
-        arns_data.extend_from_slice(name_hash.as_ref());
-        arns_data.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        arns_data.extend_from_slice(name.as_bytes());
-        arns_data.extend_from_slice(payer_pk.as_ref());
-        arns_data.extend_from_slice(&[0u8; 32]);
-        arns_data.push(1); // permabuy
-        arns_data.extend_from_slice(&[0u8; 63]);
+        arns_data.extend_from_slice(name_hash.as_ref()); // name_hash: 32
+        arns_data.extend_from_slice(payer_pk.as_ref()); // owner: 32
+        arns_data.extend_from_slice(&[0u8; 32]); // ant: 32
+        arns_data.push(1); // purchase_type = Permabuy (offset 104)
+        arns_data.extend_from_slice(&0i64.to_le_bytes()); // start_timestamp: 8
+        arns_data.push(0); // end_timestamp: None tag
+        arns_data.extend_from_slice(&[0u8; 8]); // end_timestamp: payload
+        arns_data.extend_from_slice(&10u16.to_le_bytes()); // undername_limit: 2
+        arns_data.extend_from_slice(&0u64.to_le_bytes()); // purchase_price: 8
+        arns_data.push(0); // bump: 1
+        arns_data.extend_from_slice(&(name.len() as u32).to_le_bytes()); // name len: 4
+        arns_data.extend_from_slice(name.as_bytes()); // name bytes
         let rent = ctx.banks_client.get_rent().await.unwrap();
         ctx.set_account(
             &arns_record_pda,
@@ -9554,9 +9893,10 @@ mod fund_from_funding_plan {
             .into(),
         );
 
-        // Compute fee = 200_000 * 1.0 = 200_000 mARIO.
-        let fee = 200_000u64;
-        // Plan: 100k from each gateway's delegation.
+        // Permabuy record → fee = 1_000_000 * 1.0 = 1_000_000 mARIO
+        // (WHITEPAPER_COMPARISON.md #3).
+        let fee = 1_000_000u64;
+        // Plan: split evenly across each gateway's delegation.
         let pay_per = fee / 2;
 
         // Build the call.
@@ -9722,8 +10062,9 @@ mod fund_from_funding_plan {
         let (arns_record_pda, demand_factor_pda, ant_asset_key, _) =
             super::inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await;
 
-        // Plan: 2 delegations, 100k each → 200k mARIO fee at demand_factor=1.0.
-        let fee = 200_000u64;
+        // Permabuy record (inject_arns_accounts) → 1_000_000 mARIO fee at
+        // demand_factor=1.0 (WHITEPAPER_COMPARISON.md #3); split across 2 delegations.
+        let fee = 1_000_000u64;
         let pay_per = fee / 2;
 
         let (primary_name_pda, _) =
@@ -9902,14 +10243,23 @@ mod fund_from_funding_plan {
         let (arns_record_pda, _) =
             Pubkey::find_program_address(&[b"arns_record", name_hash.as_ref()], &arns_program_id);
         let arns_disc = solana_sdk::hash::hash(b"account:ArnsRecord");
+        // Canonical ArnsRecord layout so purchase_type lands at offset 104:
+        // disc(8) + name_hash(32) + owner(32) + ant(32) + purchase_type(1)
+        // + start_ts(8) + end_ts(1+8) + undername_limit(2) + purchase_price(8)
+        // + bump(1) + name(4+N). Permabuy → fee = 1_000_000 (WHITEPAPER #3).
         let mut arns_data = arns_disc.as_ref()[..8].to_vec();
-        arns_data.extend_from_slice(name_hash.as_ref());
-        arns_data.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        arns_data.extend_from_slice(name.as_bytes());
-        arns_data.extend_from_slice(payer_pk.as_ref());
-        arns_data.extend_from_slice(&[0u8; 32]);
-        arns_data.push(1);
-        arns_data.extend_from_slice(&[0u8; 63]);
+        arns_data.extend_from_slice(name_hash.as_ref()); // name_hash: 32
+        arns_data.extend_from_slice(payer_pk.as_ref()); // owner: 32
+        arns_data.extend_from_slice(&[0u8; 32]); // ant: 32
+        arns_data.push(1); // purchase_type = Permabuy (offset 104)
+        arns_data.extend_from_slice(&0i64.to_le_bytes()); // start_timestamp: 8
+        arns_data.push(0); // end_timestamp: None tag
+        arns_data.extend_from_slice(&[0u8; 8]); // end_timestamp: payload
+        arns_data.extend_from_slice(&10u16.to_le_bytes()); // undername_limit: 2
+        arns_data.extend_from_slice(&0u64.to_le_bytes()); // purchase_price: 8
+        arns_data.push(0); // bump: 1
+        arns_data.extend_from_slice(&(name.len() as u32).to_le_bytes()); // name len: 4
+        arns_data.extend_from_slice(name.as_bytes()); // name bytes
         let rent = ctx.banks_client.get_rent().await.unwrap();
         ctx.set_account(
             &arns_record_pda,
@@ -9939,7 +10289,9 @@ mod fund_from_funding_plan {
             .into(),
         );
 
-        let fee = 200_000u64;
+        // Permabuy record → fee = 1_000_000 mARIO at demand_factor=1.0
+        // (WHITEPAPER_COMPARISON.md #3).
+        let fee = 1_000_000u64;
         let (request_key, _) = Pubkey::find_program_address(
             &[PRIMARY_NAME_REQUEST_SEED, payer_pk.as_ref()],
             &ario_core::ID,
@@ -10437,8 +10789,9 @@ async fn test_request_primary_name_emits_event_with_balance_funding_source() {
     assert_eq!(ev.name, name);
     assert_eq!(ev.request_pda, request_key);
     assert_eq!(ev.funding_source, ario_core::FUNDING_SOURCE_BALANCE);
-    // Fee = base * demand_factor / 1e6 = 200_000 * 1.0 = 200_000.
-    assert_eq!(ev.fee, 200_000);
+    // Permabuy record (inject_arns_accounts) → fee = permabuy_base * DF / 1e6
+    // = 1_000_000 * 1.0 = 1_000_000 (WHITEPAPER_COMPARISON.md #3).
+    assert_eq!(ev.fee, 1_000_000);
 }
 
 #[tokio::test]

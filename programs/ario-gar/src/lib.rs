@@ -225,6 +225,17 @@ pub mod ario_gar {
         instructions::delegate::claim_delegate_from_leaving_gateway(ctx)
     }
 
+    /// Fix #6: Claim a delegate's stake from a gateway that DISABLED delegation.
+    /// Matches Lua's auto-withdraw-on-disable (WP §6.3); on Solana delegates are
+    /// cranked out individually into withdrawal vaults. Permissionless. The
+    /// operator can't re-enable delegation until all delegates are cleared and
+    /// the cooldown elapses (see update_gateway_settings).
+    pub fn claim_delegate_from_disabled_gateway(
+        ctx: Context<ClaimDelegateFromDisabledGateway>,
+    ) -> Result<()> {
+        instructions::delegate::claim_delegate_from_disabled_gateway(ctx)
+    }
+
     /// Redelegate stake from one gateway to another (F17)
     /// Fee = min(10% * redelegation_count, 60%) — first is free, resets every 7 days
     /// Fee goes to protocol. Net amount moves to target delegation.

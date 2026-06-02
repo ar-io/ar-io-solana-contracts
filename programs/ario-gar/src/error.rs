@@ -318,4 +318,19 @@ pub enum GarError {
 
     #[msg("Unknown schema version — no migration path exists from this version")]
     UnknownSchemaVersion,
+
+    // =========================================
+    // DELEGATION LIFECYCLE ERRORS (Fix #6)
+    // Appended at the end to keep existing error codes stable.
+    // =========================================
+    #[msg("Cannot re-enable delegation while delegates still have stake; crank claim_delegate_from_disabled_gateway first")]
+    DelegatesStillActive,
+
+    #[msg(
+        "Cannot re-enable delegation until the disable cooldown (withdrawal period) has elapsed"
+    )]
+    DelegationCooldownActive,
+
+    #[msg("Delegation must be disabled on this gateway for this operation")]
+    DelegationNotDisabled,
 }

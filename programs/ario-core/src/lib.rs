@@ -142,7 +142,8 @@ pub mod ario_core {
 
     /// Request a primary name for your address (F42)
     /// M1: Charges a fee (matches Lua: primary_names.requestPrimaryName charges getTokenCost)
-    /// Fee = PRIMARY_NAME_REQUEST_BASE_FEE * demand_factor / DEMAND_FACTOR_SCALE
+    /// Fee = PRIMARY_NAME_REQUEST_BASE_FEE_{LEASE,PERMABUY} * demand_factor / DEMAND_FACTOR_SCALE
+    /// (permabuy names pay 5x the lease rate — WHITEPAPER_COMPARISON.md #3)
     /// remaining_accounts[0] = ArnsRecord PDA for base name (validates record exists)
     /// remaining_accounts[1] = DemandFactor account from ario-arns (for fee calculation)
     pub fn request_primary_name(ctx: Context<RequestPrimaryName>, name: String) -> Result<()> {

@@ -459,6 +459,13 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
             gw.weights = weights;
             // M-5: Bind weights to this epoch so distribute_epoch can verify freshness
             gw.weights.weights_epoch = epoch.epoch_index;
+            // Fix #7 (WP §6.3): apply any deferred delegate_reward_share_ratio at
+            // the start of the new epoch's tally, then clear the pending slot.
+            // distribute_epoch (later this epoch) reads the now-updated active
+            // value, so the change is epoch-stable and can't be front-run.
+            if let Some(pending) = gw.settings.pending_delegate_reward_share_ratio.take() {
+                gw.settings.delegate_reward_share_ratio = pending;
+            }
             let dst = &mut data[8..];
             let mut cursor = std::io::Cursor::new(dst);
             gw.serialize(&mut cursor)
