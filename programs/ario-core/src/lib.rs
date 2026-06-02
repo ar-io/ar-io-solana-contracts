@@ -153,16 +153,27 @@ pub mod ario_core {
     /// M2: Request AND set a primary name in one tx (auto-approve for ANT
     /// holders of the matching AntRecord).
     ///
-    /// Authorization: caller is the `AntRecord.owner` for the requested
-    /// name's undername (or `@` for base names). The AntRecord PDA is
-    /// resolved under `ant_program_id`, which `read_ant_record_owner`
-    /// requires to equal `ario_ant::ID` (canonical lockdown — pluggable
-    /// ANT programs per ADR-016 are deferred until the asset's
-    /// `ANT Program` Attributes-plugin trait can be consulted on-chain).
-    /// Earlier docs claimed PDA-seed derivation alone pinned the program
-    /// id; that's wrong — `find_program_address` derives a PDA under
-    /// whatever program the caller supplies, so without the canonical
-    /// check an attacker-deployed program would satisfy the seed match.
+    /// remaining_accounts[0] = ArnsRecord PDA for base name
+    /// remaining_accounts[1] = DemandFactor account from ario-arns
+    /// remaining_accounts[2] = AntRecord PDA (explicit per-record delegate)
+    /// remaining_accounts[3] = AntConfig PDA (ANT-level owner snapshot)
+    ///
+    /// Authorization: caller is the effective `AntRecord.owner` for the
+    /// requested name's undername (or `@` for base names) — the explicit
+    /// per-record delegate if set, else `AntConfig.last_known_owner`. The
+    /// fallback reads the ANT-level snapshot (kept fresh by
+    /// `ario_ant::transfer`) rather than the per-record
+    /// `last_reconciled_owner`, which lags ownership after a transfer and
+    /// would let a previous holder act on a name they no longer control.
+    /// The AntRecord/AntConfig PDAs are resolved under `ant_program_id`,
+    /// which `read_ant_record_owner` requires to equal `ario_ant::ID`
+    /// (canonical lockdown — pluggable ANT programs per ADR-016 are
+    /// deferred until the asset's `ANT Program` Attributes-plugin trait
+    /// can be consulted on-chain). Earlier docs claimed PDA-seed
+    /// derivation alone pinned the program id; that's wrong —
+    /// `find_program_address` derives a PDA under whatever program the
+    /// caller supplies, so without the canonical check an
+    /// attacker-deployed program would satisfy the seed match.
     pub fn request_and_set_primary_name(
         ctx: Context<RequestAndSetPrimaryName>,
         name: String,
@@ -208,8 +219,14 @@ pub mod ario_core {
     ///
     /// remaining_accounts layout:
     ///   [0..validation_account_count): primary-name validation
-    ///     ([0] ArnsRecord, [1] DemandFactor, [2] AntRecord)
+    ///     ([0] ArnsRecord, [1] DemandFactor, [2] AntRecord, [3] AntConfig)
     ///   [validation_account_count..):  funding-source PDAs
+    ///
+    /// `[3] AntConfig` is the ANT-level owner snapshot
+    /// (`ario_ant::AntConfig` PDA `["ant_config", ant_mint]`); the
+    /// implicit-owner authorization reads `last_known_owner` from it
+    /// rather than the per-record `last_reconciled_owner`, which goes
+    /// stale after an NFT transfer.
     ///
     /// `ant_program_id` must equal `ario_ant::ID` (canonical lockdown) —
     /// see `request_and_set_primary_name` for the full rationale and the
@@ -236,10 +253,16 @@ pub mod ario_core {
 
     /// Approve a primary name request (F43)
     ///
-    /// Authorization: `name_owner` must be the AntRecord.owner for the
-    /// requested name. `ant_program_id` must equal `ario_ant::ID`
-    /// (canonical lockdown) — see `request_and_set_primary_name` for the
-    /// full rationale and the ADR-016 pluggable-program follow-up.
+    /// remaining_accounts[0] = ArnsRecord PDA for base name
+    /// remaining_accounts[1] = AntRecord PDA
+    /// remaining_accounts[2] = AntConfig PDA (ANT-level owner snapshot)
+    ///
+    /// Authorization: `name_owner` must be the effective AntRecord.owner
+    /// for the requested name (explicit delegate, else
+    /// `AntConfig.last_known_owner`). `ant_program_id` must equal
+    /// `ario_ant::ID` (canonical lockdown) — see
+    /// `request_and_set_primary_name` for the full rationale and the
+    /// ADR-016 pluggable-program follow-up.
     pub fn approve_primary_name(
         ctx: Context<ApprovePrimaryName>,
         reverse_lookup_hash: [u8; 32],
@@ -271,9 +294,15 @@ pub mod ario_core {
     /// The base name owner can revoke any primary name that uses their ArNS domain.
     /// E.g., owner of "arweave" can revoke "alice_arweave" primary name.
     ///
-    /// Authorization: caller must be the AntRecord.owner for the BASE
-    /// name's @ undername. `ant_program_id` must equal `ario_ant::ID`
-    /// (canonical lockdown) — see `request_and_set_primary_name`.
+    /// remaining_accounts[0] = ArnsRecord PDA for base name
+    /// remaining_accounts[1] = AntRecord PDA (@ undername)
+    /// remaining_accounts[2] = AntConfig PDA (ANT-level owner snapshot)
+    ///
+    /// Authorization: caller must be the effective AntRecord.owner for the
+    /// BASE name's @ undername (explicit delegate, else
+    /// `AntConfig.last_known_owner`). `ant_program_id` must equal
+    /// `ario_ant::ID` (canonical lockdown) — see
+    /// `request_and_set_primary_name`.
     pub fn remove_primary_name_for_base_name(
         ctx: Context<RemovePrimaryNameForBaseName>,
         reverse_lookup_hash: [u8; 32],
