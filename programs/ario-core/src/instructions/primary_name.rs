@@ -180,12 +180,16 @@ fn read_arns_purchase_type(arns_record_info: &AccountInfo) -> Result<u8> {
 /// Resolve the base primary-name request fee (mARIO, pre-demand-factor) from
 /// an ArnsRecord's purchase type: permabuy names pay 5x the lease rate per
 /// the whitepaper. See `read_arns_purchase_type`.
+///
+/// Fails closed: `PurchaseType` is `{ Lease = 0, Permabuy = 1 }`, so any other
+/// byte is a malformed record or an incompatible future ario-arns layout —
+/// reject it rather than silently charging the (cheaper) lease rate.
 fn primary_name_base_fee(arns_record_info: &AccountInfo) -> Result<u64> {
-    Ok(if read_arns_purchase_type(arns_record_info)? == 1 {
-        ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY
-    } else {
-        ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_LEASE
-    })
+    match read_arns_purchase_type(arns_record_info)? {
+        0 => Ok(ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_LEASE),
+        1 => Ok(ArioConfig::PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY),
+        _ => err!(ArioError::InvalidAccountState),
+    }
 }
 
 /// Read demand factor from an account info, erroring if the account is invalid.

@@ -6,7 +6,10 @@
 
 ## Fix #2 — Returned Name Premium Formula
 
-**Status:** Plan ready. Code change not yet applied.
+**Status: IMPLEMENTED** — `calculate_returned_name_premium` now uses the
+whitepaper `50 − (49/14)·t` formula; assertions updated and the two boundary
+tests (`premium_at_last_second_never_zero`,
+`premium_at_exact_duration_equals_base`) added.
 
 **Problem:** The code formula `50 × (duration − elapsed) / duration` decayed the
 premium from 50x to **0x**, while the whitepaper specifies `RNP = 50 − (49/14) × t`
@@ -212,6 +215,14 @@ gates that should remain immediate — deferring them would hurt operator UX
 
 **Fix (schema change + migration required):**
 
+> ⚠️ **The Step 1–3 struct/migration details below are the ORIGINAL plan and
+> are SUPERSEDED — see the IMPLEMENTED status note at the top of this section.**
+> As shipped, the field was added to **`GatewaySettings2`** (the `gateway.settings`
+> sub-struct), NOT inserted before `Gateway.version`. `version` stays at the
+> byte-end per ADR-020. Because `GatewaySettings2` is mid-struct, the change is
+> **not** an in-place grow-then-deserialize migration; pre-mainnet we fully
+> redeploy devnet/staging. Keep the original text for historical context only.
+
 ### Step 1: Add field to Gateway struct
 
 **`programs/ario-gar/src/state/mod.rs`:**
@@ -408,6 +419,14 @@ calls the new instruction once per delegate to create withdrawal vaults.
 
 This prevents toggle churn: the operator can't dump delegates then immediately
 re-recruit.
+
+> ⚠️ **The Step 1–3 struct/migration details below are the ORIGINAL plan and
+> are SUPERSEDED — see the IMPLEMENTED status note at the top of this section.**
+> As shipped, `delegation_disabled_at` was added to **`GatewaySettings2`**, not
+> inserted before `Gateway.version`; `version` stays at the byte-end (ADR-020).
+> Mid-struct ⇒ no in-place migration (pre-mainnet full redeploy). The re-enable
+> cooldown compares against `settings.withdrawal_period`, not the const. Keep the
+> original text for historical context only.
 
 ### Step 1: Add field to Gateway struct
 
