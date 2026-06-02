@@ -81,7 +81,7 @@ ref  = Client passes account reference (ANT asset ownership check)
 
 Key cross-program reads:
   ario-core reads ario-arns: ArnsRecord + DemandFactor (primary name validation/fee)
-  ario-core reads ario-ant:  ANT NFT asset (primary name ownership check)
+  ario-core reads ario-ant:  AntRecord + AntConfig PDAs (primary name ownership — MPL-agnostic, ADR-016)
   ario-gar  reads ario-arns: NameRegistry (epoch name prescription)
   ario-arns reads ario-gar:  Gateway account (operator discount verification)
   ario-arns reads ario-ant:  ANT NFT asset (buy_name validation)
@@ -227,7 +227,8 @@ User (owns ArNS name "alice")
  │                                           │
  │  Validates:                               │
  │  - ArnsRecord exists & active (read from ario-arns)
- │  - Caller holds ANT NFT for "alice"       │
+ │  - Caller is the effective ANT owner for  │
+ │    "alice" (AntRecord + AntConfig, ario-ant)│
  │  - DemandFactor read for fee calculation  │
  │                                           │
  │  Fee: 0.2 ARIO × demand_factor           │
@@ -254,48 +255,61 @@ Requester                     ario-core              Name Owner
 - `close_expired_request` (permissionless) cleans up expired requests
 - Base name owner can revoke via `remove_primary_name_for_base_name`
 - User removes their own via `remove_primary_name`
-- Cross-program reads: ArnsRecord (ario-arns) and DemandFactor (ario-arns) via `remaining_accounts`
+- Cross-program reads via `remaining_accounts`: ArnsRecord + DemandFactor (ario-arns), and AntRecord + AntConfig (ario-ant) for owner authorization
 
 **Flow C — Undername record owner sets their own primary name (BD-097):**
 
-When a name has the form `<undername>_<base>`, both `request_and_set_primary_name`
-and `approve_primary_name` accept either the ANT NFT holder *or* the
-`AntRecord.owner` for that undername. Base names always require ANT-holder auth.
+`request_and_set_primary_name`, `approve_primary_name`, and
+`remove_primary_name_for_base_name` authorize the **effective owner** of the
+name's `AntRecord` (the `@` record for base names, the undername record
+otherwise), computed by ario-core from two canonical `ario_ant` accounts — the
+`AntRecord` PDA and the `AntConfig` PDA — without reading the Metaplex Core
+asset (MPL-agnostic, ADR-016). See BD-097 (mechanism) and BD-109 (the
+canonical-`ario_ant`-only / BYO-ANT limitation).
 
 ```
-Record Owner (AntRecord.owner = alice; alice does NOT hold the ANT NFT)
+Undername delegate (AntRecord.owner = alice, set by the current ANT holder)
  │
  │  request_and_set_primary_name("alice_company")
  │     remaining_accounts:
  │       [0] ArnsRecord(company)
  │       [1] DemandFactor
- │       [2] ANT Metaplex Core asset (held by Bob)
- │       [3] AntRecord("alice", company-ant)  ← new
+ │       [2] AntRecord("alice", company-ant)
+ │       [3] AntConfig(company-ant)            ← ANT-level owner snapshot
  │────────────────────────────────────────►  ario-core
  │                                           │
- │  ario-core sees nft_owner != caller,      │
- │  splits "alice_company" → undername "alice"│
- │  reads remaining[3] as AntRecord PDA,     │
- │  checks owner program / PDA / discriminator,│
- │  parses owner field → matches caller ✓    │
- │                                           │
- │  PrimaryName set                          │
+ │  ario-core (program-pinned to ario_ant::ID):
+ │   • reads AntConfig.last_known_owner (lko)  │
+ │   • reads AntRecord.last_reconciled_owner   │
+ │     (lro) + owner delegate                  │
+ │   • FRESH (lro == lko): effective owner =   │
+ │     owner delegate if set, else lko         │
+ │   • STALE (lro != lko, NFT moved since the  │
+ │     record was reconciled): effective owner │
+ │     = lko (ignore stale delegate + lro)     │
+ │   • require(effective owner == caller) ✓    │
+ │  PrimaryName set                            │
  │◄──────────────────────────────────────────│
 ```
 
-- The on-chain code only consults the AntRecord slot when the caller is *not*
-  the NFT holder. The SDK's always-pass policy (`requestPrimaryName` always
-  includes the AntRecord PDA for undernames) keeps the call shape uniform; the
-  contract simply ignores the slot for ANT-holder callers.
-- The AntRecord PDA is derived against the program named in the asset's
-  `ANT Program` Attributes-plugin entry (canonical fallback when absent —
-  ADR-016 / BD-100). Both the SDK and ario-core read this from the asset
-  before deriving the PDA, so BYO-ANT undernames work transparently.
-- Lazy reconciliation in ario-ant clears `AntRecord.owner` whenever the NFT
-  has been transferred since the last record write, so a stale record owner
-  cannot override a new ANT holder.
+- Authorization mirrors `ario_ant`'s own H-7 reconciliation invariant applied
+  read-only: an explicit `AntRecord.owner` delegate is honored only while the
+  record is reconciled (`last_reconciled_owner == AntConfig.last_known_owner`).
+  After a wrapped `ario_ant::transfer` (which updates `AntConfig.last_known_owner`
+  but touches no record), every record is stale, so a former delegate or former
+  holder is locked out immediately and the current owner is authorized — without
+  waiting for ario-ant to reconcile the specific record.
+- The SDK's always-pass policy supplies both the `AntRecord` and `AntConfig`
+  PDAs for the relevant name; ANT-holder callers are covered by the same path
+  (they resolve as the implicit owner `lko`).
+- The PDAs are `ario_ant`-specific (program pin + `["ant_config", mint]` /
+  `["ant_record", mint, undername_hash]` seeds). A third-party "bring your own"
+  ANT program is **not** supported on these write-authorization paths until
+  pluggable ANT-program owner-resolution lands — BD-109 (the `ANT Program`
+  read-routing of BD-100 does not yet cover these flows).
 - The ANT holder retains the safety valve: `remove_primary_name_for_base_name`
-  is unchanged and lets the holder nuke any primary name set on their domain.
+  lets the current holder nuke any primary name set on their domain
+  (`@` record, remaining_accounts `[0]`ArnsRecord `[1]`AntRecord `[2]`AntConfig).
 
 ---
 
