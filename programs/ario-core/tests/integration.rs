@@ -5533,11 +5533,14 @@ async fn assert_request_and_set_primary_name_fee(name: &str, permabuy: bool, exp
     let (config_key, arns_program_id) =
         initialize_config(&mut ctx, &mint.pubkey(), &protocol_token.pubkey()).await;
 
-    let (arns_record_pda, demand_factor_pda, ant_record_pda, _) = if permabuy {
+    let (arns_record_pda, demand_factor_pda, ant_record_pda, ant_mint) = if permabuy {
         inject_arns_accounts(&mut ctx, &arns_program_id, name, &payer_pk).await
     } else {
         inject_arns_accounts_active_lease(&mut ctx, &arns_program_id, name, &payer_pk).await
     };
+    // PR #91: request_and_set reads remaining_accounts[3] = AntConfig PDA for the
+    // last-known-owner fallback. The initiator owns this name.
+    let ant_config = install_ant_config(&mut ctx, &ant_mint, &payer_pk).await;
 
     let initiator_before = get_token_balance(&mut ctx, &initiator_token.pubkey()).await;
     let protocol_before = get_token_balance(&mut ctx, &protocol_token.pubkey()).await;
@@ -5572,6 +5575,9 @@ async fn assert_request_and_set_primary_name_fee(name: &str, permabuy: bool, exp
     account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
         ant_record_pda,
         false,
+    ));
+    account_metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        ant_config, false,
     ));
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
