@@ -37,6 +37,10 @@
       "types": "./lib/ant-escrow/index.d.ts",
       "import": "./lib/ant-escrow/index.js"
     },
+    "./mpl-core": {
+      "types": "./lib/mpl-core/index.d.ts",
+      "import": "./lib/mpl-core/index.js"
+    },
     "./canonical": {
       "types": "./lib/canonical/index.d.ts",
       "import": "./lib/canonical/index.js"
@@ -57,7 +61,7 @@
     "build:tsc": "tsc -p tsconfig.json",
     "build": "yarn codegen && yarn build:tsc",
     "postinstall": "node scripts/postinstall.mjs",
-    "clean": "rm -rf lib src/core src/gar src/arns src/ant src/ant-escrow",
+    "clean": "rm -rf lib src/core src/gar src/arns src/ant src/ant-escrow src/mpl-core",
     "prepublishOnly": "yarn clean && yarn build",
     "test": "node --test --import tsx test/canonical.cross.test.ts"
   },
