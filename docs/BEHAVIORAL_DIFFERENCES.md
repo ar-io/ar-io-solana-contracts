@@ -783,6 +783,17 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 
 ---
 
+### BD-111: Delegate Reward Share Is Carved From the Tally Snapshot, Not Live Delegated Stake (2026-06-02)
+
+| | |
+|---|---|
+| **Lua Behavior** | Disabling `allowDelegatedStaking` auto-withdraws every delegate in a single pass; the operator/delegate reward split is computed inline during distribution off the same iteration, so there is no tally-vs-distribute gap to exploit. |
+| **Solana Behavior** | `tally_weights` snapshots a per-gateway flag `GatewaySlot.delegated_at_tally` (1 iff `total_delegated_stake > 0` when the weight was tallied). `distribute_epoch` carves the delegate share (`delegate_pool = scaled × ratio`) based on THAT flag, independent of the live `total_delegated_stake` at distribution time. If the share is owed (flag set) but no delegator remains live (every delegate was cranked out post-tally), the share is **held back in the treasury** (`protocol_token_account`) rather than credited to the operator. The normal path is unchanged: with no mid-epoch delegate removal, the flag mirrors the live state. |
+| **Rationale** | Delegated stake inflates a gateway's epoch weight at tally (`gateway.total_stake()` includes `total_delegated_stake`), so the delegate share is *earned* at tally. Solana can't auto-withdraw all delegates in one tx (BD-024), so Fix #6 added the permissionless `claim_delegate_from_disabled_gateway` crank — which an operator could fire (after flipping `allow_delegated_staking` off on a still-Joined gateway) between tally and distribution to drive live `total_delegated_stake` to 0. The old split gated on the live value, so the collapsed `delegate_pool` fell entirely into `operator_stake` — letting the operator pocket the delegate share that delegated stake earned (HIGH-severity reward theft; PoC: operator `1e9` vs secure `9e8` at a 10% ratio). Keying the carve-out off the tally snapshot closes the race at its linchpin. See ADR-025. The flag is carved from `GatewaySlot._padding`, so the account layout / `GatewayRegistry::SIZE` is unchanged. |
+| **Consequence** | The force-claimed delegators still forfeit *that one epoch's* reward (they settle against the pre-distribution accumulator); the fix guarantees the operator does not receive it — it stays in the treasury. The `delegate_reward_share_ratio` is likewise frozen at tally (Fix #7), so neither input to the split is operator-manipulable after tally. |
+
+---
+
 ## Summary Statistics
 
 | Category | Count |

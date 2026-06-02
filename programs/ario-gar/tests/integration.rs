@@ -4177,6 +4177,211 @@ async fn test_epoch_create_and_tally() {
     assert_eq!(epoch.weights_tallied, 1);
     assert_eq!(epoch.tally_index, 1);
     assert!(epoch.total_composite_weight() > 0);
+
+    // ADR-025 / BD-111: this gateway has no delegated stake, so tally must
+    // record `delegated_at_tally == 0` for its slot (no delegate carve-out at
+    // distribution). The positive case is covered by
+    // test_tally_snapshots_delegated_at_tally.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[0].delegated_at_tally, 0,
+        "no delegated stake at tally must snapshot the flag as 0"
+    );
+}
+
+// ADR-025 / BD-111 regression: tally_weights must snapshot
+// GatewaySlot.delegated_at_tally = 1 when the gateway carries delegated stake,
+// so distribute_epoch carves the delegate share from this tally snapshot rather
+// than the operator-manipulable live total_delegated_stake. Without the
+// snapshot, an operator could disable delegation + crank every delegate out
+// between tally and distribution to redirect the delegate reward to itself.
+#[tokio::test]
+async fn test_tally_snapshots_delegated_at_tally() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000,
+    )
+    .await;
+
+    // clock 0 so gateway.start_timestamp (0) <= epoch.start (100)
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // Delegate to the gateway BEFORE tally so the stake contributes to weight.
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(
+        &mut ctx,
+        &delegator_token,
+        &setup.mint.pubkey(),
+        &delegator_pk,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let (delegation_key, _) = delegation_pda(&ctx.payer.pubkey(), &delegator_pk);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake {
+                amount: 20_000_000_000u64,
+            }
+            .data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Warp past epoch start, create epoch, tally.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: ctx.payer.pubkey(),
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The gateway carried delegated stake at tally → flag must be 1.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[0].delegated_at_tally, 1,
+        "delegated stake present at tally must snapshot the flag as 1"
+    );
+    assert!(
+        registry.gateways[0].composite_weight > 0,
+        "tallied gateway should have nonzero weight"
+    );
 }
 
 // -----------------------------------------
