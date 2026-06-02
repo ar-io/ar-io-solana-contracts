@@ -47,12 +47,12 @@ jobs:
     name: Release PLZ
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.90.0"
 
@@ -60,7 +60,7 @@ jobs:
       # half (release-plz-release) runs inside release.yml when an
       # operator calls it via workflow_call after the PR is merged.
       - name: Open / refresh Release PR
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
         with:
           command: release-plz-update
         env:
