@@ -357,21 +357,19 @@ esac
 # `unsafe-allow-test-attestor-pubkey` also re-enables the F-4 const-eval
 # guard in state.rs — desirable for any real-network build.
 #
-# `--features network-${BUILD_NETWORK:-devnet}` satisfies escrow's
-# `compile_error!` requiring exactly one of network-mainnet /
-# network-devnet to be enabled. The feature is only declared on escrow,
-# so it activates there only; the other crates ignore it.
+# `--features network-<net>` satisfies escrow's `compile_error!` requiring
+# exactly one of network-mainnet / network-devnet to be enabled. The feature is
+# only declared on escrow, so it activates there only; the other crates ignore
+# it.
 #
-# `--features devnet-shrunk` (BUILD_NETWORK=devnet only) shrinks the
-# zero-copy registry account sizes on ario-gar + ario-arns to fit on
-# devnet. Mainnet builds leave it off so production sizes are baked in.
-# It's declared as a no-op feature on every workspace member (PR #18) so
-# the workspace-level `--features` flag finds it without erroring.
-SBF_FEATURE_ARGS=(--no-default-features --features "network-${BUILD_NETWORK:-devnet}")
-if [[ "${BUILD_NETWORK:-}" == "devnet" ]]; then
-    SBF_FEATURE_ARGS+=(--features devnet-shrunk)
-    echo "[build-sbf] BUILD_NETWORK=devnet → enabling devnet-shrunk feature on ario-gar + ario-arns"
-fi
+# Only two attestor network bindings exist: `mainnet` (Solana mainnet) and
+# `devnet` (Solana devnet). `staging` is our full-size dress-rehearsal env that
+# *runs on Solana devnet*, so it maps to `network-devnet` — there is no
+# `network-staging` feature. Registries are always full-size (the `devnet-shrunk`
+# build mode was retired; see ADR-024).
+FEATURE_NETWORK="${BUILD_NETWORK:-devnet}"
+[[ "$FEATURE_NETWORK" == "staging" ]] && FEATURE_NETWORK="devnet"
+SBF_FEATURE_ARGS=(--no-default-features --features "network-${FEATURE_NETWORK}")
 # Use `anchor build` (not `cargo build-sbf`) so we get IDLs alongside
 # the .so files. anchor build wraps cargo-build-sbf internally + adds
 # IDL extraction via the `idl-build` cargo feature, and its
@@ -380,9 +378,9 @@ fi
 # step bundles those IDLs for downstream SDK consumers).
 #
 # anchor build forwards args after `--` to cargo build-sbf; our feature
-# combo (--no-default-features --features network-...,devnet-shrunk)
-# passes through unchanged, in addition to anchor's own
-# `--features idl-build`. Cargo unions multiple --features flags.
+# combo (--no-default-features --features network-<net>) passes through
+# unchanged, in addition to anchor's own `--features idl-build`. Cargo
+# unions multiple --features flags.
 echo "[build-sbf] anchor build -- ${SBF_FEATURE_ARGS[*]}"
 anchor build -- "${SBF_FEATURE_ARGS[@]}"
 

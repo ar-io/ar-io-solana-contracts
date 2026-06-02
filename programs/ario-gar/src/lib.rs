@@ -80,16 +80,6 @@ pub mod ario_gar {
         instructions::initialize::create_gateway_registry(ctx)
     }
 
-    /// Recovery-only: shrink an over-sized GatewayRegistry back to the
-    /// current binary's expected size and refund rent to authority.
-    /// Used when switching build modes (e.g. production → devnet-shrunk)
-    /// would otherwise leave the on-chain account too large for
-    /// `AccountLoader::load`. Authority + `migration_active` gated;
-    /// inert after `finalize_migration`.
-    pub fn admin_shrink_gateway_registry(ctx: Context<AdminShrinkGatewayRegistry>) -> Result<()> {
-        instructions::initialize::admin_shrink_gateway_registry(ctx)
-    }
-
     /// Initialize epoch settings
     pub fn initialize_epochs(
         ctx: Context<InitializeEpochs>,

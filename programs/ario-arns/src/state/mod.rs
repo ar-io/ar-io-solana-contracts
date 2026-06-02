@@ -614,9 +614,9 @@ impl ReservedName {
 /// instead of `AccountLoader<NameRegistry>`, because the header size
 /// is fixed but the slot array isn't.
 ///
-/// **Initial deploy capacity:** `INITIAL_CAPACITY` slots (50,000 on
-/// mainnet, 200 on `devnet-shrunk`). Expandable via
-/// `admin_expand_name_registry` up to any reasonable target.
+/// **Initial deploy capacity:** `INITIAL_CAPACITY` slots (50,000, all
+/// clusters). Expandable via `admin_expand_name_registry` up to any
+/// reasonable target.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct NameRegistry {
@@ -635,10 +635,7 @@ impl NameRegistry {
     pub const HEADER_BYTES: usize = 8 + Self::SIZE;
     /// Initial slot count provisioned at deploy time. Expandable via
     /// `admin_expand_name_registry`.
-    #[cfg(not(feature = "devnet-shrunk"))]
     pub const INITIAL_CAPACITY: usize = 50_000;
-    #[cfg(feature = "devnet-shrunk")]
-    pub const INITIAL_CAPACITY: usize = 200;
 
     /// Backward-compatible alias — many callers still reference
     /// `NameRegistry::MAX_NAMES` to bound iteration. Semantically the
@@ -754,9 +751,9 @@ pub fn append_name_entry(data: &mut [u8], entry: NameEntry) -> Result<u32> {
 ///
 /// Used by `release_name_to_returned` / lease-expiry cleanup paths.
 pub fn remove_name_entry_by_hash(data: &mut [u8], name_hash: [u8; 32]) -> bool {
-    // Defensive cap: if a post-shrink registry ever had `count` exceed
-    // the new capacity (shouldn't happen — admin_shrink rejects that
-    // — but cheap to defend), don't iterate past the slot region.
+    // Defensive cap: if `count` ever exceeded the slot capacity
+    // (shouldn't happen, but cheap to defend), don't iterate past the
+    // slot region.
     let count = (name_registry_header(data).count as usize).min(slot_capacity(data));
     if count == 0 {
         return false;

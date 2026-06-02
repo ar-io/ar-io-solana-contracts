@@ -78,9 +78,9 @@ fi
 if [[ "${FAST:-0}" != "1" ]]; then
     echo "==> Rebuilding ario-*.so into $FIXTURES_DIR (FAST=1 to skip)"
     # Build all 5 programs into the test dir (NOT target/deploy) via
-    # --sbf-out-dir. devnet-shrunk so registry sizes match the in-tree
-    # integration-test fixture expectations.
-    cargo build-sbf --features devnet-shrunk --sbf-out-dir "$FIXTURES_DIR" 2>&1 | tail -3
+    # --sbf-out-dir. Full-size registries (devnet-shrunk was retired —
+    # see ADR-024).
+    cargo build-sbf --sbf-out-dir "$FIXTURES_DIR" 2>&1 | tail -3
     # Re-build escrow ALONE with the opt-in test attestor key, overwriting
     # the prod-key escrow .so the workspace build just produced — again into
     # the test dir only.
@@ -101,22 +101,17 @@ fi
 
 export BPF_OUT_DIR="$FIXTURES_DIR"
 
-# When `--features devnet-shrunk` is on for the .so build, the lib
-# compiled by `cargo test` must use the same feature so struct sizes
-# match. ario-core, ario-ant, ario-ant-escrow don't use this feature
-# but it doesn't hurt to pass it (they declare it as a no-op).
-TEST_FEATURES="--features devnet-shrunk"
-
-# escrow's claim_*_attested tests need the test attestor key, which lives
-# behind the opt-in `unsafe-allow-test-attestor-pubkey` feature (kept out of
-# default so it never reaches a deploy artifact). Append it for escrow ONLY —
-# `cargo test -p ario-core --features unsafe-allow-test-attestor-pubkey` would
-# error because only escrow declares the feature.
+# Registries are always full-size (devnet-shrunk retired, ADR-024), so the .so
+# build and `cargo test` lib share the same sizes with no extra feature flags.
+#
+# escrow's claim_*_attested tests need the test attestor key, behind the opt-in
+# `unsafe-allow-test-attestor-pubkey` feature (kept out of default so it never
+# reaches a deploy artifact). Pass it for escrow ONLY — a workspace-level
+# `--features unsafe-allow-test-attestor-pubkey` would error because only escrow
+# declares it. Non-escrow crates get no feature flags.
 features_for() {
     if [[ "$1" == "ario-ant-escrow" ]]; then
-        echo "${TEST_FEATURES},unsafe-allow-test-attestor-pubkey"
-    else
-        echo "${TEST_FEATURES}"
+        echo "--features unsafe-allow-test-attestor-pubkey"
     fi
 }
 

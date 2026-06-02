@@ -49,18 +49,20 @@ const REPO_ROOT = resolve(CLIENT_ROOT, '..', '..');
 const ANCHOR_IDL_DIR = resolve(REPO_ROOT, 'target/idl');
 const OUT_ROOT = resolve(CLIENT_ROOT, 'src');
 
-// Target cluster — drives cfg-conditional field dedup. See
-// `dedupeCfgConditionalFields` for the size-pick logic.
+// Target cluster — retained only for logging and the defensive dedup
+// tie-break. Since devnet-shrunk was retired (ADR-024) all clusters share
+// full-size registries, so the IDL no longer emits cfg-conditional
+// duplicate fields and CLUSTER no longer changes the generated output.
 //
 // 'staging' is a mainnet dress-rehearsal deployed against Solana devnet
 // (per `release-clients-ts.yml` workflow input description). It carries
 // the same production-sized registries as 'mainnet' but routes to its
-// own `@staging` npm dist-tag so consumers tracking `@devnet` aren't
+// own `@staging` npm dist-tag so consumers tracking `@latest` aren't
 // pulled to the pre-mainnet artifact unexpectedly.
-const CLUSTER = (process.env.CLUSTER ?? 'devnet').toLowerCase();
-if (CLUSTER !== 'devnet' && CLUSTER !== 'staging' && CLUSTER !== 'mainnet') {
+const CLUSTER = (process.env.CLUSTER ?? 'staging').toLowerCase();
+if (CLUSTER !== 'staging' && CLUSTER !== 'mainnet') {
   console.error(
-    `[codegen] CLUSTER must be 'devnet', 'staging', or 'mainnet'; got '${CLUSTER}'`,
+    `[codegen] CLUSTER must be 'staging' or 'mainnet'; got '${CLUSTER}'`,
   );
   process.exit(1);
 }
@@ -129,29 +131,22 @@ for (const { idl, out } of PROGRAMS) {
 console.log(`[codegen] ${PROGRAMS.length} programs ✓`);
 
 /**
- * Anchor's IDL generator emits every `#[cfg]`-conditional field as a
- * SEPARATE field entry, regardless of which feature variant is active.
- * Programs in this repo use `#[cfg(feature = "devnet-shrunk")]` to swap
- * fixed-size zero-copy array sizes (e.g. `NameRegistry.names` is 200_000
- * slots on mainnet vs 200 on devnet). That produces duplicate field
- * names like `{ name: "names", type: [NameEntry; 200_000] }` followed by
- * `{ name: "names", type: [NameEntry; 200] }` — Codama renders both,
- * tsc rejects with `TS2300: Duplicate identifier`.
+ * Defensive no-op in the common case. Anchor's IDL generator emits every
+ * `#[cfg]`-conditional field as a SEPARATE entry regardless of the active
+ * feature, which historically produced duplicate field names (e.g. two
+ * `names` entries, 200_000 vs 200 slots) under the `devnet-shrunk` feature
+ * — tsc rejected those with `TS2300: Duplicate identifier`.
  *
- * We deduplicate by name within each struct type, picking the variant
- * appropriate for the target cluster:
- *   - `CLUSTER=devnet` (default): keep the SMALLER variant. Matches
- *     `build-sbf.sh BUILD_NETWORK=devnet` which compiles the .so with
- *     `--features devnet-shrunk`.
- *   - `CLUSTER=staging` and `CLUSTER=mainnet`: keep the LARGER variant.
- *     Matches the default workspace features (no `devnet-shrunk`).
- *     'staging' is a mainnet dress-rehearsal on Solana devnet — same
- *     registry sizes, separate dist-tag for downstream tracking.
- *
- * The CI release workflow sets `CLUSTER` from the workflow input.
+ * `devnet-shrunk` was retired (ADR-024): all clusters now compile the same
+ * full-size registries, so no `ario_*` account carries a cfg-conditional
+ * size field and there are normally NO duplicates to drop. This pass is
+ * kept as a guard — if any future `#[cfg]` field reintroduces a duplicate,
+ * it deduplicates by name within each struct, keeping the LARGER (i.e.
+ * production-sized) variant.
  */
 function dedupeCfgConditionalFields(idl) {
-  const preferSmaller = CLUSTER === 'devnet';
+  // No cluster prefers the smaller variant anymore; keep production sizes.
+  const preferSmaller = false;
   const dedupe = (type) => {
     if (!type || !type.fields || !Array.isArray(type.fields)) return;
     const seen = new Map(); // name -> { idx, size }

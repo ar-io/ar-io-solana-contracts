@@ -1501,9 +1501,12 @@ considered but deferred — expansion rent isn't trivial (~$3.5K from
 
 ### Hardcoded initial capacity vs configurable
 
-`INITIAL_CAPACITY = 50_000` is compile-time (200 under `devnet-shrunk`).
-Configurable rejected — initial sizing is a protocol-wide policy, not
-a per-deploy knob. Bumping requires contract upgrade.
+`INITIAL_CAPACITY = 50_000` is compile-time. Configurable rejected —
+initial sizing is a protocol-wide policy, not a per-deploy knob. Bumping
+requires contract upgrade. (At the time of this decision the value was
+`200` under the `devnet-shrunk` feature; that feature and the
+`admin_shrink_name_registry` instruction referenced below were retired —
+all clusters now compile the full 50K capacity. See ADR-024.)
 
 ### Consequences
 
