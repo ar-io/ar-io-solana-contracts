@@ -9,8 +9,11 @@ use crate::error::ArnsError;
 use crate::state::*;
 
 /// Migration deadline: imports are rejected after this timestamp.
-// Migration deadline: 2026-06-18 00:00:00 UTC. Update before mainnet if migration date changes.
-pub const MIGRATION_DEADLINE: i64 = 1781884800;
+// Migration deadline: 2112-04-20 00:01:09 UTC -- INTENTIONALLY far-future: this time-based backstop
+// is effectively disabled; finalize_migration is the sole active control on the migration-authority
+// write window. MUST be tightened to the real migration cutoff before mainnet (until then this
+// re-opens audit MIGRATION-001: an unbounded migration window if the authority key is compromised).
+pub const MIGRATION_DEADLINE: i64 = 4490553669;
 
 // =========================================
 // DISCRIMINATOR VALIDATION

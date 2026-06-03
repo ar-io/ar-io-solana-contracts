@@ -388,7 +388,7 @@ Various informational findings: idempotent re-import, case normalization correct
 ## Recommended Fix Priority
 
 ### Before Mainnet (Blockers)
-1. ~~**MIGRATION-001** — Set MIGRATION_DEADLINE in all 4 programs~~ **FIXED** (set to 2026-06-18)
+1. **MIGRATION-001** — Set MIGRATION_DEADLINE in all 4 programs. **OPEN (deferred to pre-mainnet).** The placeholder was replaced with a finite constant, but it is intentionally set far-future (2112-04-20) so the time-based backstop is effectively off; `finalize_migration` is the sole active control on the migration-authority write window. **This MUST be tightened to the real migration cutoff before mainnet** — until then the unbounded-window risk stands.
 2. ~~**GAR-013** — Add status check to prune_gateway~~ **FIXED**
 3. ~~**ARNS-003/004** — Add `.assign(&system_program::ID)` to prune functions~~ **FIXED**
 4. ~~**GAR-003** — Require Gateway PDAs in prescribe_epoch remaining_accounts~~ **FIXED**
