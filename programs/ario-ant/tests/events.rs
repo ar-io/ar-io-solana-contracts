@@ -12,7 +12,7 @@
 //! coverage. Everything in this file works against the fake asset blob
 //! built by `create_fake_asset_data`.
 
-use anchor_lang::{InstructionData, ToAccountMetas};
+use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
 use solana_program_test::*;
 use solana_sdk::{
     instruction::Instruction,
@@ -901,10 +901,15 @@ async fn test_record_acl_owner_rejects_non_ant_asset() {
         "precondition: non-ANT asset has no AntConfig"
     );
 
-    // Attacker stands up the victim's ACL config + page (permissionless) and
-    // tries to record the non-ANT asset as owned in the same transaction.
-    let mut ixs = ensure_acl_state_ixs(&victim.pubkey(), &attacker.pubkey(), false, false);
-    ixs.push(Instruction {
+    // Stand up the victim's ACL config + page first (permissionless). This
+    // tx MUST succeed so the only thing left that can fail below is the
+    // record guard itself — not an unrelated abort in ACL setup.
+    let setup = ensure_acl_state_ixs(&victim.pubkey(), &attacker.pubkey(), false, false);
+    process_with_logs(&mut ctx, &setup, &attacker).await;
+
+    // Now attempt the spoof on its own: record the non-ANT asset as owned.
+    // Single-instruction tx, so any failure is unambiguously this ix.
+    let record = Instruction {
         program_id: ario_ant::ID,
         accounts: ario_ant::accounts::RecordAclOwner {
             asset: asset.pubkey(),
@@ -916,26 +921,51 @@ async fn test_record_acl_owner_rejects_non_ant_asset() {
         }
         .to_account_metas(None),
         data: ario_ant::instruction::RecordAclOwner {}.data(),
-    });
-
+    };
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let tx =
-        Transaction::new_signed_with_payer(&ixs, Some(&attacker.pubkey()), &[&attacker], blockhash);
+    let tx = Transaction::new_signed_with_payer(
+        &[record],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        blockhash,
+    );
     let result = ctx
         .banks_client
         .process_transaction_with_metadata(tx)
         .await
         .expect("transaction should land");
-    assert!(
-        result.result.is_err(),
-        "recording a non-ANT asset must fail (missing AntConfig), got: {:?}",
-        result.result
+
+    // Anchor evaluates the `ant_config` account constraint during `Accounts`
+    // deserialization, before the handler body runs. A non-existent AntConfig
+    // PDA (owner = system program, 0 lamports) fails `Account::try_from` with
+    // `AccountNotInitialized` (3012) on instruction 0. Pin to that exact
+    // failure so this regression tracks the new guard, not any other abort.
+    assert_eq!(
+        result
+            .result
+            .expect_err("recording a non-ANT asset must fail"),
+        solana_sdk::transaction::TransactionError::InstructionError(
+            0,
+            solana_sdk::instruction::InstructionError::Custom(
+                anchor_lang::error::ErrorCode::AccountNotInitialized as u32,
+            ),
+        ),
+        "expected AccountNotInitialized (3012) on the missing ant_config PDA"
     );
 
-    // The whole tx reverted, so the victim's ACL config was never created.
+    // The guard fired before any ACL mutation: the page exists (from setup)
+    // but holds no entries — the spoof asset was never recorded.
+    let page_acct = ctx
+        .banks_client
+        .get_account(acl_page_pda(&victim.pubkey(), 0))
+        .await
+        .unwrap()
+        .expect("acl page should exist from setup");
+    let page = AclPage::try_deserialize(&mut page_acct.data.as_slice()).unwrap();
     assert!(
-        !account_exists(&mut ctx, &acl_config_pda(&victim.pubkey())).await,
-        "victim ACL must remain absent — the spoof was rejected"
+        page.entries.is_empty(),
+        "spoof asset must not be recorded — page must stay empty, got {:?}",
+        page.entries
     );
 }
 
