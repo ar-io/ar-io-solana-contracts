@@ -197,6 +197,7 @@ async fn transfer_emits_ant_transferred_event() {
             program_id: ario_ant::ID,
             accounts: ario_ant::accounts::RecordAclOwner {
                 asset: asset.pubkey(),
+                ant_config: config_pda(&asset.pubkey()),
                 acl_config: acl_config_pda(&payer_pk),
                 acl_page: acl_page_pda(&payer_pk, 0),
                 payer: payer_pk,

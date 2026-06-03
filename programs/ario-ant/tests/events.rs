@@ -860,6 +860,7 @@ async fn test_record_acl_owner_emits_event() {
         program_id: ario_ant::ID,
         accounts: ario_ant::accounts::RecordAclOwner {
             asset: asset.pubkey(),
+            ant_config: config_pda(&asset.pubkey()),
             acl_config: acl_config_pda(&owner.pubkey()),
             acl_page: acl_page_pda(&owner.pubkey(), 0),
             payer: stranger.pubkey(),
@@ -874,6 +875,68 @@ async fn test_record_acl_owner_emits_event() {
     assert_eq!(ev.mint, asset.pubkey());
     assert_eq!(ev.address, owner.pubkey());
     assert_eq!(ev.role, ACL_ROLE_OWNER);
+}
+
+/// Regression: the permissionless owner-record path must reject a Metaplex
+/// Core asset that ario-ant never initialized as an ANT. Without the
+/// `ant_config` PDA constraint on `RecordAclOwner`, an attacker could record
+/// arbitrary Core assets owned by a victim into the victim's ACL, spoofing
+/// the reverse index. Here the asset is owned by `victim` but has no
+/// `AntConfig`, so the record must fail and the ACL must stay empty.
+#[tokio::test]
+async fn test_record_acl_owner_rejects_non_ant_asset() {
+    bpf_required!();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    // Asset owned by the victim but deliberately NOT initialized as an ANT —
+    // note the absence of an `initialize_ant` call below.
+    let (mut pt, asset) = program_test_with_asset(&victim.pubkey());
+    fund(&mut pt, &victim.pubkey(), 10_000_000_000);
+    fund(&mut pt, &attacker.pubkey(), 10_000_000_000);
+    let mut ctx = pt.start_with_context().await;
+
+    // The asset's AntConfig PDA must not exist (no ANT initialization).
+    assert!(
+        !account_exists(&mut ctx, &config_pda(&asset.pubkey())).await,
+        "precondition: non-ANT asset has no AntConfig"
+    );
+
+    // Attacker stands up the victim's ACL config + page (permissionless) and
+    // tries to record the non-ANT asset as owned in the same transaction.
+    let mut ixs = ensure_acl_state_ixs(&victim.pubkey(), &attacker.pubkey(), false, false);
+    ixs.push(Instruction {
+        program_id: ario_ant::ID,
+        accounts: ario_ant::accounts::RecordAclOwner {
+            asset: asset.pubkey(),
+            ant_config: config_pda(&asset.pubkey()),
+            acl_config: acl_config_pda(&victim.pubkey()),
+            acl_page: acl_page_pda(&victim.pubkey(), 0),
+            payer: attacker.pubkey(),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: ario_ant::instruction::RecordAclOwner {}.data(),
+    });
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&ixs, Some(&attacker.pubkey()), &[&attacker], blockhash);
+    let result = ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .expect("transaction should land");
+    assert!(
+        result.result.is_err(),
+        "recording a non-ANT asset must fail (missing AntConfig), got: {:?}",
+        result.result
+    );
+
+    // The whole tx reverted, so the victim's ACL config was never created.
+    assert!(
+        !account_exists(&mut ctx, &acl_config_pda(&victim.pubkey())).await,
+        "victim ACL must remain absent — the spoof was rejected"
+    );
 }
 
 #[tokio::test]
@@ -894,6 +957,7 @@ async fn test_remove_acl_owner_emits_event() {
         program_id: ario_ant::ID,
         accounts: ario_ant::accounts::RecordAclOwner {
             asset: asset.pubkey(),
+            ant_config: config_pda(&asset.pubkey()),
             acl_config: acl_config_pda(&original_owner.pubkey()),
             acl_page: acl_page_pda(&original_owner.pubkey(), 0),
             payer: stranger.pubkey(),
@@ -924,6 +988,7 @@ async fn test_remove_acl_owner_emits_event() {
         program_id: ario_ant::ID,
         accounts: ario_ant::accounts::RecordAclOwner {
             asset: asset.pubkey(),
+            ant_config: config_pda(&asset.pubkey()),
             acl_config: acl_config_pda(&original_owner.pubkey()),
             acl_page: acl_page_pda(&original_owner.pubkey(), 0),
             payer: stranger.pubkey(),
