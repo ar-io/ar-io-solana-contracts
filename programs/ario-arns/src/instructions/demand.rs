@@ -75,7 +75,11 @@ pub fn maybe_roll_demand_period(demand: &mut DemandFactor, timestamp: i64) -> Re
     //     `*_this_period == 0`, independent of the ring buffer). The zero-
     //     activity evolution is therefore deterministic and periodic, so
     //     `advance_zero_activity_periods` applies every decay and permanent
-    //     fee-halving in O(1) and leaves `current_period` fully current.
+    //     fee-halving in BOUNDED work — independent of the gap size — and
+    //     leaves `current_period` fully current. The bound holds because the
+    //     factor can decay from at most `MAX_DEMAND_FACTOR` (the up-path
+    //     ceiling), so the initial decay-to-floor is ≤ ~510 steps; the rest is
+    //     closed-form whole-cycle halvings plus a ≤ ~53-step residual.
     //
     // This preserves the lazy-rollover invariant (state reflects `now` after
     // the call, so pricing reads and activity writes land in the right period)
@@ -118,7 +122,10 @@ fn roll_one_period(demand: &mut DemandFactor) -> Result<()> {
     let demand_increasing = is_demand_increasing(demand);
 
     if demand_increasing {
-        // Increase: factor * 1.05
+        // Increase: factor * 1.05, clamped at MAX_DEMAND_FACTOR. The clamp is a
+        // Solana-only CU-safety ceiling (BD-112) that bounds how far a later
+        // idle rollover has to decay back to the floor; it sits far above any
+        // economically reachable factor, so it never changes realistic pricing.
         demand.current_demand_factor = u64::try_from(
             (demand.current_demand_factor as u128)
                 .checked_mul(DEMAND_FACTOR_UP_ADJUSTMENT as u128)
@@ -126,7 +133,8 @@ fn roll_one_period(demand: &mut DemandFactor) -> Result<()> {
                 .checked_div(DEMAND_FACTOR_SCALE as u128)
                 .ok_or(ArnsError::ArithmeticOverflow)?,
         )
-        .map_err(|_| error!(ArnsError::ArithmeticOverflow))?;
+        .map_err(|_| error!(ArnsError::ArithmeticOverflow))?
+        .min(MAX_DEMAND_FACTOR);
     } else if demand.current_demand_factor > DEMAND_FACTOR_MIN {
         // Decrease: factor * 0.985
         demand.current_demand_factor = u64::try_from(
@@ -226,7 +234,10 @@ fn zero_activity_cycle_length() -> u64 {
 }
 
 /// Advance the demand state by `n` zero-activity periods — exactly equivalent
-/// to calling `roll_one_period` `n` times with no activity, but O(1) in `n`.
+/// to calling `roll_one_period` `n` times with no activity, in work bounded
+/// independently of `n` (the only gap-dependent term, whole-cycle halvings, is
+/// closed-form). The first decay-to-floor is ≤ ~510 steps because the factor is
+/// capped at `MAX_DEMAND_FACTOR`.
 ///
 /// PRECONDITION: `n > MOVING_AVG_PERIOD_COUNT` (guaranteed at the only call
 /// site, where the gap exceeds `MAX_ROLLOVER_PERIODS`), so the trailing ring
@@ -249,8 +260,9 @@ fn advance_zero_activity_periods(demand: &mut DemandFactor, n: u64) -> Result<()
     let mut consecutive = demand.consecutive_periods_with_min_demand_factor;
 
     // Phase 1: step to the next canonical boundary (factor == SCALE &&
-    // consecutive == 0), applying any halvings along the way. Bounded by one
-    // cycle (~53 steps).
+    // consecutive == 0), applying any halvings along the way. Bounded by the
+    // decay depth from at most MAX_DEMAND_FACTOR (≤ ~510 steps) plus the
+    // floor dwell — independent of the gap size.
     while remaining > 0 && !(factor == DEMAND_FACTOR_SCALE && consecutive == 0) {
         let (f, c, halved) = zero_activity_step(factor, consecutive);
         factor = f;
@@ -448,6 +460,25 @@ mod tests {
         assert_eq!(df.revenue_this_period, 0);
     }
 
+    /// Sustained increasing demand cannot push the factor past
+    /// MAX_DEMAND_FACTOR. This ceiling bounds the worst-case idle-rollover
+    /// decay depth (BD-112) so the closed-form fast-forward stays
+    /// compute-bounded regardless of accumulated demand.
+    #[test]
+    fn test_factor_clamped_at_max() {
+        let mut df = make_test_demand(1, 0);
+        df.current_demand_factor = MAX_DEMAND_FACTOR;
+        // Increasing demand: revenue above the (all-zero) trailing average.
+        df.revenue_this_period = 1_000_000;
+
+        roll_one_period(&mut df).unwrap();
+
+        assert_eq!(
+            df.current_demand_factor, MAX_DEMAND_FACTOR,
+            "factor must clamp at the ceiling, not grow past it"
+        );
+    }
+
     /// Assert two demand states are equal across every field the rollover
     /// mutates.
     fn assert_demand_eq(a: &DemandFactor, b: &DemandFactor, ctx: &str) {
@@ -472,7 +503,7 @@ mod tests {
         );
     }
 
-    /// The O(1) closed-form `advance_zero_activity_periods` must be byte-for-byte
+    /// The bounded closed-form `advance_zero_activity_periods` must be byte-for-byte
     /// identical to running the real per-period loop `n` times with no activity,
     /// for every gap size and from a variety of starting states. This is the
     /// load-bearing correctness proof — if it passes for all `n`, the fast path
@@ -487,6 +518,11 @@ mod tests {
             (700_000, 0, GENESIS_FEES),             // mid-decay
             (DEMAND_FACTOR_MIN, 3, GENESIS_FEES),   // at floor, counting
             (DEMAND_FACTOR_SCALE, 0, halved_fees),  // fees pre-halved
+            // factor ABOVE scale — the 1.05x up-adjustment has no ceiling, so a
+            // hot name carries an accumulated factor into a long-idle rollover.
+            (2_000_000, 0, GENESIS_FEES),     // 2x scale
+            (50_000_000, 0, GENESIS_FEES),    // 50x scale (~80 up-periods)
+            (1_000_000_000, 0, GENESIS_FEES), // 1000x scale
         ];
 
         for (factor, consec, fees) in starts {

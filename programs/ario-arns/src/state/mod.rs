@@ -29,6 +29,16 @@ pub const DEMAND_FACTOR_SCALE: u64 = 1_000_000;
 /// Minimum demand factor (0.5)
 pub const DEMAND_FACTOR_MIN: u64 = 500_000;
 
+/// Maximum demand factor (1000.0) — a CU-safety ceiling on the 1.05x
+/// up-adjustment. The Lua reference (`demand.lua`) does NOT cap the factor;
+/// this is a Solana-only bound (see BD-112) that keeps the lazy-rollover
+/// fast-forward bounded: a long-idle decay back to the floor takes at most
+/// ~510 steps from this ceiling, vs. unbounded growth otherwise. Set far above
+/// any economically reachable value (1000x base fees would require ~141
+/// consecutive periods of geometrically-rising demand), so it never affects
+/// realistic pricing — it only removes a pathological compute cliff.
+pub const MAX_DEMAND_FACTOR: u64 = 1_000 * DEMAND_FACTOR_SCALE;
+
 /// Upward adjustment multiplier (1.05x)
 pub const DEMAND_FACTOR_UP_ADJUSTMENT: u64 = 1_050_000;
 
