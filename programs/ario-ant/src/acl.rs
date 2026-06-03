@@ -460,8 +460,21 @@ pub struct CloseAclPage<'info> {
 #[derive(Accounts)]
 pub struct RecordAclOwner<'info> {
     /// CHECK: Metaplex Core asset; ownership verified in handler via
-    /// `read_asset_owner`. Owner program is checked there as well.
+    /// `read_asset_owner`. Owner program is checked there as well. The
+    /// `ant_config` PDA below is seeded by `asset.key()`, so Anchor will
+    /// fail to load it for any Core asset that ario-ant did not initialize.
     pub asset: AccountInfo<'info>,
+
+    /// Proves `asset` is a genuine AR.IO ANT: `AntConfig` is created at mint
+    /// time and seeded by the asset key, so a non-ANT Core asset has no such
+    /// PDA and this constraint fails. Without it, the permissionless owner
+    /// path would let anyone record arbitrary Core assets owned by the user
+    /// into their ACL, spoofing the reverse index.
+    #[account(
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
+        bump = ant_config.bump,
+    )]
+    pub ant_config: Account<'info, AntConfig>,
 
     #[account(
         mut,
