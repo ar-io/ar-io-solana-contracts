@@ -11,10 +11,13 @@ use crate::error::ArioError;
 use crate::state::*;
 
 /// Migration deadline: imports are rejected after this timestamp.
-// Migration deadline: 2112-04-20 00:01:09 UTC -- INTENTIONALLY far-future: this time-based backstop
-// is effectively disabled; finalize_migration is the sole active control on the migration-authority
-// write window. MUST be tightened to the real migration cutoff before mainnet (until then this
-// re-opens audit MIGRATION-001: an unbounded migration window if the authority key is compromised).
+// 2112-04-20 00:01:09 UTC -- INTENTIONALLY far-future BY DESIGN. The AR.IO Solana migration uses no
+// time-based cutoff; finalize_migration (authority-gated, one-shot) is the sole control on the
+// migration-authority write window. The constant is retained so the existing deadline checks
+// compile and short-circuit harmlessly, and the far-future value (vs i64::MAX) keeps the time check
+// permanently inert without overflow risk in deadline arithmetic. Accepted resolution of audit
+// MIGRATION-001 (see docs/SECURITY_AUDIT_INDEPENDENT.md): the time-window risk is accepted, with
+// finalize_migration bounding the window operationally.
 pub const MIGRATION_DEADLINE: i64 = 4490553669;
 
 // =========================================

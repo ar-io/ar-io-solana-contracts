@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-The AR.IO Solana contracts are well-engineered with consistent use of Anchor constraints, PDA validation, checked arithmetic, and defense-in-depth patterns. The prior audit's 29 findings are confirmed fixed. This independent assessment found **44 new findings** across all severity levels. The most critical issues are in the epoch subsystem (observer selection manipulation, single-observer failure threshold) and a registry corruption vector in gateway pruning. All programs share a common migration deadline issue (i64::MAX placeholder).
+The AR.IO Solana contracts are well-engineered with consistent use of Anchor constraints, PDA validation, checked arithmetic, and defense-in-depth patterns. The prior audit's 29 findings are confirmed fixed. This independent assessment found **44 new findings** across all severity levels. The most critical issues are in the epoch subsystem (observer selection manipulation, single-observer failure threshold) and a registry corruption vector in gateway pruning. All programs intentionally run with no time-based migration cutoff (a far-future `MIGRATION_DEADLINE`); `finalize_migration` is the sole control on the migration-authority write window — see MIGRATION-001 (accepted by design).
 
 | Severity | Count | Programs Affected |
 |----------|-------|-------------------|
@@ -24,7 +24,7 @@ The AR.IO Solana contracts are well-engineered with consistent use of Anchor con
 2. **GAR-003** — Cranker controls observer address resolution in prescribe_epoch
 3. **GAR-005** — Single observer can fail all gateways (threshold = 0 when 1 observer)
 4. **ARNS-003/004** — Pruned names become permanently unregisterable (missing `.assign()`)
-5. **MIGRATION-001** — All 4 programs have MIGRATION_DEADLINE = i64::MAX (must set before mainnet)
+5. **MIGRATION-001** — No time-based migration cutoff by design (far-future `MIGRATION_DEADLINE`); `finalize_migration` is the control — **accepted**
 
 ---
 
@@ -64,15 +64,15 @@ These are acknowledged tradeoffs documented for completeness:
 
 ### CORE-004 | High | State Machine
 **File:** `programs/ario-core/src/migration.rs:13`
-**Description:** MIGRATION_DEADLINE = i64::MAX (placeholder). Without a real deadline, migration_authority can import arbitrary state indefinitely until finalize_migration is called.
-**Impact:** If finalize_migration is delayed and migration_authority is compromised, attacker has unlimited import window for complete state corruption of Balance, Vault, VaultCounter, PrimaryName, and PrimaryNameRequest accounts.
-**Fix:** Set to concrete timestamp (e.g., migration_start + 30 days) before mainnet.
+**Description:** `MIGRATION_DEADLINE` is intentionally far-future (2112-04-20) — the AR.IO Solana migration uses **no time-based cutoff by design**. `migration_authority` can import state until `finalize_migration` is called.
+**Impact:** If `finalize_migration` is delayed and `migration_authority` is compromised, the import window is bounded only by `finalize_migration` (not by time). State corruption of Balance, Vault, VaultCounter, PrimaryName, and PrimaryNameRequest accounts is possible within that operational window.
+**Fix:** **ACCEPTED by design** — no time-based deadline; `finalize_migration` is the sole control on the window. Mitigate operationally: call `finalize_migration` promptly at cutover and destroy the `migration_authority` key after use.
 
 ### CORE-005 | High | State Machine
 **File:** `programs/ario-core/src/migration.rs:98-114`
 **Description:** import_account allows re-importing (overwriting) existing accounts. While designed for retry/recovery, a compromised migration_authority can overwrite any vault's amount to 0 or reassign any PrimaryName.
 **Impact:** Full state corruption during migration window.
-**Fix:** Inherent to migration design. Mitigate: tight MIGRATION_DEADLINE, prompt finalize, destroy migration_authority key after use.
+**Fix:** Inherent to migration design. No time-based deadline (by design); mitigate operationally: prompt `finalize_migration`, destroy migration_authority key after use.
 
 ### CORE-006 | ~~Low~~ Medium | Economic
 **File:** `programs/ario-core/src/instructions/primary_name.rs:169-200`
@@ -167,8 +167,8 @@ These are acknowledged tradeoffs documented for completeness:
 
 ### GAR-014 | Medium | Migration
 **File:** `programs/ario-gar/src/migration.rs:13`
-**Description:** MIGRATION_DEADLINE = i64::MAX (placeholder). Same issue as CORE-004.
-**Fix:** Set concrete timestamp before mainnet.
+**Description:** `MIGRATION_DEADLINE` intentionally far-future — no time-based cutoff by design. Same as CORE-004.
+**Fix:** **ACCEPTED by design** (see CORE-004); `finalize_migration` is the control.
 
 ### GAR-015 | Low | Arithmetic
 **File:** `programs/ario-gar/src/instructions/epoch.rs:360-373`
@@ -272,7 +272,7 @@ These are acknowledged tradeoffs documented for completeness:
 
 ### ARNS-012 | Informational | Migration
 **File:** `programs/ario-arns/src/migration.rs:13`
-**Description:** MIGRATION_DEADLINE = i64::MAX (placeholder). Same issue across all programs.
+**Description:** `MIGRATION_DEADLINE` intentionally far-future — no time-based cutoff by design. Same as CORE-004 (accepted by design).
 
 ### ARNS-013-020 | Informational
 Various informational findings: idempotent re-import, case normalization correct, reserved name claim naming confusion, zero-cost defense check, gateway discount pass_rate smoothing, upgrade during grace period intentional, moving average zero guard, initialize authority set from params.
@@ -295,9 +295,9 @@ Various informational findings: idempotent re-import, case normalization correct
 
 ### ANT-008 | High | Migration
 **File:** `programs/ario-ant/src/migration.rs:14`
-**Description:** MIGRATION_DEADLINE = i64::MAX (placeholder). ANT migration_authority can overwrite any AntConfig, AntControllers, or AntRecord indefinitely.
-**Impact:** Complete ANT state corruption if migration_authority is compromised.
-**Fix:** Set concrete deadline before mainnet.
+**Description:** `MIGRATION_DEADLINE` intentionally far-future — no time-based cutoff by design. ANT migration_authority can overwrite any AntConfig, AntControllers, or AntRecord until `finalize_migration`.
+**Impact:** ANT state corruption possible if migration_authority is compromised, bounded by `finalize_migration` (not by time).
+**Fix:** **ACCEPTED by design** (see CORE-004); `finalize_migration` is the control.
 
 ### ANT-009 | Medium | Migration
 **File:** `programs/ario-ant/src/migration.rs:119-131`
@@ -347,8 +347,8 @@ Various informational findings: idempotent re-import, case normalization correct
 
 ### MIGRATION-001 | High | All Programs
 **Files:** ario-core/migration.rs:13, ario-gar/migration.rs:13, ario-arns/migration.rs:13, ario-ant/migration.rs:14
-**Description:** ALL four programs have `MIGRATION_DEADLINE = i64::MAX` with TODO comments. This is the single most important pre-mainnet fix. Without real deadlines, a compromised migration_authority has an unlimited window for state corruption.
-**Fix:** Set all four to concrete timestamps before mainnet (e.g., migration_start + 30 days).
+**Description:** All four programs run with an intentionally far-future `MIGRATION_DEADLINE` (2112-04-20) — the AR.IO Solana migration has **no time-based cutoff by design**. A compromised migration_authority's write window is bounded by `finalize_migration`, not by time.
+**Fix:** **ACCEPTED by design.** No time-based deadline; `finalize_migration` (authority-gated, one-shot) is the sole control. Mitigate operationally: call `finalize_migration` promptly at cutover and destroy the migration_authority key after use.
 
 ---
 
@@ -388,7 +388,7 @@ Various informational findings: idempotent re-import, case normalization correct
 ## Recommended Fix Priority
 
 ### Before Mainnet (Blockers)
-1. **MIGRATION-001** — Set MIGRATION_DEADLINE in all 4 programs. **OPEN (deferred to pre-mainnet).** The placeholder was replaced with a finite constant, but it is intentionally set far-future (2112-04-20) so the time-based backstop is effectively off; `finalize_migration` is the sole active control on the migration-authority write window. **This MUST be tightened to the real migration cutoff before mainnet** — until then the unbounded-window risk stands.
+1. ~~**MIGRATION-001** — Set MIGRATION_DEADLINE in all 4 programs~~ **ACCEPTED (by design — not a blocker).** The AR.IO Solana migration intentionally has no time-based cutoff: `MIGRATION_DEADLINE` is set far-future (2112-04-20) and `finalize_migration` (authority-gated, one-shot) is the sole control on the migration-authority write window. No pre-mainnet action required; operational control is calling `finalize_migration` at cutover + destroying the migration_authority key.
 2. ~~**GAR-013** — Add status check to prune_gateway~~ **FIXED**
 3. ~~**ARNS-003/004** — Add `.assign(&system_program::ID)` to prune functions~~ **FIXED**
 4. ~~**GAR-003** — Require Gateway PDAs in prescribe_epoch remaining_accounts~~ **FIXED**
@@ -412,7 +412,7 @@ Various informational findings: idempotent re-import, case normalization correct
 ### Remaining Open
 - ~~**GAR-004** — Hashchain entropy~~ **MITIGATED** — payer removed from hash; residual timing risk matches Lua parity (see Appendix: Future Randomness Upgrades)
 - ~~**CORE-006** — read_demand_factor defaults to 1.0 on failure~~ **FIXED** (now errors on invalid DemandFactor account)
-- **CORE-005** — Import overwrites (inherent to migration design, mitigated by concrete MIGRATION_DEADLINE) — **ACCEPTED**
+- **CORE-005** — Import overwrites (inherent to migration design, mitigated by `finalize_migration`; no time-based deadline by design) — **ACCEPTED**
 
 ### Test Coverage (Should Add)
 17. All HIGH priority test gaps (TEST-001 through TEST-003)
@@ -453,8 +453,8 @@ Each finding was compared against the original Lua source code (`/mnt/c/source/a
 | **ARNS-005** | Low | **ALSO IN LUA** | Accept — Identical `math.floor(fee * 0.5)` approach |
 | **ARNS-007** | Low | **ALSO IN LUA** | Accept — Identical unbounded loop pattern |
 | **ARNS-008** | Low | **ALSO IN LUA** | Accept — Identical `math.ceil` for remaining years |
-| **ARNS-012** | Informational | **SOLANA-ONLY** | Fix — Migration deadline is Solana-only |
-| **MIGRATION-001** | High | **SOLANA-ONLY** | Fix — Migration infrastructure is Solana-only |
+| **ARNS-012** | Informational | **SOLANA-ONLY** | Accept — far-future deadline by design |
+| **MIGRATION-001** | High | **SOLANA-ONLY** | Accept — no time-based cutoff by design; `finalize_migration` is the control |
 | **ANT-002** | Medium | **ALSO IN LUA** (worse in Lua) | Review — Lua rebuilds entire record unconditionally; Solana gates owner field to owner/controllers only. Solana is actually better here |
 | **ANT-003** | Medium | **SOLANA-ONLY** | Fix — Metaplex Core layout parsing has no Lua equivalent |
 | **ANT-008/009** | High/Medium | **SOLANA-ONLY** | Fix — Migration is Solana-only |
@@ -477,7 +477,7 @@ The majority of findings are Solana-specific, arising from:
 1. **Account model** — remaining_accounts omission (GAR-003), missing .assign() (ARNS-003/004), rent economics (GAR-016), token account constraints (CORE-002/003)
 2. **Integer arithmetic** — u128→u64 casts (CORE-001, ARNS-001/002, GAR-001), sequential division precision (GAR-008)
 3. **Multi-transaction pipeline** — epoch bricking (GAR-009), protocol drain (GAR-006 elevated severity)
-4. **Migration infrastructure** — deadline placeholders (MIGRATION-001), re-import overwrite (CORE-005, ANT-009)
+4. **Migration infrastructure** — no time-based cutoff by design (MIGRATION-001, accepted), re-import overwrite (CORE-005, ANT-009)
 5. **NFT reconciliation** — H-7 lazy clearing (ANT-017, ANT-023)
 
 **Regressions from Lua (3 — highest priority):**
@@ -494,7 +494,7 @@ These are cases where Lua handles it correctly but the Solana port introduced a 
 3. ANT-017 — transfer_record broken after NFT transfer (Lua regression)
 4. GAR-013 — prune_gateway registry corruption (Solana-only, high impact)
 5. GAR-003 — Observer address manipulation (Solana-only, critical)
-6. MIGRATION-001 — Set all MIGRATION_DEADLINE values
+6. ~~MIGRATION-001 — Set all MIGRATION_DEADLINE values~~ — **ACCEPTED by design** (no time-based cutoff; `finalize_migration` is the control)
 
 **Should Fix (shared with Lua or elevated Solana severity):**
 7. GAR-005 — Single observer failure threshold (shared with Lua, critical impact)
