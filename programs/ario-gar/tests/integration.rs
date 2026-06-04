@@ -4201,12 +4201,8 @@ fn program_test_with_gar_and_core(
     stake_token_account: &Pubkey,
     protocol_token_account: &Pubkey,
 ) -> ProgramTest {
-    let mut pt = program_test_with_gar(
-        authority,
-        mint,
-        stake_token_account,
-        protocol_token_account,
-    );
+    let mut pt =
+        program_test_with_gar(authority, mint, stake_token_account, protocol_token_account);
     pt.add_program(
         "ario_core",
         ario_gar::ARIO_CORE_PROGRAM_ID,
@@ -10774,10 +10770,7 @@ async fn test_admin_set_epoch_duration_reanchors_genesis() {
                 authority: authority.pubkey(),
             }
             .to_account_metas(None),
-            data: ario_gar::instruction::AdminSetEpochDuration {
-                new_duration,
-            }
-            .data(),
+            data: ario_gar::instruction::AdminSetEpochDuration { new_duration }.data(),
         }],
         Some(&payer_pk),
         &[&ctx.payer, &authority],
@@ -10984,7 +10977,8 @@ async fn test_disable_at_timelock_fires_in_create_epoch() {
          account writes on Err); enabled stays true on chain"
     );
     assert_eq!(
-        es_after.disable_at, disable_time + seven_days,
+        es_after.disable_at,
+        disable_time + seven_days,
         "disable_at write is likewise reverted by the failed tx"
     );
 
