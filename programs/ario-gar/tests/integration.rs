@@ -755,6 +755,161 @@ async fn test_admin_set_withdrawal_period() {
     assert_anchor_error!(too_short_result, GarError::InvalidParameter);
 }
 
+/// Verify `transfer_authority` (ADR-026):
+///   1. Null pubkey rejected (`InvalidParameter`).
+///   2. Non-authority signer rejected (`Unauthorized`).
+///   3. Current authority rotates; `settings.authority` updates and a sibling
+///      field (`mint`) is left byte-identical (single-step, no layout change).
+///   4. The OLD authority is dead immediately after rotation (`Unauthorized`).
+///   5. Rotation to an off-curve PDA (mirrors handing to the Squads vault) is
+///      accepted, signed by the (new) current authority.
+#[tokio::test]
+async fn test_transfer_authority() {
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &Pubkey::new_unique(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (settings_key, _) = settings_pda();
+    // Make ctx.payer the admin authority (authority = bytes 8..40).
+    let mut settings_account = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    settings_account.data[8..40].copy_from_slice(ctx.payer.pubkey().as_ref());
+    // Capture the `mint` sibling field (bytes 40..72) to prove it's untouched.
+    let mint_bytes_before = settings_account.data[40..72].to_vec();
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::AccountSharedData::from(settings_account),
+    );
+
+    let ta_ix = |new_authority: Pubkey, signer: Pubkey| Instruction {
+        program_id: ario_gar::ID,
+        accounts: ario_gar::accounts::TransferAuthority {
+            settings: settings_key,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_gar::instruction::TransferAuthority { new_authority }.data(),
+    };
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::default(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 2: non-authority signer rejected.
+    let bad = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_bad = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund_bad).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::new_unique(), bad.pubkey())],
+        Some(&bad.pubkey()),
+        &[&bad],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 3: current authority rotates to a real keypair (so we can sign as it).
+    let new_auth = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(new_auth.pubkey(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let s = GatewaySettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(s.authority, new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..72],
+        &mint_bytes_before[..],
+        "sibling field (mint) must be byte-identical after rotation"
+    );
+
+    // Step 4: old authority (ctx.payer) is now dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::new_unique(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 5: rotate to an off-curve PDA (mirrors handing to a Squads vault),
+    // signed by the current authority (new_auth).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_new = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_auth.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund_new).await.unwrap();
+    let pda_target = Pubkey::find_program_address(&[b"vault-like"], &ario_gar::ID).0;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(pda_target, new_auth.pubkey())],
+        Some(&new_auth.pubkey()),
+        &[&new_auth],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let s = GatewaySettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(s.authority, pda_target);
+}
+
 #[tokio::test]
 async fn test_join_network() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
