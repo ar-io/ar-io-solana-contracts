@@ -10643,6 +10643,364 @@ async fn test_set_epochs_enabled() {
 }
 
 // -----------------------------------------
+// C2. admin_set_epoch_duration re-anchor invariant
+// -----------------------------------------
+
+/// `admin_set_epoch_duration` re-anchors `genesis_timestamp` so the
+/// current epoch's start lands at `now`
+/// (`new_genesis = now - current_epoch_index * new_duration`,
+/// epoch.rs ~lines 61-105). Assert:
+///   1. After the call, `genesis + current_epoch_index * new_duration == now`
+///      (±a few seconds of chain-clock drift), i.e. epoch[current] starts ≈now.
+///   2. An already-created (in-flight) Epoch PDA's stamped `end_timestamp`
+///      is NOT mutated by the duration change (timestamps are frozen at
+///      create time).
+#[tokio::test]
+async fn test_admin_set_epoch_duration_reanchors_genesis() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    // Authority keypair we control so it can sign admin_set_epoch_duration.
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // Epochs enabled, genesis=1_000, duration=86_400, current_epoch_index=0.
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    // Fund the authority so it can pay/sign.
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // Warp to a clock well past genesis so create_epoch(0) succeeds.
+    let create_time = 50_000i64;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = create_time;
+    ctx.set_sysvar(&clock);
+
+    // Create epoch 0 (current_epoch_index advances 0 -> 1 afterwards).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Record the in-flight epoch's stamped end_timestamp (epoch 0 was created
+    // with old genesis=1_000, duration=86_400 -> start=1_000, end=87_400).
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch0_before: &Epoch =
+        bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let end_before = epoch0_before.end_timestamp;
+    assert_eq!(epoch0_before.start_timestamp, 1_000);
+    assert_eq!(end_before, 1_000 + 86_400);
+
+    // Read current_epoch_index (should be 1 after creating epoch 0).
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es_before = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert_eq!(es_before.current_epoch_index, 1);
+
+    // Warp to a new "now" and change the duration. The re-anchor must make
+    // epoch[current_epoch_index=1] start at this new now.
+    let reanchor_time = 200_000i64;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = reanchor_time;
+    ctx.set_sysvar(&clock);
+
+    let new_duration = 3_600i64; // shrink 1 day -> 1 hour
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetEpochDuration {
+                new_duration,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // (1) Re-anchor invariant: genesis + current_idx * new_duration ≈ now.
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es_after = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert_eq!(es_after.epoch_duration, new_duration);
+    let current_idx = es_after.current_epoch_index as i64;
+    let next_epoch_start = es_after.genesis_timestamp + current_idx * new_duration;
+    // Chain clock can drift a couple seconds from the sysvar we set; allow a
+    // small window.
+    let drift = (next_epoch_start - reanchor_time).abs();
+    assert!(
+        drift <= 5,
+        "epoch[current] start {next_epoch_start} should re-anchor to ~now {reanchor_time} (drift {drift}s)"
+    );
+
+    // (2) In-flight epoch 0's stamped end_timestamp is unchanged.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch0_after: &Epoch =
+        bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch0_after.end_timestamp, end_before,
+        "duration change must NOT mutate an already-created epoch's end_timestamp"
+    );
+    assert_eq!(epoch0_after.start_timestamp, 1_000);
+}
+
+// -----------------------------------------
+// C3. disable_at 7-day timelock fires inside create_epoch
+// -----------------------------------------
+
+/// `set_epochs_enabled(false)` only schedules a disable via
+/// `disable_at = now + 7d`; `enabled` stays true. Once `now >= disable_at`,
+/// `create_epoch` takes the disable branch (epoch.rs:251-255), which sets
+/// `enabled=false`, clears `disable_at`, then `return Err(EpochsNotEnabled)`.
+/// This test drives the full path: schedule the disable, warp past the
+/// timelock, call create_epoch, and assert it is rejected with
+/// `EpochsNotEnabled`.
+///
+/// FINDING (reported, NOT fixed — test-only task): the doc comment at
+/// epoch.rs:201-202 says the `enabled` flag "actually flips" once the
+/// timelock elapses and the next `create_epoch` runs. It does NOT: the
+/// handler mutates `enabled`/`disable_at` and then returns `Err` on the
+/// same instruction, so Solana discards those writes when the tx fails.
+/// `enabled` therefore never persists to `false` via this path; the
+/// EpochSettings keeps reading `enabled == true` with the original
+/// `disable_at`. The user-visible guarantee still holds — create_epoch is
+/// permanently blocked after the timelock because `disable_at` stays set
+/// and in the past — so this is a state-bookkeeping / documentation
+/// discrepancy rather than a security hole. The assertions below pin the
+/// ACTUAL observed behavior (per the task's "do not weaken assertions /
+/// do not edit the contract" rule).
+#[tokio::test]
+async fn test_disable_at_timelock_fires_in_create_epoch() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // Epochs enabled, genesis=1_000, duration=86_400.
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    // Set "now" before scheduling the disable.
+    let disable_time = 100_000i64;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = disable_time;
+    ctx.set_sysvar(&clock);
+
+    // Schedule the disable (timelocked).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::SetEpochsEnabled { enabled: false }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // During the timelock: still enabled, disable_at = now + 7d.
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert!(es.enabled, "enabled stays true during the 7-day timelock");
+    let seven_days = 7 * 24 * 60 * 60i64;
+    assert_eq!(es.disable_at, disable_time + seven_days);
+
+    // Warp PAST disable_at (timelock expired).
+    let after_timelock = es.disable_at + 1;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = after_timelock;
+    ctx.set_sysvar(&clock);
+
+    // create_epoch past the timelock takes the disable branch
+    // (epoch.rs:251-255) and rejects with EpochsNotEnabled.
+    let (epoch_key, _) = epoch_pda(0);
+    let make_create_tx = |blockhash| {
+        Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::CreateEpoch {
+                    epoch_settings: epoch_settings_key,
+                    epoch: epoch_key,
+                    registry: setup.registry_key,
+                    settings: setup.settings_key,
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    payer: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::CreateEpoch {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        )
+    };
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(make_create_tx(blockhash))
+        .await;
+    assert_anchor_error!(result, GarError::EpochsNotEnabled);
+
+    // IMPORTANT — observable on-chain behavior (see FINDING in this test's
+    // doc-block below): the handler sets `enabled = false` / `disable_at = 0`
+    // (epoch.rs:252-253) but then `return Err(..)` on the SAME instruction,
+    // so Solana's runtime DISCARDS those writes when the tx fails. The
+    // EpochSettings therefore still reads `enabled == true` and the original
+    // `disable_at` after the failed create_epoch — NOT the doc-comment's
+    // "the flag actually flips" wording (epoch.rs:201-202).
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es_after = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert!(
+        es_after.enabled,
+        "failed create_epoch tx reverts the in-handler enabled=false write (Solana discards \
+         account writes on Err); enabled stays true on chain"
+    );
+    assert_eq!(
+        es_after.disable_at, disable_time + seven_days,
+        "disable_at write is likewise reverted by the failed tx"
+    );
+
+    // The user-visible *guarantee* the 7-day timelock promises still holds:
+    // because `disable_at` remains set and in the past, every subsequent
+    // create_epoch keeps failing with EpochsNotEnabled. New epochs are
+    // permanently blocked after the timelock, even though the `enabled`
+    // field itself never persists to false via this path.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result2 = ctx
+        .banks_client
+        .process_transaction(make_create_tx(blockhash))
+        .await;
+    assert_anchor_error!(result2, GarError::EpochsNotEnabled);
+}
+
+// -----------------------------------------
 // D. cancel_withdrawal delegate path
 // -----------------------------------------
 
