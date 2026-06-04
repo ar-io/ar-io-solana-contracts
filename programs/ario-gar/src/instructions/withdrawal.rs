@@ -403,3 +403,122 @@ pub struct CloseDrainedWithdrawal<'info> {
     /// a drained vault. Rent always goes to `owner` regardless of who signs.
     pub closer: Signer<'info>,
 }
+
+#[cfg(test)]
+mod decay_tests {
+    //! Unit coverage for the linearly-decaying expedited-withdrawal penalty
+    //! rate computed in `instant_withdrawal` (this file, ~lines 84-103).
+    //!
+    //! `expected_penalty_rate` below is a 1:1 mirror of that inline
+    //! computation — it is NOT production code (it lives in a `#[cfg(test)]`
+    //! module). If the source formula changes, this mirror and these
+    //! assertions must change with it. The end-to-end interpolation against
+    //! the real handler is covered by the `instant_withdrawal_*` integration
+    //! tests in `tests/integration.rs`.
+    use crate::RATE_SCALE;
+
+    /// Byte-for-byte mirror of the penalty branch in `instant_withdrawal`.
+    fn expected_penalty_rate(
+        max_penalty: u64,
+        min_penalty: u64,
+        total_period: i64,
+        created_at: i64,
+        now: i64,
+    ) -> u64 {
+        let elapsed = now.saturating_sub(created_at).max(0);
+        if total_period == 0 || elapsed >= total_period {
+            min_penalty
+        } else {
+            let decay = (max_penalty.saturating_sub(min_penalty) as u128)
+                .checked_mul(elapsed as u128)
+                .unwrap()
+                .checked_div(total_period as u128)
+                .unwrap() as u64;
+            let rate_after_decay = max_penalty.saturating_sub(decay);
+            rate_after_decay.max(min_penalty).min(max_penalty)
+        }
+    }
+
+    const MAX: u64 = 500_000; // default max_expedited_withdrawal_penalty (50%)
+    const MIN: u64 = 100_000; // default min_expedited_withdrawal_penalty (10%)
+    const PERIOD: i64 = 30 * 86_400; // default withdrawal_period (30 days)
+
+    #[test]
+    fn decay_at_known_elapsed_points() {
+        // elapsed = 0  ->  exactly max (no decay yet)
+        assert_eq!(expected_penalty_rate(MAX, MIN, PERIOD, 0, 0), MAX);
+
+        // elapsed = period/4  ->  max - (max-min)/4 = 500_000 - 100_000 = 400_000
+        let q = PERIOD / 4;
+        assert_eq!(expected_penalty_rate(MAX, MIN, PERIOD, 0, q), 400_000);
+
+        // elapsed = period/2  ->  max - (max-min)/2 = 500_000 - 200_000 = 300_000
+        let half = PERIOD / 2;
+        assert_eq!(expected_penalty_rate(MAX, MIN, PERIOD, 0, half), 300_000);
+
+        // elapsed = period - 1  ->  just above min, NOT yet min (boundary is `>=`)
+        let almost = PERIOD - 1;
+        let rate_almost = expected_penalty_rate(MAX, MIN, PERIOD, 0, almost);
+        assert!(
+            rate_almost > MIN && rate_almost < MIN + 100,
+            "at period-1 the rate should be just above min, got {rate_almost}"
+        );
+
+        // elapsed = period  ->  exactly min (the `elapsed >= total_period` arm)
+        assert_eq!(expected_penalty_rate(MAX, MIN, PERIOD, 0, PERIOD), MIN);
+
+        // elapsed = period + 1  ->  still min (clamped via the `>=` arm)
+        assert_eq!(expected_penalty_rate(MAX, MIN, PERIOD, 0, PERIOD + 1), MIN);
+    }
+
+    #[test]
+    fn boundary_is_inclusive_at_period() {
+        // The source gate is `elapsed >= total_period` (not `>`), so the
+        // transition to the minimum rate happens AT the period boundary, not
+        // one second after it. Pin that: period-1 is still decaying, period
+        // is already min.
+        let at_period_minus_one = expected_penalty_rate(MAX, MIN, PERIOD, 0, PERIOD - 1);
+        let at_period = expected_penalty_rate(MAX, MIN, PERIOD, 0, PERIOD);
+        assert!(at_period_minus_one > MIN, "period-1 still decaying");
+        assert_eq!(at_period, MIN, "period boundary is inclusive -> min");
+    }
+
+    #[test]
+    fn zero_total_period_yields_min() {
+        // total_period == 0 short-circuits to min (avoids div-by-zero) for any
+        // elapsed, including elapsed == 0.
+        assert_eq!(expected_penalty_rate(MAX, MIN, 0, 0, 0), MIN);
+        assert_eq!(expected_penalty_rate(MAX, MIN, 0, 0, 123_456), MIN);
+    }
+
+    #[test]
+    fn result_always_within_min_max_clamp() {
+        // Sweep elapsed across (and beyond) the period; the rate must never
+        // leave [min, max] regardless of input.
+        for num in 0..=40i64 {
+            let now = (PERIOD * num) / 30; // 0 .. ~1.33 * period
+            let rate = expected_penalty_rate(MAX, MIN, PERIOD, 0, now);
+            assert!(
+                (MIN..=MAX).contains(&rate),
+                "rate {rate} out of [{MIN},{MAX}] at elapsed {now}"
+            );
+        }
+        // A future-clock created_at (now < created_at) clamps elapsed to 0
+        // via `.max(0)`, so the rate is max (no negative decay).
+        assert_eq!(expected_penalty_rate(MAX, MIN, PERIOD, 1_000, 500), MAX);
+    }
+
+    #[test]
+    fn fee_and_payout_track_the_rate() {
+        // The fee is amount * rate / RATE_SCALE, payout = amount - fee.
+        // Sanity-check the conversion the handler performs after computing the
+        // rate, at mid-period (rate = 300_000 = 30%).
+        let amount: u64 = 1_000_000;
+        let rate = expected_penalty_rate(MAX, MIN, PERIOD, 0, PERIOD / 2);
+        let fee = (amount as u128 * rate as u128 / RATE_SCALE as u128) as u64;
+        let payout = amount - fee;
+        assert_eq!(rate, 300_000);
+        assert_eq!(fee, 300_000);
+        assert_eq!(payout, 700_000);
+    }
+}

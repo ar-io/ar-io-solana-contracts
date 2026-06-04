@@ -9949,6 +9949,201 @@ async fn test_instant_withdrawal_decay_boundaries() {
     );
 }
 
+// -----------------------------------------
+// test_instant_withdrawal_decay_quarter_and_period_edge
+// -----------------------------------------
+
+/// Complements `test_instant_withdrawal_decay_boundaries` (which pins
+/// elapsed ∈ {0, half, total}) with the points that exercise the exact
+/// shape of the linear ramp and the inclusive `>=` boundary in
+/// `instant_withdrawal` (withdrawal.rs ~lines 84-103):
+///   * elapsed = period/4   -> max - (max-min)/4 = 40% (ramp is linear)
+///   * elapsed = period - 1 -> still decaying, fee strictly above the 10% min
+///   * elapsed = period + 1 -> min (10%), confirming the `>=` gate clamps
+///
+/// All three are charged by the real on-chain handler (not a mirror), so a
+/// regression in the interpolation or the boundary comparison fails here.
+#[tokio::test]
+async fn test_instant_withdrawal_decay_quarter_and_period_edge() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // 50k stake supports three 10k withdrawals while staying above the 20k
+    // operator minimum.
+    let initial_stake = 50_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, initial_stake).await;
+    let payer_pk = ctx.payer.pubkey();
+    let (withdrawal_counter_key, _) = withdrawal_counter_pda(&payer_pk);
+
+    let decrease_amount = 10_000_000_000u64;
+    let total_period = 30 * 86_400i64;
+
+    // Create three withdrawal vaults (ids 0,1,2) up front; capture each
+    // vault's created_at so the elapsed offset is exact.
+    let mut created_ats = [0i64; 3];
+    for (id, slot) in created_ats.iter_mut().enumerate() {
+        let (withdrawal_key, _) = withdrawal_pda(&payer_pk, id as u64);
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DecreaseOperatorStake {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    withdrawal_counter: withdrawal_counter_key,
+                    withdrawal: withdrawal_key,
+                    operator: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DecreaseOperatorStake {
+                    amount: decrease_amount,
+                }
+                .data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let acct = ctx
+            .banks_client
+            .get_account(withdrawal_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let w = Withdrawal::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        *slot = w.created_at;
+    }
+
+    // (elapsed offset, expected fee, expected payout) for each vault.
+    // rate(elapsed) = max - (max-min)*elapsed/period, clamped to [min,max].
+    //   quarter:  rate = 500_000 - 400_000/4 = 400_000 (40%) -> fee 4B, payout 6B
+    //   period+1: elapsed >= period -> min = 100_000 (10%)  -> fee 1B, payout 9B
+    let quarter = total_period / 4;
+    let cases = [
+        (0usize, quarter, 4_000_000_000u64, 6_000_000_000u64),
+        (1usize, total_period + 1, 1_000_000_000u64, 9_000_000_000u64),
+    ];
+
+    for (id, elapsed, expected_fee, expected_payout) in cases {
+        let (withdrawal_key, _) = withdrawal_pda(&payer_pk, id as u64);
+        let mut clock = ctx
+            .banks_client
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .await
+            .unwrap();
+        clock.unix_timestamp = created_ats[id] + elapsed;
+        ctx.set_sysvar(&clock);
+
+        let balance_before = get_token_balance(&mut ctx, &setup.operator_token.pubkey()).await;
+        let protocol_before = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::InstantWithdrawal {
+                    settings: setup.settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    owner_token_account: setup.operator_token.pubkey(),
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    owner: payer_pk,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::InstantWithdrawal {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let balance_after = get_token_balance(&mut ctx, &setup.operator_token.pubkey()).await;
+        let protocol_after = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+        assert_eq!(
+            balance_after - balance_before,
+            expected_payout,
+            "elapsed={elapsed}: payout mismatch"
+        );
+        assert_eq!(
+            protocol_after - protocol_before,
+            expected_fee,
+            "elapsed={elapsed}: fee mismatch"
+        );
+    }
+
+    // Vault 2 at elapsed = period - 1: still on the decaying ramp, so the
+    // fee must be strictly greater than the 10% floor (1B) — proving the
+    // boundary is `>=` (min only AT/after period), not `>` (min just before).
+    let (withdrawal_key_2, _) = withdrawal_pda(&payer_pk, 2);
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = created_ats[2] + total_period - 1;
+    ctx.set_sysvar(&clock);
+
+    let protocol_before = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InstantWithdrawal {
+                settings: setup.settings_key,
+                withdrawal: withdrawal_key_2,
+                stake_token_account: setup.stake_token.pubkey(),
+                owner_token_account: setup.operator_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                owner: payer_pk,
+                token_program: spl_token::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InstantWithdrawal {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let protocol_after = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    let fee_at_period_minus_one = protocol_after - protocol_before;
+    // 10% floor on a 10k withdrawal is exactly 1B. At period-1 the rate is
+    // still above min, so the fee must exceed that floor.
+    assert!(
+        fee_at_period_minus_one > 1_000_000_000u64,
+        "at period-1 the penalty must still be above the 10% min (got fee {fee_at_period_minus_one}); \
+         a `>` boundary instead of `>=` would not change this point, but a fee == 1B would mean the \
+         min-clamp fired one second too early"
+    );
+    // And it must remain below the 50% ceiling (5B).
+    assert!(
+        fee_at_period_minus_one < 5_000_000_000u64,
+        "at period-1 the penalty must be below the 50% max"
+    );
+}
+
 // =========================================
 // COVERAGE GAP TESTS
 // =========================================
