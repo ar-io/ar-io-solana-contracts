@@ -8539,8 +8539,9 @@ async fn test_import_account_rejects_epoch_settings_discriminator() {
 // inject a state where every active slot is `Pubkey::default()`. With
 // no real gateways, pass 2 produces zero pending distributions →
 // `transfer_amount == 0` → the ario-core CPI is skipped, so this test
-// does NOT need ario-core loaded (which is why all the other
-// distribute_epoch tests are #[ignore]'d).
+// does NOT need ario-core loaded. (The other distribute_epoch tests
+// that DO reach the treasury CPI load ario-core as a native processor
+// via `program_test_with_gar_and_core` — see that helper.)
 //
 // Pre-fix the loop would hit the `registry.gateways[dist_idx].address
 // == gateway.operator` require! on the very first cleared slot and
