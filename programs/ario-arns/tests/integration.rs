@@ -224,6 +224,14 @@ fn name_registry_key() -> Pubkey {
     Pubkey::find_program_address(&[NAME_REGISTRY_SEED], &ario_arns::ID).0
 }
 
+/// Read the `amount` of an SPL token account by pubkey.
+async fn spl_token_balance(ctx: &mut ProgramTestContext, key: Pubkey) -> u64 {
+    let account = ctx.banks_client.get_account(key).await.unwrap().unwrap();
+    spl_token::state::Account::unpack(&account.data)
+        .unwrap()
+        .amount
+}
+
 async fn create_mint(
     ctx: &mut ProgramTestContext,
     mint: &Keypair,
@@ -1995,6 +2003,249 @@ async fn test_buy_returned_name_high_premium() {
         "At returned_at, premium should be exactly {}x (expected {}, got {})",
         RETURNED_NAME_MAX_MULTIPLIER, expected_premium_price, record.purchase_price
     );
+}
+
+/// AREA 2: returned-name MID-auction premium charged on-chain.
+///
+/// The existing returned-name integration tests only buy at the two extremes:
+/// t=0 (50x, `test_buy_returned_name_high_premium`) and after the window closes
+/// (1x, `test_buy_returned_name`). The linearly-decaying mid-window price
+/// (`pricing.rs::calculate_returned_name_premium`) was only ever exercised by
+/// the in-crate unit test `test_returned_name_premium_halfway` — never charged
+/// through an executed `buy_returned_name` with a real SPL transfer + revenue
+/// split.
+///
+/// This test releases a name into the ReturnedName state, warps to EXACTLY the
+/// 7-day midpoint of the 14-day auction window, executes `buy_returned_name`,
+/// and asserts:
+///   1. the charged `purchase_price` equals the protocol's own mid-window
+///      formula (`registration_fee * 25.5`, the linear midpoint
+///      50 − (49/14)*7 = 25.5x), recomputed from the live on-chain demand
+///      factor + fee table so the assertion is exact, not approximate;
+///   2. the implied premium MULTIPLIER is 25.5x (within integer rounding);
+///   3. the SPL transfers + 50/50 initiator revenue split move exactly the
+///      right token amounts (initiator != protocol → half to each).
+#[tokio::test]
+async fn test_buy_returned_name_mid_auction_premium() {
+    use ario_arns::pricing::{calculate_registration_fee, calculate_returned_name_premium};
+
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "midwindow";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    // Release the name. `release_name` records `returned_at` = current chain
+    // clock (TEST_PERIOD_ZERO_START, since we haven't warped yet) and sets the
+    // initiator to the caller (ctx.payer) — NOT the config PDA — so the rebuy
+    // takes the 50/50 split path.
+    let (returned_name_key, _) = returned_name_pda(name);
+    let registry_key = name_registry_key();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::ReleaseName {
+                config: config_pda().0,
+                arns_record: arns_record_key,
+                returned_name: returned_name_key,
+                name_registry: registry_key,
+                ant_asset: ant_key,
+                caller: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::ReleaseName {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Confirm returned_at, and that the initiator is the payer (50/50 split path).
+    let returned = {
+        let acct = ctx
+            .banks_client
+            .get_account(returned_name_key)
+            .await
+            .unwrap()
+            .unwrap();
+        ReturnedName::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+    let returned_at = returned.returned_at;
+    assert_eq!(returned_at, TEST_PERIOD_ZERO_START);
+    assert_eq!(
+        returned.initiator,
+        ctx.payer.pubkey(),
+        "initiator must be the release caller, not the protocol (drives the 50/50 split)"
+    );
+    assert_ne!(
+        returned.initiator,
+        config_pda().0,
+        "initiator must differ from the config PDA so the rebuy is a 50/50 split"
+    );
+
+    // Warp to EXACTLY the 7-day midpoint of the 14-day window.
+    // elapsed = 7d, duration = 14d → multiplier = 50 − 49*(7/14) = 25.5x.
+    let mid_elapsed = RETURNED_NAME_DURATION_SECONDS / 2;
+    assert_eq!(mid_elapsed, 7 * 86_400, "midpoint must be exactly 7 days");
+    let buy_timestamp = returned_at + mid_elapsed;
+    let current_slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(current_slot + 2).unwrap();
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = buy_timestamp;
+    ctx.set_sysvar(&clock);
+
+    // Snapshot the two token-account balances before the rebuy.
+    let protocol_before = spl_token_balance(&mut ctx, setup.protocol_token.pubkey()).await;
+    let buyer_before = spl_token_balance(&mut ctx, setup.buyer_token.pubkey()).await;
+
+    // Execute the mid-window buy_returned_name.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::BuyReturnedName {
+                config: config_pda().0,
+                demand_factor: demand_factor_pda().0,
+                returned_name: returned_name_key,
+                arns_record: arns_record_pda(name).0,
+                name_registry: registry_key,
+                buyer_token_account: setup.buyer_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                initiator_token_account: setup.buyer_token.pubkey(),
+                buyer: ctx.payer.pubkey(),
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::BuyReturnedName {
+                params: ario_arns::BuyReturnedNameParams {
+                    name: name.to_string(),
+                    purchase_type: PurchaseType::Permabuy,
+                    years: 0,
+                    ant: ant_key,
+                },
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Read the charged price off the freshly-created record.
+    let new_arns_key = arns_record_pda(name).0;
+    let record = {
+        let acct = ctx
+            .banks_client
+            .get_account(new_arns_key)
+            .await
+            .unwrap()
+            .unwrap();
+        ArnsRecord::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+
+    // Recompute the expected price from the LIVE on-chain demand factor + fees
+    // (buy_returned_name lazily rolled the demand factor across the 7 idle
+    // periods, so the registration fee already reflects that decay). Using the
+    // protocol's own public pricing functions makes this assertion exact.
+    let demand = {
+        let acct = ctx
+            .banks_client
+            .get_account(setup.demand_factor_key)
+            .await
+            .unwrap()
+            .unwrap();
+        DemandFactor::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+    let base_fee = demand.fees[name.len() - 1];
+    let registration_fee = calculate_registration_fee(
+        base_fee,
+        PurchaseType::Permabuy,
+        0,
+        demand.current_demand_factor,
+    )
+    .unwrap();
+    let expected_mid_cost =
+        calculate_returned_name_premium(registration_fee, returned_at, buy_timestamp).unwrap();
+
+    assert_eq!(
+        record.purchase_price, expected_mid_cost,
+        "mid-window charged price must equal the protocol's linear-decay formula \
+         (registration_fee={registration_fee}, expected={expected_mid_cost}, \
+         got={})",
+        record.purchase_price
+    );
+
+    // Verify the implied multiplier is 25.5x within integer rounding. The
+    // formula computes multiplier = 25_500_000 (25.5 * SCALE) at the exact
+    // midpoint, so purchase_price == registration_fee * 25_500_000 / SCALE.
+    let expected_from_multiplier =
+        (registration_fee as u128 * 25_500_000u128 / DEMAND_FACTOR_SCALE as u128) as u64;
+    assert_eq!(
+        record.purchase_price, expected_from_multiplier,
+        "mid-window multiplier must be exactly 25.5x of the registration fee"
+    );
+    // And the back-computed multiplier rounds to ~25.5x (sanity on direction:
+    // strictly between the 1x floor and the 50x ceiling).
+    let implied_multiplier_scaled = (record.purchase_price as u128 * DEMAND_FACTOR_SCALE as u128
+        / registration_fee as u128) as u64;
+    assert!(
+        (24_500_000..=25_500_000).contains(&implied_multiplier_scaled),
+        "implied multiplier {implied_multiplier_scaled} (scaled) should be ~25.5x at the midpoint"
+    );
+    assert!(
+        record.purchase_price > registration_fee,
+        "mid-window price must exceed the 1x floor"
+    );
+    assert!(
+        record.purchase_price < registration_fee * RETURNED_NAME_MAX_MULTIPLIER,
+        "mid-window price must be below the 50x ceiling"
+    );
+
+    // Verify the SPL transfer + 50/50 revenue split moved exact amounts.
+    // initiator != protocol → protocol gets token_cost/2, initiator (== the
+    // buyer's own token account here) is refunded the remainder, so the buyer's
+    // net spend is exactly the protocol's half.
+    let reward_for_protocol = record.purchase_price / 2;
+    let reward_for_initiator = record.purchase_price - reward_for_protocol;
+    let protocol_after = spl_token_balance(&mut ctx, setup.protocol_token.pubkey()).await;
+    let buyer_after = spl_token_balance(&mut ctx, setup.buyer_token.pubkey()).await;
+
+    assert_eq!(
+        protocol_after - protocol_before,
+        reward_for_protocol,
+        "protocol must receive exactly half of the mid-window cost"
+    );
+    // Buyer pays the full cost out and is refunded the initiator half back into
+    // the same account → net debit is the protocol's half.
+    assert_eq!(
+        buyer_before - buyer_after,
+        record.purchase_price - reward_for_initiator,
+        "buyer's net debit must equal the protocol's half (initiator half refunded)"
+    );
+    assert_eq!(
+        buyer_before - buyer_after,
+        reward_for_protocol,
+        "buyer net debit equals reward_for_protocol when self-buying"
+    );
+
+    // Record sanity.
+    assert_eq!(record.owner, ctx.payer.pubkey());
+    assert_eq!(record.name, name);
+    assert!(matches!(record.purchase_type, PurchaseType::Permabuy));
 }
 
 // =========================================
