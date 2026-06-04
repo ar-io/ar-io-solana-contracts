@@ -62,6 +62,26 @@ fn anchor_processor(
     }
 }
 
+/// Native-processor bridge for ario-core, used by the `distribute_epoch`
+/// lifecycle tests. `distribute_epoch` CPIs into
+/// `ario_core::release_treasury_to_recipient` to move the per-epoch reward
+/// pool out of the treasury (whose SPL authority lives on ario-core's
+/// `ArioConfig` PDA). The tests load ario-core in-process via
+/// `pt.add_program("ario_core", ario_gar::ARIO_CORE_PROGRAM_ID, ...)`; the
+/// gar source pins the CPI target to `ARIO_CORE_PROGRAM_ID`, which is the
+/// placeholder `declare_id!()` literal ario-core was compiled with, so the
+/// loaded-at address matches ario-core's runtime declared ID.
+fn ario_core_processor(
+    program_id: &Pubkey,
+    accounts: &[anchor_lang::prelude::AccountInfo],
+    data: &[u8],
+) -> anchor_lang::solana_program::entrypoint::ProgramResult {
+    unsafe {
+        let accounts: &[anchor_lang::prelude::AccountInfo] = std::mem::transmute(accounts);
+        ario_core::entry(program_id, accounts, data)
+    }
+}
+
 /// Create a ProgramTest with pre-initialized GAR state.
 ///
 /// In native processor mode, Anchor's `init` CPI to system_program is limited to
@@ -458,6 +478,54 @@ async fn setup_gar(
     let (settings_key, _) = settings_pda();
     create_token_account(ctx, &stake_token, &mint.pubkey(), &settings_key).await;
     create_token_account(ctx, &protocol_token, &mint.pubkey(), &settings_key).await;
+
+    let (registry_key, _) = registry_pda();
+
+    GarSetup {
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+        registry_key,
+        settings_key,
+    }
+}
+
+/// Variant of `setup_gar` for the `distribute_epoch` lifecycle tests: the
+/// `protocol_token_account` (the treasury / transfer source) is created with
+/// its SPL `Owner` authority set to ario-core's `ArioConfig` PDA, matching
+/// production — `release_treasury_to_recipient` signs the SPL transfer FROM
+/// the treasury with the ArioConfig PDA as authority, so the treasury must be
+/// owned by that PDA, not by gar settings. The stake token account (transfer
+/// destination) stays owned by gar settings; SPL transfers don't require the
+/// destination's owner to sign.
+async fn setup_gar_with_core_treasury(
+    ctx: &mut ProgramTestContext,
+    mint: Keypair,
+    mint_authority: Keypair,
+    operator_token: Keypair,
+    stake_token: Keypair,
+    protocol_token: Keypair,
+) -> GarSetup {
+    create_mint(ctx, &mint, &mint_authority.pubkey()).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    create_token_account(ctx, &operator_token, &mint.pubkey(), &payer_pk).await;
+    mint_tokens(
+        ctx,
+        &mint.pubkey(),
+        &operator_token.pubkey(),
+        &mint_authority,
+        100_000_000_000,
+    )
+    .await;
+
+    let (settings_key, _) = settings_pda();
+    create_token_account(ctx, &stake_token, &mint.pubkey(), &settings_key).await;
+    // Treasury source: owned by the ArioConfig PDA (production parity).
+    let (ario_config_key, _) = ario_config_pda();
+    create_token_account(ctx, &protocol_token, &mint.pubkey(), &ario_config_key).await;
 
     let (registry_key, _) = registry_pda();
 
@@ -4035,6 +4103,121 @@ fn pre_create_epoch_settings(
     );
 }
 
+/// Canonical `ArioConfig` PDA address, derived from the placeholder
+/// `ARIO_CORE_PROGRAM_ID` that ario-core was compiled with (its
+/// `declare_id!()` literal). This is the address `distribute_epoch`'s
+/// `ario_config` account constraint resolves to
+/// (`seeds = [b"ario_config"], seeds::program = ARIO_CORE_PROGRAM_ID`).
+fn ario_config_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"ario_config"], &ario_gar::ARIO_CORE_PROGRAM_ID)
+}
+
+/// Pre-create ario-core's `ArioConfig` PDA so `distribute_epoch`'s CPI into
+/// `ario_core::release_treasury_to_recipient` can authenticate the transfer.
+///
+/// ario-core deserializes this as a typed `Account<ArioConfig>` and enforces:
+///   * `config.treasury == protocol_token_account` (transfer source)
+///   * `config.gar_program == ario_gar::ID` (caller authentication — the
+///     `gar_settings` signer must derive from this program ID)
+///
+/// The byte layout mirrors `ario_core::state::ArioConfig` exactly (borsh,
+/// sequential). Built WITHOUT the `migration-test` feature, so the struct
+/// has no `field_1/2/3` tail and `version` is the canonical 1.0.0.
+fn pre_create_ario_config(pt: &mut ProgramTest, treasury: &Pubkey, gar_program: &Pubkey) {
+    use anchor_lang::solana_program::hash::hash;
+
+    let (config_key, config_bump) = ario_config_pda();
+    // SIZE = disc(8) + authority(32) + mint(32) + arns_program(32)
+    //      + treasury(32) + 7*u64/i64(56) + migration_active(1)
+    //      + migration_authority(32) + bump(1) + gar_program(32)
+    //      + version(3) = 261
+    let size = 261usize;
+    let mut data = vec![0u8; size];
+
+    // Anchor account discriminator
+    let disc = hash(b"account:ArioConfig");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+
+    let mut offset = 8usize;
+    let dummy_authority = Pubkey::new_unique();
+    // authority: Pubkey
+    data[offset..offset + 32].copy_from_slice(dummy_authority.as_ref());
+    offset += 32;
+    // mint: Pubkey (unused by release_treasury_to_recipient)
+    data[offset..offset + 32].copy_from_slice(Pubkey::new_unique().as_ref());
+    offset += 32;
+    // arns_program: Pubkey (unused here)
+    data[offset..offset + 32].copy_from_slice(Pubkey::new_unique().as_ref());
+    offset += 32;
+    // treasury: Pubkey — pinned source; MUST equal protocol_token_account
+    data[offset..offset + 32].copy_from_slice(treasury.as_ref());
+    offset += 32;
+    // total_supply / protocol_balance / circulating_supply / locked_supply:
+    // u64 (4 * 8 = 32 bytes, all 0)
+    offset += 32;
+    // min_vault_duration / max_vault_duration / primary_name_request_expiry:
+    // i64 (3 * 8 = 24 bytes, all 0)
+    offset += 24;
+    // migration_active: bool — false (release ix is NOT gated on this)
+    data[offset] = 0;
+    offset += 1;
+    // migration_authority: Pubkey
+    data[offset..offset + 32].copy_from_slice(dummy_authority.as_ref());
+    offset += 32;
+    // bump: u8
+    data[offset] = config_bump;
+    offset += 1;
+    // gar_program: Pubkey — caller authentication, MUST equal ario_gar::ID
+    data[offset..offset + 32].copy_from_slice(gar_program.as_ref());
+    offset += 32;
+    // version: SchemaVersion { major, minor, patch } = 1.0.0
+    data[offset] = 1;
+    data[offset + 1] = 0;
+    data[offset + 2] = 0;
+    offset += 3;
+    debug_assert_eq!(offset, size, "ArioConfig hand-serialization length drift");
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        config_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(size),
+            data,
+            owner: ario_gar::ARIO_CORE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+}
+
+/// `program_test_with_gar`, plus the ario-core native processor and a
+/// pre-created `ArioConfig` PDA — the setup `distribute_epoch` needs to CPI
+/// into `ario_core::release_treasury_to_recipient`. `treasury` MUST be the
+/// same pubkey passed as `protocol_token_account` (the transfer source that
+/// ario-core pins against `ArioConfig.treasury`).
+fn program_test_with_gar_and_core(
+    authority: &Pubkey,
+    mint: &Pubkey,
+    stake_token_account: &Pubkey,
+    protocol_token_account: &Pubkey,
+) -> ProgramTest {
+    let mut pt = program_test_with_gar(
+        authority,
+        mint,
+        stake_token_account,
+        protocol_token_account,
+    );
+    pt.add_program(
+        "ario_core",
+        ario_gar::ARIO_CORE_PROGRAM_ID,
+        processor!(ario_core_processor),
+    );
+    // gar_program in ArioConfig must be ario-gar's program ID so the
+    // gar_settings PDA signer (derived from ario_gar::ID) authenticates.
+    pre_create_ario_config(&mut pt, protocol_token_account, &ario_gar::ID);
+    pt
+}
+
 // -----------------------------------------
 // 1. test_epoch_create_and_tally
 // -----------------------------------------
@@ -4389,11 +4572,10 @@ async fn test_tally_snapshots_delegated_at_tally() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_full_lifecycle() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -4402,7 +4584,7 @@ async fn test_epoch_full_lifecycle() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -4603,8 +4785,8 @@ async fn test_epoch_full_lifecycle() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -5234,11 +5416,10 @@ async fn test_epoch_save_observations_not_prescribed() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_distribute_before_end() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -5247,6 +5428,8 @@ async fn test_epoch_distribute_before_end() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
+    // The `EpochInProgress` guard rejects before the treasury CPI, so the
+    // treasury SPL-owner doesn't matter here — plain setup_gar is fine.
     let setup = setup_gar(
         &mut ctx,
         mint,
@@ -5407,8 +5590,8 @@ async fn test_epoch_distribute_before_end() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -5436,11 +5619,10 @@ async fn test_epoch_distribute_before_end() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_close_before_retention() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -5449,7 +5631,7 @@ async fn test_epoch_close_before_retention() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -5617,8 +5799,8 @@ async fn test_epoch_close_before_retention() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -7132,13 +7314,12 @@ async fn test_stake_conservation_payment_paths() {
 }
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_reward_budget_not_exceeded() {
     // Verify that reward distribution never transfers more than epoch.total_eligible_rewards
     // from the protocol token account.
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -7147,7 +7328,7 @@ async fn test_epoch_reward_budget_not_exceeded() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -7335,8 +7516,8 @@ async fn test_epoch_reward_budget_not_exceeded() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -8766,11 +8947,10 @@ async fn test_compound_delegation_rewards_permissionless() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_close_epoch_happy() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -8779,7 +8959,7 @@ async fn test_close_epoch_happy() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -8919,8 +9099,8 @@ async fn test_close_epoch_happy() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -9778,12 +9958,11 @@ async fn test_instant_withdrawal_decay_boundaries() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_close_observation() {
     // After a distributed epoch, close an observation PDA to reclaim rent.
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -9792,7 +9971,7 @@ async fn test_close_observation() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -9961,8 +10140,8 @@ async fn test_close_observation() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -11730,11 +11909,10 @@ async fn test_redelegate_stake_with_fee() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_failed_gateway() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -11743,7 +11921,7 @@ async fn test_distribute_epoch_failed_gateway() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -11922,8 +12100,8 @@ async fn test_distribute_epoch_failed_gateway() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -11985,11 +12163,10 @@ async fn test_distribute_epoch_failed_gateway() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_twice_fails() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -11998,7 +12175,7 @@ async fn test_distribute_epoch_twice_fails() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -12160,8 +12337,8 @@ async fn test_distribute_epoch_twice_fails() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -12235,11 +12412,10 @@ async fn test_distribute_epoch_twice_fails() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_with_delegate_rewards() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -12248,7 +12424,7 @@ async fn test_distribute_epoch_with_delegate_rewards() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -12493,8 +12669,8 @@ async fn test_distribute_epoch_with_delegate_rewards() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -13259,13 +13435,12 @@ async fn test_save_observations_invalid_count() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
 
     let operator2 = Keypair::new();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -13284,7 +13459,7 @@ async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
     );
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -13554,8 +13729,8 @@ async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
         settings: setup.settings_key,
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::ID,
         payer: payer_pk,
     }
@@ -16541,7 +16716,6 @@ async fn test_finalize_gone_blocks_with_outstanding_delegations() {
 // =====================================================================
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_close_epoch_blocks_unclosed_observations() {
     // close_epoch must reject when any Observation PDA is still open. Without
     // this gate the orphaned PDAs would lose their parent reference and rent
@@ -16554,7 +16728,7 @@ async fn test_close_epoch_blocks_unclosed_observations() {
     // with EpochObservationsNotClosed; close_observation then unlocks it.
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -16562,7 +16736,7 @@ async fn test_close_epoch_blocks_unclosed_observations() {
     );
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -16725,8 +16899,8 @@ async fn test_close_epoch_blocks_unclosed_observations() {
         settings: setup.settings_key,
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::ID,
         payer: payer_pk,
     }

@@ -41,6 +41,15 @@ spl-token = { workspace = true, features = ["no-entrypoint"] }
 tokio.workspace = true
 proptest.workspace = true
 ario-test-utils = { path = "../../test-utils" }
+# Test-only: the distribute_epoch lifecycle tests CPI into
+# `ario_core::release_treasury_to_recipient`, so they load ario-core as a
+# native-processor program in solana-program-test. This is a dev-dependency
+# cycle (ario-core -> ario-gar normally), which Cargo permits because
+# dev-dependencies never enter the compiled `.so` / cpi graph. `cpi`
+# (=> no-entrypoint) is set so the linked-in ario-core does NOT emit a
+# duplicate Solana entrypoint symbol; `ario_core::entry` stays reachable
+# for the test's native processor bridge.
+ario-core = { path = "../ario-core", features = ["cpi"] }
 
 [lints]
 workspace = true

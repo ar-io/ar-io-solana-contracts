@@ -419,6 +419,7 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "ario-core",
  "ario-test-utils",
  "blake3",
  "bytemuck",
