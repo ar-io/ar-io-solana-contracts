@@ -670,6 +670,16 @@ pub mod ario_ant {
         finalize_migration_handler(ctx)
     }
 
+    /// Rotate the admin `authority` on `AntMigrationConfig` to `new_authority`
+    /// (ADR-026). Gated on the current admin authority; rejects the null
+    /// pubkey. Used to hand governance to the Squads multisig vault.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        transfer_authority_handler(ctx, new_authority)
+    }
+
     // =========================================
     // ANT MIGRATION (per-ANT schema upgrade)
     // =========================================
@@ -2768,6 +2778,16 @@ fn close_account_to_authority<'info>(
     drop(data);
     account.assign(&anchor_lang::solana_program::system_program::ID);
     Ok(())
+}
+
+/// Emitted by `transfer_authority` (ADR-026) when the admin `authority` on
+/// `AntMigrationConfig` is rotated. `old_authority` is the signer that
+/// authorized the rotation.
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
 }
 
 /// Emitted when a record is created or updated via `set_record`.

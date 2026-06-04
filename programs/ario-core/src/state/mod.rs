@@ -638,6 +638,18 @@ pub struct ConfigUpdatedEvent {
     pub timestamp: i64,
 }
 
+/// Emitted by the dedicated `transfer_authority` (ADR-026) when the admin
+/// `authority` is rotated. `old_authority` is the signer that authorized the
+/// rotation. (`update_config` with `new_authority` emits `ConfigUpdatedEvent`
+/// with `field = CORE_CONFIG_FIELD_NEW_AUTHORITY` instead — both paths are
+/// equivalent; this event is for the dedicated instruction.)
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

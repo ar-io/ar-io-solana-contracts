@@ -127,6 +127,16 @@ pub mod ario_arns {
         instructions::reserved::reserve::handler(ctx, params)
     }
 
+    /// Rotate the admin `authority` to `new_authority` (ADR-026). Gated on the
+    /// current admin authority; rejects the null pubkey. Used to hand
+    /// governance to the Squads multisig vault post-migration.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::transfer_authority(ctx, new_authority)
+    }
+
     /// Claim a reserved name
     pub fn claim_reserved_name(ctx: Context<ClaimReservedName>) -> Result<()> {
         instructions::reserved::claim::handler(ctx)
@@ -780,6 +790,15 @@ pub const PURCHASE_TYPE_PERMABUY: u8 = 1;
 
 /// Emitted on every successful name purchase. Covers `buy_name` plus
 /// all four `buy_name_from_*` variants (delegation / operator_stake /
+/// Emitted by `transfer_authority` (ADR-026) when the admin `authority` is
+/// rotated. `old_authority` is the signer that authorized the rotation.
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
 /// withdrawal / funding_plan) — the funding path is encoded in
 /// `funding_source`.
 #[event]

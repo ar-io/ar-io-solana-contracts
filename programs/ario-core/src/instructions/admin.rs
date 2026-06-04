@@ -57,6 +57,13 @@ pub mod update_config {
             });
         }
         if let Some(new_authority) = params.new_authority {
+            // ADR-026 null guard: reject the all-zero pubkey so a fat-fingered
+            // renounce cannot brick admin into an unspendable address. Mirrors
+            // the dedicated `transfer_authority`.
+            require!(
+                new_authority != Pubkey::default(),
+                ArioError::InvalidParameter
+            );
             config.authority = new_authority;
             let mut new_value = [0u8; 32];
             new_value.copy_from_slice(&new_authority.to_bytes());
@@ -87,6 +94,55 @@ pub mod update_config {
 
 #[derive(Accounts)]
 pub struct UpdateConfig<'info> {
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = config.authority == authority.key() @ ArioError::Unauthorized,
+    )]
+    pub config: Account<'info, ArioConfig>,
+
+    pub authority: Signer<'info>,
+}
+
+/// Dedicated single-step admin-authority rotation (ADR-026). Equivalent to
+/// `update_config` with only `new_authority` set, but a named, single-purpose
+/// instruction so all five programs share one `transfer_authority`. Also
+/// rotates the admin gate that `ario-ant-escrow::admin_purge_unclaimed_ant`
+/// reads cross-program from `ArioConfig.authority`.
+pub mod transfer_authority {
+    use super::*;
+
+    pub fn handler(ctx: Context<TransferAuthority>, new_authority: Pubkey) -> Result<()> {
+        require!(
+            new_authority != Pubkey::default(),
+            ArioError::InvalidParameter
+        );
+
+        let config = &mut ctx.accounts.config;
+        let old_authority = config.authority;
+        config.authority = new_authority;
+
+        emit!(AuthorityTransferredEvent {
+            old_authority,
+            new_authority,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        msg!(
+            "ArioConfig.authority {} → {} (admin rotation)",
+            old_authority,
+            new_authority
+        );
+        Ok(())
+    }
+}
+
+/// Context for `transfer_authority`. `constraint = config.authority ==
+/// authority.key()` binds the signer to the CURRENT admin authority — the
+/// only load-bearing check. Mirrors `UpdateConfig`'s gate.
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
     #[account(
         mut,
         seeds = [CONFIG_SEED],

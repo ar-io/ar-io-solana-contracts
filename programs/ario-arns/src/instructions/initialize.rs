@@ -297,3 +297,52 @@ pub struct AdminExpandNameRegistry<'info> {
 
     pub system_program: Program<'info, System>,
 }
+
+/// Single-step rotation of the admin `authority` (ADR-026). Gated on the
+/// CURRENT admin `authority` (never `migration_authority`). Rejects the null
+/// pubkey; any other pubkey is allowed, including off-curve PDAs (the Squads
+/// vault). No `migration_active` constraint so recovery / hand-off works
+/// post-migration.
+pub fn transfer_authority(
+    ctx: Context<TransferAuthority>,
+    new_authority: Pubkey,
+) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        crate::error::ArnsError::InvalidParameter
+    );
+
+    let config = &mut ctx.accounts.config;
+    let old_authority = config.authority;
+    config.authority = new_authority;
+
+    let clock = Clock::get()?;
+    emit!(crate::AuthorityTransferredEvent {
+        old_authority,
+        new_authority,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "ArnsConfig.authority {} → {} (admin rotation)",
+        old_authority,
+        new_authority
+    );
+
+    Ok(())
+}
+
+/// Context for `transfer_authority`. `has_one = authority` binds the signer to
+/// the CURRENT admin authority — the only load-bearing check.
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [ARNS_CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ crate::error::ArnsError::Unauthorized,
+    )]
+    pub config: Account<'info, ArnsConfig>,
+
+    pub authority: Signer<'info>,
+}

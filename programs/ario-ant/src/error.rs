@@ -190,4 +190,10 @@ pub enum AntError {
     /// unrelated ANT's live state and refund its rent here, so we refuse.
     #[msg("Orphan-cleanup record does not belong to the supplied asset")]
     OrphanRecordAssetMismatch,
+
+    /// `transfer_authority` (ADR-026): the new admin authority cannot be the
+    /// null pubkey (System program / all-zero) — that would brick admin into
+    /// an unspendable address.
+    #[msg("New authority cannot be the null pubkey")]
+    InvalidAuthority,
 }
