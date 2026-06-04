@@ -84,6 +84,20 @@ fn anchor_processor(
 /// Create a ProgramTest with a pre-allocated NameRegistry (400KB zero-copy account).
 /// NameRegistry is too large for Anchor `init` in native processor mode (>10KB realloc limit).
 fn program_test_with_registry() -> ProgramTest {
+    program_test_with_registry_inner(true)
+}
+
+/// Variant that skips loading the MPL Core BPF program. Used only by flows that
+/// never touch an ANT asset (e.g. the demand-factor stepping tests, which drive
+/// `update_demand_factor` / `initialize` and nothing else). Omitting MPL Core
+/// lets these tests run against the NATIVE `ario_arns` processor without
+/// requiring `BPF_OUT_DIR` (which would otherwise force every program — including
+/// `ario_arns` — to be loaded from a prebuilt `.so`).
+fn program_test_with_registry_no_mpl() -> ProgramTest {
+    program_test_with_registry_inner(false)
+}
+
+fn program_test_with_registry_inner(load_mpl_core: bool) -> ProgramTest {
     use anchor_lang::solana_program::hash::hash;
 
     let mut pt = ProgramTest::new("ario_arns", ario_arns::ID, processor!(anchor_processor));
@@ -108,7 +122,26 @@ fn program_test_with_registry() -> ProgramTest {
     //
     // The migration/localnet/scripts/patch-and-build.sh wrapper handles
     // steps 1+2 for surfpool runs; for cargo, set BPF_OUT_DIR yourself.
-    pt.add_program("mpl_core", MPL_CORE_PROGRAM_ID, None);
+    if load_mpl_core {
+        // MPL Core is only available as a prebuilt `.so`, so it must be loaded
+        // via the BPF path (`add_program(.., None)` resolves it from BPF_OUT_DIR
+        // / `tests/fixtures`). When BPF_OUT_DIR is set (the canonical CI flow
+        // after `anchor build`), `prefer_bpf` is already true and `ario_arns`
+        // is loaded from its freshly-built `.so` — leave that untouched.
+        //
+        // When BPF_OUT_DIR is NOT set, `ProgramTest::new` above registered
+        // `ario_arns` as the NATIVE processor (compiled from the current
+        // source), but `prefer_bpf` is false so `add_program("mpl_core", None)`
+        // would fail to load the fixture. Flip `prefer_bpf` to true here — AFTER
+        // ario_arns was already added as native — so MPL Core loads from the
+        // committed `tests/fixtures/mpl_core.so` while ario_arns stays native.
+        // This lets the MPL-touching tests run from source without a prebuilt
+        // `ario_arns.so`; the resolution decision is per-`add_program` call.
+        if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+            pt.prefer_bpf(true);
+        }
+        pt.add_program("mpl_core", MPL_CORE_PROGRAM_ID, None);
+    }
 
     // Pre-create NameRegistry
     let registry_size = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
@@ -698,6 +731,17 @@ struct ArnsSetup {
 
 /// Initialize the ArNS program and return setup info.
 async fn setup_arns(ctx: &mut ProgramTestContext) -> ArnsSetup {
+    setup_arns_with_initial_demand_factor(ctx, DEMAND_FACTOR_SCALE).await
+}
+
+/// Same as `setup_arns` but seeds the demand factor at `initial_demand_factor`
+/// instead of 1.0. Used by the demand-factor stepping tests that drive the
+/// floor/halving state machine from the real MAINNET start value (9.8x). The
+/// on-chain `initialize` requires `initial_demand_factor >= DEMAND_FACTOR_MIN`.
+async fn setup_arns_with_initial_demand_factor(
+    ctx: &mut ProgramTestContext,
+    initial_demand_factor: u64,
+) -> ArnsSetup {
     // Anchor chain time to TEST_PERIOD_ZERO_START so chain time matches
     // period_zero_start_timestamp (which is required by the on-chain
     // validation in initialize.rs to be `>= 1_577_836_800` AND
@@ -760,7 +804,7 @@ async fn setup_arns(ctx: &mut ProgramTestContext) -> ArnsSetup {
                     treasury: protocol_token.pubkey(),
                     period_zero_start_timestamp: TEST_PERIOD_ZERO_START,
                     migration_authority: ctx.payer.pubkey(),
-                    initial_demand_factor: 1_000_000, // DEMAND_FACTOR_SCALE (1.0)
+                    initial_demand_factor,
                 },
             }
             .data(),
@@ -6120,7 +6164,18 @@ mod fund_from_stake {
 
         let mut pt = ProgramTest::new("ario_arns", ario_arns::ID, processor!(anchor_processor));
         pt.add_program("ario_gar", ario_gar::ID, processor!(gar_processor));
-        // mpl_core needed for mint_test_ant / transfer_test_ant CPIs.
+        // mpl_core needed for mint_test_ant / transfer_test_ant CPIs. It is only
+        // available as a prebuilt `.so`, so it must come in via the BPF path.
+        // ario_arns + ario_gar were just added as NATIVE processors above; when
+        // BPF_OUT_DIR is unset, `prefer_bpf` is false and `add_program(mpl_core,
+        // None)` cannot resolve the fixture. Flip `prefer_bpf` to true AFTER the
+        // two native processors are registered so MPL Core loads from
+        // `tests/fixtures/mpl_core.so` while the two ario programs stay native.
+        // When BPF_OUT_DIR IS set (CI), `prefer_bpf` is already true and all
+        // three load from their `.so`s — leave that untouched.
+        if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+            pt.prefer_bpf(true);
+        }
         pt.add_program("mpl_core", MPL_CORE_PROGRAM_ID, None);
         // Both programs need bigger budgets — ario-arns CPI to ario-gar is heavy.
         pt.set_compute_max_units(1_400_000);
@@ -10566,6 +10621,12 @@ async fn test_buy_name_registry_full() {
     // Build a ProgramTest that pre-creates the registry with count = MAX_NAMES.
     let mut pt = ProgramTest::new("ario_arns", ario_arns::ID, processor!(anchor_processor));
     pt.set_compute_max_units(1_000_000);
+    // See `program_test_with_registry_inner`: when BPF_OUT_DIR is unset, flip
+    // `prefer_bpf` AFTER ario_arns was registered native so MPL Core still loads
+    // from the committed fixture; when set (CI), leave it (all load from `.so`).
+    if std::env::var("BPF_OUT_DIR").is_err() && std::env::var("SBF_OUT_DIR").is_err() {
+        pt.prefer_bpf(true);
+    }
     pt.add_program("mpl_core", MPL_CORE_PROGRAM_ID, None);
 
     let registry_size = NameRegistry::bytes_for_capacity(NameRegistry::INITIAL_CAPACITY);
@@ -11855,4 +11916,332 @@ async fn test_extend_lease_from_withdrawal_relaxed_cap() {
             );
         }
     }
+}
+
+// =========================================
+// DEMAND-FACTOR STEPPING AT THE MINIMUM (on-chain)
+//
+// Coverage for the floor / permanent-halving state machine in
+// `instructions/demand.rs::roll_one_period` (lines ~151-169):
+//   * The factor is clamped at DEMAND_FACTOR_MIN (0.5x) on every decay step.
+//   * `consecutive_periods_with_min_demand_factor` increments each period the
+//     factor sits at the floor.
+//   * After MAX_PERIODS_AT_MIN_DEMAND_FACTOR (=7) consecutive periods at the
+//     floor, the NEXT period (the 8th observation at-floor) permanently halves
+//     ALL fees, resets the factor to DEMAND_FACTOR_SCALE (1.0), and resets the
+//     consecutive counter to 0.
+//
+// These tests drive the permissionless `update_demand_factor` instruction
+// against the live SPT chain (no purchase activity), warping the clock across
+// daily period boundaries. Unlike the existing in-crate unit tests (which take
+// a single step from factor=1.0), they:
+//   (a) start from the real MAINNET genesis factor 9.8x and run through TWO
+//       full halving cycles, asserting the reset invariants after each, and
+//   (b) pin the >=7 vs >7 boundary (un-halved at exactly 7 at-floor periods,
+//       halved on the next).
+// =========================================
+
+/// Pure reference model of one ZERO-ACTIVITY period, expressed only in terms of
+/// the public protocol constants exported from `ario_arns::state`. Mirrors the
+/// not-increasing branch of `roll_one_period` exactly (every zero-activity
+/// period takes that branch). Returns the new `(factor, consecutive)` plus
+/// whether THIS period triggered a permanent fee-halving.
+///
+/// This is the test's independent oracle: the on-chain `update_demand_factor`
+/// execution is asserted against predictions from this model, so a divergence
+/// between model and contract surfaces as a test failure rather than being
+/// silently re-derived from the contract's own private helpers.
+fn ref_zero_activity_step(factor: u64, consecutive: u32) -> (u64, u32, bool) {
+    let mut factor = factor;
+    if factor > DEMAND_FACTOR_MIN {
+        factor = ((factor as u128) * (DEMAND_FACTOR_DOWN_ADJUSTMENT as u128)
+            / (DEMAND_FACTOR_SCALE as u128)) as u64;
+    }
+    if factor <= DEMAND_FACTOR_MIN {
+        if consecutive >= MAX_PERIODS_AT_MIN_DEMAND_FACTOR {
+            (DEMAND_FACTOR_SCALE, 0, true) // permanent halving → reset
+        } else {
+            (DEMAND_FACTOR_MIN, consecutive + 1, false)
+        }
+    } else {
+        (factor, 0, false)
+    }
+}
+
+/// Absolute chain timestamp for the START of a given 1-based period, anchored at
+/// `TEST_PERIOD_ZERO_START`. `get_period_for_timestamp` returns
+/// `(elapsed / PERIOD_LENGTH_SECONDS) + 1`, so period `p` begins at
+/// `period_zero_start + (p - 1) * PERIOD_LENGTH_SECONDS`.
+fn timestamp_for_period_start(period: u64) -> i64 {
+    TEST_PERIOD_ZERO_START + (period as i64 - 1) * PERIOD_LENGTH_SECONDS
+}
+
+/// Warp the SPT chain to the start of `target_period` and run the
+/// permissionless `update_demand_factor` instruction, then return the freshly
+/// deserialized `DemandFactor` account.
+async fn warp_and_update_demand(
+    ctx: &mut ProgramTestContext,
+    demand_factor_key: Pubkey,
+    target_period: u64,
+) -> DemandFactor {
+    // Advance slots so the bank produces a new blockhash, then override the
+    // wall-clock timestamp to the desired period boundary.
+    let current_slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(current_slot + 1).unwrap();
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = timestamp_for_period_start(target_period);
+    ctx.set_sysvar(&clock);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_arns::ID,
+            accounts: ario_arns::accounts::UpdateDemandFactor {
+                demand_factor: demand_factor_key,
+                payer: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_arns::instruction::UpdateDemandFactor {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let df_account = ctx
+        .banks_client
+        .get_account(demand_factor_key)
+        .await
+        .unwrap()
+        .unwrap();
+    DemandFactor::try_deserialize(&mut df_account.data.as_slice()).unwrap()
+}
+
+/// AREA 1(a): start at the real MAINNET genesis demand factor (9.8x), let the
+/// factor decay with NO purchase activity all the way to the floor, and ride it
+/// through TWO consecutive permanent-halving cycles. After each halving cycle,
+/// assert the contract reset the factor to SCALE, zeroed the consecutive
+/// counter, and halved EVERY fee again (cumulative ×0.5 per cycle), checked at
+/// both fees[0] and a mid-table index.
+#[tokio::test]
+async fn test_demand_factor_decays_from_mainnet_start_through_two_halvings() {
+    const MAINNET_INITIAL_DEMAND_FACTOR: u64 = 9_800_000; // 9.8x — AO live value
+
+    let mut pt = program_test_with_registry_no_mpl();
+    let mut ctx = pt.start_with_context().await;
+    let setup =
+        setup_arns_with_initial_demand_factor(&mut ctx, MAINNET_INITIAL_DEMAND_FACTOR).await;
+
+    // Sanity: genesis seeded the 9.8x factor with the unmodified fee table.
+    let genesis = {
+        let acct = ctx
+            .banks_client
+            .get_account(setup.demand_factor_key)
+            .await
+            .unwrap()
+            .unwrap();
+        DemandFactor::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+    assert_eq!(genesis.current_demand_factor, MAINNET_INITIAL_DEMAND_FACTOR);
+    assert_eq!(genesis.current_period, 1);
+    assert_eq!(genesis.fees, GENESIS_FEES);
+    assert_eq!(genesis.consecutive_periods_with_min_demand_factor, 0);
+
+    // A mid-table fee index distinct from fees[0]; both must halve each cycle.
+    const MID_IDX: usize = 6; // 7-char fee (800_000_000)
+    assert_ne!(GENESIS_FEES[0], GENESIS_FEES[MID_IDX]);
+
+    // Drive the reference model forward from genesis to locate the FIRST TWO
+    // periods that complete a permanent halving. The model starts at period 1
+    // (the genesis period); rolling it once closes period `p` and lands at
+    // period `p + 1`, mirroring the contract's `current_period` advance.
+    let mut model_factor = MAINNET_INITIAL_DEMAND_FACTOR;
+    let mut model_consec: u32 = 0;
+    let mut model_period: u64 = genesis.current_period; // 1
+    let mut halving_periods: Vec<u64> = Vec::new();
+    // Guard against an accidental infinite loop if constants ever change such
+    // that the floor/halving is unreachable.
+    let mut guard = 0u64;
+    while halving_periods.len() < 2 {
+        let (f, c, halved) = ref_zero_activity_step(model_factor, model_consec);
+        model_factor = f;
+        model_consec = c;
+        model_period += 1; // this step advanced into a new period
+        if halved {
+            // After this period's roll completes, `current_period` == model_period
+            // and the contract sits at the post-halving reset state.
+            halving_periods.push(model_period);
+        }
+        guard += 1;
+        assert!(
+            guard < 100_000,
+            "reference model never reached two halvings — constants drifted?"
+        );
+    }
+
+    // Expected cumulative fee tables after the 1st and 2nd halvings.
+    let mut fees_after_first = GENESIS_FEES;
+    for f in fees_after_first.iter_mut() {
+        *f = (*f as u128 * DEMAND_FACTOR_MIN as u128 / DEMAND_FACTOR_SCALE as u128) as u64;
+    }
+    let mut fees_after_second = fees_after_first;
+    for f in fees_after_second.iter_mut() {
+        *f = (*f as u128 * DEMAND_FACTOR_MIN as u128 / DEMAND_FACTOR_SCALE as u128) as u64;
+    }
+
+    // --- Cycle 1: warp to the exact post-first-halving boundary ---
+    let demand =
+        warp_and_update_demand(&mut ctx, setup.demand_factor_key, halving_periods[0]).await;
+    assert_eq!(
+        demand.current_period, halving_periods[0],
+        "chain period must match the model's first-halving period"
+    );
+    assert_eq!(
+        demand.current_demand_factor, DEMAND_FACTOR_SCALE,
+        "after the 1st halving the factor resets to 1.0 (SCALE)"
+    );
+    assert_eq!(
+        demand.consecutive_periods_with_min_demand_factor, 0,
+        "after the 1st halving the consecutive-at-min counter resets to 0"
+    );
+    assert_eq!(
+        demand.fees[0],
+        GENESIS_FEES[0] / 2,
+        "after the 1st halving fees[0] is halved once"
+    );
+    assert_eq!(
+        demand.fees[MID_IDX],
+        GENESIS_FEES[MID_IDX] / 2,
+        "after the 1st halving the mid-table fee is halved once"
+    );
+    assert_eq!(
+        demand.fees, fees_after_first,
+        "entire fee table halved exactly once after cycle 1"
+    );
+
+    // --- Cycle 2: warp to the exact post-second-halving boundary ---
+    let demand =
+        warp_and_update_demand(&mut ctx, setup.demand_factor_key, halving_periods[1]).await;
+    assert_eq!(
+        demand.current_period, halving_periods[1],
+        "chain period must match the model's second-halving period"
+    );
+    assert_eq!(
+        demand.current_demand_factor, DEMAND_FACTOR_SCALE,
+        "after the 2nd halving the factor resets to 1.0 (SCALE) again"
+    );
+    assert_eq!(
+        demand.consecutive_periods_with_min_demand_factor, 0,
+        "after the 2nd halving the consecutive-at-min counter resets to 0 again"
+    );
+    assert_eq!(
+        demand.fees[0],
+        GENESIS_FEES[0] / 4,
+        "after the 2nd halving fees[0] is cumulatively quartered"
+    );
+    assert_eq!(
+        demand.fees[MID_IDX],
+        GENESIS_FEES[MID_IDX] / 4,
+        "after the 2nd halving the mid-table fee is cumulatively quartered"
+    );
+    assert_eq!(
+        demand.fees, fees_after_second,
+        "entire fee table halved exactly twice after cycle 2"
+    );
+}
+
+/// AREA 1(b): pin the `>= 7` vs `> 7` boundary in the floor/halving check.
+/// At EXACTLY MAX_PERIODS_AT_MIN_DEMAND_FACTOR (7) consecutive at-floor periods
+/// the fees are STILL un-halved (factor pinned at the floor, counter == 7); the
+/// VERY NEXT period (the 8th observation at-floor) is the one that halves and
+/// resets. This locks down the off-by-one — a `> 7` would halve one period late
+/// and a `>= 6` would halve one period early.
+#[tokio::test]
+async fn test_demand_factor_halving_boundary_seven_vs_eight() {
+    // Seed exactly at the floor so we observe the at-floor dwell directly. The
+    // genesis period (period 1) is already AT the floor, so the first roll into
+    // period 2 records the 1st consecutive-at-min observation.
+    let mut pt = program_test_with_registry_no_mpl();
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_arns_with_initial_demand_factor(&mut ctx, DEMAND_FACTOR_MIN).await;
+
+    let genesis = {
+        let acct = ctx
+            .banks_client
+            .get_account(setup.demand_factor_key)
+            .await
+            .unwrap()
+            .unwrap();
+        DemandFactor::try_deserialize(&mut acct.data.as_slice()).unwrap()
+    };
+    assert_eq!(genesis.current_demand_factor, DEMAND_FACTOR_MIN);
+    assert_eq!(genesis.consecutive_periods_with_min_demand_factor, 0);
+    assert_eq!(genesis.current_period, 1);
+    assert_eq!(genesis.fees, GENESIS_FEES);
+
+    // Roll forward one period at a time. Each roll that closes an at-floor
+    // period increments the counter; once the counter has reached
+    // MAX_PERIODS_AT_MIN_DEMAND_FACTOR (7), the next at-floor period halves.
+    //
+    // Period 1 (genesis) is at-floor with counter 0. Rolling into period
+    // `1 + k` records the k-th at-floor observation, so:
+    //   * counter == 7  is reached at period 1 + 7 == 8  (fees STILL un-halved)
+    //   * the halving fires rolling into period 1 + 8 == 9 (fees halved, reset)
+    let counter_reaches_seven_at_period = 1 + MAX_PERIODS_AT_MIN_DEMAND_FACTOR as u64; // 8
+    let halving_period = counter_reaches_seven_at_period + 1; // 9
+
+    // Step up to and including the period where the counter hits exactly 7.
+    let mut last = genesis;
+    for p in 2..=counter_reaches_seven_at_period {
+        last = warp_and_update_demand(&mut ctx, setup.demand_factor_key, p).await;
+    }
+
+    // EXACTLY 7 consecutive at-floor periods: factor still pinned at the floor,
+    // counter == 7, and crucially the fees are STILL the untouched genesis table.
+    assert_eq!(
+        last.current_period, counter_reaches_seven_at_period,
+        "should be at the period where the at-min counter reaches 7"
+    );
+    assert_eq!(
+        last.consecutive_periods_with_min_demand_factor, MAX_PERIODS_AT_MIN_DEMAND_FACTOR,
+        "at-min counter must be exactly 7 here"
+    );
+    assert_eq!(
+        last.current_demand_factor, DEMAND_FACTOR_MIN,
+        "factor stays pinned at the floor while dwelling"
+    );
+    assert_eq!(
+        last.fees, GENESIS_FEES,
+        "at exactly 7 consecutive at-floor periods the fees must NOT yet be halved (>= 7 boundary, not yet crossed)"
+    );
+
+    // The NEXT period (the 8th at-floor observation) is the one that halves.
+    let after = warp_and_update_demand(&mut ctx, setup.demand_factor_key, halving_period).await;
+    assert_eq!(after.current_period, halving_period);
+    assert_eq!(
+        after.consecutive_periods_with_min_demand_factor, 0,
+        "the halving period resets the at-min counter to 0"
+    );
+    assert_eq!(
+        after.current_demand_factor, DEMAND_FACTOR_SCALE,
+        "the halving period resets the factor to 1.0 (SCALE)"
+    );
+    assert_eq!(
+        after.fees[0],
+        GENESIS_FEES[0] / 2,
+        "the halving period (8th at-floor) halves fees[0]"
+    );
+    let mut expected_halved = GENESIS_FEES;
+    for f in expected_halved.iter_mut() {
+        *f = (*f as u128 * DEMAND_FACTOR_MIN as u128 / DEMAND_FACTOR_SCALE as u128) as u64;
+    }
+    assert_eq!(
+        after.fees, expected_halved,
+        "the entire fee table is halved exactly once on the halving period"
+    );
 }
