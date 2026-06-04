@@ -9,11 +9,11 @@
     "ario_ant_escrow": null
   },
   "programs": {
-    "ario_core": null,
-    "ario_gar": null,
-    "ario_arns": null,
-    "ario_ant": null,
-    "ario_ant_escrow": null
+    "ario_core": "73YoECm6NKXpVRoe5f1Q9BcP5DJGPFUjnFy6AxBE5Nvh",
+    "ario_gar": "89fNiiwgpFSPHKuqfNUkgYTYjtAJAhyqHjXmgXeppGpf",
+    "ario_arns": "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ",
+    "ario_ant": "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5",
+    "ario_ant_escrow": "5HZhe9UqKL5zAsdz81nuuaxV41h8bFhudzxxBigAQndM"
   },
   "mints": {
     "ario": null
@@ -23,5 +23,5 @@
   },
   "upgrade_authority": null,
   "upgrade_authority_kind": "squads-v4-multisig",
-  "attestor_pubkey": null
+  "attestor_pubkey": "7XtUnotZAeYZNzVSYV5nb7S9YH9qHXyVFM6NeNMu6efE"
 }
