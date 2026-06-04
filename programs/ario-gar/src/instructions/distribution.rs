@@ -29,6 +29,16 @@ struct PendingDistribution<'a, 'info> {
     /// `total_delegated_stake`, so post-tally forced delegate withdrawals can't
     /// redirect the delegate share to the operator (ADR-025 / BD-111).
     had_delegation_at_tally: bool,
+    /// Did this gateway have a non-zero composite weight at tally? A gateway
+    /// that joined after `epoch.start_timestamp` is forced to `composite = 0`
+    /// in tally (SHOULD-13) and is therefore EXCLUDED from the per-gateway
+    /// reward divisor (`joined_count` in prescribe_epoch). It must likewise be
+    /// excluded from the payout / stats here, or the gateway pool is paid to
+    /// more gateways than it was divided by (over-allocation; divisor ≠
+    /// recipients). Matches Lua, where the active set used for the divisor IS
+    /// the recipient set. Leavers and cleared slots also carry composite 0 but
+    /// are handled separately (`is_leaving` / address-default skip).
+    eligible: bool,
 }
 
 /// Split a gateway's (already treasury-scaled) epoch reward into the operator
@@ -185,6 +195,19 @@ pub fn distribute_epoch<'info>(
             false
         };
 
+        // Reward eligibility — mirror of the divisor. prescribe_epoch divides
+        // the gateway pool by `joined_count` = registry slots with
+        // composite_weight > 0; a late-joiner (joined after epoch_start →
+        // composite forced to 0 at tally, SHOULD-13 in epoch.rs) is excluded
+        // from that divisor. Its weights ARE fresh (it was tallied) so the
+        // freshness gate above passes — but it must NOT collect per_gateway, or
+        // the pool is paid to (J + late-joiners) while divided by J → systematic
+        // over-allocation of the gateway pool vs. total_eligible × ratio. Gating
+        // here aligns the recipient set with the divisor set, matching Lua where
+        // the active set used for the divisor IS the recipient set. (Leavers and
+        // cleared slots also carry composite 0 but are handled above.)
+        let is_eligible = registry.gateways[dist_idx].composite_weight > 0;
+
         // 6-scenario reward calculation (matches Lua exactly):
         //   1. passed + prescribed + observed  → per_gateway + per_observer
         //   2. passed + prescribed + !observed → per_gateway * (1 - penalty)
@@ -192,7 +215,7 @@ pub fn distribute_epoch<'info>(
         //   4. failed + prescribed + observed  → per_observer
         //   5. failed + prescribed + !observed → 0
         //   6. failed + !prescribed            → 0
-        let full_reward = if is_leaving {
+        let full_reward = if is_leaving || !is_eligible {
             0
         } else if !failed {
             if is_prescribed {
@@ -228,6 +251,7 @@ pub fn distribute_epoch<'info>(
             is_observed,
             failed,
             had_delegation_at_tally: registry.gateways[dist_idx].delegated_at_tally != 0,
+            eligible: is_eligible,
         });
 
         dist_idx += 1;
@@ -331,9 +355,12 @@ pub fn distribute_epoch<'info>(
             }
         }
 
-        // Stats update — Lua-parity skip for leaving gateways. Only ticks
-        // when the gateway actually participated in this epoch.
-        if !p.is_leaving {
+        // Stats update — Lua-parity skip for gateways that did not participate
+        // in this epoch's active set: leavers AND composite-ineligible
+        // late-joiners (excluded from the reward divisor above). Ticking
+        // total/passed epochs for a late-joiner would inflate its future
+        // gateway_performance_ratio for an epoch it was excluded from earning.
+        if !p.is_leaving && p.eligible {
             p.gateway.stats.total_epochs = p.gateway.stats.total_epochs.saturating_add(1);
             if !p.failed {
                 p.gateway.stats.passed_epochs = p.gateway.stats.passed_epochs.saturating_add(1);

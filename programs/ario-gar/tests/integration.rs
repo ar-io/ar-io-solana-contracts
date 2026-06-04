@@ -14362,6 +14362,320 @@ async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
 }
 
 // -----------------------------------------
+// Late-joiner reward exclusion: a gateway that joins AFTER epoch.start_timestamp
+// (but before create_epoch) is forced to composite_weight = 0 in tally
+// (SHOULD-13), so it is excluded from the per_gateway reward DIVISOR
+// (joined_count). Pre-fix, distribute_epoch had no composite-eligibility gate,
+// so the late-joiner still collected a full per_gateway share — paying the
+// gateway pool to (J + late-joiners) while dividing it by J (over-allocation;
+// divisor != recipients). The fix gates the payout AND stats on
+// composite_weight > 0, matching Lua where the divisor set IS the recipient set.
+// -----------------------------------------
+#[tokio::test]
+async fn test_distribute_epoch_late_joiner_excluded_from_reward() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+
+    let operator2 = Keypair::new();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    pt.add_account(
+        operator2.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 50_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund protocol
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Gateway 1 joins BEFORE epoch start (clock 0 <= epoch_start 100) -> ELIGIBLE.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key1 = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // Gateway 2 joins AFTER epoch start (clock 150 > epoch_start 100) -> LATE-JOINER.
+    // tally forces its effective_composite to 0 (SHOULD-13), so it is excluded
+    // from the reward divisor but is otherwise a fresh, Joined gateway.
+    let op2_pk = operator2.pubkey();
+    let op2_token = Keypair::new();
+    create_token_account(&mut ctx, &op2_token, &setup.mint.pubkey(), &op2_pk).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &op2_token.pubkey(),
+        &setup.mint_authority,
+        100_000_000_000,
+    )
+    .await;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 150;
+    ctx.set_sysvar(&clock);
+    let gateway_key2 = join_gateway_with_operator(
+        &mut ctx,
+        &setup,
+        &operator2,
+        &op2_token.pubkey(),
+        stake_amount,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // Pin slot for deterministic hashchain; clock still within epoch 0 [100, 86500].
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 150;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    // Create epoch (2 gateways in the registry).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Tally both: gw1 -> composite > 0 (eligible), gw2 -> composite 0 (late-joiner).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Prescribe — only gw1 has non-zero weight, so it is the only selectable
+    // observer; gw2 (weight 0) is never selected. Pass only gw1 (as the
+    // divisor test does), so no permutation retry is needed.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gateway_key1,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The late-joiner's stake before distribution (must be unchanged after).
+    let gw2_stake_before = {
+        let acct = ctx
+            .banks_client
+            .get_account(gateway_key2)
+            .await
+            .unwrap()
+            .unwrap();
+        Gateway::try_deserialize(&mut acct.data.as_slice())
+            .unwrap()
+            .operator_stake
+    };
+    assert_eq!(
+        gw2_stake_before, stake_amount,
+        "sanity: late-joiner's pre-distribution stake is its join stake"
+    );
+
+    // Warp past epoch end so distribute is allowed.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100 + 86_400 + 100; // epoch_start(100) + duration + buffer
+    ctx.set_sysvar(&clock);
+
+    // Distribute — cranker passes both slots in registry order.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut distribute_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: distribute_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("distribute_epoch must complete with a late-joiner in the registry");
+
+    // Late-joiner: composite 0 => excluded from the divisor => must receive ZERO
+    // reward, and its stats must NOT tick (it didn't participate this epoch).
+    // Pre-fix it collected a full per_gateway share (the over-allocation bug).
+    let gw2_after = ctx
+        .banks_client
+        .get_account(gateway_key2)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw2_after = Gateway::try_deserialize(&mut gw2_after.data.as_slice()).unwrap();
+    assert_eq!(
+        gw2_after.operator_stake,
+        gw2_stake_before,
+        "late-joiner (composite 0, excluded from the reward divisor) must receive \
+         ZERO reward; pre-fix it was paid a full per_gateway share (over-allocation). \
+         Got delta {}",
+        gw2_after.operator_stake.saturating_sub(gw2_stake_before),
+    );
+    assert_eq!(
+        gw2_after.stats.total_epochs, 0,
+        "late-joiner did not participate this epoch; its stats must not tick"
+    );
+
+    // Eligible gateway DID earn — proves the gateway pool was non-zero, so the
+    // late-joiner's zero is a real exclusion, not a vacuous all-zero epoch.
+    let gw1_after = ctx
+        .banks_client
+        .get_account(gateway_key1)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw1_after = Gateway::try_deserialize(&mut gw1_after.data.as_slice()).unwrap();
+    assert!(
+        gw1_after.operator_stake > stake_amount,
+        "eligible gateway must receive the per_gateway reward (got delta {})",
+        gw1_after.operator_stake.saturating_sub(stake_amount),
+    );
+    assert_eq!(
+        gw1_after.stats.total_epochs, 1,
+        "eligible gateway gets its epoch counted"
+    );
+
+    // Epoch fully distributed across both slots.
+    let epoch_after = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch_after: &Epoch =
+        bytemuck::from_bytes(&epoch_after.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch_after.rewards_distributed, 1,
+        "distribute must complete"
+    );
+    assert_eq!(epoch_after.distribution_index, 2, "both slots advanced");
+}
+
+// -----------------------------------------
 // G5. update_observer_address on leaving gateway (line 397)
 // -----------------------------------------
 
