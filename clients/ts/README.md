@@ -49,12 +49,10 @@ Each subpath exposes Codama's standard surface:
 
 ## What is this?
 
-The AR.IO Network is migrating from AO (Arweave Object) to Solana. The
-on-chain programs live in [this
+The AR.IO Network's on-chain programs run on Solana. They live in [this
 repo](https://github.com/ar-io/ar-io-solana-contracts) under `programs/`;
-this package is the auto-generated TypeScript client all downstream
-consumers (the public AR.IO SDK, migration tooling, third-party
-integrators) import from.
+this package is the auto-generated TypeScript client that downstream
+consumers (the public AR.IO SDK, third-party integrators) import from.
 
 Generated artifacts (`src/<program>/` + `lib/`) are not committed — every
 release runs `anchor build && yarn codegen && yarn build` from a clean
