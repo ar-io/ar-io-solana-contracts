@@ -186,9 +186,10 @@ feature branch ─PR─▶ develop ─PR─▶ main
   Required reviewers / branch protection on `main` are the human gate.
   Merging triggers `upgrade-mainnet.yml`: build with mainnet feature
   flags, stage upgrade buffers, transfer buffer authority to the
-  Squads V4 multisig, attach a buffer manifest to a draft GitHub
-  release. The multisig signers vote and execute the upgrade
-  separately (CI never holds the upgrade key).
+  Squads V3 multisig vault (authority index 1), attach a buffer manifest
+  to a draft GitHub release. The multisig signers vote and execute the
+  upgrade separately from the legacy Squads (V3) app (CI never holds the
+  upgrade key).
 
 ### Day-to-day commands
 
@@ -357,21 +358,28 @@ land on devnet (today: only `ario_ant_escrow`):
 3. Verifies `declare_id!()` matches `program-ids/mainnet.json` exactly
    (drift here would brick the upgrade).
 4. Runs `scripts/mainnet-prepare-upgrade.sh`:
+   * Verifies the V3 vault (`SQUADS_V3_VAULT`, falling back to the legacy
+     `SQUADS_MULTISIG_PUBKEY` var) is System-owned — rejecting a multisig
+     *config* account or a V4 multisig.
+   * `solana program extend`s any program whose new `.so` exceeds its
+     on-chain ProgramData capacity (permissionless; the Execute would
+     otherwise fail on size).
    * Generates a fresh buffer keypair per program.
    * `solana program write-buffer` uploads the new `.so` to that buffer.
    * `solana program set-buffer-authority` transfers control of the
-     buffer to the Squads V4 multisig (`vars.SQUADS_MULTISIG_PUBKEY`).
+     buffer to the **Squads V3 vault** (authority index 1).
    * Emits `release/upgrade-<sha>/buffer-manifest.json` listing
      `{program, buffer, buffer_sha256, so_size_bytes}`.
 5. Publishes a draft GitHub release with the bundle + manifest attached.
 
-The Squads multisig signers then:
+The Squads V3 multisig signers then (from the **legacy** Squads app, not
+app.squads.so):
 
 1. Independently fetch each buffer (`solana program dump <buffer>
    /tmp/<prog>.so`) and verify `shasum -a 256` against
    `buffer_sha256` from the manifest.
-2. From the Squads UI, propose an `Upgrade(program, buffer, spill,
-   authority=multisig)` transaction.
+2. In Developers → Programs, "Add upgrade" with the buffer + spill, then
+   "Verify authority" (the buffer authority is already the vault).
 3. Approve to threshold and execute. The new bytecode is now live.
 
 Required GitHub repo configuration:
@@ -383,8 +391,12 @@ Required GitHub repo configuration:
     <buffer>` after the upgrade lands.
 * Variables:
   * `MAINNET_RPC_URL` (default `https://api.mainnet-beta.solana.com`).
-  * `SQUADS_MULTISIG_PUBKEY` — the multisig that will hold buffer
-    authority.
+  * `SQUADS_MULTISIG_PUBKEY` — **the Squads V3 vault PDA (authority index
+    1)** that holds upgrade authority and receives buffer authority. NOT the
+    multisig config account. (The script reads this as `SQUADS_V3_VAULT` and
+    verifies it is System-owned, so a wrong value is caught before staging.)
+    Optionally also set `SQUADS_V3_MULTISIG` (the config account) for a
+    SMPL-ownership cross-check.
 
 > **Why this split.** CI runs without an upgrade key. Buffer staging
 > is reversible (the multisig can `program close` the buffers if
