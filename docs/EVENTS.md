@@ -36,10 +36,10 @@ Full API in `sdk/src/solana/events.ts`.
 
 | Program | Events | Highlights |
 |---|---|---|
-| `ario-core` (13) | Token transfer, vault CRUD, primary-name lifecycle, supply/migration finalized, config updates |
-| `ario-gar` (30) | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), multi-source funding plan |
-| `ario-arns` (12) | Name purchases (5 base events × `funding_source: u8` covering 25 emit variants), reassign/release, reservation lifecycle, prune, demand-factor updates |
-| `ario-ant` (15) | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`) |
+| `ario-core` (14) | Token transfer, vault CRUD, primary-name lifecycle, supply/migration finalized, config updates, admin-authority transfer (ADR-026) |
+| `ario-gar` (31) | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), multi-source funding plan, admin-authority transfer (ADR-026) |
+| `ario-arns` (13) | Name purchases (5 base events × `funding_source: u8` covering 25 emit variants), reassign/release, reservation lifecycle, prune, demand-factor updates, admin-authority transfer (ADR-026) |
+| `ario-ant` (16) | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`), admin-authority transfer (ADR-026) |
 | `ario-ant-escrow` (4) | Unified shapes for 15 instructions via `asset_type: u8` (ANT/Tokens/Vault) + `claim_protocol: u8` (Arweave/Ethereum) |
 
 Full per-event field shapes: `BD-103` in
