@@ -296,6 +296,26 @@ cmd_prepare_upgrade() {
   for prog in $PROGRAMS; do
     so="target/deploy/${prog}.so"; [[ -f "$so" ]] || fail "Missing $so"
     pid="$(manifest_id "$prog")"; [[ -n "$pid" ]] || fail "$prog: no ID in manifest"
+
+    # A Squads/BPFLoaderUpgradeable `Upgrade` CANNOT grow the program — it
+    # fails to EXECUTE if the new .so is larger than the on-chain ProgramData
+    # capacity. `solana program deploy` (Agave 2.1) allocates exactly the
+    # program size, so any larger build needs `program extend` FIRST. Extend
+    # is permissionless (no upgrade-authority signer), so the deployer can run
+    # it even after handoff. Auto-extend here so the multisig's Execute can't
+    # fail on size. (Learned from the staging dress-rehearsal.)
+    new_size="$(stat -c%s "$so" 2>/dev/null || stat -f%z "$so")"
+    pd_addr="$(solana program show "$pid" --url "$DEPLOY_CLUSTER" 2>/dev/null | awk '/ProgramData Address/{print $NF}')"
+    if [[ -n "$pd_addr" ]]; then
+      pd_cap="$(solana account "$pd_addr" --url "$DEPLOY_CLUSTER" 2>/dev/null | awk '/Length/{print $2}')"
+      need=$(( new_size + 45 ))   # 45-byte ProgramData header
+      if [[ -n "$pd_cap" && "$need" -gt "$pd_cap" ]]; then
+        extra=$(( need - pd_cap + 4096 ))   # +4KB cushion
+        warn "[$prog] new .so ($new_size B) exceeds ProgramData capacity ($pd_cap B); extending by $extra B (deployer-paid, refundable)."
+        solana_auth program extend "$pid" "$extra"
+      fi
+    fi
+
     echo; echo "[$prog $pid] write-buffer..."
     buffer_kp="$OUT_DIR/${prog}-buffer.json"
     solana-keygen new --no-bip39-passphrase -o "$buffer_kp" --silent
