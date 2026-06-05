@@ -62,7 +62,7 @@ Add a dedicated `transfer_authority(new_authority: Pubkey)` instruction to
 `ario-gar`, `ario-arns`, and `ario-ant`, and a matching wrapper to
 `ario-core`. Semantics (identical across programs):
 
-```
+```text
 Accounts: { <config/settings> PDA (mut, seeds, bump = self.bump,
             has_one = authority @ <Prog>Error::Unauthorized),
             authority: Signer }

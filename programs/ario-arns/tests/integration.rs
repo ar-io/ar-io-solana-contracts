@@ -12503,7 +12503,9 @@ async fn test_demand_factor_halving_boundary_seven_vs_eight() {
 /// shape) accepted. `setup_arns` sets `config.authority = ctx.payer`.
 #[tokio::test]
 async fn test_transfer_authority() {
-    let mut pt = program_test_with_registry();
+    // No Metaplex Core CPI in this path, so use the lighter no-MPL harness
+    // (runs on the native processor, independent of the mpl_core.so fixture).
+    let mut pt = program_test_with_registry_no_mpl();
     let mut ctx = pt.start_with_context().await;
     let setup = setup_arns(&mut ctx).await;
     let config_key = setup.config_key;
