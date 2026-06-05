@@ -119,6 +119,20 @@ pub struct EscrowRecipientUpdatedEvent {
     pub timestamp: i64,
 }
 
+/// Emitted by `admin_purge_unclaimed_ant` when an abandoned escrow is
+/// burned after the grace period. Indexers can use this to mark the
+/// asset as terminally gone (vs. a normal cancel/claim which transfers
+/// it back to a wallet).
+#[event]
+pub struct EscrowAntPurgedEvent {
+    pub ant_mint: Pubkey,
+    pub depositor: Pubkey,
+    pub deposit_slot: u64,
+    pub purged_at_slot: u64,
+    pub elapsed_slots: u64,
+    pub authority: Pubkey,
+}
+
 // =========================================================================
 // Helpers
 // =========================================================================

@@ -745,6 +745,14 @@ pub fn pay_from_funding_plan<'info>(
     // ClaimDelegateFromLeavingGateway init pattern (delegate.rs:574-590) but
     // does the create_account + Borsh write manually because the slot count
     // is variable.
+    {
+        let counter = &mut ctx.accounts.withdrawal_counter;
+        if counter.bump == 0 {
+            counter.owner = ctx.accounts.payer.key();
+            counter.bump = ctx.bumps.withdrawal_counter;
+            counter.version = WITHDRAWAL_COUNTER_VERSION;
+        }
+    }
     let now = Clock::get()?.unix_timestamp;
     let withdrawal_period = ctx.accounts.settings.withdrawal_period;
     for (gateway_operator, residue) in residue_targets.iter() {
@@ -839,6 +847,7 @@ pub fn pay_from_funding_plan<'info>(
             is_exit_vault: false,
             is_protected: false,
             bump: vault_bump,
+            version: WITHDRAWAL_VERSION,
         };
         let mut data = new_vault_info.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);

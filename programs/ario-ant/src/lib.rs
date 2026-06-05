@@ -6,6 +6,7 @@ pub mod acl;
 pub mod error;
 pub mod migration;
 pub mod mpl_core_cpi;
+pub mod schema_migration;
 pub mod state;
 
 pub use acl::*;
@@ -669,33 +670,269 @@ pub mod ario_ant {
         finalize_migration_handler(ctx)
     }
 
+    /// Rotate the admin `authority` on `AntMigrationConfig` to `new_authority`
+    /// (ADR-026). Gated on the current admin authority; rejects the null
+    /// pubkey. Used to hand governance to the Squads multisig vault.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        transfer_authority_handler(ctx, new_authority)
+    }
+
     // =========================================
     // ANT MIGRATION (per-ANT schema upgrade)
     // =========================================
 
-    /// Migrate an ANT's on-chain state to the latest schema version.
-    /// Permissionless: anyone can pay to migrate any ANT — this only
-    /// upgrades the data layout and never changes user data.
-    /// Uses realloc to handle account size changes between versions.
-    pub fn migrate_ant(ctx: Context<MigrateAnt>) -> Result<()> {
-        let config = &mut ctx.accounts.ant_config;
+    /// Migrate an ANT's `AntConfig` and `AntControllers` to the latest schema
+    /// versions. Permissionless — anyone can pay the realloc rent. The
+    /// `schema_migration` dispatch functions step through every intermediate
+    /// version in order, so a single call handles any version gap.
+    ///
+    /// Per-undername `AntRecord` and `AntRecordMetadata` accounts have their
+    /// own instructions (`migrate_ant_record`, `migrate_ant_record_metadata`)
+    /// because their cardinality is unbounded and cannot fit in a single tx.
+    pub fn migrate_ant(ctx: Context<AntMigration>) -> Result<()> {
+        let asset_key = ctx.accounts.asset.key();
+        let payer = ctx.accounts.payer.to_account_info();
+        let system_program = ctx.accounts.system_program.to_account_info();
+
+        // Grow-then-deserialize each account (see schema_migration::grow_account).
+        // grow_account is idempotent when the account is already at target
+        // size (early-return inside the helper), so calling both before the
+        // version gate doesn't waste rent for fully-migrated ANTs.
+        let config_info = ctx.accounts.ant_config.to_account_info();
+        schema_migration::grow_account(&config_info, &payer, &system_program, AntConfig::SIZE)?;
+        let mut config: AntConfig = {
+            let data = config_info.try_borrow_data()?;
+            AntConfig::try_deserialize(&mut &data[..])?
+        };
+
+        let controllers_info = ctx.accounts.ant_controllers.to_account_info();
+        schema_migration::grow_account(
+            &controllers_info,
+            &payer,
+            &system_program,
+            AntControllers::SIZE,
+        )?;
+        let mut controllers: AntControllers = {
+            let data = controllers_info.try_borrow_data()?;
+            AntControllers::try_deserialize(&mut &data[..])?
+        };
+
+        // Per-account version gates (audit M-6, 2026-05-29). Pre-fix,
+        // `require!(config.version < ANT_CONFIG_VERSION, ...)` bailed
+        // BEFORE the controllers check, so controllers-only migrations
+        // became unreachable any time `ANT_CONTROLLERS_VERSION` was
+        // bumped without a parallel `ANT_CONFIG_VERSION` bump. Today
+        // both versions are (1,0,0) so the bug is latent — but the
+        // first future controllers-only schema change would have
+        // produced ANTs with up-to-date config and stale controllers
+        // that this ix could never reach. The split gate below makes
+        // migrate_ant succeed iff EITHER account needs migration.
+        let config_needs_migrate = config.version < ANT_CONFIG_VERSION;
+        let controllers_needs_migrate = controllers.version < ANT_CONTROLLERS_VERSION;
         require!(
-            config.version < ANT_CONFIG_VERSION,
+            config_needs_migrate || controllers_needs_migrate,
             AntError::AlreadyLatestVersion
         );
 
-        // Future: perform migration steps based on config.version
-        // match config.version {
-        //     0 => migrate_v0_to_v1(config, ...),
-        //     1 => migrate_v1_to_v2(config, ...),
-        //     _ => {}
-        // }
+        if config_needs_migrate {
+            schema_migration::migrate_config_version(&mut config)?;
+            schema_migration::write_account(&config_info, &config)?;
+            msg!(
+                "ANT {} config migrated to {}.{}.{}",
+                asset_key,
+                config.version.major,
+                config.version.minor,
+                config.version.patch,
+            );
+        }
 
-        config.version = ANT_CONFIG_VERSION;
+        if controllers_needs_migrate {
+            schema_migration::migrate_controllers_version(&mut controllers)?;
+            schema_migration::write_account(&controllers_info, &controllers)?;
+            msg!(
+                "ANT {} controllers migrated to {}.{}.{}",
+                asset_key,
+                controllers.version.major,
+                controllers.version.minor,
+                controllers.version.patch,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Migrate a single `AntRecord` PDA to the latest schema version.
+    /// Permissionless — anyone can pay. Call once per undername that needs
+    /// migrating; callers can derive which records exist via `getProgramAccounts`
+    /// filtered on `ANT_RECORD_SEED`.
+    pub fn migrate_ant_record(ctx: Context<AntMigrationRecord>, undername: String) -> Result<()> {
+        let info = ctx.accounts.record.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AntRecord::SIZE,
+        )?;
+        let mut record: AntRecord = {
+            let data = info.try_borrow_data()?;
+            AntRecord::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            record.version < ANT_RECORD_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_record_version(&mut record)?;
+        schema_migration::write_account(&info, &record)?;
         msg!(
-            "ANT {} migrated to version {}",
+            "ANT {} record '{}' migrated to {}.{}.{}",
             ctx.accounts.asset.key(),
-            ANT_CONFIG_VERSION,
+            undername,
+            record.version.major,
+            record.version.minor,
+            record.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a single `AntRecordMetadata` PDA to the latest schema version.
+    /// Permissionless — anyone can pay. Only needed for records that have an
+    /// existing metadata PDA; the `undername` is the same one passed to
+    /// `migrate_ant_record`.
+    pub fn migrate_ant_record_metadata(
+        ctx: Context<AntMigrationRecordMetadata>,
+        undername: String,
+    ) -> Result<()> {
+        let info = ctx.accounts.record_metadata.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AntRecordMetadata::SIZE,
+        )?;
+        let mut metadata: AntRecordMetadata = {
+            let data = info.try_borrow_data()?;
+            AntRecordMetadata::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            metadata.version < ANT_RECORD_METADATA_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_record_metadata_version(&mut metadata)?;
+        schema_migration::write_account(&info, &metadata)?;
+        msg!(
+            "ANT {} record metadata '{}' migrated to {}.{}.{}",
+            ctx.accounts.asset.key(),
+            undername,
+            metadata.version.major,
+            metadata.version.minor,
+            metadata.version.patch,
+        );
+        Ok(())
+    }
+
+    // =========================================
+    // SCHEMA MIGRATION — AntMigrationConfig, AclConfig, AclPage
+    // =========================================
+
+    /// Migrate the singleton `AntMigrationConfig` account to the latest schema.
+    pub fn migrate_ant_migration_config(ctx: Context<AntMigrationConfigMigration>) -> Result<()> {
+        let info = ctx.accounts.migration_config.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AntMigrationConfig::SIZE,
+        )?;
+        let mut config: AntMigrationConfig = {
+            let data = info.try_borrow_data()?;
+            AntMigrationConfig::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            config.version < ANT_MIGRATION_CONFIG_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_migration_config_version(&mut config)?;
+        schema_migration::write_account(&info, &config)?;
+        msg!(
+            "AntMigrationConfig migrated to {}.{}.{}",
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a user's `AclConfig` account to the latest schema.
+    pub fn migrate_acl_config(ctx: Context<AclConfigMigration>) -> Result<()> {
+        let info = ctx.accounts.acl_config.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            AclConfig::SIZE,
+        )?;
+        let mut config: AclConfig = {
+            let data = info.try_borrow_data()?;
+            AclConfig::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            config.version < ACL_CONFIG_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_acl_config_version(&mut config)?;
+        schema_migration::write_account(&info, &config)?;
+        msg!(
+            "AclConfig for {} migrated to {}.{}.{}",
+            config.user,
+            config.version.major,
+            config.version.minor,
+            config.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate a user's `AclPage` account to the latest schema.
+    pub fn migrate_acl_page(ctx: Context<AclPageMigration>, page_idx: u64) -> Result<()> {
+        let info = ctx.accounts.acl_page.to_account_info();
+        // AclPage is variable-length (entries: Vec) — its on-chain size is not
+        // a fixed const, so we can't grow to a known SIZE. A pre-version page
+        // is exactly SCHEMA_VERSION_SIZE bytes short (missing the trailing
+        // `version`) and can't be deserialized until grown. Detect that by
+        // attempting the deserialize; on EOF, grow by exactly the version
+        // field and retry. (A versioned page deserializes fine → no grow.)
+        let needs_grow = {
+            let data = info.try_borrow_data()?;
+            AclPage::try_deserialize(&mut &data[..]).is_err()
+        };
+        if needs_grow {
+            let new_size = info.data_len() + SCHEMA_VERSION_SIZE;
+            schema_migration::grow_account(
+                &info,
+                &ctx.accounts.payer.to_account_info(),
+                &ctx.accounts.system_program.to_account_info(),
+                new_size,
+            )?;
+        }
+        let mut page: AclPage = {
+            let data = info.try_borrow_data()?;
+            AclPage::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            page.version < ACL_PAGE_VERSION,
+            AntError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_acl_page_version(&mut page)?;
+        schema_migration::write_account(&info, &page)?;
+        msg!(
+            "AclPage {} for {} migrated to {}.{}.{}",
+            page_idx,
+            page.user,
+            page.version.major,
+            page.version.minor,
+            page.version.patch,
         );
         Ok(())
     }
@@ -1124,6 +1361,187 @@ pub mod ario_ant {
     /// to `acl_config.user`.
     pub fn close_acl_config(ctx: Context<CloseAclConfig>) -> Result<()> {
         close_acl_config_handler(ctx)
+    }
+
+    // =========================================
+    // RENT RECLAIM (user-callable + admin orphan cleanup)
+    // =========================================
+    //
+    // Four user-callable closes that let the current NFT holder destroy
+    // their ANT's on-chain state and recover rent. Order-independent —
+    // close any PDA in any order. The mpl-core asset itself is burned via
+    // a separate mpl-core `BurnV1` ix (not gated through ario-ant); this
+    // module only closes the per-ANT state we own.
+    //
+    // Authorization: every user-callable close re-reads the asset's MPL
+    // Core owner field on-chain and verifies the signer matches. Stale
+    // owner (e.g., after a transfer) is rejected.
+    //
+    // Plus one admin-callable cleanup for the post-purge case where the
+    // mpl-core asset has been burned (by `ario-ant-escrow::admin_purge`)
+    // and the per-ANT state remains orphaned. Authority-only, refunds to
+    // the migration_authority.
+
+    /// Close a single `AntRecord` PDA. Caller must be the current MPL
+    /// Core asset owner. Rent flows to the caller. The corresponding
+    /// `AntRecordMetadata` PDA (if any) must be closed separately via
+    /// `close_ant_record_metadata`.
+    pub fn close_ant_record(ctx: Context<CloseAntRecord>, _undername: String) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntRecordClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            undername_hash: ctx.accounts.record.undername.as_bytes().to_vec(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Close a single `AntRecordMetadata` PDA. Caller must be the current
+    /// MPL Core asset owner. Rent flows to the caller.
+    pub fn close_ant_record_metadata_for_owner(
+        ctx: Context<CloseAntRecordMetadataForOwner>,
+        _undername: String,
+    ) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntRecordMetadataClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            undername_hash: ctx.accounts.record_metadata.undername_hash.to_vec(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Close the ANT's `AntControllers` PDA. Caller must be the current
+    /// MPL Core asset owner. Rent flows to the caller.
+    pub fn close_ant_controllers(ctx: Context<CloseAntControllers>) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntControllersClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Close the ANT's `AntConfig` PDA. Caller must be the current MPL
+    /// Core asset owner. Rent flows to the caller. Does NOT require
+    /// other per-ANT PDAs to be closed first — leaves them recoverable
+    /// via separate ixs, or as orphaned-but-permissionless-closeable via
+    /// `close_orphaned_record_metadata` after the parent record's gone.
+    pub fn close_ant_config(ctx: Context<CloseAntConfig>) -> Result<()> {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        drop(asset_data);
+        require!(
+            ctx.accounts.caller.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        emit!(AntConfigClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            closer: ctx.accounts.caller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Admin-only cleanup of per-ANT state for an asset that has been
+    /// burned by `ario_ant_escrow::admin_purge_unclaimed_ant`. Closes
+    /// `AntConfig` + `AntControllers` if present, and any AntRecord +
+    /// AntRecordMetadata PDAs passed via `remaining_accounts`. Refunds
+    /// all rent to the configured migration_authority.
+    ///
+    /// Pre-condition: the mpl-core asset for `mint` must already be
+    /// closed (System-owned, empty data). This ensures no user can
+    /// reconcile / claim the orphaned state after cleanup.
+    pub fn admin_close_orphaned_ant_state<'info>(
+        ctx: Context<'_, '_, '_, 'info, AdminCloseOrphanedAntState<'info>>,
+    ) -> Result<()> {
+        // The asset account must be in the post-burn state: System-owned
+        // and zero data. If it's still mpl-core-owned, the asset is
+        // alive — refuse, this is for orphaned-state recovery only.
+        let asset = &ctx.accounts.asset;
+        require!(
+            asset.data_is_empty() && asset.owner == &anchor_lang::system_program::ID,
+            AntError::AssetStillExists
+        );
+
+        let mut closed_records: u32 = 0;
+        let mut closed_metadata: u32 = 0;
+        let authority_info = ctx.accounts.authority.to_account_info();
+        let asset_key = asset.key();
+        for acct in ctx.remaining_accounts.iter() {
+            // Per-account discriminator dispatch — close whichever PDA
+            // type this happens to be. Each record is bound to the asset
+            // being cleaned (see the mint check below); within that, the
+            // Anchor close pattern refunds to the authority.
+            if acct.data_is_empty() {
+                continue;
+            }
+            // Read the 8-byte discriminator AND the record's `mint` field
+            // (bytes 8..40 — the first field on both AntRecord and
+            // AntRecordMetadata) in one borrow, then drop it before
+            // `close_account_to_authority` mutates the account's data.
+            let (disc, record_mint): ([u8; 8], Pubkey) = {
+                let data = acct.try_borrow_data()?;
+                if data.len() < 40 {
+                    continue;
+                }
+                let mut disc = [0u8; 8];
+                disc.copy_from_slice(&data[0..8]);
+                let mut mint = [0u8; 32];
+                mint.copy_from_slice(&data[8..40]);
+                (disc, Pubkey::new_from_array(mint))
+            };
+            if disc == AntRecord::DISCRIMINATOR || disc == AntRecordMetadata::DISCRIMINATOR {
+                // Defense-in-depth: bind every closed record to the asset
+                // being cleaned up. The auth gate already restricts this ix
+                // to the migration authority; this stops that authority from
+                // accidentally passing (and thereby closing + draining the
+                // rent of) a live record belonging to a DIFFERENT asset —
+                // e.g. via a tooling bug that mixes up account lists.
+                require_keys_eq!(record_mint, asset_key, AntError::OrphanRecordAssetMismatch);
+            }
+            if disc == AntRecord::DISCRIMINATOR {
+                close_account_to_authority(acct, &authority_info)?;
+                closed_records += 1;
+            } else if disc == AntRecordMetadata::DISCRIMINATOR {
+                close_account_to_authority(acct, &authority_info)?;
+                closed_metadata += 1;
+            }
+        }
+
+        emit!(OrphanedAntStateClosedEvent {
+            mint: ctx.accounts.asset.key(),
+            closed_records,
+            closed_metadata,
+            closer: ctx.accounts.authority.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
     }
 
     // =========================================
@@ -1691,24 +2109,140 @@ pub struct ManageMetadata<'info> {
 }
 
 #[derive(Accounts)]
-pub struct MigrateAnt<'info> {
+pub struct AntMigration<'info> {
     /// CHECK: Metaplex Core asset
     #[account(
         constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
     )]
     pub asset: AccountInfo<'info>,
 
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
     #[account(
         mut,
         seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
-        bump = ant_config.bump,
-        realloc = AntConfig::SIZE,
-        realloc::payer = payer,
-        realloc::zero = false,
+        bump,
     )]
-    pub ant_config: Account<'info, AntConfig>,
+    pub ant_config: UncheckedAccount<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
+        bump,
+    )]
+    pub ant_controllers: UncheckedAccount<'info>,
 
     /// Anyone can pay to migrate any ANT (permissionless)
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct AntMigrationRecord<'info> {
+    /// CHECK: Metaplex Core asset — validates the record belongs to a real ANT.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_SEED, asset.key().as_ref(), &hash_undername(&undername)],
+        bump,
+    )]
+    pub record: UncheckedAccount<'info>,
+
+    /// Anyone can pay to migrate any ANT record (permissionless)
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct AntMigrationRecordMetadata<'info> {
+    /// CHECK: Metaplex Core asset — validates the metadata belongs to a real ANT.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_META_SEED, asset.key().as_ref(), &hash_undername(&undername)],
+        bump,
+    )]
+    pub record_metadata: UncheckedAccount<'info>,
+
+    /// Anyone can pay to migrate any ANT record metadata (permissionless)
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AntMigrationConfigMigration<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump,
+    )]
+    pub migration_config: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AclConfigMigration<'info> {
+    /// CHECK: the user whose ACL this is
+    pub user: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [ACL_CONFIG_SEED, user.key().as_ref()],
+        bump,
+    )]
+    pub acl_config: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(page_idx: u64)]
+pub struct AclPageMigration<'info> {
+    /// CHECK: the user whose ACL page this is
+    pub user: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [ACL_PAGE_SEED, user.key().as_ref(), &page_idx.to_le_bytes()],
+        bump,
+    )]
+    pub acl_page: UncheckedAccount<'info>,
+
     #[account(mut)]
     pub payer: Signer<'info>,
 
@@ -2074,6 +2608,188 @@ pub const RECORD_METADATA_FIELD_ALL: u8 = 0;
 pub const ACL_ROLE_OWNER: u8 = 0;
 pub const ACL_ROLE_CONTROLLER: u8 = 1;
 
+// =========================================
+// RENT RECLAIM — Accounts structs
+// =========================================
+
+/// Close one `AntRecord` PDA. Caller signs as the NFT owner.
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct CloseAntRecord<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint; read in the
+    /// handler to verify caller == current owner.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_SEED, asset.key().as_ref(), &hash_undername(&undername.to_lowercase())],
+        bump = record.bump,
+        close = caller,
+    )]
+    pub record: Account<'info, AntRecord>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Close one `AntRecordMetadata` PDA for the current NFT owner.
+#[derive(Accounts)]
+#[instruction(undername: String)]
+pub struct CloseAntRecordMetadataForOwner<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_RECORD_META_SEED, asset.key().as_ref(), &hash_undername(&undername.to_lowercase())],
+        bump = record_metadata.bump,
+        close = caller,
+    )]
+    pub record_metadata: Account<'info, AntRecordMetadata>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Close the `AntControllers` PDA. Caller signs as the NFT owner.
+#[derive(Accounts)]
+pub struct CloseAntControllers<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
+        bump = controllers.bump,
+        close = caller,
+    )]
+    pub controllers: Account<'info, AntControllers>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Close the `AntConfig` PDA. Caller signs as the NFT owner.
+#[derive(Accounts)]
+pub struct CloseAntConfig<'info> {
+    /// CHECK: Validated as MPL Core asset via the constraint.
+    #[account(
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
+        bump = config.bump,
+        close = caller,
+    )]
+    pub config: Account<'info, AntConfig>,
+
+    #[account(mut)]
+    pub caller: Signer<'info>,
+}
+
+/// Admin-only post-burn cleanup of orphaned per-ANT PDAs. The asset must
+/// already be closed (System-owned, empty data) — typically because
+/// `ario_ant_escrow::admin_purge_unclaimed_ant` burned it.
+///
+/// Closes whichever of `AntConfig` + `AntControllers` are passed (mut),
+/// plus iterates `remaining_accounts` for AntRecord + AntRecordMetadata
+/// PDAs (discriminator-dispatched). All rent refunds to `authority`.
+#[derive(Accounts)]
+pub struct AdminCloseOrphanedAntState<'info> {
+    /// CHECK: Must be the post-burn state (System-owned, empty).
+    /// Validated in the handler — refuses to proceed if the asset is
+    /// still mpl-core-owned (i.e. alive). PDA derivations below use
+    /// `asset.key()` directly so the asset and the closed PDAs are
+    /// cryptographically bound (security audit fix: previously a
+    /// separate `mint_key` field allowed an attacker to pass an
+    /// unrelated empty asset + a LIVE ANT's mint pubkey as `mint_key`,
+    /// closing the live ANT's state to themselves).
+    pub asset: AccountInfo<'info>,
+
+    /// Admin authority gate. `has_one = authority` constrains the
+    /// signer to equal `AntMigrationConfig.authority` — without this,
+    /// the original ix was permissionless and would have let any
+    /// caller route per-ANT rent to themselves (security audit fix).
+    #[account(
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump = migration_config.bump,
+        has_one = authority @ AntError::Unauthorized,
+    )]
+    pub migration_config: Account<'info, AntMigrationConfig>,
+
+    /// AntConfig PDA — closed to `authority`. Seeded on the asset's
+    /// own pubkey (which survives mpl-core BurnV1 unchanged), so the
+    /// post-burn check on `asset` proves the live state below was
+    /// orphaned by THIS asset's burn — not some other live ANT.
+    #[account(
+        mut,
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
+        bump = config.bump,
+        close = authority,
+    )]
+    pub config: Account<'info, AntConfig>,
+
+    /// AntControllers PDA — closed to `authority`. Same asset-bound
+    /// PDA derivation as `config`.
+    #[account(
+        mut,
+        seeds = [ANT_CONTROLLERS_SEED, asset.key().as_ref()],
+        bump = controllers.bump,
+        close = authority,
+    )]
+    pub controllers: Account<'info, AntControllers>,
+
+    /// Protocol admin authority. Verified to equal
+    /// `migration_config.authority` via `has_one` above.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+/// Manual account close — used by `admin_close_orphaned_ant_state` to
+/// close arbitrary AntRecord / AntRecordMetadata PDAs passed in
+/// `remaining_accounts`. Mirrors Anchor's `close = recipient` semantics:
+/// drain lamports → recipient, zero the data, reassign to system program.
+fn close_account_to_authority<'info>(
+    account: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+) -> Result<()> {
+    let lamports = account.lamports();
+    **account.try_borrow_mut_lamports()? = 0;
+    **authority.try_borrow_mut_lamports()? = authority
+        .lamports()
+        .checked_add(lamports)
+        .ok_or(AntError::ArithmeticOverflow)?;
+    let mut data = account.try_borrow_mut_data()?;
+    for byte in data.iter_mut() {
+        *byte = 0;
+    }
+    drop(data);
+    account.assign(&anchor_lang::solana_program::system_program::ID);
+    Ok(())
+}
+
+/// Emitted by `transfer_authority` (ADR-026) when the admin `authority` on
+/// `AntMigrationConfig` is rotated. `old_authority` is the signer that
+/// authorized the rotation.
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
 /// Emitted when a record is created or updated via `set_record`.
 #[event]
 pub struct RecordSetEvent {
@@ -2252,5 +2968,53 @@ pub struct AclEntryRemovedEvent {
     pub address: Pubkey,
     /// 0 = Owner, 1 = Controller
     pub role: u8,
+    pub timestamp: i64,
+}
+
+// =========================================
+// RENT RECLAIM events
+// =========================================
+
+/// Emitted when an `AntRecord` PDA is closed (user-callable).
+#[event]
+pub struct AntRecordClosedEvent {
+    pub mint: Pubkey,
+    pub undername_hash: Vec<u8>,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when an `AntRecordMetadata` PDA is closed by the NFT owner.
+#[event]
+pub struct AntRecordMetadataClosedEvent {
+    pub mint: Pubkey,
+    pub undername_hash: Vec<u8>,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when the `AntControllers` PDA is closed.
+#[event]
+pub struct AntControllersClosedEvent {
+    pub mint: Pubkey,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when the `AntConfig` PDA is closed.
+#[event]
+pub struct AntConfigClosedEvent {
+    pub mint: Pubkey,
+    pub closer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted when admin-cleanup batches close orphaned per-ANT state.
+#[event]
+pub struct OrphanedAntStateClosedEvent {
+    pub mint: Pubkey,
+    pub closed_records: u32,
+    pub closed_metadata: u32,
+    pub closer: Pubkey,
     pub timestamp: i64,
 }

@@ -56,6 +56,7 @@ pub fn save_observations(
     observation.report_tx_id = report_tx_id;
     observation.submitted_at = clock.unix_timestamp;
     observation.bump = ctx.bumps.observation;
+    observation.version = OBSERVATION_VERSION;
 
     // Running tally: increment failure_counts for failed gateways
     let active = epoch.active_gateway_count as usize;
@@ -119,7 +120,7 @@ pub struct SaveObservations<'info> {
     #[account(
         init,
         payer = observer,
-        space = 8 + Observation::SIZE,
+        space = Observation::SIZE,
         seeds = [OBSERVATION_SEED, &epoch_index.to_le_bytes(), observer.key().as_ref()],
         bump,
     )]

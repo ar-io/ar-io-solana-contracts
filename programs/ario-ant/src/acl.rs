@@ -130,6 +130,7 @@ pub fn register_acl_config_handler(ctx: Context<RegisterAclConfig>, user: Pubkey
     cfg.page_count = 0;
     cfg.total_entries = 0;
     cfg.bump = ctx.bumps.acl_config;
+    cfg.version = ACL_CONFIG_VERSION;
     msg!("AclConfig initialized for {}", user);
     Ok(())
 }
@@ -154,6 +155,7 @@ pub fn add_acl_page_handler(ctx: Context<AddAclPage>) -> Result<()> {
     page.page_idx = cfg.page_count;
     page.entries = Vec::new();
     page.bump = ctx.bumps.acl_page;
+    page.version = ACL_PAGE_VERSION;
 
     cfg.page_count = cfg
         .page_count
@@ -458,8 +460,21 @@ pub struct CloseAclPage<'info> {
 #[derive(Accounts)]
 pub struct RecordAclOwner<'info> {
     /// CHECK: Metaplex Core asset; ownership verified in handler via
-    /// `read_asset_owner`. Owner program is checked there as well.
+    /// `read_asset_owner`. Owner program is checked there as well. The
+    /// `ant_config` PDA below is seeded by `asset.key()`, so Anchor will
+    /// fail to load it for any Core asset that ario-ant did not initialize.
     pub asset: AccountInfo<'info>,
+
+    /// Proves `asset` is a genuine AR.IO ANT: `AntConfig` is created at mint
+    /// time and seeded by the asset key, so a non-ANT Core asset has no such
+    /// PDA and this constraint fails. Without it, the permissionless owner
+    /// path would let anyone record arbitrary Core assets owned by the user
+    /// into their ACL, spoofing the reverse index.
+    #[account(
+        seeds = [ANT_CONFIG_SEED, asset.key().as_ref()],
+        bump = ant_config.bump,
+    )]
+    pub ant_config: Account<'info, AntConfig>,
 
     #[account(
         mut,

@@ -1,9 +1,9 @@
 name: Upgrade (mainnet)
 
 # Builds, stages BPF write-buffers on mainnet, and transfers buffer
-# authority to the Squads multisig.  The actual program upgrade is
-# executed by multisig signers from the Squads UI — CI never holds
-# the upgrade key.
+# authority to the Squads V3 multisig VAULT (authority index 1).  The
+# actual program upgrade is executed by multisig signers from the legacy
+# Squads (V3) app — CI never holds the upgrade key.
 #
 # Required GitHub environment: "mainnet"
 #   - Required reviewers: at minimum two AR.IO core engineers.
@@ -11,12 +11,16 @@ name: Upgrade (mainnet)
 #   Secrets:
 #     MAINNET_BUFFER_AUTHORITY_KEYPAIR    Hot wallet that pays write-buffer
 #                                         rent and signs the set-buffer-
-#                                         authority transfer to the multisig.
+#                                         authority transfer to the vault.
 #                                         Passed via env only (process
 #                                         substitution — never written to disk).
 #   Vars:
 #     MAINNET_RPC_URL                     default: https://api.mainnet-beta.solana.com
-#     SQUADS_MULTISIG_PUBKEY              Multisig PDA holding upgrade authority.
+#     SQUADS_MULTISIG_PUBKEY              The Squads V3 VAULT PDA (authority
+#                                         index 1) that holds upgrade authority
+#                                         and receives buffer authority — NOT
+#                                         the multisig config account. The
+#                                         script verifies it is System-owned.
 
 # Serialize mainnet upgrades; do not cancel in-progress buffer staging —
 # partial runs can leave orphaned buffers.
@@ -94,8 +98,8 @@ jobs:
             exit 1
           fi
 
-      - name: Check attestor pubkey (strict — blocks test key)
-        run: bash scripts/check-attestor-pubkey.sh --strict
+      - name: Check attestor pubkey (strict — blocks test key + devnet key on mainnet)
+        run: bash scripts/check-attestor-pubkey.sh --strict --cluster mainnet
 
       - name: Build (mainnet feature flags)
         run: |

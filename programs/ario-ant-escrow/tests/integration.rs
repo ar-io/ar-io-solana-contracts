@@ -33,9 +33,9 @@ use solana_sdk::{
 use ario_ant_escrow::error::EscrowError;
 use ario_ant_escrow::state::{
     derive_initial_nonce, EscrowAnt, EscrowToken, ARWEAVE_PUBKEY_LEN, ASSET_TYPE_ANT,
-    ASSET_TYPE_TOKEN, ASSET_TYPE_VAULT, ESCROW_ANT_SEED, ESCROW_TOKEN_SEED, ESCROW_VAULT_SEED,
-    ESCROW_VERSION_V1, ETHEREUM_PUBKEY_LEN, MPL_CORE_PROGRAM_ID, PROTOCOL_ARWEAVE,
-    PROTOCOL_ETHEREUM,
+    ASSET_TYPE_TOKEN, ASSET_TYPE_VAULT, ESCROW_ANT_SEED, ESCROW_ANT_VERSION, ESCROW_TOKEN_SEED,
+    ESCROW_TOKEN_VERSION, ESCROW_VAULT_SEED, ETHEREUM_PUBKEY_LEN, MPL_CORE_PROGRAM_ID,
+    PROTOCOL_ARWEAVE, PROTOCOL_ETHEREUM,
 };
 use ario_ant_escrow::{
     EscrowCancelledEvent, EscrowClaimedEvent, EscrowDepositedEvent, EscrowRecipientUpdatedEvent,
@@ -426,7 +426,7 @@ async fn test_deposit_ant_arweave() {
 
     // EscrowAnt populated correctly.
     let escrow = fetch_escrow(&mut ctx, asset_kp.pubkey()).await;
-    assert_eq!(escrow.version, ESCROW_VERSION_V1);
+    assert_eq!(escrow.version, ESCROW_ANT_VERSION);
     assert_eq!(escrow.depositor, depositor.pubkey());
     assert_eq!(escrow.ant_mint, asset_kp.pubkey());
     assert_eq!(escrow.recipient_protocol, PROTOCOL_ARWEAVE);
@@ -1819,7 +1819,7 @@ async fn test_deposit_tokens_happy_path() {
 
     // Verify PDA state.
     let escrow = fetch_escrow_token(&mut ctx, escrow_addr).await;
-    assert_eq!(escrow.version, 1);
+    assert_eq!(escrow.version, ESCROW_TOKEN_VERSION);
     assert_eq!(escrow.depositor, setup.depositor.pubkey());
     assert_eq!(escrow.asset_type, ASSET_TYPE_TOKEN);
     assert_eq!(escrow.amount, amount);
@@ -2207,6 +2207,36 @@ async fn test_claim_tokens_protocol_mismatch_fails() {
 // =========================================
 
 #[tokio::test]
+async fn test_deposit_vault_rejects_revocable() {
+    // ADR-021 regression guard: the escrow has no field for a legitimate
+    // revoker, so a revocable vault could only ever be controlled by the
+    // unbound claim-tx payer (theft). `deposit_vault` rejects revocable=true
+    // at the source, so the unhonorable flag can never be stored.
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let amount = 500_000_000u64;
+    let setup = setup_token_escrow(&mut ctx, amount).await;
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_addr, &setup.mint_kp.pubkey()).await;
+
+    let result = deposit_vault_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400i64,
+        true, // revocable — must be rejected
+        PROTOCOL_ETHEREUM,
+        ethereum_address_fixture(0xEE),
+    )
+    .await;
+    assert_anchor_error!(result, EscrowError::RevocableVaultUnsupported);
+}
+
+#[tokio::test]
 async fn test_deposit_vault_happy_path() {
     if skip_if_no_bpf_artifacts() {
         return;
@@ -2227,7 +2257,7 @@ async fn test_deposit_vault_happy_path() {
         escrow_ata.pubkey(),
         amount,
         lock_duration,
-        true, // revocable
+        false, // escrow rejects revocable (ADR-021); happy path is non-revocable
         PROTOCOL_ETHEREUM,
         eth_addr.clone(),
     )
@@ -2235,12 +2265,12 @@ async fn test_deposit_vault_happy_path() {
     .expect("deposit_vault should succeed");
 
     let escrow = fetch_escrow_token(&mut ctx, escrow_addr).await;
-    assert_eq!(escrow.version, 1);
+    assert_eq!(escrow.version, ESCROW_TOKEN_VERSION);
     assert_eq!(escrow.depositor, setup.depositor.pubkey());
     assert_eq!(escrow.asset_type, ASSET_TYPE_VAULT);
     assert_eq!(escrow.amount, amount);
     assert_eq!(escrow.recipient_protocol, PROTOCOL_ETHEREUM);
-    assert!(escrow.vault_revocable);
+    assert!(!escrow.vault_revocable);
     // vault_end_timestamp should be clock.unix_timestamp + lock_duration.
     // We can't know the exact clock time, but it should be > 0 and in the future.
     assert!(
@@ -2427,7 +2457,7 @@ async fn test_cancel_vault_deposit() {
         escrow_ata.pubkey(),
         amount,
         30 * 86_400,
-        true, // revocable — irrelevant for cancel by depositor, but exercises the path
+        false, // deposit rejects revocable (ADR-021); cancel is depositor-only regardless
         PROTOCOL_ETHEREUM,
         ethereum_address_fixture(0xAA),
     )
@@ -2509,7 +2539,7 @@ async fn test_update_vault_recipient() {
         escrow_ata.pubkey(),
         amount,
         30 * 86_400,
-        true,
+        false, // escrow rejects revocable (ADR-021)
         PROTOCOL_ARWEAVE,
         arweave_pubkey_fixture(0xAA),
     )
@@ -2539,7 +2569,7 @@ async fn test_update_vault_recipient() {
     assert_ne!(after.nonce, nonce_before, "nonce did not rotate");
     // Vault-specific fields untouched by recipient update.
     assert_eq!(after.amount, amount);
-    assert!(after.vault_revocable);
+    assert!(!after.vault_revocable);
     assert!(after.vault_end_timestamp > 0);
 }
 
@@ -2585,28 +2615,20 @@ async fn test_update_vault_recipient_non_depositor_fails() {
 // Vault Escrow — claim_vault_{arweave,ethereum}
 // =========================================
 //
-// These tests cover two of the three claim paths the on-chain handler
-// implements:
+// The on-chain handler implements exactly two claim outcomes for vaults:
 //
-//  - **Expired-vault path** (happy): the on-chain handler routes the SPL
-//    transfer straight to `claimant_token_account` and does NOT consult
-//    `vault_introspect`. We warp the test clock past `vault_end_timestamp`
-//    and assert the claim succeeds without any sibling instruction.
+//  - **Expired-vault path** (happy): once `clock >= vault_end_timestamp`,
+//    the handler routes the SPL transfer straight to
+//    `claimant_token_account` (liquid). We warp the test clock past
+//    `vault_end_timestamp` and assert the claim succeeds.
 //
-//  - **Active-vault path** (negative): the on-chain handler MUST find a
-//    matching `ario_core::vaulted_transfer` sibling in the same tx via
-//    `vault_introspect::verify_vaulted_transfer_in_tx`. We submit the
-//    claim while the vault is still active without that sibling and
-//    assert the on-chain handler rejects with
-//    `MissingVaultedTransferInstruction`.
-//
-// The **active-vault happy** path (claim + sibling vaulted_transfer in
-// the same tx, tokens re-locked into a new vault for the claimant) is
-// not exercised here — it requires `ario_core` to be deployed and
-// initialised inside this program-test runtime, which is a substantial
-// new test-infra expansion. End-to-end coverage of that path lives in
-// the SDK localnet suite (`sdk/src/solana/escrow-tokens.localnet.test.ts`)
-// where Surfpool already has all programs deployed.
+//  - **Active-vault path** (rejected): while `clock < vault_end_timestamp`,
+//    the handler rejects with `VaultStillLocked`. The former active
+//    re-lock path (release-to-payer + sibling `vaulted_transfer`
+//    introspection) was REMOVED — its introspection had no 1:1
+//    claim↔re-lock binding (reuse / redirection; Codex finding). See the
+//    active-vault re-lock removal ADR / ACTIVE_VAULT_DISABLE_ROLLOUT.md.
+//    A locked vault must wait until expiry, then claims liquid.
 
 async fn claim_vault_ethereum_tx(
     ctx: &mut ProgramTestContext,
@@ -2621,15 +2643,14 @@ async fn claim_vault_ethereum_tx(
     extra_ixs: Vec<Ix>,
 ) -> std::result::Result<(), BanksClientError> {
     let (escrow, _bump) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let _ = payer_ata_pubkey; // active-path intermediate account removed
     let accounts = ario_ant_escrow::accounts::ClaimVaultEthereum {
         escrow,
         escrow_token_account: escrow_ata_pubkey,
         claimant_token_account: claimant_ata_pubkey,
-        payer_token_account: payer_ata_pubkey,
         claimant: claimant.pubkey(),
         depositor: setup.depositor.pubkey(),
         payer: payer.pubkey(),
-        instructions_sysvar: solana_sdk::sysvar::instructions::id(),
         token_program: spl_token::id(),
         system_program: solana_sdk::system_program::ID,
     }
@@ -2756,7 +2777,7 @@ async fn test_claim_vault_ethereum_expired_happy_path() {
 }
 
 #[tokio::test]
-async fn test_claim_vault_ethereum_active_without_sibling_fails() {
+async fn test_claim_vault_ethereum_active_rejected() {
     if skip_if_no_bpf_artifacts() {
         return;
     }
@@ -2834,7 +2855,122 @@ async fn test_claim_vault_ethereum_active_without_sibling_fails() {
         vec![],
     )
     .await;
-    assert_anchor_error!(result, EscrowError::MissingVaultedTransferInstruction);
+    // Active (still-locked) vault claims are disabled — rejected regardless of
+    // any sibling instruction. (Pre-ADR this returned
+    // MissingVaultedTransferInstruction.)
+    assert_anchor_error!(result, EscrowError::VaultStillLocked);
+
+    // Belt-and-braces: nothing moved. Atomic-reject implies these, but pin
+    // them so a future refactor that accidentally moves token logic before
+    // the gate fails loudly. Mirrors the assertions in the Arweave variant.
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_acct.is_some() && !escrow_acct.as_ref().unwrap().data.is_empty(),
+        "escrow PDA must remain open after a rejected active claim"
+    );
+    let escrow_bal = get_token_balance(&mut ctx, &escrow_ata.pubkey()).await;
+    assert_eq!(escrow_bal, amount, "escrow tokens must be untouched");
+}
+
+/// Boundary: a vault is claimable when `clock == vault_end_timestamp` (the
+/// on-chain gate is `clock >= vault_end_timestamp`). Pins the `>=` semantics
+/// so a future refactor to `>` would fail this test.
+#[tokio::test]
+async fn test_claim_vault_ethereum_at_unlock_boundary() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let amount = 500_000_000u64;
+    let setup = setup_token_escrow(&mut ctx, amount).await;
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_addr, &setup.mint_kp.pubkey()).await;
+
+    let sk_bytes: [u8; 32] = {
+        let mut b = [0u8; 32];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = ((i as u8).wrapping_mul(13).wrapping_add(3)) | 1;
+        }
+        b
+    };
+    let secret_key = libsecp256k1::SecretKey::parse(&sk_bytes).unwrap();
+    let (_, eth_addr) = sign_ethereum(b"dummy", &secret_key);
+
+    deposit_vault_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400,
+        false,
+        PROTOCOL_ETHEREUM,
+        eth_addr.to_vec(),
+    )
+    .await
+    .expect("deposit_vault should succeed");
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_addr).await;
+    // Warp to EXACTLY vault_end_timestamp (not +1). The on-chain `>=` should
+    // accept; a refactor to `>` would fail this with `VaultStillLocked`.
+    warp_clock_to(&mut ctx, escrow_state.vault_end_timestamp).await;
+
+    let claimant = Keypair::new();
+    let claimant_ata = Keypair::new();
+    let payer_ata = Keypair::new();
+    airdrop(&mut ctx, &claimant.pubkey(), 2_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+    create_token_account(
+        &mut ctx,
+        &payer_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+
+    let msg = build_escrow_canonical(
+        "vault",
+        &setup.asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &eth_addr,
+    );
+    let (signature, _) = sign_ethereum(&msg, &secret_key);
+
+    claim_vault_ethereum_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        &claimant,
+        claimant_ata.pubkey(),
+        &claimant,
+        payer_ata.pubkey(),
+        escrow_state.nonce,
+        signature,
+        vec![],
+    )
+    .await
+    .expect("at vault_end boundary the claim should SUCCEED (>=, not >)");
+
+    // Claimant got the tokens liquid + escrow closed.
+    let claimant_bal = get_token_balance(&mut ctx, &claimant_ata.pubkey()).await;
+    assert_eq!(
+        claimant_bal, amount,
+        "claimant must receive full amount at the boundary"
+    );
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_acct.is_none() || escrow_acct.as_ref().unwrap().data.is_empty(),
+        "escrow PDA should be closed after a successful boundary claim"
+    );
 }
 
 // =========================================
@@ -4430,12 +4566,12 @@ async fn claim_vault_arweave_attested_tx(
         canonical_message,
     );
 
+    let _ = payer_ata_pubkey; // active-path intermediate account removed
     let (escrow, _bump) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
     let accounts = ario_ant_escrow::accounts::ClaimVaultArweaveAttested {
         escrow,
         escrow_token_account: escrow_ata_pubkey,
         claimant_token_account: claimant_ata_pubkey,
-        payer_token_account: payer_ata_pubkey,
         claimant: claimant.pubkey(),
         depositor: setup.depositor.pubkey(),
         payer: payer.pubkey(),
@@ -4554,6 +4690,98 @@ async fn test_claim_vault_arweave_attested_expired_happy_path() {
     );
 }
 
+/// Active (still-locked) Arweave-attested vault claim is rejected with
+/// `VaultStillLocked`, even with a valid attestation. The attestation is
+/// verified FIRST (so this proves the rejection is the lock gate, not an
+/// attestation failure), then the still-locked gate fires. Mirror of
+/// `test_claim_vault_ethereum_active_rejected`.
+#[tokio::test]
+async fn test_claim_vault_arweave_attested_active_rejected() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let amount = 500_000_000u64;
+    let setup = setup_token_escrow(&mut ctx, amount).await;
+    let (escrow_addr, _) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_addr, &setup.mint_kp.pubkey()).await;
+
+    // 30-day lock — vault stays ACTIVE (we do NOT warp the clock).
+    deposit_vault_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400,
+        false,
+        PROTOCOL_ARWEAVE,
+        vec![0xAAu8; 512],
+    )
+    .await
+    .expect("deposit_vault should succeed");
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_addr).await;
+
+    let claimant = Keypair::new();
+    let claimant_ata = Keypair::new();
+    let payer_ata = Keypair::new();
+    airdrop(&mut ctx, &claimant.pubkey(), 2_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+    create_token_account(
+        &mut ctx,
+        &payer_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+
+    // Valid attestation over the canonical message (so we pass the sig gate
+    // and reach the still-locked gate).
+    let canonical = build_escrow_canonical(
+        "vault",
+        &setup.asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &[0xAAu8; 512],
+    );
+    let kp = test_attestor_keypair();
+    use ed25519_dalek::Signer;
+    let sig_bytes: [u8; 64] = kp.sign(&canonical).to_bytes();
+
+    let result = claim_vault_arweave_attested_tx(
+        &mut ctx,
+        &setup,
+        escrow_ata.pubkey(),
+        &claimant,
+        claimant_ata.pubkey(),
+        &claimant,
+        payer_ata.pubkey(),
+        escrow_state.nonce,
+        &canonical,
+        sig_bytes,
+        vec![],
+    )
+    .await;
+    assert_anchor_error!(result, EscrowError::VaultStillLocked);
+
+    // Escrow must remain open and funded — nothing moved.
+    let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_acct.is_some() && !escrow_acct.as_ref().unwrap().data.is_empty(),
+        "escrow PDA must remain open after a rejected active claim"
+    );
+    let escrow_bal = get_token_balance(&mut ctx, &escrow_ata.pubkey()).await;
+    assert_eq!(escrow_bal, amount, "escrow tokens must be untouched");
+}
+
 #[tokio::test]
 async fn measure_cu_claim_vault_arweave_attested_expired() {
     if skip_if_no_bpf_artifacts() {
@@ -4615,11 +4843,11 @@ async fn measure_cu_claim_vault_arweave_attested_expired() {
     let attestor_pubkey_bytes: [u8; 32] = ario_ant_escrow::state::ATTESTOR_PUBKEY.to_bytes();
     let ed25519_ix = build_ed25519_sigverify_ix(&attestor_pubkey_bytes, &sig_bytes, &canonical);
     let (escrow, _bump) = escrow_vault_pda(&setup.depositor.pubkey(), &setup.asset_id);
+    let _ = payer_ata; // active-path intermediate account removed
     let accounts = ario_ant_escrow::accounts::ClaimVaultArweaveAttested {
         escrow,
         escrow_token_account: escrow_ata.pubkey(),
         claimant_token_account: claimant_ata.pubkey(),
-        payer_token_account: payer_ata.pubkey(),
         claimant: claimant.pubkey(),
         depositor: setup.depositor.pubkey(),
         payer: claimant.pubkey(),
@@ -5100,7 +5328,7 @@ async fn test_deposit_vault_emits_deposited_event() {
         asset_id: setup.asset_id,
         amount,
         lock_duration_seconds: lock_duration,
-        revocable: true,
+        revocable: false, // escrow rejects revocable (ADR-021)
         recipient_protocol: PROTOCOL_ETHEREUM,
         recipient_pubkey: eth_addr.clone(),
     }
@@ -5134,4 +5362,268 @@ async fn test_deposit_vault_emits_deposited_event() {
     assert_eq!(ev.amount, amount);
     assert_eq!(ev.recipient_protocol, PROTOCOL_ETHEREUM);
     assert_eq!(ev.recipient_pubkey_len, 20);
+}
+
+// =========================================================================
+// RENT RECLAIM — admin_purge_unclaimed_ant
+// =========================================================================
+// Coverage:
+//   - rejects when signer != ArioConfig.authority
+//   - rejects when grace period hasn't elapsed
+//   - succeeds after grace period (warps slot, asserts burn + close)
+//
+// These tests pre-populate an `ArioConfig` PDA via `pt.add_account` so we
+// can verify the cross-program auth check without spinning up the full
+// `ario_core` initialize flow. The bytes are constructed via
+// `AnchorSerialize` on a zero-initialized `ArioConfig` with our test
+// authority pubkey set — every other field defaults are fine since
+// admin_purge_unclaimed_ant only reads `.authority`.
+
+use ario_ant_escrow::state::UNCLAIMED_PURGE_GRACE_SLOTS;
+use ario_core::state::ArioConfig;
+
+fn ario_config_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"ario_config"], &ario_core::ID)
+}
+
+/// Build the bytes for a fake `ArioConfig` account with the given
+/// authority. All other fields are zeroed. Suitable only for tests that
+/// exercise ixs which only read `ArioConfig.authority`.
+fn fake_ario_config_bytes(authority: Pubkey, bump: u8) -> Vec<u8> {
+    use anchor_lang::{AnchorSerialize, Discriminator};
+    let config = ArioConfig {
+        authority,
+        mint: Pubkey::default(),
+        arns_program: Pubkey::default(),
+        treasury: Pubkey::default(),
+        total_supply: 0,
+        protocol_balance: 0,
+        circulating_supply: 0,
+        locked_supply: 0,
+        min_vault_duration: 0,
+        max_vault_duration: 0,
+        primary_name_request_expiry: 0,
+        migration_active: false,
+        migration_authority: Pubkey::default(),
+        bump,
+        gar_program: Pubkey::default(),
+        version: ario_core::state::ARIO_CONFIG_VERSION,
+    };
+    let mut bytes = ArioConfig::DISCRIMINATOR.to_vec();
+    config.serialize(&mut bytes).unwrap();
+    // Pad to exact SIZE so Anchor's deserializer doesn't complain about
+    // a short account (a few historical configs were exactly SIZE).
+    bytes.resize(ArioConfig::SIZE, 0);
+    bytes
+}
+
+fn program_test_with_ario_config(authority: &Pubkey) -> ProgramTest {
+    let mut pt = program_test();
+    let (config_addr, bump) = ario_config_pda();
+    let data = fake_ario_config_bytes(*authority, bump);
+    let lamports = solana_sdk::rent::Rent::default().minimum_balance(data.len());
+    pt.add_account(
+        config_addr,
+        solana_sdk::account::Account {
+            lamports,
+            data,
+            owner: ario_core::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    pt
+}
+
+async fn admin_purge_tx(
+    ctx: &mut ProgramTestContext,
+    asset: Pubkey,
+    authority: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (escrow, _) = escrow_pda(&asset);
+    let (ario_config, _) = ario_config_pda();
+    let accounts = ario_ant_escrow::accounts::AdminPurgeUnclaimedAnt {
+        escrow,
+        ant_asset: asset,
+        ario_config,
+        authority: authority.pubkey(),
+        mpl_core_program: MPL_CORE_PROGRAM_ID,
+        system_program: solana_sdk::system_program::ID,
+    }
+    .to_account_metas(None);
+    let data = ario_ant_escrow::instruction::AdminPurgeUnclaimedAnt {}.data();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Ix {
+            program_id: ario_ant_escrow::ID,
+            accounts,
+            data,
+        }],
+        Some(&authority.pubkey()),
+        &[authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_admin_purge_rejects_unauthorized() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let real_authority = Keypair::new();
+    let attacker = Keypair::new();
+    let mut ctx = program_test_with_ario_config(&real_authority.pubkey())
+        .start_with_context()
+        .await;
+
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    airdrop(&mut ctx, &attacker.pubkey(), 5_000_000_000).await;
+
+    let asset_kp = Keypair::new();
+    mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0),
+    )
+    .await
+    .expect("deposit");
+
+    // Even if we somehow elapsed the grace period, attacker can't purge.
+    let result = admin_purge_tx(&mut ctx, asset_kp.pubkey(), &attacker).await;
+    assert_anchor_error!(result, EscrowError::Unauthorized);
+}
+
+#[tokio::test]
+async fn test_admin_purge_rejects_grace_not_elapsed() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let authority = Keypair::new();
+    let mut ctx = program_test_with_ario_config(&authority.pubkey())
+        .start_with_context()
+        .await;
+
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    airdrop(&mut ctx, &authority.pubkey(), 5_000_000_000).await;
+
+    let asset_kp = Keypair::new();
+    mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0),
+    )
+    .await
+    .expect("deposit");
+
+    // Right after deposit, the grace period definitively hasn't elapsed
+    // (current_slot - deposit_slot is single digits, vs. 394M required).
+    let result = admin_purge_tx(&mut ctx, asset_kp.pubkey(), &authority).await;
+    assert_anchor_error!(result, EscrowError::PurgeGraceNotElapsed);
+}
+
+#[tokio::test]
+async fn test_admin_purge_succeeds_after_grace() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let authority = Keypair::new();
+    let mut ctx = program_test_with_ario_config(&authority.pubkey())
+        .start_with_context()
+        .await;
+
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    airdrop(&mut ctx, &authority.pubkey(), 5_000_000_000).await;
+
+    let asset_kp = Keypair::new();
+    mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0),
+    )
+    .await
+    .expect("deposit");
+
+    // Warp past the grace period. `warp_to_slot` advances the slot the
+    // bank reports via Clock::get(); admin_purge consults it.
+    let (escrow_addr, _) = escrow_pda(&asset_kp.pubkey());
+    let escrow_acct = ctx
+        .banks_client
+        .get_account(escrow_addr)
+        .await
+        .unwrap()
+        .unwrap();
+    let escrow: EscrowAnt = EscrowAnt::try_deserialize(&mut escrow_acct.data.as_slice()).unwrap();
+    let target_slot = escrow.deposit_slot + UNCLAIMED_PURGE_GRACE_SLOTS + 1;
+    ctx.warp_to_slot(target_slot).expect("warp past grace");
+
+    let authority_lamports_before = ctx
+        .banks_client
+        .get_account(authority.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    admin_purge_tx(&mut ctx, asset_kp.pubkey(), &authority)
+        .await
+        .expect("purge after grace");
+
+    // Escrow PDA closed
+    let escrow_after = ctx.banks_client.get_account(escrow_addr).await.unwrap();
+    assert!(
+        escrow_after.is_none() || escrow_after.as_ref().unwrap().data.is_empty(),
+        "escrow PDA should be closed after purge"
+    );
+
+    // Asset state after BurnV1: mpl-core marks the asset's discriminator
+    // as `Uninitialized` (data[0] == 0) but does NOT close the account
+    // or refund its rent — that's mpl-core's design. So the asset stays
+    // around as an inert tombstone. The load-bearing protocol outcome
+    // is captured by:
+    //   1. The asset is no longer recognized as live mpl-core state
+    //      (Discriminator::Uninitialized at byte 0).
+    //   2. The escrow PDA's rent flowed to authority (next assertion).
+    // The asset's own rent (~$0.21) is stranded in the tombstone — an
+    // mpl-core limitation, not an escrow bug. Future work could ship
+    // a permissionless `close_burned_asset` if mpl-core ever exposes one.
+    let asset_after = ctx
+        .banks_client
+        .get_account(asset_kp.pubkey())
+        .await
+        .unwrap();
+    if let Some(acct) = asset_after.as_ref() {
+        assert!(
+            !acct.data.is_empty() && acct.data[0] == 0,
+            "asset's discriminator should be Uninitialized after burn (data[0..1]={:?})",
+            acct.data.first(),
+        );
+    }
+
+    // Rent flowed to authority (net positive after tx fee)
+    let authority_lamports_after = ctx
+        .banks_client
+        .get_account(authority.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert!(
+        authority_lamports_after > authority_lamports_before,
+        "authority should net-positive after purge (before={}, after={})",
+        authority_lamports_before,
+        authority_lamports_after,
+    );
 }

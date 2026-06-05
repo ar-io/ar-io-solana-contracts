@@ -6,7 +6,7 @@ use crate::{
     mpl_core_cpi::{set_update_authority_signed_by_wallet, transfer_asset_signed_by_wallet},
     state::{
         derive_initial_nonce, read_mpl_core_owner, validated_protocol_and_len, EscrowAnt,
-        ESCROW_ANT_SEED, ESCROW_VERSION_V1, MPL_CORE_PROGRAM_ID, RECIPIENT_PUBKEY_MAX_LEN,
+        ESCROW_ANT_SEED, ESCROW_ANT_VERSION, MPL_CORE_PROGRAM_ID, RECIPIENT_PUBKEY_MAX_LEN,
     },
     EscrowDepositedEvent,
 };
@@ -91,7 +91,7 @@ pub fn handler(
     //    zero-padded to RECIPIENT_PUBKEY_MAX_LEN; verifiers slice via
     //    `recipient_pubkey_active()`.
     let escrow = &mut ctx.accounts.escrow;
-    escrow.version = ESCROW_VERSION_V1;
+    escrow.version = ESCROW_ANT_VERSION;
     escrow.bump = ctx.bumps.escrow;
     escrow.depositor = ctx.accounts.depositor.key();
     escrow.ant_mint = ctx.accounts.ant_asset.key();
@@ -109,7 +109,17 @@ pub fn handler(
         &ctx.accounts.depositor.key(),
     );
     escrow.deposit_slot = deposit_slot;
-    escrow._reserved = [0u8; 32];
+    #[cfg(not(feature = "migration-test"))]
+    {
+        escrow._reserved = [0u8; 30];
+    }
+    #[cfg(feature = "migration-test")]
+    {
+        escrow._reserved = [0u8; 17];
+        escrow.field_1 = 0;
+        escrow.field_2 = 0;
+        escrow.field_3 = false;
+    }
 
     let (recipient_pubkey_buf, recipient_pubkey_len) = encode_recipient_pubkey_for_event(
         escrow.recipient_protocol,

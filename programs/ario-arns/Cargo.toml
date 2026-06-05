@@ -21,11 +21,13 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
-# devnet-shrunk: compile-time shrink of zero-copy NameRegistry for smoke-test
-# clusters (200_000→200 slots, ~8 MB→~8 KB). Propagates to ario-gar so the
-# Epoch struct's failure_counts array sizes consistently. Mainnet/testnet
-# MUST NOT enable this feature. See state/mod.rs.
-devnet-shrunk = ["ario-gar/devnet-shrunk"]
+# No-op: defined so workspace-wide --features network-mainnet /
+# network-devnet works during build-sbf.sh's BPF build (only
+# ario-ant-escrow actually gates on these to bake the cluster
+# identifier into its canonical claim message).
+network-mainnet = []
+network-devnet = []
+migration-test = []
 default = []
 
 [dependencies]

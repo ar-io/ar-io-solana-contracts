@@ -40,6 +40,7 @@ pub fn initialize(ctx: Context<InitializeGar>, params: InitializeParams) -> Resu
     settings.total_delegated = 0;
     settings.total_withdrawn = 0;
     settings.bump = ctx.bumps.settings;
+    settings.version = GATEWAY_SETTINGS_VERSION;
 
     msg!("GAR program initialized");
     Ok(())
@@ -137,63 +138,6 @@ fn write_gateway_registry_header(registry: &AccountInfo, authority: Pubkey) -> R
     Ok(())
 }
 
-/// Recovery-only: shrink an over-sized `GatewayRegistry` PDA back to the
-/// current binary's expected size, refunding the rent diff to the
-/// authority.
-///
-/// The use case: a build-flag flip changes `GatewayRegistry::SIZE`
-/// (e.g. crossing from a production binary that allocated a ~168 KB
-/// registry to a `devnet-shrunk` binary that expects ~1.7 KB). The
-/// on-chain account is too big for the new binary's
-/// `AccountLoader::load`, which panics with a size mismatch. This ix uses
-/// `AccountInfo` (not `AccountLoader`) so it doesn't panic, and reallocs
-/// the account down to `8 + GatewayRegistry::SIZE` of the *current*
-/// binary, then transfers the freed rent lamports to the authority.
-///
-/// Authority-gated AND `migration_active`-gated. Inert after mainnet
-/// `finalize_migration`. Refuses to truncate populated slot data
-/// (`count <= MAX_GATEWAYS`).
-pub fn admin_shrink_gateway_registry(ctx: Context<AdminShrinkGatewayRegistry>) -> Result<()> {
-    let registry = &ctx.accounts.registry;
-    let target = 8 + GatewayRegistry::SIZE;
-
-    let current_len = registry.data_len();
-    require!(current_len > target, GarError::RegistryAlreadyShrunk);
-
-    // Belt-and-braces: don't truncate into populated slot data.
-    {
-        let data = registry.try_borrow_data()?;
-        let count = u32::from_le_bytes(
-            data[40..44]
-                .try_into()
-                .map_err(|_| GarError::InvalidAccountData)?,
-        ) as usize;
-        require!(
-            count <= GatewayRegistry::MAX_GATEWAYS,
-            GarError::ShrinkWouldLoseData
-        );
-    }
-
-    registry.realloc(target, false)?;
-
-    // Refund excess rent to authority. realloc preserves the head data and
-    // truncates the (unused) tail; the account's lamports are unchanged by
-    // realloc itself, so the surplus over the new rent minimum is free to
-    // transfer.
-    let new_minimum = Rent::get()?.minimum_balance(target);
-    let refund = registry.lamports().saturating_sub(new_minimum);
-    **registry.try_borrow_mut_lamports()? -= refund;
-    **ctx.accounts.authority.try_borrow_mut_lamports()? += refund;
-
-    msg!(
-        "GatewayRegistry shrunk: {} -> {} bytes, refunded {} lamports",
-        current_len,
-        target,
-        refund
-    );
-    Ok(())
-}
-
 pub fn initialize_epochs(
     ctx: Context<InitializeEpochs>,
     params: InitializeEpochParams,
@@ -242,6 +186,7 @@ pub fn initialize_epochs(
     settings.failed_gateway_slash_rate = 1_000_000;
     settings.disable_at = 0;
     settings.bump = ctx.bumps.epoch_settings;
+    settings.version = EPOCH_SETTINGS_VERSION;
 
     msg!("Epoch settings initialized");
     Ok(())
@@ -305,34 +250,11 @@ pub struct CreateGatewayRegistry<'info> {
 }
 
 #[derive(Accounts)]
-pub struct AdminShrinkGatewayRegistry<'info> {
-    /// Authority gate via `has_one`, migration-window gate via
-    /// `migration_active`. Inert post `finalize_migration`.
-    #[account(
-        seeds = [SETTINGS_SEED],
-        bump = settings.bump,
-        has_one = authority @ crate::error::GarError::Unauthorized,
-        constraint = settings.migration_active @ crate::error::GarError::MigrationInactive,
-    )]
-    pub settings: Account<'info, GatewaySettings>,
-
-    /// CHECK: deliberately `AccountInfo` rather than `AccountLoader` so the
-    /// ix works against an oversized account whose current bytes no longer
-    /// match the binary's `GatewayRegistry::SIZE`. PDA seed check ensures
-    /// we only touch the canonical registry.
-    #[account(mut, seeds = [REGISTRY_SEED], bump)]
-    pub registry: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub authority: Signer<'info>,
-}
-
-#[derive(Accounts)]
 pub struct InitializeEpochs<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + EpochSettings::SIZE,
+        space = EpochSettings::SIZE,
         seeds = [EPOCH_SETTINGS_SEED],
         bump,
     )]
@@ -401,6 +323,123 @@ pub struct AdminRepairSettings<'info> {
         bump = settings.bump,
         has_one = authority @ crate::error::GarError::Unauthorized,
         constraint = settings.migration_active @ crate::error::GarError::MigrationInactive,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    pub authority: Signer<'info>,
+}
+
+/// Authority-gated override of `GatewaySettings.withdrawal_period` (the lock
+/// duration applied to every NEW withdrawal vault created by
+/// `withdraw_operator_stake` / `withdraw_delegation`). Mirrors
+/// `admin_set_epoch_duration`'s pattern for `EpochSettings.epoch_duration`.
+///
+/// Primary use cases:
+///   1. **Devnet testing.** The default (`WITHDRAWAL_LOCK_PERIOD` = 30 days)
+///      is impractical for end-to-end claim-withdrawal validation on a real
+///      cluster. Operators can drop the period to seconds for a test run.
+///   2. **Mainnet emergency.** If a security incident requires shortening
+///      the unstake window (or lengthening it to delay an in-flight exit),
+///      the multisig has a direct lever instead of needing a code upgrade.
+///
+/// **Existing withdrawal vaults are unaffected.** Their unlock timestamps
+/// were stamped at creation time (`unlock_timestamp = created_at +
+/// settings.withdrawal_period`) and are checked against `Clock::unix_timestamp`
+/// at `claim_withdrawal`. Only withdrawals initiated AFTER this update use
+/// the new period.
+///
+/// Authority-only. NOT migration-gated (unlike `admin_repair_settings`) so
+/// the lever remains available after `finalize_migration`. Min bound of 60
+/// seconds matches `admin_set_epoch_duration` to prevent accidental
+/// withdrawal-front-running by setting to 0.
+pub fn admin_set_withdrawal_period(
+    ctx: Context<AdminSetWithdrawalPeriod>,
+    new_period_seconds: i64,
+) -> Result<()> {
+    require!(
+        new_period_seconds >= 60,
+        crate::error::GarError::InvalidParameter
+    );
+
+    let settings = &mut ctx.accounts.settings;
+    let old_period = settings.withdrawal_period;
+    settings.withdrawal_period = new_period_seconds;
+
+    let clock = Clock::get()?;
+    emit!(crate::WithdrawalPeriodUpdatedEvent {
+        admin: ctx.accounts.authority.key(),
+        old_period_seconds: old_period,
+        new_period_seconds,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "GatewaySettings.withdrawal_period {} → {} seconds (admin override)",
+        old_period,
+        new_period_seconds
+    );
+
+    Ok(())
+}
+
+/// Context for `admin_set_withdrawal_period`. Authority gate matches
+/// `admin_repair_settings`; no `migration_active` constraint so the lever
+/// remains available post-migration for ops / emergency tuning.
+#[derive(Accounts)]
+pub struct AdminSetWithdrawalPeriod<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    pub authority: Signer<'info>,
+}
+
+/// Single-step rotation of the admin `authority` (ADR-026). Gated on the
+/// CURRENT admin `authority` (never `migration_authority`). Rejects the null
+/// pubkey so a fat-fingered renounce cannot brick admin into an unspendable
+/// address; any other pubkey is allowed, including off-curve PDAs such as the
+/// Squads vault. No `migration_active` constraint — recovery / hand-off must
+/// work post-migration.
+pub fn transfer_authority(ctx: Context<TransferAuthority>, new_authority: Pubkey) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        crate::error::GarError::InvalidParameter
+    );
+
+    let settings = &mut ctx.accounts.settings;
+    let old_authority = settings.authority;
+    settings.authority = new_authority;
+
+    let clock = Clock::get()?;
+    emit!(crate::AuthorityTransferredEvent {
+        old_authority,
+        new_authority,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "GatewaySettings.authority {} → {} (admin rotation)",
+        old_authority,
+        new_authority
+    );
+
+    Ok(())
+}
+
+/// Context for `transfer_authority`. `has_one = authority` binds the signer to
+/// the CURRENT admin authority — the only load-bearing check. Mirrors
+/// `admin_set_withdrawal_period`'s gate.
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
     )]
     pub settings: Account<'info, GatewaySettings>,
 

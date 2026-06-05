@@ -6,7 +6,7 @@ first; this file is the working notes / institutional memory layer that
 agents need to avoid common mistakes.
 
 > **Connecting to deployed clusters?** Program IDs and the ARIO mint
-> live in [`program-ids/devnet.json`](program-ids/devnet.json) and
+> live in [`program-ids/staging.json`](program-ids/staging.json) and
 > [`program-ids/mainnet.json`](program-ids/mainnet.json). The on-chain
 > `declare_id!()` literals only match a real keypair after the relevant
 > deploy workflow has run — fresh checkouts of `develop` carry placeholder
@@ -228,6 +228,25 @@ changes are NOT backward-compatible — see "ArioConfig" in the
 schema-evolution checklist in [`docs/DECISIONS.md`](docs/DECISIONS.md)
 before modifying.
 
+### Schema versioning & `migrate_*` (ADR-020)
+
+`version: SchemaVersion` is **append-only and at the byte-end** of every
+borsh `#[account]` (after any variable-length field); new fields append at
+the end or carve from a `_reserved` tail. **Never reorder** an existing
+field post-launch. `migrate_*` instructions MUST use the
+**grow-then-deserialize** pattern (`schema_migration::grow_account` +
+`write_account` on an `UncheckedAccount`), NOT a typed `Account<T>` +
+`realloc` — Anchor deserializes the new layout *before* `realloc` runs, so a
+pre-version (shorter) account hits Borsh EOF (`AccountDidNotDeserialize`,
+3003) and the migration is unreachable. Serialize back via `write_account`'s
+temp-buffer copy, never `try_serialize(&mut *data)` (it advances and
+truncates the account). New migration tests must build a **genuine
+pre-version** account (old SIZE, no version bytes), not a full-size one with
+`version={0,0,0}`. Exception: `ario-ant-escrow` uses fixed-SIZE
+`_reserved`-absorbs accounts (no realloc ever) and keeps typed `Account<T>`;
+if a future escrow field exceeds `_reserved`, convert it to
+grow-then-deserialize. See [`docs/adrs/0020-…`](docs/adrs/0020-schema-migration-grow-then-deserialize.md).
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool
@@ -292,17 +311,39 @@ cargo test                                      # all tests
 cargo test -p ario-core                         # one program
 cargo test -p ario-gar test_join_network        # specific test
 
-# Tests that CPI into Metaplex Core (UpdatePluginV1 trait sync) need
-# mpl_core.so staged + BPF_OUT_DIR set + the program's own .so present:
-#   ario-arns      — all integration tests
-#   ario-ant       — clear_attributes + sync_attributes only
-#   ario-ant-escrow — integration + event-coverage tests
-cargo build-sbf --manifest-path programs/ario-arns/Cargo.toml   # or ario-ant / -ant-escrow
-cp programs/ario-arns/tests/fixtures/mpl_core.so target/deploy/
-BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-arns
-# Same recipe for ario-ant's MPL-Core-CPI tests:
-BPF_OUT_DIR="$(pwd)/target/deploy" cargo test -p ario-ant \
-  --test clear_attributes --test sync_attributes
+# Integration tests touching Metaplex Core (UpdatePluginV1 trait sync,
+# TransferV1, BurnV1) need mpl_core.so staged + BPF_OUT_DIR set + the
+# program's own .so aligned with the source's declare_id. Use the
+# wrapper — it stages mpl_core.so, rebuilds .so files against the
+# current source, and passes the right feature flags. Avoids the
+# `Custom(4100) DeclaredProgramIdMismatch` foot-gun that bites after
+# `build-sbf.sh --sync` leaves a synced .so paired with restored
+# placeholder source.
+./scripts/test-integration.sh ario-arns                 # one suite
+./scripts/test-integration.sh ario-ant-escrow test_admin_purge   # filtered
+./scripts/test-integration.sh --all                     # everything
+FAST=1 ./scripts/test-integration.sh ario-arns          # skip rebuild
+
+# Manual recipe (DO NOT USE unless you know why — most snags come from
+# skipping the wrapper). Requires `target/deploy/<prog>.so` aligned
+# with the source `declare_id!()` value. If you ran build-sbf.sh --sync
+# the .so is mismatched; rebuild with plain `cargo build-sbf`:
+#   cargo build-sbf
+#   cp programs/ario-ant-escrow/tests/fixtures/mpl_core.so target/deploy/
+#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test \
+#     -p ario-arns --test integration
+#
+# ESCROW ONLY: the `claim_*_attested` tests sign with the deterministic
+# test attestor key, which lives behind the opt-in
+# `unsafe-allow-test-attestor-pubkey` feature (kept OUT of escrow's
+# default features so it can never reach a deploy artifact — see
+# programs/ario-ant-escrow/Cargo.toml). Add it to BOTH the .so build and
+# the `cargo test` invocation (cargo applies it only to escrow):
+#   cargo build-sbf --features unsafe-allow-test-attestor-pubkey
+#   BPF_OUT_DIR="$(pwd)/target/deploy" cargo test \
+#     --features unsafe-allow-test-attestor-pubkey \
+#     -p ario-ant-escrow --test integration
+# The wrapper (test-integration.sh) does this automatically.
 
 # Devnet deploy (idempotent — re-runs upgrade against the same program IDs)
 bash scripts/devnet-deploy.sh

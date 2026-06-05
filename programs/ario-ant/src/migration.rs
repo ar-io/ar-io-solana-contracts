@@ -108,6 +108,16 @@ fn require_trailing_zero_padding(data: &[u8], i: usize) -> Result<()> {
     Ok(())
 }
 
+/// Skip the three-byte `SchemaVersion { major, minor, patch }` field.
+fn skip_schema_version(data: &[u8], i: &mut usize) -> Result<()> {
+    require!(
+        data.len() >= *i + SCHEMA_VERSION_SIZE,
+        AntError::InvalidAccountData
+    );
+    *i += SCHEMA_VERSION_SIZE;
+    Ok(())
+}
+
 fn validate_ant_config_borsh_payload(data: &[u8]) -> Result<()> {
     let mut i = 8usize;
     skip_pubkey(data, &mut i)?;
@@ -118,7 +128,7 @@ fn validate_ant_config_borsh_payload(data: &[u8]) -> Result<()> {
     skip_vec_string(data, &mut i)?;
     skip_pubkey(data, &mut i)?;
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -127,7 +137,7 @@ fn validate_ant_controllers_borsh_payload(data: &[u8]) -> Result<()> {
     skip_pubkey(data, &mut i)?;
     skip_vec_pubkey(data, &mut i)?;
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -142,7 +152,7 @@ fn validate_ant_record_borsh_payload(data: &[u8]) -> Result<()> {
     skip_option_pubkey(data, &mut i)?; // owner
     skip_pubkey(data, &mut i)?; // last_reconciled_owner
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -157,7 +167,7 @@ fn validate_ant_record_metadata_borsh_payload(data: &[u8]) -> Result<()> {
     skip_option_string(data, &mut i)?; // record_description
     skip_option_vec_string(data, &mut i)?; // record_keywords
     let _bump = read_u8(data, &mut i)?;
-    let _version = read_u8(data, &mut i)?;
+    skip_schema_version(data, &mut i)?;
     require_trailing_zero_padding(data, i)
 }
 
@@ -182,8 +192,14 @@ fn validate_ant_account_borsh(disc: &[u8; 8], data: &[u8]) -> Result<()> {
 }
 
 /// Migration deadline: imports are rejected after this timestamp.
-// Migration deadline: 2026-06-18 00:00:00 UTC. Update before mainnet if migration date changes.
-pub const MIGRATION_DEADLINE: i64 = 1781884800;
+// 2112-04-20 00:01:09 UTC -- INTENTIONALLY far-future BY DESIGN. The AR.IO Solana migration uses no
+// time-based cutoff; finalize_migration (authority-gated, one-shot) is the sole control on the
+// migration-authority write window. The constant is retained so the existing deadline checks
+// compile and short-circuit harmlessly, and the far-future value (vs i64::MAX) keeps the time check
+// permanently inert without overflow risk in deadline arithmetic. Accepted resolution of audit
+// MIGRATION-001 (see docs/SECURITY_AUDIT_INDEPENDENT.md): the time-window risk is accepted, with
+// finalize_migration bounding the window operationally.
+pub const MIGRATION_DEADLINE: i64 = 4490553669;
 
 // =========================================
 // DISCRIMINATOR VALIDATION
@@ -229,6 +245,7 @@ pub fn initialize_migration_handler(
     config.migration_authority = params.migration_authority;
     config.migration_active = true;
     config.bump = ctx.bumps.migration_config;
+    config.version = ANT_MIGRATION_CONFIG_VERSION;
     msg!("ANT migration config initialized");
     Ok(())
 }
@@ -335,6 +352,55 @@ pub fn finalize_migration_handler(ctx: Context<FinalizeMigration>) -> Result<()>
     config.migration_active = false;
     msg!("Migration finalized — import instructions permanently disabled");
     Ok(())
+}
+
+/// Single-step rotation of the admin `authority` on `AntMigrationConfig`
+/// (ADR-026). Gated on the CURRENT admin `authority` (never
+/// `migration_authority`). Rejects the null pubkey; any other pubkey is
+/// allowed, including off-curve PDAs (the Squads vault). No `migration_active`
+/// constraint — the admin authority (which gates
+/// `admin_close_orphaned_ant_state`) must stay rotatable after migration is
+/// finalized.
+pub fn transfer_authority_handler(
+    ctx: Context<TransferAuthority>,
+    new_authority: Pubkey,
+) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        AntError::InvalidAuthority
+    );
+
+    let config = &mut ctx.accounts.migration_config;
+    let old_authority = config.authority;
+    config.authority = new_authority;
+
+    emit!(crate::AuthorityTransferredEvent {
+        old_authority,
+        new_authority,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    msg!(
+        "AntMigrationConfig.authority {} → {} (admin rotation)",
+        old_authority,
+        new_authority
+    );
+    Ok(())
+}
+
+/// Context for `transfer_authority`. `has_one = authority` binds the signer to
+/// the CURRENT admin authority — the only load-bearing check. No
+/// `migration_active` gate so rotation works post-finalize.
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump = migration_config.bump,
+        has_one = authority @ AntError::Unauthorized,
+    )]
+    pub migration_config: Account<'info, AntMigrationConfig>,
+    pub authority: Signer<'info>,
 }
 
 // =========================================

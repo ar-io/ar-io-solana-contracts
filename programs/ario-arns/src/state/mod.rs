@@ -29,6 +29,16 @@ pub const DEMAND_FACTOR_SCALE: u64 = 1_000_000;
 /// Minimum demand factor (0.5)
 pub const DEMAND_FACTOR_MIN: u64 = 500_000;
 
+/// Maximum demand factor (1000.0) — a CU-safety ceiling on the 1.05x
+/// up-adjustment. The Lua reference (`demand.lua`) does NOT cap the factor;
+/// this is a Solana-only bound (see BD-112) that keeps the lazy-rollover
+/// fast-forward bounded: a long-idle decay back to the floor takes at most
+/// ~510 steps from this ceiling, vs. unbounded growth otherwise. Set far above
+/// any economically reachable value (1000x base fees would require ~141
+/// consecutive periods of geometrically-rising demand), so it never affects
+/// realistic pricing — it only removes a pathological compute cliff.
+pub const MAX_DEMAND_FACTOR: u64 = 1_000 * DEMAND_FACTOR_SCALE;
+
 /// Upward adjustment multiplier (1.05x)
 pub const DEMAND_FACTOR_UP_ADJUSTMENT: u64 = 1_050_000;
 
@@ -88,6 +98,118 @@ pub const GATEWAY_OPERATOR_DISCOUNT_PCT: u64 = 200_000;
 
 /// Number of entries in the genesis fee table (indices 0..=50)
 pub const NUM_NAME_LENGTH_FEES: usize = 51;
+
+/// Metaplex Core program ID.
+///
+/// ario-arns is MPL-agnostic per ADR-016 (no `mpl-core` crate dependency, no
+/// `UpdatePluginV1` CPI), but `reassign_name` / `release_name` still authorize
+/// against the *current* ANT NFT holder by reading the asset account's owner
+/// bytes directly. A raw read needs neither the crate nor a CPI, so it stays
+/// ADR-016-compatible. Used as the expected `ant_asset.owner` in those handlers.
+pub const MPL_CORE_PROGRAM_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d");
+
+/// Read the `owner` field from a Metaplex Core asset account's raw data.
+///
+/// Verified against the mpl-core v1.8.0 `AssetV1` layout:
+/// - byte 0: `Key` (u8) = 1 for `AssetV1`
+/// - bytes 1..33: `Owner` (Pubkey, 32 bytes)
+/// - byte 33+: `UpdateAuthority` (varies — not needed here)
+///
+/// A local copy of `ario_ant::read_mpl_core_owner` so ario-arns takes no
+/// dependency on ario-ant. Callers MUST first assert the account is owned by
+/// [`MPL_CORE_PROGRAM_ID`] (via an Anchor `constraint`) — this function only
+/// parses the layout, it does not verify the account's program owner.
+///
+/// WARNING: hardcodes the MPL Core `AssetV1` byte layout; there is no
+/// compile-time verification because mpl-core is not a Cargo dependency. If
+/// Metaplex Core changes the `AssetV1` layout, update this in lockstep with
+/// `ario_ant::read_mpl_core_owner`.
+pub fn read_mpl_core_owner(data: &[u8]) -> Result<Pubkey> {
+    require!(data.len() >= 33, crate::error::ArnsError::InvalidAntAsset);
+    require!(data[0] == 1, crate::error::ArnsError::InvalidAntAsset);
+    let owner_bytes: [u8; 32] = data[1..33]
+        .try_into()
+        .map_err(|_| crate::error::ArnsError::InvalidAntAsset)?;
+    Ok(Pubkey::from(owner_bytes))
+}
+
+// =========================================
+// SIZING CONSTANTS
+// =========================================
+
+/// Anchor account discriminator (first 8 bytes of SHA-256("account:<Name>")).
+pub const ANCHOR_DISCRIMINATOR_SIZE: usize = 8;
+
+/// Solana `Pubkey` serialized size.
+pub const PUBKEY_SIZE: usize = 32;
+
+/// Borsh `u32` length prefix used for `String` and `Vec<T>`.
+pub const BORSH_LEN_PREFIX: usize = 4;
+
+/// Borsh `Option<T>` discriminant byte (0 = None, 1 = Some).
+pub const BORSH_OPTION_PREFIX: usize = 1;
+
+/// Bump seed (single `u8`).
+pub const BUMP_SIZE: usize = 1;
+
+/// `SchemaVersion { major, minor, patch }` — 3 consecutive u8s.
+pub const SCHEMA_VERSION_SIZE: usize = 3;
+
+// =========================================
+// SCHEMA VERSIONING
+// =========================================
+
+/// Semantic version for ArNS on-chain account schemas.
+///
+/// Stored as three consecutive `u8` bytes (3 bytes on the wire).
+/// `Ord` is derived lexicographically over `(major, minor, patch)`, which
+/// matches semver precedence: major is compared first, then minor, then
+/// patch. This means `config.version < ARNS_CONFIG_VERSION` is a valid
+/// "needs migration" guard.
+///
+/// Bump rules:
+///   - `major`: breaking layout change (field removed, type changed, reorder)
+///   - `minor`: additive layout change (new field appended, default = zero)
+///   - `patch`: logic-only change (no layout change; bump optional for audits)
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
+pub struct SchemaVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl SchemaVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Current schema version for each ArNS account type.
+///
+/// Bump the appropriate constant when changing the on-chain layout; the
+/// `schema_migration` module's dispatch functions key off the stored version
+/// to walk an account through every intermediate step up to the new current.
+#[cfg(not(feature = "migration-test"))]
+pub const ARNS_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+#[cfg(feature = "migration-test")]
+pub const ARNS_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
+pub const DEMAND_FACTOR_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ARNS_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const RETURNED_NAME_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const RESERVED_NAME_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 // =========================================
 // GENESIS FEES (mARIO)
@@ -192,14 +314,35 @@ pub struct ArnsConfig {
     pub migration_authority: Pubkey,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
+    /// Schema v1.1.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.0.0→1.1.0 migration arm with a default of 1000.
+    #[cfg(feature = "migration-test")]
+    pub field_1: u64,
+    /// Schema v1.2.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.1.0→1.2.0 migration arm with a default of 42.
+    #[cfg(feature = "migration-test")]
+    pub field_2: u32,
+    /// Schema v1.3.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.2.0→1.3.0 migration arm with a default of true.
+    #[cfg(feature = "migration-test")]
+    pub field_3: bool,
 }
 
 impl ArnsConfig {
     // discriminator(8) + authority(32) + mint(32) + treasury(32) + grace_period(8)
     // + return_auction_duration(8) + max_lease_length_years(1) + total_names_registered(8)
     // + next_records_prune(8) + next_returned_names_prune(8)
-    // + migration_active(1) + migration_authority(32) + bump(1)
-    pub const SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1;
+    // + migration_active(1) + migration_authority(32) + bump(1) + version(3)
+    #[cfg(not(feature = "migration-test"))]
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 3;
+
+    #[cfg(feature = "migration-test")]
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 + 3
+        + 8   // field_1: u64
+        + 4   // field_2: u32
+        + 1; // field_3: bool
 }
 
 // =========================================
@@ -238,6 +381,8 @@ pub struct DemandFactor {
     pub criteria: u8,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 /// Demand factor criteria: which metric determines if demand is increasing
@@ -255,6 +400,7 @@ impl DemandFactor {
     // + period_zero_start_timestamp(8)
     // + criteria(1)
     // + bump(1)
+    // + version(3)
     pub const SIZE: usize = 8
         + 8
         + 8
@@ -266,7 +412,8 @@ impl DemandFactor {
         + (8 * NUM_NAME_LENGTH_FEES)
         + 8
         + 1
-        + 1;
+        + 1
+        + 3;
 }
 
 // =========================================
@@ -298,6 +445,7 @@ impl DemandFactor {
 ///   - purchase_price:        124 (8)
 ///   - bump:                  132 (1)
 ///   - name (variable-length): 133 (4 + ≤51)
+///   - version:               (after name; variable offset, byte-end)
 #[account]
 pub struct ArnsRecord {
     /// SHA256 hash of lowercase name (used for PDA derivation)
@@ -323,17 +471,23 @@ pub struct ArnsRecord {
     /// PDA bump
     pub bump: u8,
     /// The name string (max 51 chars, original casing preserved).
-    /// Variable-length — must remain the last field so all preceding
-    /// fields stay at fixed byte offsets for memcmp filtering.
+    /// Variable-length. The memcmp-filtered fixed fields (`owner` @40,
+    /// `ant` @72, …) all precede it, so their offsets stay stable.
     pub name: String,
+    /// Schema version for forward-compatible migrations. MUST be the
+    /// byte-end (last) field: it follows the variable-length `name` so a
+    /// pre-versioning record can be grown + zero-filled and read as
+    /// {0,0,0} → bootstrap. Reordered here from before `name` (which made
+    /// old records unloadable). See `schema_migration::grow_account`.
+    pub version: SchemaVersion,
 }
 
 impl ArnsRecord {
     // discriminator(8) + name_hash(32) + owner(32) + ant(32)
     // + purchase_type(1) + start_timestamp(8) + end_timestamp(1 + 8)
-    // + undername_limit(2) + purchase_price(8) + bump(1)
+    // + undername_limit(2) + purchase_price(8) + bump(1) + version(3)
     // + name(4 + MAX_NAME_LENGTH)
-    pub const SIZE: usize = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + (4 + MAX_NAME_LENGTH);
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + 3 + (4 + MAX_NAME_LENGTH);
 
     /// Byte offset of `ant` within the account data. Memcmp filter
     /// target for "ArNS records by ANT mint" point queries. SDK
@@ -404,12 +558,14 @@ pub struct ReturnedName {
     pub returned_at: i64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl ReturnedName {
     // discriminator(8) + name(4 + MAX_NAME_LENGTH) + name_hash(32)
-    // + initiator(32) + returned_at(8) + bump(1)
-    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 32 + 32 + 8 + 1;
+    // + initiator(32) + returned_at(8) + bump(1) + version(3)
+    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 32 + 32 + 8 + 1 + 3;
 }
 
 // =========================================
@@ -432,50 +588,209 @@ pub struct ReservedName {
     pub created_at: i64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl ReservedName {
     // discriminator(8) + name(4 + MAX_NAME_LENGTH) + reserved_for(1 + 32)
-    // + expires_at(1 + 8) + reserved_by(32) + created_at(8) + bump(1)
-    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 33 + 9 + 32 + 8 + 1;
+    // + expires_at(1 + 8) + reserved_by(32) + created_at(8) + bump(1) + version(3)
+    pub const SIZE: usize = 8 + (4 + MAX_NAME_LENGTH) + 33 + 9 + 32 + 8 + 1 + 3;
 }
 
 // =========================================
 // NAME REGISTRY (for epoch prescription)
 // =========================================
 
-/// Global name registry for efficient enumeration
-/// PDA: ["name_registry"]
-/// NOTE: Uses zero-copy for performance with large name counts.
-/// This enables the epoch system to prescribe names without an off-chain indexer.
+/// Global name registry for efficient enumeration.
+/// PDA: `["name_registry"]`
 ///
-/// **Capacity is build-time configurable.** Production builds use 200,000
-/// slots (~8 MB on-chain, ~57 SOL rent). Devnet/testnet smoke-test builds
-/// enable `--features devnet-shrunk` to compile with 200 slots (~8 KB,
-/// ~0.06 SOL rent). Anchor zero-copy requires the on-chain account size
-/// to match the binary's struct size exactly — deploying a mismatched
-/// pair will panic on every `AccountLoader::load()`. See the matching
-/// note on `GatewayRegistry`.
+/// **Dynamic-capacity layout (ADR-020, 2026-05-22):** The on-chain
+/// account is variable-size — the struct here is the header only (40
+/// bytes), and slots live after it as a raw byte array. Slot count is
+/// derived from `data.len()` at read time, so reallocs (expand/shrink)
+/// don't need to update any header field. This pattern is used by
+/// OpenBook v2, MarginFi, Phoenix, and mpl-core itself.
+///
+/// Layout in bytes:
+/// ```text
+/// [0..8]    Anchor discriminator
+/// [8..48]   header (this struct: authority, count, _padding)
+/// [48..]    NameEntry slots (40 bytes each, count derived from data.len())
+/// ```
+///
+/// Slot access goes through the `name_slots` / `name_slots_mut` helpers
+/// below — every reading ix uses `AccountInfo` and these helpers
+/// instead of `AccountLoader<NameRegistry>`, because the header size
+/// is fixed but the slot array isn't.
+///
+/// **Initial deploy capacity:** `INITIAL_CAPACITY` slots (50,000, all
+/// clusters). Expandable via `admin_expand_name_registry` up to any
+/// reasonable target.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct NameRegistry {
     pub authority: Pubkey,
     pub count: u32,
     pub _padding: [u8; 4],
-    /// Array of name hashes (SHA256) for registered active names
-    /// Names are added when purchased and removed when expired/released
-    #[cfg(not(feature = "devnet-shrunk"))]
-    pub names: [NameEntry; 200_000],
-    #[cfg(feature = "devnet-shrunk")]
-    pub names: [NameEntry; 200],
 }
 
 impl NameRegistry {
-    pub const SIZE: usize = 32 + 4 + 4 + (NameEntry::SIZE * Self::MAX_NAMES);
-    #[cfg(not(feature = "devnet-shrunk"))]
-    pub const MAX_NAMES: usize = 200_000;
-    #[cfg(feature = "devnet-shrunk")]
-    pub const MAX_NAMES: usize = 200;
+    /// On-chain struct size (header only). Excludes the 8-byte Anchor
+    /// discriminator. Used by Anchor's `init` constraint and by
+    /// `AccountLoader` size check.
+    pub const SIZE: usize = 32 + 4 + 4;
+    /// Byte offset where the first NameEntry slot begins (includes the
+    /// 8-byte discriminator).
+    pub const HEADER_BYTES: usize = 8 + Self::SIZE;
+    /// Initial slot count provisioned at deploy time. Expandable via
+    /// `admin_expand_name_registry`.
+    pub const INITIAL_CAPACITY: usize = 50_000;
+
+    /// Backward-compatible alias — many callers still reference
+    /// `NameRegistry::MAX_NAMES` to bound iteration. Semantically the
+    /// same as INITIAL_CAPACITY for fresh deployments, but on a
+    /// post-expand registry the actual capacity (derived from
+    /// `data.len()` via `slot_capacity`) may be higher.
+    pub const MAX_NAMES: usize = Self::INITIAL_CAPACITY;
+
+    /// Total account bytes for a registry at the given slot capacity.
+    /// Includes the 8-byte discriminator.
+    pub const fn bytes_for_capacity(slots: usize) -> usize {
+        Self::HEADER_BYTES + slots * NameEntry::SIZE
+    }
+}
+
+/// Compute the current slot capacity from raw account data length.
+/// Round-trips through `(data.len() - HEADER_BYTES) / NameEntry::SIZE`.
+/// The trailing bytes beyond `capacity * 40` (if data.len() isn't a
+/// perfect multiple) are ignored.
+pub fn slot_capacity(data: &[u8]) -> usize {
+    data.len().saturating_sub(NameRegistry::HEADER_BYTES) / NameEntry::SIZE
+}
+
+/// Read-only slice view of every NameEntry slot. Returns an empty
+/// slice if the account is too small to contain the header. Bounds
+/// check defends against truncated registries (audit finding #4).
+pub fn name_slots(data: &[u8]) -> &[NameEntry] {
+    if data.len() < NameRegistry::HEADER_BYTES {
+        return &[];
+    }
+    let cap = slot_capacity(data);
+    let end = NameRegistry::HEADER_BYTES + cap * NameEntry::SIZE;
+    bytemuck::cast_slice(&data[NameRegistry::HEADER_BYTES..end])
+}
+
+/// Mutable slice view of every NameEntry slot. Same shape as
+/// `name_slots` but allows in-place edits + swap_remove during
+/// `buy_record` / `release` flows. Empty slice on truncated input.
+pub fn name_slots_mut(data: &mut [u8]) -> &mut [NameEntry] {
+    if data.len() < NameRegistry::HEADER_BYTES {
+        return &mut [];
+    }
+    let cap = slot_capacity(data);
+    let end = NameRegistry::HEADER_BYTES + cap * NameEntry::SIZE;
+    bytemuck::cast_slice_mut(&mut data[NameRegistry::HEADER_BYTES..end])
+}
+
+/// Read the registry header (authority + count + padding) from raw
+/// account data. Skips the 8-byte Anchor discriminator. Callers must
+/// ensure `data.len() >= HEADER_BYTES` — the wrapping ixs already
+/// enforce this via PDA-seed-constrained account access, but in-program
+/// callers should prefer the fallible `try_name_registry_header` below
+/// if working with raw bytes from an unknown source.
+pub fn name_registry_header(data: &[u8]) -> &NameRegistry {
+    bytemuck::from_bytes(&data[8..NameRegistry::HEADER_BYTES])
+}
+
+/// Mutable header reader. Used by `buy_record` / `release` to bump
+/// `count`.
+pub fn name_registry_header_mut(data: &mut [u8]) -> &mut NameRegistry {
+    bytemuck::from_bytes_mut(&mut data[8..NameRegistry::HEADER_BYTES])
+}
+
+/// Fallible variants — return an `InvalidAccountData` error instead
+/// of panicking on truncated input. Use these in handlers that receive
+/// account data through `remaining_accounts` or other paths where the
+/// PDA-seed validation can't statically guarantee the size.
+pub fn try_name_registry_header(data: &[u8]) -> Result<&NameRegistry> {
+    require!(
+        data.len() >= NameRegistry::HEADER_BYTES,
+        crate::error::ArnsError::InvalidAccountData
+    );
+    Ok(name_registry_header(data))
+}
+
+pub fn try_name_registry_header_mut(data: &mut [u8]) -> Result<&mut NameRegistry> {
+    require!(
+        data.len() >= NameRegistry::HEADER_BYTES,
+        crate::error::ArnsError::InvalidAccountData
+    );
+    Ok(name_registry_header_mut(data))
+}
+
+/// Append a new NameEntry to the registry. Returns the index it was
+/// written at. Errors with `RegistryFull` if `count >= capacity` (no
+/// expansion auto-triggered; caller must call `admin_expand_name_registry`
+/// in a separate tx).
+///
+/// Encapsulates the borrow-checker dance: header and slot bytes are
+/// non-overlapping regions, but `bytemuck::from_bytes_mut` returns a
+/// reference that conflicts with `cast_slice_mut`. We work around it
+/// by scoping each borrow narrowly.
+pub fn append_name_entry(data: &mut [u8], entry: NameEntry) -> Result<u32> {
+    let capacity = slot_capacity(data);
+    let count_before = name_registry_header(data).count as usize;
+    require!(
+        count_before < capacity,
+        crate::error::ArnsError::RegistryFull
+    );
+    let new_count = (count_before as u32)
+        .checked_add(1)
+        .ok_or(crate::error::ArnsError::ArithmeticOverflow)?;
+    name_registry_header_mut(data).count = new_count;
+    name_slots_mut(data)[count_before] = entry;
+    Ok(count_before as u32)
+}
+
+/// Remove the NameEntry with the given `name_hash` via swap-remove
+/// (move last slot into the freed position, zero out the now-unused
+/// last slot, decrement count). No-op if the hash is not found. The
+/// moved slot's `registry_index` self-pointer is updated to its new
+/// position.
+///
+/// Used by `release_name_to_returned` / lease-expiry cleanup paths.
+pub fn remove_name_entry_by_hash(data: &mut [u8], name_hash: [u8; 32]) -> bool {
+    // Defensive cap: if `count` ever exceeded the slot capacity
+    // (shouldn't happen, but cheap to defend), don't iterate past the
+    // slot region.
+    let count = (name_registry_header(data).count as usize).min(slot_capacity(data));
+    if count == 0 {
+        return false;
+    }
+
+    let mut found_idx: Option<usize> = None;
+    for j in 0..count {
+        if name_slots(data)[j].name_hash == name_hash {
+            found_idx = Some(j);
+            break;
+        }
+    }
+    let idx = match found_idx {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let last = count - 1;
+    if idx != last {
+        let last_entry = name_slots(data)[last];
+        let slots = name_slots_mut(data);
+        slots[idx] = last_entry;
+        slots[idx].registry_index = idx as u32;
+    }
+    name_slots_mut(data)[last] = NameEntry::default();
+    name_registry_header_mut(data).count = (count - 1) as u32;
+    true
 }
 
 /// Entry in the name registry for enumeration
@@ -522,6 +837,42 @@ impl RegistryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================
+    // Metaplex Core AssetV1 owner-read tests
+    // (mirrors ario_ant::read_mpl_core_owner unit tests; BD-106)
+    // =========================================
+
+    #[test]
+    fn read_mpl_core_owner_valid_asset() {
+        let mut data = vec![0u8; 33];
+        data[0] = 1; // Key::AssetV1
+        data[1..33].copy_from_slice(&[7u8; 32]);
+        assert_eq!(read_mpl_core_owner(&data).unwrap(), Pubkey::from([7u8; 32]));
+    }
+
+    #[test]
+    fn read_mpl_core_owner_rejects_wrong_key() {
+        let mut data = vec![0u8; 33];
+        data[0] = 0; // not AssetV1
+        assert!(read_mpl_core_owner(&data).is_err());
+        data[0] = 2; // HashedAssetV1
+        assert!(read_mpl_core_owner(&data).is_err());
+    }
+
+    #[test]
+    fn read_mpl_core_owner_rejects_short_data() {
+        assert!(read_mpl_core_owner(&[1u8; 32]).is_err()); // 32 < 33
+        assert!(read_mpl_core_owner(&[]).is_err());
+    }
+
+    #[test]
+    fn read_mpl_core_owner_ignores_trailing_data() {
+        let mut data = vec![0u8; 64]; // UpdateAuthority etc. trail the owner
+        data[0] = 1;
+        data[1..33].copy_from_slice(&[9u8; 32]);
+        assert_eq!(read_mpl_core_owner(&data).unwrap(), Pubkey::from([9u8; 32]));
+    }
 
     // =========================================
     // 3C. Demand Factor Tests
@@ -604,6 +955,7 @@ mod tests {
             undername_limit: 10,
             purchase_price: 1_000_000,
             bump: 0,
+            version: ARNS_RECORD_VERSION,
         }
     }
 
@@ -619,6 +971,7 @@ mod tests {
             undername_limit: 10,
             purchase_price: 5_000_000,
             bump: 0,
+            version: ARNS_RECORD_VERSION,
         }
     }
 
@@ -712,34 +1065,33 @@ mod tests {
 
     #[test]
     fn demand_factor_size() {
-        // 8 + 8 + 8 + 8 + 8 + 4 + 56 + 56 + 408 + 8 + 1 + 1 = 574
-        assert_eq!(DemandFactor::SIZE, 574);
+        // 8 + 8 + 8 + 8 + 8 + 4 + 56 + 56 + 408 + 8 + 1 + 1 + 3 = 577
+        assert_eq!(DemandFactor::SIZE, 577);
     }
 
     #[test]
     fn arns_config_size() {
-        // 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1 + 32 + 1 = 179
-        assert_eq!(ArnsConfig::SIZE, 179);
+        #[cfg(not(feature = "migration-test"))]
+        assert_eq!(ArnsConfig::SIZE, 182);
+        #[cfg(feature = "migration-test")]
+        assert_eq!(ArnsConfig::SIZE, 182 + 8 + 4 + 1);
     }
 
-    /// ADR-016 / BD-100 layout pin. The asset-side ANT Program design
-    /// deliberately keeps `ArnsRecord` at its pre-PR-40 size (188 bytes)
-    /// — the registry-side approach would have grown this to 220, and
-    /// any future reintroduction of an `ant_program: Pubkey` field
-    /// here would silently bloat every name's rent forever. If this
-    /// assertion fails, refresh the SIZE comment AND the `ANT_OFFSET`
-    /// memcmp constant in `sdk/src/solana/constants.ts`. (See PR #40
-    /// for the rejected registry-side design.)
+    /// ADR-016 / BD-100 layout pin. The memcmp offsets (owner @ 40,
+    /// ant @ 72) are load-bearing — the SDK pins them in
+    /// `sdk/src/solana/constants.ts`. The `version` field sits after
+    /// `bump` (offset 133, 3 bytes) and before the variable-length
+    /// `name` (offset 136) so all fixed-offset fields are unchanged.
     #[test]
-    fn arns_record_layout_pinned_at_188_bytes() {
+    fn arns_record_layout_pinned_at_191_bytes() {
         // discriminator(8) + name_hash(32) + owner(32) + ant(32)
         // + purchase_type(1) + start_timestamp(8) + end_timestamp(1+8)
-        // + undername_limit(2) + purchase_price(8) + bump(1)
+        // + undername_limit(2) + purchase_price(8) + bump(1) + version(3)
         // + name(4 + MAX_NAME_LENGTH=51)
-        // = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + 4 + 51
-        // = 188
-        assert_eq!(ArnsRecord::SIZE, 188);
-        // Byte offsets pinned for the SDK's memcmp queries.
+        // = 8 + 32 + 32 + 32 + 1 + 8 + 9 + 2 + 8 + 1 + 3 + 4 + 51
+        // = 191
+        assert_eq!(ArnsRecord::SIZE, 191);
+        // Byte offsets pinned for the SDK's memcmp queries — MUST NOT CHANGE.
         assert_eq!(ArnsRecord::OWNER_OFFSET, 40);
         assert_eq!(ArnsRecord::ANT_OFFSET, 72);
     }
@@ -858,15 +1210,15 @@ mod tests {
     }
 
     #[test]
-    fn demand_factor_size_574() {
+    fn demand_factor_size_577() {
         // discriminator(8) + current_demand_factor(8) + current_period(8)
         // + purchases_this_period(8) + revenue_this_period(8)
         // + consecutive_periods_with_min_demand_factor(4)
         // + trailing_period_purchases(8*7=56)
         // + trailing_period_revenues(8*7=56)
         // + fees(8*51=408) + period_zero_start_timestamp(8)
-        // + criteria(1) + bump(1) = 574
-        assert_eq!(DemandFactor::SIZE, 574);
+        // + criteria(1) + bump(1) + version(3) = 577
+        assert_eq!(DemandFactor::SIZE, 577);
     }
 
     fn make_demand_factor(
@@ -888,6 +1240,7 @@ mod tests {
             period_zero_start_timestamp: 0,
             criteria,
             bump: 0,
+            version: DEMAND_FACTOR_VERSION,
         }
     }
 

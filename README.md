@@ -40,7 +40,7 @@ edge exists.
 ## Status
 
 * **Devnet**: deployed by CI on every merge to `develop`. Program IDs
-  pinned in [`program-ids/devnet.json`](program-ids/devnet.json).
+  pinned in [`program-ids/staging.json`](program-ids/staging.json).
 * **Mainnet**: upgrades staged by CI on every merge to `main`, executed
   by the AR.IO Squads multisig. Program IDs pinned in
   [`program-ids/mainnet.json`](program-ids/mainnet.json).
@@ -58,7 +58,7 @@ edge exists.
 ├── localnet/
 │   └── surfpool-svm-features.sh # canonical Surfpool feature gate list
 ├── program-ids/                 # per-cluster program ID manifests (committed)
-│   ├── devnet.json
+│   ├── staging.json
 │   └── mainnet.json
 ├── programs/
 │   ├── ario-core/
@@ -101,7 +101,7 @@ edge exists.
 | Rust (BPF)          | `1.79.0`   | bundled inside `cargo-build-sbf`; Cargo.lock must stay parseable by its Cargo 1.79 (see note below). |
 | Solana (Agave) CLI  | `2.1.0`    | newer 2.x releases drop Cargo 1.79 manifest support |
 | Anchor              | `0.31.1`   | `avm install 0.31.1 && avm use 0.31.1` |
-| [Surfpool](https://github.com/solana-foundation/surfpool) | `1.1+` | local validator with mainnet-style SVM gates |
+| [Surfpool](https://github.com/solana-foundation/surfpool) | `1.2.x` | local validator with mainnet-style SVM gates. **Use `1.2.x` specifically** — `1.1.x` lacks `--skip-blockhash-check` (added in 1.2.0, used by `scripts/start-localnet.sh`); `1.3.x` changed `--rpc-port` → `--port` (script not yet adapted). |
 | `cargo-fuzz` *(optional)* | latest | for the escrow signature-verifier fuzz targets |
 
 `Cargo.toml` pins several workspace deps (`solana-*=2.1.0`,
@@ -179,16 +179,19 @@ feature branch ─PR─▶ develop ─PR─▶ main
   full test suite, IDL ABI stability check, escrow fuzz smoke) before
   the PR is mergeable.
 * Merging to `develop` triggers `upgrade-devnet.yml`: full build, deploy
-  to devnet, refresh `program-ids/devnet.json` (auto-committed back to
+  to devnet, refresh `program-ids/staging.json` (auto-committed back to
   `develop`), and publish a versioned release tarball with IDLs + .so +
   keypairs so downstream clients can update or run their own Surfpool.
 * Cutting a mainnet release happens by opening a `develop → main` PR.
   Required reviewers / branch protection on `main` are the human gate.
   Merging triggers `upgrade-mainnet.yml`: build with mainnet feature
   flags, stage upgrade buffers, transfer buffer authority to the
-  Squads V4 multisig, attach a buffer manifest to a draft GitHub
-  release. The multisig signers vote and execute the upgrade
-  separately (CI never holds the upgrade key).
+  Squads V3 multisig vault (authority index 1), attach a buffer manifest
+  to a draft GitHub release. The multisig signers vote and execute the
+  upgrade separately from the legacy Squads (V3) app (CI never holds the
+  upgrade key). Step-by-step admin ceremonies (program upgrades **and**
+  privileged admin instructions) are in
+  [`docs/SQUADS_OPS.md`](docs/SQUADS_OPS.md).
 
 ### Day-to-day commands
 
@@ -263,7 +266,7 @@ deploys (a manual operator action — see below).
    workflow will not produce a keypair file in `target/deploy/`,
    `~/.config/solana/`, or anywhere else on the runner.
 3. Runs `scripts/devnet-deploy.sh`:
-   1. Reads `program-ids/devnet.json` for the live program IDs.
+   1. Reads `program-ids/staging.json` for the live program IDs.
    2. Calls `bash build-sbf.sh --sync-from-manifest`, which patches each
       program's `declare_id!()` in source from the manifest, builds the
       `.so` files, then restores source on EXIT. The `.so`s in
@@ -274,10 +277,10 @@ deploys (a manual operator action — see below).
       `vars.DEVNET_RPC_URL`, signed by the in-memory authority key.
       Programs with `null` entries (today `ario_ant_escrow`) are
       skipped — first deploys never happen in CI.
-   4. Updates `program-ids/devnet.json` with the new `deployer` and
+   4. Updates `program-ids/staging.json` with the new `deployer` and
       per-program `deployed_at` timestamps. `.programs` is **never**
       overwritten by CI.
-4. Auto-commits & pushes `program-ids/devnet.json` if it changed.
+4. Auto-commits & pushes `program-ids/staging.json` if it changed.
 5. Runs `scripts/package-release.sh` and uploads
    `release/ar-io-solana-contracts-devnet-<ts>-<sha>.tar.gz` as both a
    workflow artifact and a GitHub pre-release.
@@ -288,7 +291,7 @@ The bundle includes:
   entry)
 * `so/*.so` — compiled BPF binaries (same set)
 * `program-ids.json` — same content as the in-repo
-  `program-ids/devnet.json`
+  `program-ids/staging.json`
 * `VERSION` — version, cluster, git SHA, build timestamp, toolchain
   versions
 * `SHA256SUMS` — checksums
@@ -343,7 +346,7 @@ land on devnet (today: only `ario_ant_escrow`):
    solana program set-upgrade-authority <new_program_id> \
      --new-upgrade-authority <DEVNET_AUTHORITY_PUBKEY>
    ```
-5. Add the resulting program ID to `program-ids/devnet.json` under
+5. Add the resulting program ID to `program-ids/staging.json` under
    `.programs.<name>` and commit. CI will pick it up automatically on
    the next merge to `develop`.
 
@@ -357,21 +360,28 @@ land on devnet (today: only `ario_ant_escrow`):
 3. Verifies `declare_id!()` matches `program-ids/mainnet.json` exactly
    (drift here would brick the upgrade).
 4. Runs `scripts/mainnet-prepare-upgrade.sh`:
+   * Verifies the V3 vault (`SQUADS_V3_VAULT`, falling back to the legacy
+     `SQUADS_MULTISIG_PUBKEY` var) is System-owned — rejecting a multisig
+     *config* account or a V4 multisig.
+   * `solana program extend`s any program whose new `.so` exceeds its
+     on-chain ProgramData capacity (permissionless; the Execute would
+     otherwise fail on size).
    * Generates a fresh buffer keypair per program.
    * `solana program write-buffer` uploads the new `.so` to that buffer.
    * `solana program set-buffer-authority` transfers control of the
-     buffer to the Squads V4 multisig (`vars.SQUADS_MULTISIG_PUBKEY`).
+     buffer to the **Squads V3 vault** (authority index 1).
    * Emits `release/upgrade-<sha>/buffer-manifest.json` listing
      `{program, buffer, buffer_sha256, so_size_bytes}`.
 5. Publishes a draft GitHub release with the bundle + manifest attached.
 
-The Squads multisig signers then:
+The Squads V3 multisig signers then (from the **legacy** Squads app, not
+app.squads.so):
 
 1. Independently fetch each buffer (`solana program dump <buffer>
    /tmp/<prog>.so`) and verify `shasum -a 256` against
    `buffer_sha256` from the manifest.
-2. From the Squads UI, propose an `Upgrade(program, buffer, spill,
-   authority=multisig)` transaction.
+2. In Developers → Programs, "Add upgrade" with the buffer + spill, then
+   "Verify authority" (the buffer authority is already the vault).
 3. Approve to threshold and execute. The new bytecode is now live.
 
 Required GitHub repo configuration:
@@ -383,8 +393,12 @@ Required GitHub repo configuration:
     <buffer>` after the upgrade lands.
 * Variables:
   * `MAINNET_RPC_URL` (default `https://api.mainnet-beta.solana.com`).
-  * `SQUADS_MULTISIG_PUBKEY` — the multisig that will hold buffer
-    authority.
+  * `SQUADS_MULTISIG_PUBKEY` — **the Squads V3 vault PDA (authority index
+    1)** that holds upgrade authority and receives buffer authority. NOT the
+    multisig config account. (The script reads this as `SQUADS_V3_VAULT` and
+    verifies it is System-owned, so a wrong value is caught before staging.)
+    Optionally also set `SQUADS_V3_MULTISIG` (the config account) for a
+    SMPL-ownership cross-check.
 
 > **Why this split.** CI runs without an upgrade key. Buffer staging
 > is reversible (the multisig can `program close` the buffers if

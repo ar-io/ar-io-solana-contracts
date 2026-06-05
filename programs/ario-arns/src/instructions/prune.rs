@@ -72,26 +72,12 @@ pub mod prune_expired {
                 continue;
             }
 
-            // M5: Remove from NameRegistry (swap-remove pattern)
+            // M5: Remove from NameRegistry (swap-remove via byte-offset
+            // helper, ADR-020 dynamic-capacity layout).
             {
-                let mut registry = ctx.accounts.name_registry.load_mut()?;
-                let reg_count = registry.count as usize;
-                let mut found_idx = None;
-                for j in 0..reg_count {
-                    if registry.names[j].name_hash == record.name_hash {
-                        found_idx = Some(j);
-                        break;
-                    }
-                }
-                if let Some(idx) = found_idx {
-                    let last = reg_count - 1;
-                    if idx != last {
-                        registry.names[idx] = registry.names[last];
-                        registry.names[idx].registry_index = idx as u32;
-                    }
-                    registry.names[last] = NameEntry::default();
-                    registry.count = registry.count.saturating_sub(1);
-                }
+                let registry_info = &ctx.accounts.name_registry;
+                let mut registry_data = registry_info.try_borrow_mut_data()?;
+                remove_name_entry_by_hash(&mut registry_data, record.name_hash);
             }
 
             // Close the account: transfer lamports to payer
@@ -243,6 +229,7 @@ pub mod prune_to_returned {
         returned.returned_at = clock.unix_timestamp;
         returned.initiator = config.key(); // Protocol-initiated (100% to protocol on buy)
         returned.bump = ctx.bumps.returned_name;
+        returned.version = RETURNED_NAME_VERSION;
 
         // Update prune schedule
         let prune_ts = clock
@@ -255,24 +242,12 @@ pub mod prune_to_returned {
 
         config.total_names_registered = config.total_names_registered.saturating_sub(1);
 
-        // Remove from name registry
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        let mut found_idx = None;
-        for i in 0..count {
-            if registry.names[i].name_hash == name_hash {
-                found_idx = Some(i);
-                break;
-            }
-        }
-        if let Some(idx) = found_idx {
-            let last = count - 1;
-            if idx != last {
-                registry.names[idx] = registry.names[last];
-                registry.names[idx].registry_index = idx as u32;
-            }
-            registry.names[last] = NameEntry::default();
-            registry.count = registry.count.saturating_sub(1);
+        // Remove from name registry (swap-remove via byte-offset helper,
+        // ADR-020 dynamic-capacity layout).
+        {
+            let registry_info = &ctx.accounts.name_registry;
+            let mut registry_data = registry_info.try_borrow_mut_data()?;
+            remove_name_entry_by_hash(&mut registry_data, name_hash);
         }
 
         // ArnsRecord closed by close constraint
@@ -306,8 +281,10 @@ pub struct PruneExpiredNames<'info> {
     pub config: Account<'info, ArnsConfig>,
 
     /// M5: NameRegistry for removing pruned entries
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -356,8 +333,10 @@ pub struct PruneToReturned<'info> {
     )]
     pub returned_name: Account<'info, ReturnedName>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,

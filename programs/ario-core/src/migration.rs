@@ -11,8 +11,14 @@ use crate::error::ArioError;
 use crate::state::*;
 
 /// Migration deadline: imports are rejected after this timestamp.
-// Migration deadline: 2026-06-18 00:00:00 UTC. Update before mainnet if migration date changes.
-pub const MIGRATION_DEADLINE: i64 = 1781884800;
+// 2112-04-20 00:01:09 UTC -- INTENTIONALLY far-future BY DESIGN. The AR.IO Solana migration uses no
+// time-based cutoff; finalize_migration (authority-gated, one-shot) is the sole control on the
+// migration-authority write window. The constant is retained so the existing deadline checks
+// compile and short-circuit harmlessly, and the far-future value (vs i64::MAX) keeps the time check
+// permanently inert without overflow risk in deadline arithmetic. Accepted resolution of audit
+// MIGRATION-001 (see docs/SECURITY_AUDIT_INDEPENDENT.md): the time-window risk is accepted, with
+// finalize_migration bounding the window operationally.
+pub const MIGRATION_DEADLINE: i64 = 4490553669;
 
 // =========================================
 // DISCRIMINATOR VALIDATION
@@ -26,6 +32,14 @@ fn known_discriminator(disc: &[u8; 8]) -> Option<usize> {
         ("account:VaultCounter", VaultCounter::SIZE),
         ("account:PrimaryName", PrimaryName::SIZE),
         ("account:PrimaryNameRequest", PrimaryNameRequest::SIZE),
+        // Reverse (name -> owner) lookup record. Migrated via import_account
+        // alongside the forward PrimaryName; both phase5-user-state and the
+        // backfill-primary-name-reverse tool emit it. Omitting it here made
+        // import_account reject every reverse record (InvalidAccountData 6041),
+        // which would also break later set_primary_name / approve_primary_name
+        // (they take the reverse PDA as a mut account). No authority field, so
+        // no overwrite-hijack risk that warrants the config-style exclusion.
+        ("account:PrimaryNameReverse", PrimaryNameReverse::SIZE),
     ];
     for (name, size) in checks {
         let h = hash(name.as_bytes());
@@ -190,6 +204,7 @@ pub fn import_balance_handler(
     balance.owner = owner;
     balance.amount = amount;
     balance.bump = ctx.bumps.balance;
+    balance.version = BALANCE_VERSION;
 
     // Pre-registered branch: distribute tokens to the recipient ATA.
     // Unregistered (owner == migration_authority) skips — those tokens stay

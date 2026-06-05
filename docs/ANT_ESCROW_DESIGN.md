@@ -938,7 +938,7 @@ For Ethereum, show the EIP-191 prefix as a separate block so users can see what'
 
 3. **Solana → Solana escrow (Ed25519 path).** Trivial to add given the multi-protocol design. Useful for sub-account flows and enterprise wallets that want to escrow ANTs internally.
 
-4. **Permissionless cleanup of abandoned escrows.** Add a no-op `prune_abandoned` instruction with a long expiry (e.g., 5 years of zero activity) that allows anyone to close the escrow and burn the rent. Solves the state-bloat concern at minor UX cost. Decide if this is worth the complexity vs accepting the ~$0.67 abandonment cost.
+4. **Permissionless cleanup of abandoned escrows.** ✅ **SHIPPED via ADR-019 (2026-05-21)** as `admin_purge_unclaimed_ant` — admin-gated rather than fully permissionless (signer must equal `ArioConfig.authority`) to keep mainnet treasury flows on a single key, but otherwise matches this design with a 5-year grace via `UNCLAIMED_PURGE_GRACE_SLOTS = 394_200_000`. Paired with `admin_close_orphaned_ant_state` in `ario-ant` for post-burn per-ANT PDA cleanup. See `RENT_RECLAIM.md` for the operator runbook.
 
 5. **Multi-recipient escrows.** `recipient: OneOf<Vec<Pubkey>>` allowing any of N keys to claim. Useful for enterprise wallets with multi-key arrangements. Adds verification complexity and account size; defer until use case is concrete.
 
@@ -963,7 +963,11 @@ The program now has **15 total instructions**: the original 5 ANT instructions p
 
 **Vault claim behavior:**
 
-Active vaults (where `end_timestamp > now`) are claimed using transaction instruction introspection: the escrow verifies via `sysvar::instructions` that a matching `ario_core::vaulted_transfer` instruction exists in the same transaction (20-instruction loop limit, 60-second tolerance on lock duration). The sibling `vaulted_transfer` creates a new time-locked vault for the claimant preserving the remaining lock duration. Expired vaults are claimed as liquid SPL transfers. This preserves the protocol's staking/locking invariants.
+Vaults are claimable **only after** `end_timestamp` and are delivered as **liquid** SPL transfers to the claimant. A claim attempted while the vault is still locked (`now < end_timestamp`) is rejected with `VaultStillLocked`.
+
+> **ADR-022 (2026-05-28): the active-vault re-lock path was removed.** Previously, claiming a still-locked vault released tokens to a wallet and re-locked them for the claimant via a sibling `ario_core::vaulted_transfer` confirmed by `sysvar::instructions` introspection. That introspection had no 1:1 binding between a claim and the re-lock it credited, so one `vaulted_transfer` could satisfy multiple batched claims (lock bypass / relayer skim; Codex finding). Because the re-lock granted the claimant no liquidity, nothing depended on it (the migration claims vaults liquid-after-expiry), token/vault escrows are never purged, and escrow is pre-mainnet, the path was disabled rather than reworked. The heavier direct-CPI design that would preserve early-claim-with-preserved-lock is recorded in ADR-022 as the way to revive it. See **ADR-022** / **BD-107**.
+
+The earlier revocable-controller theft variant on the (now-removed) active path was independently closed by **ADR-021** / **BD-105**, and `deposit_vault` still rejects `revocable=true` (`RevocableVaultUnsupported`). `ario_core` revocable vaults are unaffected for direct use; only the escrow declines to produce/accept them.
 
 **Account model:**
 

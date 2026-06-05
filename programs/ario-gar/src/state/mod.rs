@@ -46,6 +46,88 @@ pub const EPOCH_SETTINGS_SEED: &[u8] = b"epoch_settings";
 pub const OBSERVATION_SEED: &[u8] = b"observation";
 
 // =========================================
+// BORSH / ACCOUNT LAYOUT SIZING CONSTANTS
+// =========================================
+
+/// Anchor account discriminator (first 8 bytes of SHA-256("account:<Name>")).
+pub const ANCHOR_DISCRIMINATOR_SIZE: usize = 8;
+
+/// Solana `Pubkey` serialized size.
+pub const PUBKEY_SIZE: usize = 32;
+
+/// Borsh `u32` length prefix used for `String` and `Vec<T>`.
+pub const BORSH_LEN_PREFIX: usize = 4;
+
+/// Borsh `Option<T>` discriminant byte (0 = None, 1 = Some).
+pub const BORSH_OPTION_PREFIX: usize = 1;
+
+/// Bump seed (single `u8`).
+pub const BUMP_SIZE: usize = 1;
+
+/// `SchemaVersion { major, minor, patch }` — 3 consecutive u8s.
+pub const SCHEMA_VERSION_SIZE: usize = 3;
+
+// =========================================
+// SCHEMA VERSION
+// =========================================
+
+/// Semantic version for GAR on-chain account schemas.
+///
+/// Stored as three consecutive `u8` bytes (3 bytes on the wire).
+/// `Ord` is derived lexicographically over `(major, minor, patch)`, which
+/// matches semver precedence: major is compared first, then minor, then
+/// patch. This means `account.version < ACCOUNT_VERSION` is a valid
+/// "needs migration" guard.
+///
+/// Bump rules:
+///   - `major`: breaking layout change (field removed, type changed, reorder)
+///   - `minor`: additive layout change (new field appended, default = zero)
+///   - `patch`: logic-only change (no layout change; bump optional for audits)
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
+pub struct SchemaVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl SchemaVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+// =========================================
+// PER-ACCOUNT VERSION CONSTANTS
+// =========================================
+
+#[cfg(not(feature = "migration-test"))]
+pub const GATEWAY_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+#[cfg(feature = "migration-test")]
+pub const GATEWAY_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
+pub const GATEWAY_REGISTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+// 1.1.0: GatewaySettings2 gained `pending_delegate_reward_share_ratio` (Fix #7)
+// and `delegation_disabled_at` (Fix #6). Because GatewaySettings2 sits mid-struct
+// inside Gateway, this is NOT an in-place grow-then-deserialize migration — see
+// `schema_migration::migrate_gateway_version`. Existing pre-1.1.0 accounts are
+// recreated (devnet/staging full redeploy), not migrated.
+pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
+pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const WITHDRAWAL_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ALLOWLIST_ENTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const OBSERVER_LOOKUP_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const REDELEGATION_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const EPOCH_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const EPOCH_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const OBSERVATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+
+// =========================================
 // GATEWAY SETTINGS
 // =========================================
 
@@ -95,9 +177,17 @@ pub struct GatewaySettings {
     pub total_delegated: u64,
     pub total_withdrawn: u64,
     pub bump: u8,
+    pub version: SchemaVersion,
+    #[cfg(feature = "migration-test")]
+    pub field_1: u64,
+    #[cfg(feature = "migration-test")]
+    pub field_2: u32,
+    #[cfg(feature = "migration-test")]
+    pub field_3: bool,
 }
 
 impl GatewaySettings {
+    #[cfg(not(feature = "migration-test"))]
     pub const SIZE: usize = 8  // discriminator
         + 32  // authority
         + 32  // mint
@@ -116,7 +206,32 @@ impl GatewaySettings {
         + 8   // total_staked
         + 8   // total_delegated
         + 8   // total_withdrawn
-        + 1; // bump
+        + 1   // bump
+        + SCHEMA_VERSION_SIZE; // version
+    #[cfg(feature = "migration-test")]
+    pub const SIZE: usize = 8  // discriminator
+        + 32  // authority
+        + 32  // mint
+        + 8   // min_operator_stake
+        + 8   // min_delegate_stake
+        + 8   // withdrawal_period
+        + 8   // max_expedited_withdrawal_penalty
+        + 8   // min_expedited_withdrawal_penalty
+        + 8   // min_expedited_withdrawal_amount
+        + 4   // max_delegates_per_gateway
+        + 1   // migration_active
+        + 32  // migration_authority
+        + 32  // stake_token_account
+        + 32  // protocol_token_account
+        + 32  // arns_program_id
+        + 8   // total_staked
+        + 8   // total_delegated
+        + 8   // total_withdrawn
+        + 1   // bump
+        + SCHEMA_VERSION_SIZE // version
+        + 8   // field_1
+        + 4   // field_2
+        + 1; // field_3
 }
 
 // =========================================
@@ -140,7 +255,17 @@ pub struct GatewaySlot {
     pub composite_weight: u64, // 8 bytes
     pub start_timestamp: i64,  // 8 bytes
     pub status: u8,            // 1 byte (see STATUS_* constants)
-    pub _padding: [u8; 7],     // 7 bytes (align struct to 8 bytes)
+    /// 1 = this gateway carried delegated stake when its weight was tallied
+    /// for the in-flight epoch; 0 = none. Written by `tally_weights`, read by
+    /// `distribute_epoch` to decide whether the delegate reward share is
+    /// carved out — independent of the *live* `total_delegated_stake` at
+    /// distribution time. This closes the reward-theft race where an operator
+    /// disables delegation and cranks every delegate into a withdrawal vault
+    /// between tally and distribution (dropping live delegated stake to 0) to
+    /// redirect the delegate share into operator_stake. See ADR-025 / BD-111.
+    /// Carved from former `_padding` — `GatewaySlot::SIZE` is unchanged.
+    pub delegated_at_tally: u8, // 1 byte
+    pub _padding: [u8; 6],     // 6 bytes (align struct to 8 bytes)
 }
 
 impl GatewaySlot {
@@ -153,15 +278,10 @@ impl GatewaySlot {
 /// PDA: ["gateway_registry"]
 /// NOTE: Uses zero-copy for performance with large gateway counts.
 ///
-/// **Capacity is build-time configurable.** Production builds use 3,000
-/// slots (~168 KB on-chain, ~1.17 SOL rent). Devnet/testnet smoke-test
-/// builds enable `--features devnet-shrunk` to compile with 30 slots
-/// (~1.7 KB, ~0.012 SOL rent), avoiding ~57 SOL of stranded rent across
-/// the registries when smoke-testing capacity isn't needed. The on-chain
-/// account size MUST match the binary's expectation (Anchor zero-copy
-/// requires exact size match); deploying a `devnet-shrunk` binary against
-/// an account allocated for production size will panic on every
-/// `AccountLoader::load()`, and vice versa.
+/// Fixed capacity of 3,000 slots (~168 KB on-chain, ~1.17 SOL rent). The
+/// on-chain account size MUST match the binary's expectation (Anchor zero-copy
+/// requires an exact size match), so this is a compile-time constant across all
+/// clusters — staging and mainnet both use full size.
 #[account(zero_copy(unsafe))]
 #[repr(C)]
 pub struct GatewayRegistry {
@@ -169,20 +289,16 @@ pub struct GatewayRegistry {
     pub authority: Pubkey,
     pub count: u32,
     pub _padding: [u8; 4],
-    #[cfg(not(feature = "devnet-shrunk"))]
     pub gateways: [GatewaySlot; 3000],
-    #[cfg(feature = "devnet-shrunk")]
-    pub gateways: [GatewaySlot; 30],
+    pub version_bytes: [u8; 3],
+    pub _padding2: [u8; 5],
 }
 
 impl GatewayRegistry {
-    /// 32 (authority) + 4 (count) + 4 (_padding) + 56 (GatewaySlot) * MAX_GATEWAYS.
-    /// Production: 32+4+4+(56*3000) = 168,040. Devnet-shrunk: 32+4+4+(56*30) = 1,720.
-    pub const SIZE: usize = 32 + 4 + 4 + (56 * Self::MAX_GATEWAYS);
-    #[cfg(not(feature = "devnet-shrunk"))]
+    /// 32 (authority) + 4 (count) + 4 (_padding) + 56 (GatewaySlot) * MAX_GATEWAYS
+    /// + 3 (version_bytes) + 5 (_padding2).
+    pub const SIZE: usize = 32 + 4 + 4 + (56 * Self::MAX_GATEWAYS) + 3 + 5;
     pub const MAX_GATEWAYS: usize = 3000;
-    #[cfg(feature = "devnet-shrunk")]
-    pub const MAX_GATEWAYS: usize = 30;
 }
 
 // =========================================
@@ -226,6 +342,7 @@ pub struct Gateway {
     /// Increases each epoch during distribute_epoch
     pub cumulative_reward_per_token: u128,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl Gateway {
@@ -249,7 +366,8 @@ impl Gateway {
         + RegistryIndex::SIZE  // registry_index
         + 32  // observer_address
         + 16  // cumulative_reward_per_token
-        + 1; // bump
+        + 1   // bump
+        + SCHEMA_VERSION_SIZE; // version
 
     /// Minimum operator stake required to join (in base units)
     pub const MIN_OPERATOR_STAKE: u64 = 20_000_000_000; // 20,000 ARIO
@@ -303,10 +421,26 @@ pub struct GatewaySettings2 {
     /// When true, only delegates on the allowlist (or existing stakers) can delegate
     /// Matches Lua: allowedDelegatesLookup ~= nil
     pub allowlist_enabled: bool,
+    /// Fix #7 (WP §6.3): a `delegate_reward_share_ratio` change requested via
+    /// `update_gateway_settings` during an epoch is staged here and applied at
+    /// the next `tally_weights` (start of the following epoch), so an operator
+    /// can't front-run `distribute_epoch` to change their reward split. `None`
+    /// when no change is pending. Stored in basis points (0-10000), same scale
+    /// as `delegate_reward_share_ratio`.
+    pub pending_delegate_reward_share_ratio: Option<u16>,
+    /// Fix #6 (WP §6.3): timestamp (seconds) when the operator disabled
+    /// `allow_delegated_staking`. Starts the cooldown that blocks re-enabling
+    /// until all delegates have been withdrawn AND `settings.withdrawal_period`
+    /// has elapsed. `None` when delegation is enabled (or was never disabled).
+    pub delegation_disabled_at: Option<i64>,
 }
 
 impl GatewaySettings2 {
-    pub const SIZE: usize = 1 + 2 + 8 + 1;
+    // 1 (allow_delegated_staking) + 2 (delegate_reward_share_ratio)
+    // + 8 (min_delegation_amount) + 1 (allowlist_enabled)
+    // + 3 (pending_delegate_reward_share_ratio: Option<u16>, max)
+    // + 9 (delegation_disabled_at: Option<i64>, max)
+    pub const SIZE: usize = 1 + 2 + 8 + 1 + 3 + 9;
 }
 
 /// Gateway weights for epoch observer selection and reward distribution
@@ -464,10 +598,11 @@ pub struct Delegation {
     /// gateway's current accumulator is what's owed to the delegate.
     pub reward_debt: u128,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl Delegation {
-    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1;
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1 + SCHEMA_VERSION_SIZE;
 }
 
 /// Settle pending delegate rewards using the reward-per-share accumulator.
@@ -509,10 +644,11 @@ pub struct WithdrawalCounter {
     pub owner: Pubkey,
     pub next_id: u64,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl WithdrawalCounter {
-    pub const SIZE: usize = 8 + 32 + 8 + 1;
+    pub const SIZE: usize = 8 + 32 + 8 + 1 + SCHEMA_VERSION_SIZE;
 }
 
 /// Pending withdrawal
@@ -542,14 +678,15 @@ pub struct Withdrawal {
     /// vault that behaves like every other operator-side withdrawal.
     pub is_protected: bool,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl Withdrawal {
     /// Account discriminator (8) + owner (32) + id (8) + gateway (32)
     /// + amount (8) + created_at (8) + available_at (8)
     /// + is_delegate (1) + is_exit_vault (1) + is_protected (1)
-    /// + bump (1) = 108 bytes.
-    pub const SIZE: usize = 8 + 32 + 8 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1;
+    /// + bump (1) + version (3) = 111 bytes.
+    pub const SIZE: usize = 8 + 32 + 8 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -564,10 +701,11 @@ pub struct AllowlistEntry {
     pub delegate: Pubkey,
     pub added_at: i64,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl AllowlistEntry {
-    pub const SIZE: usize = 8 + 32 + 32 + 8 + 1;
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 1 + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -581,10 +719,11 @@ impl AllowlistEntry {
 pub struct ObserverLookup {
     pub gateway: Pubkey,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl ObserverLookup {
-    pub const SIZE: usize = 8 + 32 + 1; // 41
+    pub const SIZE: usize = 8 + 32 + 1 + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -605,10 +744,11 @@ pub struct RedelegationRecord {
     /// When the fee counter resets (last_redelegation_at + 7 days)
     pub fee_reset_at: i64,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl RedelegationRecord {
-    pub const SIZE: usize = 8 + 32 + 4 + 8 + 8 + 1;
+    pub const SIZE: usize = 8 + 32 + 4 + 8 + 8 + 1 + SCHEMA_VERSION_SIZE;
 
     /// Redelegation fee reset interval (7 days, matches Lua)
     pub const FEE_RESET_INTERVAL: i64 = 7 * 86_400;
@@ -680,6 +820,7 @@ pub struct EpochSettings {
     /// instead of instantly disabling. create_epoch checks this timestamp.
     pub disable_at: i64,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl EpochSettings {
@@ -694,7 +835,8 @@ impl EpochSettings {
         + 1   // max_consecutive_failures
         + 8   // failed_gateway_slash_rate
         + 8   // disable_at
-        + 1; // bump
+        + 1   // bump
+        + SCHEMA_VERSION_SIZE; // version
     /// 7-day timelock for disabling epochs
     pub const EPOCH_DISABLE_DELAY: i64 = 7 * 24 * 60 * 60;
 }
@@ -726,6 +868,16 @@ pub struct Epoch {
     pub total_composite_weight_hi: u64,
 
     // --- Hashchain for deterministic randomness ---
+    /// Deterministic entropy beacon. Written **exactly once**, in
+    /// `create_epoch` via `load_init()` (`epoch.rs`), and read-only
+    /// thereafter — `tally_weights`, `prescribe_epoch`, `distribute_epoch`,
+    /// `close_epoch`, and every admin/migration path leave it untouched
+    /// (verified: the only write in the crate is `epoch.hashchain = …` in
+    /// `create_epoch`). This stability between `weights_tallied == 1` and
+    /// `prescribe_epoch` is what lets a client mirror the observer-selection
+    /// roulette off-chain to know which Gateway PDAs to pass as
+    /// `remaining_accounts`. See `@ar.io/sdk`'s `predictPrescribedObservers`
+    /// helper and `programs/ario-gar/examples/predict_prescribed_observers.rs`.
     pub hashchain: [u8; 32],
 
     // --- u32 fields ---
@@ -748,10 +900,7 @@ pub struct Epoch {
     pub observations_closed: u8,
 
     // --- Failure tallies (u16 per gateway slot — sized to GatewayRegistry::MAX_GATEWAYS) ---
-    #[cfg(not(feature = "devnet-shrunk"))]
     pub failure_counts: [u16; 3000],
-    #[cfg(feature = "devnet-shrunk")]
-    pub failure_counts: [u16; 30],
 
     // --- Embedded prescriptions ---
     /// Observer addresses (the observer_address from Gateway, used to verify signer)
@@ -763,7 +912,8 @@ pub struct Epoch {
 
     /// Bitmap tracking which prescribed observers have submitted (50 bits = 7 bytes)
     pub has_observed: [u8; 7],
-    pub _padding2: [u8; 5],
+    pub version_bytes: [u8; 3],
+    pub _padding2: [u8; 2],
 }
 
 impl Epoch {
@@ -851,10 +1001,11 @@ pub struct Observation {
     pub report_tx_id: [u8; 32],
     pub submitted_at: i64,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl Observation {
-    pub const SIZE: usize = 8 + 8 + 32 + 375 + 2 + 32 + 8 + 1;
+    pub const SIZE: usize = 8 + 8 + 32 + 375 + 2 + 32 + 8 + 1 + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -1125,6 +1276,7 @@ mod tests {
             last_redelegation_at: 0,
             fee_reset_at,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         }
     }
 
@@ -1190,7 +1342,9 @@ mod tests {
     #[test]
     fn gateway_settings2_size_correct() {
         // 1 + 2 + 8 + 1 = 12 (auto_stake removed in cfc7a8b)
-        assert_eq!(GatewaySettings2::SIZE, 12);
+        // + 3 (pending_delegate_reward_share_ratio: Option<u16>, Fix #7)
+        // + 9 (delegation_disabled_at: Option<i64>, Fix #6) = 24
+        assert_eq!(GatewaySettings2::SIZE, 24);
     }
 
     #[test]
@@ -1209,17 +1363,8 @@ mod tests {
 
     #[test]
     fn epoch_size_correct() {
-        #[cfg(not(feature = "devnet-shrunk"))]
-        {
-            // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
-            assert_eq!(Epoch::SIZE, 9400);
-        }
-        #[cfg(feature = "devnet-shrunk")]
-        {
-            // 9*8 + 32 + 3*4 + 8*1 + 30*2 + 50*32*2 + 2*32 + 7 + 5 = 3460,
-            // padded to next u64 boundary = 3464.
-            assert_eq!(Epoch::SIZE, 3464);
-        }
+        // 9*8 + 32 + 3*4 + 8*1 + 3000*2 + 50*32*2 + 2*32 + 7 + 5 = 9400
+        assert_eq!(Epoch::SIZE, 9400);
     }
 
     // =========================================
@@ -1330,12 +1475,12 @@ mod tests {
 
     #[test]
     fn withdrawal_size_correct() {
-        assert_eq!(Withdrawal::SIZE, 108);
+        assert_eq!(Withdrawal::SIZE, 111);
     }
 
     #[test]
     fn withdrawal_counter_size_correct() {
-        assert_eq!(WithdrawalCounter::SIZE, 49);
+        assert_eq!(WithdrawalCounter::SIZE, 52);
     }
 
     fn make_withdrawal(is_exit_vault: bool, available_at: i64) -> Withdrawal {
@@ -1350,6 +1495,7 @@ mod tests {
             is_exit_vault,
             is_protected: false,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         }
     }
 
@@ -1368,9 +1514,9 @@ mod tests {
     #[test]
     fn withdrawal_size_constant_matches_layout() {
         // Discriminator + owner + id + gateway + amount + created_at +
-        // available_at + is_delegate + is_exit_vault + is_protected + bump
-        // = 8 + 32 + 8 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 = 108
-        assert_eq!(Withdrawal::SIZE, 108);
+        // available_at + is_delegate + is_exit_vault + is_protected + bump + version
+        // = 8 + 32 + 8 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 3 = 111
+        assert_eq!(Withdrawal::SIZE, 111);
     }
 
     #[test]
@@ -1498,11 +1644,14 @@ mod tests {
                 delegate_reward_share_ratio: 500,
                 min_delegation_amount: 10_000_000,
                 allowlist_enabled: false,
+                pending_delegate_reward_share_ratio: None,
+                delegation_disabled_at: None,
             },
             registry_index: RegistryIndex::default(),
             observer_address: Pubkey::default(),
             cumulative_reward_per_token: 1_000_000_000_000_000_000, // 1e18
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1511,6 +1660,7 @@ mod tests {
             start_timestamp: 0,
             reward_debt: 1_000_000_000_000_000_000, // same as cumulative
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         settle_delegate_rewards(&mut gateway, &mut delegation);
         assert_eq!(delegation.amount, 50_000_000); // unchanged
@@ -1541,11 +1691,14 @@ mod tests {
                 delegate_reward_share_ratio: 500,
                 min_delegation_amount: 10_000_000,
                 allowlist_enabled: false,
+                pending_delegate_reward_share_ratio: None,
+                delegation_disabled_at: None,
             },
             registry_index: RegistryIndex::default(),
             observer_address: Pubkey::default(),
             cumulative_reward_per_token: 2_000_000_000_000_000_000, // 2e18
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1554,6 +1707,7 @@ mod tests {
             start_timestamp: 0,
             reward_debt: 1_000_000_000_000_000_000, // 1e18
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let old_total = gateway.total_delegated_stake;
         settle_delegate_rewards(&mut gateway, &mut delegation);
@@ -1593,10 +1747,7 @@ mod tests {
 
     #[test]
     fn gateway_registry_size_correct() {
-        #[cfg(not(feature = "devnet-shrunk"))]
-        assert_eq!(GatewayRegistry::SIZE, 168_040);
-        #[cfg(feature = "devnet-shrunk")]
-        assert_eq!(GatewayRegistry::SIZE, 1_720);
+        assert_eq!(GatewayRegistry::SIZE, 168_048);
     }
 
     // =========================================
@@ -1769,11 +1920,16 @@ mod tests {
                 delegate_reward_share_ratio: 0,
                 min_delegation_amount: 0,
                 allowlist_enabled: false,
+                // Some(_) so these Options serialize to their max width
+                // (3 and 9 bytes), matching the SIZE upper-bound formula.
+                pending_delegate_reward_share_ratio: Some(0),
+                delegation_disabled_at: Some(0),
             },
             registry_index: RegistryIndex::default(),
             observer_address: Pubkey::default(),
             cumulative_reward_per_token: 0,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         }
     }
 
@@ -1797,6 +1953,7 @@ mod tests {
             start_timestamp: 0,
             reward_debt: 0,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut buf = Vec::new();
         d.try_serialize(&mut buf).unwrap();
@@ -1816,6 +1973,7 @@ mod tests {
             is_exit_vault: false,
             is_protected: false,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut buf = Vec::new();
         w.try_serialize(&mut buf).unwrap();
@@ -1828,6 +1986,7 @@ mod tests {
             owner: Pubkey::default(),
             next_id: 0,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut buf = Vec::new();
         c.try_serialize(&mut buf).unwrap();
@@ -1845,6 +2004,7 @@ mod tests {
             delegate: Pubkey::default(),
             added_at: 0,
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut buf = Vec::new();
         a.try_serialize(&mut buf).unwrap();

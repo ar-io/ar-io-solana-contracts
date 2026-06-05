@@ -140,11 +140,22 @@ pub enum ArnsError {
     MigrationExpired,
 
     // =========================================
-    // ADMIN SHRINK (devnet-shrunk recovery)
+    // RESERVED — formerly admin-shrink (registry recovery), removed when
+    // `devnet-shrunk` was retired. Kept (unused) to preserve ArnsError codes.
+    // Do NOT reuse.
     // =========================================
-    #[msg("Registry account is already at or below the target shrunk size")]
+    #[msg("Reserved (formerly RegistryAlreadyShrunk)")]
     RegistryAlreadyShrunk,
 
-    #[msg("Shrinking would truncate populated registry slot data")]
+    #[msg("Reserved (formerly ShrinkWouldLoseData)")]
     ShrinkWouldLoseData,
+
+    // =========================================
+    // SCHEMA MIGRATION ERRORS
+    // =========================================
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
 }

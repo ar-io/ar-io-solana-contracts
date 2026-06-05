@@ -16,3 +16,4 @@ export * as gar from './gar/index.js';
 export * as arns from './arns/index.js';
 export * as ant from './ant/index.js';
 export * as antEscrow from './ant-escrow/index.js';
+export * as mplCore from './mpl-core/index.js';

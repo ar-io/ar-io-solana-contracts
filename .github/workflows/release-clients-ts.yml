@@ -26,10 +26,10 @@ on:
   workflow_dispatch:
     inputs:
       cluster:
-        description: "Target cluster (devnet | mainnet) — drives cfg-conditional registry sizes"
+        description: "Target cluster (staging | mainnet) — drives the npm version suffix + codegen dedup. 'staging' is the full-size dress-rehearsal env on Solana devnet. (The legacy shrunk 'devnet' env was retired — ADR-024.)"
         type: choice
         options:
-          - devnet
+          - staging
           - mainnet
         required: true
       version:
@@ -115,10 +115,10 @@ jobs:
           avm install "${ANCHOR_VERSION}"
           avm use "${ANCHOR_VERSION}"
 
-      # Anchor generates IDLs at `target/idl/<program>.json`. The IDL
-      # includes BOTH cfg variants of conditional fields regardless of
-      # active features (Anchor IDL gen quirk). The clients/ts codegen
-      # dedupes based on CLUSTER env var.
+      # Anchor generates IDLs at `target/idl/<program>.json`. Registries are
+      # now full-size on every cluster (devnet-shrunk retired — ADR-024), so
+      # the IDL no longer carries cfg-conditional duplicate fields; the
+      # codegen dedup pass is a defensive no-op.
       - name: Anchor build (produces IDLs)
         run: anchor build
 
@@ -164,8 +164,8 @@ jobs:
           # `cluster` is `choice` for workflow_dispatch but `string` for
           # workflow_call — validate here so a malicious calling workflow
           # can't slip through.
-          if [[ "$INPUT_CLUSTER" != "devnet" && "$INPUT_CLUSTER" != "mainnet" ]]; then
-            echo "::error::Invalid cluster: '$INPUT_CLUSTER' (must be 'devnet' or 'mainnet')"
+          if [[ "$INPUT_CLUSTER" != "staging" && "$INPUT_CLUSTER" != "mainnet" ]]; then
+            echo "::error::Invalid cluster: '$INPUT_CLUSTER' (must be 'staging' or 'mainnet')"
             exit 1
           fi
           if [[ -n "$INPUT_VERSION" ]]; then
@@ -184,14 +184,15 @@ jobs:
             echo "::error::Invalid run number: '$RUN_NUMBER'"
             exit 1
           fi
-          # Devnet releases get a -devnet.<run> suffix so each publish is
-          # uniquely versioned. Mainnet uses the bare semver from package.json.
-          if [[ "$INPUT_CLUSTER" == "devnet" ]]; then
-            # Strip any existing prerelease suffix to avoid e.g. 0.1.0-devnet.5-devnet.6
+          # Staging releases get a -staging.<run> prerelease suffix so each
+          # publish is uniquely versioned (the dress-rehearsal channel
+          # re-publishes often). Mainnet uses the bare semver from package.json.
+          if [[ "$INPUT_CLUSTER" == "staging" ]]; then
+            # Strip any existing prerelease suffix to avoid e.g. 0.1.0-staging.5-staging.6
             base="${target%%-*}"
-            target="${base}-devnet.${RUN_NUMBER}"
+            target="${base}-staging.${RUN_NUMBER}"
           fi
-          # Final sanity check: even the derived devnet-suffixed value must
+          # Final sanity check: even the derived staging-suffixed value must
           # still be valid semver. Belt-and-braces against future edits to
           # the suffix logic.
           if [[ ! "$target" =~ $SEMVER_RE ]]; then
@@ -211,11 +212,17 @@ jobs:
           INPUT_CLUSTER: ${{ inputs.cluster }}
         run: |
           set -euo pipefail
-          if [[ "$INPUT_CLUSTER" == "mainnet" ]]; then
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=devnet" >> "$GITHUB_OUTPUT"
-          fi
+          case "$INPUT_CLUSTER" in
+            mainnet) echo "tag=latest"  >> "$GITHUB_OUTPUT" ;;
+            staging) echo "tag=staging" >> "$GITHUB_OUTPUT" ;;
+            *)
+              # Unreachable: cluster was already validated in the Compute
+              # version step. Defensive default just in case a future
+              # re-order moves this step ahead of validation.
+              echo "::error::Determine dist-tag: unexpected cluster '$INPUT_CLUSTER'"
+              exit 1
+              ;;
+          esac
 
       - name: npm pack (sanity check)
         working-directory: clients/ts
@@ -236,11 +243,11 @@ jobs:
         run: |
           set -euo pipefail
           # `DIST_TAG` is set by the previous step from validated cluster
-          # input, so it's already one of `latest` | `devnet`. Validate
-          # again as belt-and-braces — `npm publish --tag <x>` happily
-          # accepts arbitrary strings, so even a future-step mistake
-          # shouldn't let a devnet build poison the mainnet tag.
-          if [[ "$DIST_TAG" != "latest" && "$DIST_TAG" != "devnet" ]]; then
+          # input, so it's already one of `latest` | `staging`.
+          # Validate again as belt-and-braces — `npm publish --tag <x>`
+          # happily accepts arbitrary strings, so even a future-step
+          # mistake shouldn't let a staging build poison the mainnet tag.
+          if [[ "$DIST_TAG" != "latest" && "$DIST_TAG" != "staging" ]]; then
             echo "::error::Invalid dist-tag: '$DIST_TAG'"
             exit 1
           fi

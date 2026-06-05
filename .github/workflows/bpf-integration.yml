@@ -1,0 +1,63 @@
+name: BPF integration (manual)
+
+# Runs the full BPF integration suite via `scripts/test-integration.sh`.
+# Covers ario-arns / ario-ant / ario-ant-escrow which require mpl_core.so
+# under BPF_OUT_DIR and are intentionally NOT in the fast PR workflow.
+#
+# Triggers:
+#   workflow_dispatch — on-demand, e.g. before merging a contract-touching PR
+#   schedule          — nightly, so regressions get caught within 24h even
+#                       if no one triggers manually
+#
+# Cost: ~10-15 min per run (BPF build + ~540 integration tests).
+#
+# Why this is separate from build-test.yml:
+#   - Adding BPF builds to every PR adds ~10-15 min per push, multiplied
+#     by every contributor + every revision
+#   - Solana CLI install can be flaky; required CI failures from infra
+#     issues are annoying
+#   - Original team's design treats deploy as the integration gate;
+#     this workflow provides an opt-in safety net without changing that
+#     contract
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 06:00 UTC (~01:00 ET / 22:00 PT) — catches drift
+    # introduced by the previous day's merges before the next morning's
+    # work starts.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_HOST: 1.90.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bpf-integration:
+    name: arns + ant + ant-escrow integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_HOST }}
+
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.0/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ar-io-contracts-bpf-integration
+
+      - name: Run integration suite
+        # The wrapper handles all the BPF/declare_id alignment that
+        # otherwise bit us in the PR #60 retrospective. See
+        # scripts/test-integration.sh header for the full recipe.
+        run: bash scripts/test-integration.sh --all

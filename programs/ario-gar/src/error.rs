@@ -119,6 +119,14 @@ pub enum GarError {
     #[msg("Epochs not enabled")]
     EpochsNotEnabled,
 
+    #[msg("Epochs are already enabled — cannot mutate counter while cranker is live")]
+    EpochsAlreadyEnabled,
+
+    #[msg(
+        "Epoch counter has already advanced past zero — admin_set_current_epoch_index is one-shot"
+    )]
+    EpochCounterAlreadyAdvanced,
+
     #[msg("Epoch not started yet")]
     EpochNotStarted,
 
@@ -294,11 +302,37 @@ pub enum GarError {
     InvalidExcessWithdrawalPda,
 
     // =========================================
-    // ADMIN SHRINK (devnet-shrunk recovery)
+    // RESERVED — formerly admin-shrink (registry recovery), removed when
+    // `devnet-shrunk` was retired. Kept (unused) to preserve GarError codes
+    // so downstream decoders (cranker/observer) don't shift. Do NOT reuse.
     // =========================================
-    #[msg("Registry account is already at or below the target shrunk size")]
+    #[msg("Reserved (formerly RegistryAlreadyShrunk)")]
     RegistryAlreadyShrunk,
 
-    #[msg("Shrinking would truncate populated registry slot data")]
+    #[msg("Reserved (formerly ShrinkWouldLoseData)")]
     ShrinkWouldLoseData,
+
+    // =========================================
+    // SCHEMA MIGRATION ERRORS
+    // =========================================
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
+
+    // =========================================
+    // DELEGATION LIFECYCLE ERRORS (Fix #6)
+    // Appended at the end to keep existing error codes stable.
+    // =========================================
+    #[msg("Cannot re-enable delegation while delegates still have stake; crank claim_delegate_from_disabled_gateway first")]
+    DelegatesStillActive,
+
+    #[msg(
+        "Cannot re-enable delegation until the disable cooldown (withdrawal period) has elapsed"
+    )]
+    DelegationCooldownActive,
+
+    #[msg("Delegation must be disabled on this gateway for this operation")]
+    DelegationNotDisabled,
 }

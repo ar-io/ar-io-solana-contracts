@@ -25,6 +25,7 @@ pub const ARIO_CORE_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("A
 pub mod error;
 pub mod instructions;
 pub mod migration;
+pub mod schema_migration;
 pub mod state;
 
 use instructions::*;
@@ -79,16 +80,6 @@ pub mod ario_gar {
         instructions::initialize::create_gateway_registry(ctx)
     }
 
-    /// Recovery-only: shrink an over-sized GatewayRegistry back to the
-    /// current binary's expected size and refund rent to authority.
-    /// Used when switching build modes (e.g. production → devnet-shrunk)
-    /// would otherwise leave the on-chain account too large for
-    /// `AccountLoader::load`. Authority + `migration_active` gated;
-    /// inert after `finalize_migration`.
-    pub fn admin_shrink_gateway_registry(ctx: Context<AdminShrinkGatewayRegistry>) -> Result<()> {
-        instructions::initialize::admin_shrink_gateway_registry(ctx)
-    }
-
     /// Initialize epoch settings
     pub fn initialize_epochs(
         ctx: Context<InitializeEpochs>,
@@ -115,6 +106,37 @@ pub mod ario_gar {
             new_stake_token_account,
             new_protocol_token_account,
         )
+    }
+
+    /// Override `GatewaySettings.withdrawal_period` — the lock duration
+    /// applied to every NEW operator-stake or delegate withdrawal vault.
+    /// Mirrors `admin_set_epoch_duration`'s pattern for epoch tuning.
+    ///
+    /// Existing withdrawal vaults are unaffected (their unlock timestamps
+    /// were stamped at create time). Only withdrawals initiated AFTER this
+    /// call use the new period. Authority-only. Minimum 60 seconds.
+    ///
+    /// Primary use case is devnet testing: the production default
+    /// (`WITHDRAWAL_LOCK_PERIOD` = 30 days) is impractical for end-to-end
+    /// claim-withdrawal validation on a real cluster. Secondary use case
+    /// is emergency tuning by the multisig without a code upgrade. See
+    /// `instructions::initialize::admin_set_withdrawal_period` for the
+    /// full motivation comment.
+    pub fn admin_set_withdrawal_period(
+        ctx: Context<AdminSetWithdrawalPeriod>,
+        new_period_seconds: i64,
+    ) -> Result<()> {
+        instructions::initialize::admin_set_withdrawal_period(ctx, new_period_seconds)
+    }
+
+    /// Rotate the admin `authority` to `new_authority` (ADR-026). Gated on the
+    /// current admin authority; rejects the null pubkey. Used to hand
+    /// governance to the Squads multisig vault post-migration.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::transfer_authority(ctx, new_authority)
     }
 
     // =========================================
@@ -203,6 +225,17 @@ pub mod ario_gar {
         instructions::delegate::claim_delegate_from_leaving_gateway(ctx)
     }
 
+    /// Fix #6: Claim a delegate's stake from a gateway that DISABLED delegation.
+    /// Matches Lua's auto-withdraw-on-disable (WP §6.3); on Solana delegates are
+    /// cranked out individually into withdrawal vaults. Permissionless. The
+    /// operator can't re-enable delegation until all delegates are cleared and
+    /// the cooldown elapses (see update_gateway_settings).
+    pub fn claim_delegate_from_disabled_gateway(
+        ctx: Context<ClaimDelegateFromDisabledGateway>,
+    ) -> Result<()> {
+        instructions::delegate::claim_delegate_from_disabled_gateway(ctx)
+    }
+
     /// Redelegate stake from one gateway to another (F17)
     /// Fee = min(10% * redelegation_count, 60%) — first is free, resets every 7 days
     /// Fee goes to protocol. Net amount moves to target delegation.
@@ -280,6 +313,24 @@ pub mod ario_gar {
         new_duration: i64,
     ) -> Result<()> {
         instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
+    }
+
+    /// Authority-gated one-shot to set `current_epoch_index` to a non-zero
+    /// starting value (and re-anchor `genesis_timestamp` so the first
+    /// `create_epoch` fires immediately for that index). Use case:
+    /// AO → Solana cutover where Solana should pick up at AO's last
+    /// epoch + 1 for indexer / dashboard / reward-decay continuity.
+    ///
+    /// Pre-conditions: `enabled == false` AND
+    /// `current_epoch_index == 0`. After the cranker advances the
+    /// counter (or epochs are enabled), the lever is permanently
+    /// locked. See `instructions::epoch::admin_set_current_epoch_index`
+    /// for the full rationale.
+    pub fn admin_set_current_epoch_index(
+        ctx: Context<UpdateEpochSettings>,
+        new_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_current_epoch_index(ctx, new_index)
     }
 
     /// Close the EpochSettings PDA (authority-only). The only path to
@@ -505,6 +556,478 @@ pub mod ario_gar {
             total_withdrawn,
         )
     }
+
+    // =========================================
+    // SCHEMA MIGRATION (version bump + realloc)
+    // =========================================
+
+    pub fn migrate_gateway_settings(ctx: Context<MigrateGatewaySettings>) -> Result<()> {
+        let info = ctx.accounts.settings.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::GatewaySettings::SIZE,
+        )?;
+        let mut account: state::GatewaySettings = {
+            let data = info.try_borrow_data()?;
+            state::GatewaySettings::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::GATEWAY_SETTINGS_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_gateway_settings_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "GatewaySettings migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_gateway(ctx: Context<MigrateGateway>) -> Result<()> {
+        let info = ctx.accounts.gateway.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Gateway::SIZE,
+        )?;
+        let mut account: state::Gateway = {
+            let data = info.try_borrow_data()?;
+            state::Gateway::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::GATEWAY_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_gateway_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "Gateway migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_delegation(ctx: Context<MigrateDelegation>) -> Result<()> {
+        let info = ctx.accounts.delegation.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Delegation::SIZE,
+        )?;
+        let mut account: state::Delegation = {
+            let data = info.try_borrow_data()?;
+            state::Delegation::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::DELEGATION_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_delegation_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "Delegation migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_withdrawal_counter(ctx: Context<MigrateWithdrawalCounter>) -> Result<()> {
+        let info = ctx.accounts.withdrawal_counter.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::WithdrawalCounter::SIZE,
+        )?;
+        let mut account: state::WithdrawalCounter = {
+            let data = info.try_borrow_data()?;
+            state::WithdrawalCounter::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::WITHDRAWAL_COUNTER_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_withdrawal_counter_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "WithdrawalCounter migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_withdrawal(ctx: Context<MigrateWithdrawal>, withdrawal_id: u64) -> Result<()> {
+        let _ = withdrawal_id;
+        let info = ctx.accounts.withdrawal.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Withdrawal::SIZE,
+        )?;
+        let mut account: state::Withdrawal = {
+            let data = info.try_borrow_data()?;
+            state::Withdrawal::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::WITHDRAWAL_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_withdrawal_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "Withdrawal migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_allowlist_entry(ctx: Context<MigrateAllowlistEntry>) -> Result<()> {
+        let info = ctx.accounts.allowlist_entry.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::AllowlistEntry::SIZE,
+        )?;
+        let mut account: state::AllowlistEntry = {
+            let data = info.try_borrow_data()?;
+            state::AllowlistEntry::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::ALLOWLIST_ENTRY_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_allowlist_entry_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "AllowlistEntry migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_observer_lookup(ctx: Context<MigrateObserverLookup>) -> Result<()> {
+        let info = ctx.accounts.observer_lookup.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::ObserverLookup::SIZE,
+        )?;
+        let mut account: state::ObserverLookup = {
+            let data = info.try_borrow_data()?;
+            state::ObserverLookup::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::OBSERVER_LOOKUP_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_observer_lookup_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "ObserverLookup migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_redelegation_record(ctx: Context<MigrateRedelegationRecord>) -> Result<()> {
+        let info = ctx.accounts.redelegation_record.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::RedelegationRecord::SIZE,
+        )?;
+        let mut account: state::RedelegationRecord = {
+            let data = info.try_borrow_data()?;
+            state::RedelegationRecord::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::REDELEGATION_RECORD_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_redelegation_record_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "RedelegationRecord migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_epoch_settings(ctx: Context<MigrateEpochSettings>) -> Result<()> {
+        let info = ctx.accounts.epoch_settings.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::EpochSettings::SIZE,
+        )?;
+        let mut account: state::EpochSettings = {
+            let data = info.try_borrow_data()?;
+            state::EpochSettings::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::EPOCH_SETTINGS_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_epoch_settings_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "EpochSettings migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+
+    pub fn migrate_observation(ctx: Context<MigrateObservation>, epoch_index: u64) -> Result<()> {
+        let _ = epoch_index;
+        let info = ctx.accounts.observation.to_account_info();
+        schema_migration::grow_account(
+            &info,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            state::Observation::SIZE,
+        )?;
+        let mut account: state::Observation = {
+            let data = info.try_borrow_data()?;
+            state::Observation::try_deserialize(&mut &data[..])?
+        };
+        require!(
+            account.version < state::OBSERVATION_VERSION,
+            error::GarError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_observation_version(&mut account)?;
+        schema_migration::write_account(&info, &account)?;
+        msg!(
+            "Observation migrated to {}.{}.{}",
+            account.version.major,
+            account.version.minor,
+            account.version.patch,
+        );
+        Ok(())
+    }
+}
+
+// =========================================
+// SCHEMA MIGRATION ACCOUNT CONTEXTS
+// =========================================
+
+#[derive(Accounts)]
+pub struct MigrateGatewaySettings<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::SETTINGS_SEED],
+        bump,
+    )]
+    pub settings: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateGateway<'info> {
+    /// CHECK: gateway operator
+    pub operator: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::GATEWAY_SEED, operator.key().as_ref()],
+        bump,
+    )]
+    pub gateway: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateDelegation<'info> {
+    /// CHECK: gateway operator key used in PDA seeds
+    pub gateway: AccountInfo<'info>,
+
+    /// CHECK: delegator key used in PDA seeds
+    pub delegator: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::DELEGATION_SEED, gateway.key().as_ref(), delegator.key().as_ref()],
+        bump,
+    )]
+    pub delegation: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateWithdrawalCounter<'info> {
+    /// CHECK: owner key used in PDA seeds
+    pub owner: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::WITHDRAWAL_COUNTER_SEED, owner.key().as_ref()],
+        bump,
+    )]
+    pub withdrawal_counter: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(withdrawal_id: u64)]
+pub struct MigrateWithdrawal<'info> {
+    /// CHECK: owner key used in PDA seeds
+    pub owner: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::WITHDRAWAL_SEED, owner.key().as_ref(), &withdrawal_id.to_le_bytes()],
+        bump,
+    )]
+    pub withdrawal: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateAllowlistEntry<'info> {
+    /// CHECK: gateway operator key used in PDA seeds
+    pub gateway: AccountInfo<'info>,
+
+    /// CHECK: delegate key used in PDA seeds
+    pub delegate: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::ALLOWLIST_SEED, gateway.key().as_ref(), delegate.key().as_ref()],
+        bump,
+    )]
+    pub allowlist_entry: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateObserverLookup<'info> {
+    /// CHECK: observer address used in PDA seeds
+    pub observer: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::OBSERVER_LOOKUP_SEED, observer.key().as_ref()],
+        bump,
+    )]
+    pub observer_lookup: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateRedelegationRecord<'info> {
+    /// CHECK: delegator key used in PDA seeds
+    pub delegator: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::REDELEGATION_SEED, delegator.key().as_ref()],
+        bump,
+    )]
+    pub redelegation_record: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateEpochSettings<'info> {
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::EPOCH_SETTINGS_SEED],
+        bump,
+    )]
+    pub epoch_settings: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct MigrateObservation<'info> {
+    /// CHECK: observer key used in PDA seeds
+    pub observer: AccountInfo<'info>,
+
+    /// CHECK: PDA pinned by seeds + canonical bump; grown then deserialized
+    /// in the handler (grow-then-deserialize, see schema_migration::grow_account).
+    #[account(
+        mut,
+        seeds = [state::OBSERVATION_SEED, &epoch_index.to_le_bytes(), observer.key().as_ref()],
+        bump,
+    )]
+    pub observation: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // =========================================
@@ -875,6 +1398,45 @@ pub struct EpochDurationUpdatedEvent {
     pub old_genesis_timestamp: i64,
     pub new_genesis_timestamp: i64,
     pub current_epoch_index: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_current_epoch_index`. The one-shot AO →
+/// Solana cutover lever. Indexers tracking the epoch counter need
+/// this to know Solana didn't actually run epochs 0..(new_index-1) —
+/// the counter jumped. Without this event, an indexer scanning
+/// `EpochCreatedEvent`s would see epoch numbers start at `new_index`
+/// out of nowhere and might log warnings or treat earlier indices as
+/// "missing." This event explicitly records the discontinuity.
+#[event]
+pub struct EpochCounterAdvancedEvent {
+    pub admin: Pubkey,
+    pub new_index: u64,
+    pub old_genesis_timestamp: i64,
+    pub new_genesis_timestamp: i64,
+    pub epoch_duration: i64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_withdrawal_period`. Indexers tracking the
+/// withdrawal-claim eligibility window need this to recompute
+/// `unlock_timestamp = vault.created_at + settings.withdrawal_period` for
+/// any NEW withdrawal vault created after the timestamp here. Existing
+/// vaults retain their stamped `unlock_timestamp` and are unaffected.
+#[event]
+pub struct WithdrawalPeriodUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_period_seconds: i64,
+    pub new_period_seconds: i64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `transfer_authority` (ADR-026) when the admin `authority` is
+/// rotated. `old_authority` is the signer that authorized the rotation.
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
     pub timestamp: i64,
 }
 

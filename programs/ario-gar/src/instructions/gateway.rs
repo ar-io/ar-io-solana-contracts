@@ -91,6 +91,9 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
         delegate_reward_share_ratio: params.delegate_reward_share_ratio as u16 * 100,
         min_delegation_amount: min_delegation,
         allowlist_enabled: false,
+        // No pending ratio change and delegation not disabled at join time.
+        pending_delegate_reward_share_ratio: None,
+        delegation_disabled_at: None,
     };
     // M3: Observer address (client passes operator key for default)
     gateway.observer_address = params.observer_address;
@@ -99,8 +102,10 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
     let observer_lookup = &mut ctx.accounts.observer_lookup;
     observer_lookup.gateway = ctx.accounts.operator.key();
     observer_lookup.bump = ctx.bumps.observer_lookup;
+    observer_lookup.version = OBSERVER_LOOKUP_VERSION;
     gateway.cumulative_reward_per_token = 0;
     gateway.bump = ctx.bumps.gateway;
+    gateway.version = GATEWAY_VERSION;
 
     // Add to registry
     let mut registry = ctx.accounts.registry.load_mut()?;
@@ -115,7 +120,8 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
         composite_weight: 0,
         start_timestamp: gateway.start_timestamp,
         status: GatewaySlot::STATUS_JOINED,
-        _padding: [0; 7],
+        delegated_at_tally: 0,
+        _padding: [0; 6],
     };
     registry.count = registry
         .count
@@ -147,15 +153,27 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
 }
 
 /// Leave the AR.IO network (F11)
-/// Sets gateway to Leaving status with a 90-day leave period.
-/// Operator stake becomes withdrawable after leave period.
+/// Sets gateway to Leaving status. Stake splits into two vaults with
+/// DIFFERENT lock periods, mirroring `gar.lua::leaveNetwork`:
+///   - Protected exit vault (min portion): `GATEWAY_LEAVE_PERIOD` (90 days).
+///     Uses `leaveLengthMs` in Lua via `createGatewayExitVault`.
+///   - Excess vault (above-min portion): `settings.withdrawal_period`
+///     (30 days default). Uses `withdrawLengthMs` in Lua via
+///     `createGatewayWithdrawVault`.
 /// Delegates are notified to withdraw (handled via separate delegate withdrawal txs).
-/// Matches Lua: gateway.status = "leaving", leaveLengthMs = 90 days
 pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
-    let available_at = now
+    // Protected exit vault gets the 90-day leave-network lock.
+    let protected_available_at = now
         .checked_add(GATEWAY_LEAVE_PERIOD)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    // Excess vault gets the shorter regular-withdrawal lock — same as if
+    // the operator had used `withdraw_operator_stake` while staying joined.
+    // Reading from settings (not the `WITHDRAWAL_LOCK_PERIOD` const) so the
+    // `admin_set_withdrawal_period` lever applies here too.
+    let excess_available_at = now
+        .checked_add(ctx.accounts.settings.withdrawal_period)
         .ok_or(GarError::ArithmeticOverflow)?;
     let gateway = &mut ctx.accounts.gateway;
 
@@ -183,6 +201,11 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
     let excess_amount = pre_stake.saturating_sub(min_stake);
 
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.operator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
     let exit_id = counter.next_id;
     let excess_id = exit_id.checked_add(1).ok_or(GarError::ArithmeticOverflow)?;
 
@@ -201,7 +224,7 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
         exit.amount = protected_amount;
         exit.created_at = now;
         exit.available_at = if protected_amount > 0 {
-            available_at
+            protected_available_at
         } else {
             now
         };
@@ -209,6 +232,7 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
         exit.is_exit_vault = true;
         exit.is_protected = protected_amount > 0;
         exit.bump = ctx.bumps.withdrawal;
+        exit.version = WITHDRAWAL_VERSION;
     }
 
     // 2. Manual create excess vault when warranted.
@@ -282,11 +306,12 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
             gateway: gateway.operator,
             amount: excess_amount,
             created_at: now,
-            available_at,
+            available_at: excess_available_at,
             is_delegate: false,
             is_exit_vault: true,
             is_protected: false,
             bump: vault_bump,
+            version: WITHDRAWAL_VERSION,
         };
         let mut data = excess_acc.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -322,10 +347,13 @@ pub fn leave_network<'info>(ctx: Context<'_, '_, 'info, 'info, LeaveNetwork<'inf
     // failure tallies to whichever gateway took over the freed slot
     // (audit H2 / H3, 2026-04).
     //
-    // Known limitation: `epoch.total_composite_weight` is NOT decremented
-    // here. A leaver mid-epoch slightly biases prescribe_epoch's weighted
-    // roulette toward later slots (probability skew ≪ 1 slot). Acceptable
-    // pre-mainnet; documented for future cranker coordination.
+    // `epoch.total_composite_weight` is intentionally not decremented here.
+    // The snapshot stays meaningful for `EpochWeightsTalliedEvent` (which
+    // reports the tally-time total), and `prescribe_epoch` recomputes the
+    // live sum from current registry weights before sampling — so a leaver
+    // with cleared composite_weight cannot bias roulette toward downstream
+    // slots. See `epoch.rs::prescribe_epoch` "Sample modulo the *live* sum"
+    // comment for the Codex 2026-05-28 finding this guards against.
     let mut registry = ctx.accounts.registry.load_mut()?;
     let index = gateway.registry_index.index as usize;
     require!(
@@ -416,6 +444,39 @@ pub fn update_gateway_settings(
         fields_changed |= GATEWAY_SETTINGS_FIELD_NOTE;
     }
     if let Some(allow_delegated_staking) = params.allow_delegated_staking {
+        // Fix #6 (WP §6.3): read the OLD value once, branch on the transition,
+        // then write the new value. Disabling starts a cooldown and requires
+        // delegates to be cranked out (claim_delegate_from_disabled_gateway);
+        // re-enabling is gated on zero remaining delegates + cooldown elapsed.
+        let was_enabled = gateway.settings.allow_delegated_staking;
+        if !allow_delegated_staking && was_enabled {
+            // Disabling: record the timestamp that starts the re-enable cooldown.
+            // Existing delegates are NOT auto-withdrawn (no single-tx PDA scan on
+            // Solana, BD-024); the cranker moves them to withdrawal vaults via
+            // claim_delegate_from_disabled_gateway.
+            gateway.settings.delegation_disabled_at = Some(Clock::get()?.unix_timestamp);
+        } else if allow_delegated_staking && !was_enabled {
+            // Re-enabling: require all delegates withdrawn AND the cooldown
+            // elapsed, so an operator can't dump delegates then immediately
+            // re-recruit (toggle churn).
+            require!(
+                gateway.total_delegated_stake == 0,
+                GarError::DelegatesStillActive
+            );
+            if let Some(disabled_at) = gateway.settings.delegation_disabled_at {
+                // Cooldown mirrors the delegate withdrawal lock
+                // (`settings.withdrawal_period`) so the admin_set_withdrawal_period
+                // lever applies consistently to both the vaults and this gate.
+                require!(
+                    Clock::get()?.unix_timestamp
+                        >= disabled_at
+                            .checked_add(ctx.accounts.settings.withdrawal_period)
+                            .ok_or(GarError::ArithmeticOverflow)?,
+                    GarError::DelegationCooldownActive
+                );
+            }
+            gateway.settings.delegation_disabled_at = None;
+        }
         gateway.settings.allow_delegated_staking = allow_delegated_staking;
         fields_changed |= GATEWAY_SETTINGS_FIELD_ALLOW_DELEGATED_STAKING;
     }
@@ -426,7 +487,12 @@ pub fn update_gateway_settings(
             (ratio as u16) * 100 <= MAX_DELEGATE_REWARD_SHARE,
             GarError::InvalidRewardShare
         );
-        gateway.settings.delegate_reward_share_ratio = ratio as u16 * 100;
+        // Fix #7 (WP §6.3): do NOT apply immediately — stage the change so it
+        // takes effect at the next `tally_weights` (start of the following
+        // epoch). This stops an operator front-running `distribute_epoch` to
+        // change their reward split mid-epoch. The active
+        // `delegate_reward_share_ratio` is untouched until tally applies pending.
+        gateway.settings.pending_delegate_reward_share_ratio = Some(ratio as u16 * 100);
         fields_changed |= GATEWAY_SETTINGS_FIELD_DELEGATE_REWARD_SHARE_RATIO;
     }
     if let Some(min_stake) = params.min_delegate_stake {
@@ -472,6 +538,7 @@ pub fn update_observer_address(
     let new_lookup = &mut ctx.accounts.new_observer_lookup;
     new_lookup.gateway = ctx.accounts.operator.key();
     new_lookup.bump = ctx.bumps.new_observer_lookup;
+    new_lookup.version = OBSERVER_LOOKUP_VERSION;
 
     emit!(ObserverAddressUpdatedEvent {
         operator: gateway.operator,
@@ -522,6 +589,11 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
     let excess_amount = post_slash.saturating_sub(min_stake);
 
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = gateway.operator;
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
     let exit_id = counter.next_id;
     let excess_id = exit_id.checked_add(1).ok_or(GarError::ArithmeticOverflow)?;
 
@@ -545,6 +617,7 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
         exit.is_exit_vault = protected_amount > 0;
         exit.is_protected = protected_amount > 0;
         exit.bump = ctx.bumps.withdrawal;
+        exit.version = WITHDRAWAL_VERSION;
     }
 
     // 2. Manual create excess vault when post_slash > min_stake.
@@ -619,6 +692,7 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
             is_exit_vault: true,
             is_protected: false,
             bump: vault_bump,
+            version: WITHDRAWAL_VERSION,
         };
         let mut data = excess_acc.try_borrow_mut_data()?;
         let mut cursor = std::io::Cursor::new(&mut data[..]);
@@ -1141,7 +1215,8 @@ pub fn finalize_gone<'info>(ctx: Context<'_, '_, 'info, 'info, FinalizeGone<'inf
         composite_weight: 0,
         start_timestamp: 0,
         status: GatewaySlot::STATUS_JOINED,
-        _padding: [0; 7],
+        delegated_at_tally: 0,
+        _padding: [0; 6],
     };
     registry.count = registry.count.saturating_sub(1);
 

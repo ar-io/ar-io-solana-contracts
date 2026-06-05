@@ -1,0 +1,25 @@
+{
+  "cluster": "https://api.devnet.solana.com",
+  "deployer": "FHgQn4W9oFUR9GNzq4yprpvkPdNipVbFnmxEFfknxFMy",
+  "deployed_at": {
+    "ario_core": "2026-06-03T14:47:24Z",
+    "ario_gar": "2026-06-03T14:47:24Z",
+    "ario_arns": "2026-06-03T14:47:24Z",
+    "ario_ant": "2026-06-03T14:47:24Z",
+    "ario_ant_escrow": "2026-06-03T14:47:24Z"
+  },
+  "programs": {
+    "ario_core": "8Njx9wPkXiNzDCgjwVsJFRjpAEV34gGW3n8DzX3V23m1",
+    "ario_gar": "7WsDTrtZBsfKtnP33XkjuqXCY69JE7n4QVYpynqJCFxz",
+    "ario_arns": "6EZNezcg4rc5hnh8HG34vGquT3WpW5xXypzPb24uyEpp",
+    "ario_ant": "DbHbRwUD1oAn1mrDSqtWtvwGcNrmhWdD2g8L4xmeQ7NX",
+    "ario_ant_escrow": "bttco5oAnBwCucG63iKokBJCZmNr493f3Ewe9LM3oTx"
+  },
+  "mints": {
+    "ario": null
+  },
+  "external": {
+    "mpl_core": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+  },
+  "lastUpdated": "2026-06-03T14:47:24Z"
+}

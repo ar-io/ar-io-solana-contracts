@@ -16,6 +16,76 @@ pub const PRIMARY_NAME_REQUEST_SEED: &[u8] = b"primary_name_request";
 pub const PRIMARY_NAME_REVERSE_SEED: &[u8] = b"primary_name_reverse";
 
 // =========================================
+// BORSH / ACCOUNT LAYOUT SIZING CONSTANTS
+// =========================================
+
+/// Anchor account discriminator (first 8 bytes of SHA-256("account:<Name>")).
+pub const ANCHOR_DISCRIMINATOR_SIZE: usize = 8;
+
+/// Solana `Pubkey` serialized size.
+pub const PUBKEY_SIZE: usize = 32;
+
+/// Borsh `u32` length prefix used for `String` and `Vec<T>`.
+pub const BORSH_LEN_PREFIX: usize = 4;
+
+/// Borsh `Option<T>` discriminant byte (0 = None, 1 = Some).
+pub const BORSH_OPTION_PREFIX: usize = 1;
+
+/// Bump seed (single `u8`).
+pub const BUMP_SIZE: usize = 1;
+
+/// `SchemaVersion { major, minor, patch }` — 3 consecutive u8s.
+pub const SCHEMA_VERSION_SIZE: usize = 3;
+
+// =========================================
+// SCHEMA VERSION
+// =========================================
+
+/// Semantic version for on-chain account schemas.
+///
+/// Stored as three consecutive `u8` bytes (3 bytes on the wire).
+/// `Ord` is derived lexicographically over `(major, minor, patch)`, which
+/// matches semver precedence.
+///
+/// Bump rules:
+///   - `major`: breaking layout change (field removed, type changed, reorder)
+///   - `minor`: additive layout change (new field appended, default = zero)
+///   - `patch`: logic-only change (no layout change; bump optional for audits)
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
+pub struct SchemaVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl SchemaVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+// =========================================
+// ACCOUNT VERSION CONSTANTS
+// =========================================
+
+#[cfg(not(feature = "migration-test"))]
+pub const ARIO_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+#[cfg(feature = "migration-test")]
+pub const ARIO_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
+pub const BALANCE_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const VAULT_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const VAULT_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const PRIMARY_NAME_REQUEST_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const PRIMARY_NAME_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const PRIMARY_NAME_REVERSE_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+
+// =========================================
 // PROTOCOL CONFIGURATION
 // =========================================
 
@@ -60,14 +130,29 @@ pub struct ArioConfig {
     /// the account and writes the field). On a pre-realloc account this
     /// field reads as `Pubkey::default()`.
     pub gar_program: Pubkey,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
+    /// Schema v1.1.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.0.0→1.1.0 migration arm with a default of 1000.
+    #[cfg(feature = "migration-test")]
+    pub field_1: u64,
+    /// Schema v1.2.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.1.0→1.2.0 migration arm with a default of 42.
+    #[cfg(feature = "migration-test")]
+    pub field_2: u32,
+    /// Schema v1.3.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.2.0→1.3.0 migration arm with a default of true.
+    #[cfg(feature = "migration-test")]
+    pub field_3: bool,
 }
 
 impl ArioConfig {
-    pub const SIZE: usize = 8  // discriminator
-        + 32  // authority
-        + 32  // mint
-        + 32  // arns_program
-        + 32  // treasury
+    #[cfg(not(feature = "migration-test"))]
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // authority
+        + PUBKEY_SIZE  // mint
+        + PUBKEY_SIZE  // arns_program
+        + PUBKEY_SIZE  // treasury
         + 8   // total_supply
         + 8   // protocol_balance
         + 8   // circulating_supply
@@ -76,9 +161,79 @@ impl ArioConfig {
         + 8   // max_vault_duration
         + 8   // primary_name_request_expiry
         + 1   // migration_active
-        + 32  // migration_authority
-        + 1   // bump
-        + 32; // gar_program (appended for backward-compat realloc)
+        + PUBKEY_SIZE  // migration_authority
+        + BUMP_SIZE
+        + PUBKEY_SIZE  // gar_program
+        + SCHEMA_VERSION_SIZE;
+
+    /// Byte offset of the `gar_program` field within the account's data
+    /// region (counting from byte 0, i.e. including the 8-byte
+    /// discriminator). Used by `admin_set_gar_program`, which operates
+    /// on an `UncheckedAccount` (the typed `Account<T>` load would fail
+    /// on the pre-realloc 226-byte account) and must therefore write at
+    /// a hand-computed offset. **DO NOT compute this as `SIZE - 32`** —
+    /// post-PR #53, `version: SchemaVersion` (3 bytes) is appended
+    /// *after* `gar_program`, so `SIZE - 32` overlaps the version field
+    /// and shifts `gar_program` by 3 bytes. The static_assert below
+    /// keeps this offset in sync with the struct layout at compile
+    /// time: appending a field before `gar_program` will fail the
+    /// build until this constant is also updated.
+    pub const GAR_PROGRAM_OFFSET: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // authority
+        + PUBKEY_SIZE  // mint
+        + PUBKEY_SIZE  // arns_program
+        + PUBKEY_SIZE  // treasury
+        + 8   // total_supply
+        + 8   // protocol_balance
+        + 8   // circulating_supply
+        + 8   // locked_supply
+        + 8   // min_vault_duration
+        + 8   // max_vault_duration
+        + 8   // primary_name_request_expiry
+        + 1   // migration_active
+        + PUBKEY_SIZE  // migration_authority
+        + BUMP_SIZE;
+    // = 226. Followed by gar_program (32) then version (3) → SIZE = 261.
+
+    /// Compile-time assertion: appending or reordering fields before
+    /// `gar_program` (or removing the trailing 3-byte version field)
+    /// must also update `GAR_PROGRAM_OFFSET`. Without this check the
+    /// admin_set_gar_program handler would silently write at the wrong
+    /// offset — the exact regression that produced C-1.
+    ///
+    /// The migration-test build path has additional fields after
+    /// `version`, so SIZE grows but `gar_program` stays at the same
+    /// offset; the assertion uses the production SIZE form via cfg.
+    #[cfg(not(feature = "migration-test"))]
+    const _GAR_PROGRAM_OFFSET_ASSERT: () = {
+        assert!(
+            Self::GAR_PROGRAM_OFFSET + PUBKEY_SIZE + SCHEMA_VERSION_SIZE == Self::SIZE,
+            "ArioConfig::GAR_PROGRAM_OFFSET out of sync with struct layout — \
+             a field was added/reordered before gar_program; update both."
+        );
+    };
+
+    #[cfg(feature = "migration-test")]
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // authority
+        + PUBKEY_SIZE  // mint
+        + PUBKEY_SIZE  // arns_program
+        + PUBKEY_SIZE  // treasury
+        + 8   // total_supply
+        + 8   // protocol_balance
+        + 8   // circulating_supply
+        + 8   // locked_supply
+        + 8   // min_vault_duration
+        + 8   // max_vault_duration
+        + 8   // primary_name_request_expiry
+        + 1   // migration_active
+        + PUBKEY_SIZE  // migration_authority
+        + BUMP_SIZE
+        + PUBKEY_SIZE  // gar_program
+        + SCHEMA_VERSION_SIZE
+        + 8   // field_1: u64
+        + 4   // field_2: u32
+        + 1; // field_3: bool
 
     /// Default minimum vault duration: 14 days (matches Lua MIN_TOKEN_LOCK_TIME)
     pub const DEFAULT_MIN_VAULT_DURATION: i64 = 14 * 86_400;
@@ -93,11 +248,23 @@ impl ArioConfig {
     /// Matches Lua: constants.MIN_VAULT_SIZE = 100 ARIO
     pub const MIN_VAULT_SIZE: u64 = 100_000_000;
 
-    /// M1: Base fee for primary name requests (mARIO).
-    /// Matches Lua: baseFeeForNameLength(51) * UNDERNAME_LEASE_FEE_PERCENTAGE
-    /// = 200_000_000 * 0.001 = 200_000 mARIO (0.2 ARIO) at demand_factor=1.0
+    /// Base fee for primary name requests on a **leased** ArNS name (mARIO).
+    /// Whitepaper §9.3/§12.3: equal to the fee for a single undername on a
+    /// 51-char name of equivalent purchase type.
+    /// = baseFeeForNameLength(51) * UNDERNAME_LEASE_FEE_PERCENTAGE
+    /// = 200_000_000 * 0.001 = 200_000 mARIO (0.2 ARIO) at demand_factor=1.0.
     /// Demand factor is applied by reading the ArNS DemandFactor via remaining_accounts.
-    pub const PRIMARY_NAME_REQUEST_BASE_FEE: u64 = 200_000;
+    pub const PRIMARY_NAME_REQUEST_BASE_FEE_LEASE: u64 = 200_000;
+
+    /// Base fee for primary name requests on a **permabuy** ArNS name (mARIO).
+    /// Whitepaper §9.3/§12.3: a permabuy primary name costs the permabuy
+    /// undername rate (5x the lease rate).
+    /// = baseFeeForNameLength(51) * UNDERNAME_PERMABUY_FEE_PERCENTAGE
+    /// = 200_000_000 * 0.005 = 1_000_000 mARIO (1.0 ARIO) at demand_factor=1.0.
+    /// See WHITEPAPER_COMPARISON.md discrepancy #3. NOTE: diverges from the
+    /// Lua source (BD-031), which uses the lease rate unconditionally; the
+    /// v3.0.0 whitepaper is canonical here.
+    pub const PRIMARY_NAME_REQUEST_BASE_FEE_PERMABUY: u64 = 1_000_000;
 }
 
 // =========================================
@@ -115,10 +282,16 @@ pub struct Balance {
     pub amount: u64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl Balance {
-    pub const SIZE: usize = 8 + 32 + 8 + 1;
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // owner
+        + 8            // amount
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -135,10 +308,16 @@ pub struct VaultCounter {
     pub next_id: u64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl VaultCounter {
-    pub const SIZE: usize = 8 + 32 + 8 + 1;
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // owner
+        + 8            // next_id
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 /// Locked token vault
@@ -161,18 +340,21 @@ pub struct Vault {
     pub revocable: bool,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl Vault {
-    pub const SIZE: usize = 8  // discriminator
-        + 32  // owner
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // owner
         + 8   // vault_id
         + 8   // amount
         + 8   // start_timestamp
         + 8   // end_timestamp
-        + 33  // controller (Option<Pubkey>)
+        + (BORSH_OPTION_PREFIX + PUBKEY_SIZE)  // controller (Option<Pubkey>)
         + 1   // revocable
-        + 1; // bump
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 
     /// Check if vault is unlocked
     pub fn is_unlocked(&self, current_timestamp: i64) -> bool {
@@ -203,15 +385,18 @@ pub struct PrimaryNameRequest {
     pub expires_at: i64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl PrimaryNameRequest {
-    pub const SIZE: usize = 8  // discriminator
-        + 32  // initiator
-        + (4 + 63)  // name (String with max 63 chars)
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // initiator
+        + (BORSH_LEN_PREFIX + 63)  // name (String with max 63 chars)
         + 8   // created_at
         + 8   // expires_at
-        + 1; // bump
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 
     /// Maximum primary name length (matches Lua MAX_PRIMARY_NAME_LENGTH = 63)
     pub const MAX_NAME_LENGTH: usize = 63;
@@ -234,14 +419,17 @@ pub struct PrimaryName {
     pub set_at: i64,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl PrimaryName {
-    pub const SIZE: usize = 8  // discriminator
-        + 32  // owner
-        + (4 + 63)  // name
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE  // owner
+        + (BORSH_LEN_PREFIX + 63)  // name
         + 8   // set_at
-        + 1; // bump
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 /// Reverse lookup: name → owner. Ensures a name can only be set as primary for one address.
@@ -254,13 +442,16 @@ pub struct PrimaryNameReverse {
     pub owner: Pubkey,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl PrimaryNameReverse {
-    pub const SIZE: usize = 8  // discriminator
-        + (4 + 63)  // name (String with max 63 chars)
-        + 32  // owner
-        + 1; // bump
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + (BORSH_LEN_PREFIX + 63)  // name (String with max 63 chars)
+        + PUBKEY_SIZE  // owner
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -447,6 +638,18 @@ pub struct ConfigUpdatedEvent {
     pub timestamp: i64,
 }
 
+/// Emitted by the dedicated `transfer_authority` (ADR-026) when the admin
+/// `authority` is rotated. `old_authority` is the signer that authorized the
+/// rotation. (`update_config` with `new_authority` emits `ConfigUpdatedEvent`
+/// with `field = CORE_CONFIG_FIELD_NEW_AUTHORITY` instead — both paths are
+/// equivalent; this event is for the dedicated instruction.)
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +668,7 @@ mod tests {
             controller,
             revocable,
             bump: 0,
+            version: VAULT_VERSION,
         }
     }
 
@@ -510,8 +714,8 @@ mod tests {
 
     #[test]
     fn vault_size_calculation() {
-        // discriminator(8) + owner(32) + vault_id(8) + amount(8) + start(8) + end(8) + controller(33) + revocable(1) + bump(1) = 107
-        assert_eq!(Vault::SIZE, 107);
+        // discriminator(8) + owner(32) + vault_id(8) + amount(8) + start(8) + end(8) + controller(33) + revocable(1) + bump(1) + version(3) = 110
+        assert_eq!(Vault::SIZE, 110);
     }
 
     #[test]
@@ -538,6 +742,7 @@ mod tests {
             created_at: 0,
             expires_at: 100,
             bump: 0,
+            version: PRIMARY_NAME_REQUEST_VERSION,
         };
         assert!(!request.is_expired(50));
     }
@@ -550,6 +755,7 @@ mod tests {
             created_at: 0,
             expires_at: 100,
             bump: 0,
+            version: PRIMARY_NAME_REQUEST_VERSION,
         };
         assert!(request.is_expired(100));
     }
@@ -562,6 +768,7 @@ mod tests {
             created_at: 0,
             expires_at: 100,
             bump: 0,
+            version: PRIMARY_NAME_REQUEST_VERSION,
         };
         assert!(request.is_expired(200));
     }
@@ -587,25 +794,25 @@ mod tests {
         // + total_supply(8) + protocol_balance(8) + circulating_supply(8) + locked_supply(8)
         // + min_vault_duration(8) + max_vault_duration(8) + primary_name_request_expiry(8)
         // + migration_active(1) + migration_authority(32) + bump(1)
-        // + gar_program(32) = 258
-        assert_eq!(ArioConfig::SIZE, 258);
+        // + gar_program(32) + version(3) = 261
+        assert_eq!(ArioConfig::SIZE, 261);
     }
 
     #[test]
     fn balance_size_matches() {
-        // discriminator(8) + owner(32) + amount(8) + bump(1) = 49
-        assert_eq!(Balance::SIZE, 49);
+        // discriminator(8) + owner(32) + amount(8) + bump(1) + version(3) = 52
+        assert_eq!(Balance::SIZE, 52);
     }
 
     #[test]
     fn vault_counter_size() {
-        // discriminator(8) + owner(32) + next_id(8) + bump(1) = 49
-        assert_eq!(VaultCounter::SIZE, 49);
+        // discriminator(8) + owner(32) + next_id(8) + bump(1) + version(3) = 52
+        assert_eq!(VaultCounter::SIZE, 52);
     }
 
     #[test]
     fn vault_size() {
-        assert_eq!(Vault::SIZE, 107);
+        assert_eq!(Vault::SIZE, 110);
     }
 
     // =========================================
@@ -675,8 +882,8 @@ mod tests {
 
     #[test]
     fn primary_name_request_size() {
-        // discriminator(8) + initiator(32) + name(4+63) + created_at(8) + expires_at(8) + bump(1) = 124
-        assert_eq!(PrimaryNameRequest::SIZE, 124);
+        // discriminator(8) + initiator(32) + name(4+63) + created_at(8) + expires_at(8) + bump(1) + version(3) = 127
+        assert_eq!(PrimaryNameRequest::SIZE, 127);
     }
 
     #[test]
@@ -687,8 +894,8 @@ mod tests {
 
     #[test]
     fn primary_name_size() {
-        // discriminator(8) + owner(32) + name(4+63) + set_at(8) + bump(1) = 116
-        assert_eq!(PrimaryName::SIZE, 116);
+        // discriminator(8) + owner(32) + name(4+63) + set_at(8) + bump(1) + version(3) = 119
+        assert_eq!(PrimaryName::SIZE, 119);
     }
 
     // =========================================

@@ -41,7 +41,7 @@ pub enum AntError {
     #[msg("Controller not found")]
     ControllerNotFound,
 
-    #[msg("Maximum controllers reached (10)")]
+    #[msg("Maximum controllers reached (4)")]
     MaxControllersReached,
 
     #[msg("Name too long (max 61 characters)")]
@@ -50,10 +50,10 @@ pub enum AntError {
     #[msg("Name cannot be empty")]
     NameEmpty,
 
-    #[msg("Description too long (max 256 characters)")]
+    #[msg("Description too long (max 128 characters)")]
     DescriptionTooLong,
 
-    #[msg("Too many keywords (max 8)")]
+    #[msg("Too many keywords (max 3)")]
     TooManyKeywords,
 
     #[msg("Keyword too long (max 32 characters)")]
@@ -108,6 +108,9 @@ pub enum AntError {
     // ANT migration
     #[msg("ANT is already at the latest version")]
     AlreadyLatestVersion,
+
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
 
     #[msg("Migration deadline has passed")]
     MigrationExpired,
@@ -170,4 +173,27 @@ pub enum AntError {
     /// does not point at the asset being synced.
     #[msg("Invalid ArnsRecord for sync_attributes")]
     InvalidArnsRecord,
+
+    /// `admin_close_orphaned_ant_state`: the asset must be in post-burn
+    /// state (System-owned, empty data) before per-ANT orphans can be
+    /// cleaned up.
+    #[msg("Asset still exists — cannot clean up orphaned state for a live asset")]
+    AssetStillExists,
+
+    /// Arithmetic overflow during manual account-close lamport math.
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
+
+    /// `admin_close_orphaned_ant_state`: a record passed in
+    /// `remaining_accounts` does not belong to the asset being cleaned up
+    /// (its stored `mint` != `asset.key()`). Closing it would destroy an
+    /// unrelated ANT's live state and refund its rent here, so we refuse.
+    #[msg("Orphan-cleanup record does not belong to the supplied asset")]
+    OrphanRecordAssetMismatch,
+
+    /// `transfer_authority` (ADR-026): the new admin authority cannot be the
+    /// null pubkey (System program / all-zero) — that would brick admin into
+    /// an unspendable address.
+    #[msg("New authority cannot be the null pubkey")]
+    InvalidAuthority,
 }

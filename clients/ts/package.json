@@ -1,9 +1,9 @@
 {
   "name": "@ar.io/solana-contracts",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "TypeScript client for the AR.IO Solana programs (ario-core, ario-gar, ario-arns, ario-ant, ario-ant-escrow). Codama-generated per-program clients plus hand-written helpers for things the IDL doesn't expose (e.g. the ANT-escrow canonical-message builders signed off-chain by the attestor and reconstructed on-chain for Ed25519 verification).",
   "license": "AGPL-3.0-or-later",
-  "homepage": "https://github.com/ar-io/ar-io-solana-contracts/tree/develop/clients/ts",
+  "homepage": "https://github.com/ar-io/ar-io-solana-contracts/tree/main/clients/ts",
   "repository": {
     "type": "git",
     "url": "https://github.com/ar-io/ar-io-solana-contracts.git",
@@ -37,6 +37,10 @@
       "types": "./lib/ant-escrow/index.d.ts",
       "import": "./lib/ant-escrow/index.js"
     },
+    "./mpl-core": {
+      "types": "./lib/mpl-core/index.d.ts",
+      "import": "./lib/mpl-core/index.js"
+    },
     "./canonical": {
       "types": "./lib/canonical/index.d.ts",
       "import": "./lib/canonical/index.js"
@@ -57,7 +61,7 @@
     "build:tsc": "tsc -p tsconfig.json",
     "build": "yarn codegen && yarn build:tsc",
     "postinstall": "node scripts/postinstall.mjs",
-    "clean": "rm -rf lib src/core src/gar src/arns src/ant src/ant-escrow",
+    "clean": "rm -rf lib src/core src/gar src/arns src/ant src/ant-escrow src/mpl-core",
     "prepublishOnly": "yarn clean && yarn build",
     "test": "node --test --import tsx test/canonical.cross.test.ts"
   },

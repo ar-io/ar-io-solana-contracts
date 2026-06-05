@@ -16,10 +16,13 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
-# devnet-shrunk: compile-time shrink of zero-copy registries for smoke-test
-# clusters. GatewayRegistry: 3000→30 slots (~168 KB→~1.7 KB), Epoch.failure_counts
-# matches. Mainnet/testnet MUST NOT enable this feature. See state/mod.rs.
-devnet-shrunk = []
+migration-test = []
+# No-op: defined so workspace-wide --features network-mainnet /
+# network-devnet works during build-sbf.sh's BPF build (only
+# ario-ant-escrow actually gates on these to bake the cluster
+# identifier into its canonical claim message).
+network-mainnet = []
+network-devnet = []
 default = []
 
 [dependencies]
@@ -38,6 +41,15 @@ spl-token = { workspace = true, features = ["no-entrypoint"] }
 tokio.workspace = true
 proptest.workspace = true
 ario-test-utils = { path = "../../test-utils" }
+# Test-only: the distribute_epoch lifecycle tests CPI into
+# `ario_core::release_treasury_to_recipient`, so they load ario-core as a
+# native-processor program in solana-program-test. This is a dev-dependency
+# cycle (ario-core -> ario-gar normally), which Cargo permits because
+# dev-dependencies never enter the compiled `.so` / cpi graph. `cpi`
+# (=> no-entrypoint) is set so the linked-in ario-core does NOT emit a
+# duplicate Solana entrypoint symbol; `ario_core::entry` stays reachable
+# for the test's native processor bridge.
+ario-core = { path = "../ario-core", features = ["cpi"] }
 
 [lints]
 workspace = true

@@ -230,6 +230,7 @@ pub mod buy_name_from_delegation {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -256,18 +257,18 @@ pub mod buy_name_from_delegation {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         if !ctx.accounts.reserved_name_check.data_is_empty() {
             let reserved_info = ctx.accounts.reserved_name_check.to_account_info();
@@ -428,6 +429,7 @@ pub mod buy_name_from_operator_stake {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -453,18 +455,18 @@ pub mod buy_name_from_operator_stake {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         if !ctx.accounts.reserved_name_check.data_is_empty() {
             let reserved_info = ctx.accounts.reserved_name_check.to_account_info();
@@ -623,6 +625,7 @@ pub mod buy_returned_name_from_delegation {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -648,18 +651,18 @@ pub mod buy_returned_name_from_delegation {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         emit!(ReturnedNamePurchasedEvent {
             buyer: ctx.accounts.buyer.key(),
@@ -792,6 +795,7 @@ pub mod buy_returned_name_from_operator_stake {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -817,18 +821,18 @@ pub mod buy_returned_name_from_operator_stake {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         emit!(ReturnedNamePurchasedEvent {
             buyer: ctx.accounts.buyer.key(),
@@ -869,8 +873,10 @@ pub struct BuyNameFromDelegation<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     /// CHECK: ReservedName PDA — verified in handler
     #[account(mut)]
@@ -929,8 +935,10 @@ pub struct BuyNameFromOperatorStake<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     /// CHECK: ReservedName PDA — verified in handler
     #[account(mut)]
@@ -994,8 +1002,10 @@ pub struct BuyReturnedNameFromDelegation<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     /// Buyer's token account (needed for initiator's share of returned name split)
     #[account(
@@ -1072,8 +1082,10 @@ pub struct BuyReturnedNameFromOperatorStake<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     /// Buyer's token account (needed for initiator's share)
     #[account(
@@ -1249,6 +1261,7 @@ pub mod buy_name_from_withdrawal {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1274,18 +1287,18 @@ pub mod buy_name_from_withdrawal {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         if !ctx.accounts.reserved_name_check.data_is_empty() {
             let reserved_info = ctx.accounts.reserved_name_check.to_account_info();
@@ -1439,6 +1452,7 @@ pub mod buy_returned_name_from_withdrawal {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1464,18 +1478,18 @@ pub mod buy_returned_name_from_withdrawal {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         emit!(ReturnedNamePurchasedEvent {
             buyer: ctx.accounts.buyer.key(),
@@ -1624,6 +1638,7 @@ pub mod buy_name_from_funding_plan {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1649,18 +1664,18 @@ pub mod buy_name_from_funding_plan {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         if !ctx.accounts.reserved_name_check.data_is_empty() {
             let reserved_info = ctx.accounts.reserved_name_check.to_account_info();
@@ -1830,6 +1845,7 @@ pub mod buy_returned_name_from_funding_plan {
         record.undername_limit = DEFAULT_UNDERNAME_COUNT as u16;
         record.purchase_price = token_cost;
         record.bump = ctx.bumps.arns_record;
+        record.version = ARNS_RECORD_VERSION;
 
         let config = &mut ctx.accounts.config;
         config.total_names_registered = config
@@ -1855,18 +1871,18 @@ pub mod buy_returned_name_from_funding_plan {
             .checked_add(token_cost)
             .ok_or(ArnsError::ArithmeticOverflow)?;
 
-        let mut registry = ctx.accounts.name_registry.load_mut()?;
-        let count = registry.count as usize;
-        require!(count < NameRegistry::MAX_NAMES, ArnsError::RegistryFull);
-        registry.names[count] = NameEntry {
-            name_hash,
-            registry_index: count as u32,
-            _padding: [0u8; 4],
-        };
-        registry.count = registry
-            .count
-            .checked_add(1)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        // Append to name registry (dynamic-capacity layout, ADR-020)
+        let registry_info = &ctx.accounts.name_registry;
+        let mut registry_data = registry_info.try_borrow_mut_data()?;
+        let count = name_registry_header(&registry_data).count as u32;
+        append_name_entry(
+            &mut registry_data,
+            NameEntry {
+                name_hash,
+                registry_index: count,
+                _padding: [0u8; 4],
+            },
+        )?;
 
         emit!(ReturnedNamePurchasedEvent {
             buyer: ctx.accounts.buyer.key(),
@@ -1903,8 +1919,10 @@ pub struct BuyNameFromWithdrawal<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     /// CHECK: ReservedName PDA — verified in handler
     #[account(mut)]
@@ -1965,8 +1983,10 @@ pub struct BuyReturnedNameFromWithdrawal<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     #[account(
         mut,
@@ -2026,8 +2046,10 @@ pub struct BuyNameFromFundingPlan<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     /// CHECK: ReservedName PDA — verified in handler
     #[account(mut)]
@@ -2094,8 +2116,10 @@ pub struct BuyReturnedNameFromFundingPlan<'info> {
     )]
     pub arns_record: Box<Account<'info, ArnsRecord>>,
 
+    /// CHECK: Variable-size NameRegistry (ADR-020 dynamic-capacity).
+    /// Handler uses byte-offset helpers.
     #[account(mut, seeds = [NAME_REGISTRY_SEED], bump)]
-    pub name_registry: AccountLoader<'info, NameRegistry>,
+    pub name_registry: AccountInfo<'info>,
 
     #[account(
         mut,

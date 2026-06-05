@@ -35,8 +35,8 @@ pub mod error;
 pub mod events;
 pub mod instructions;
 pub mod mpl_core_cpi;
+pub mod schema_migration;
 pub mod state;
-pub mod vault_introspect;
 pub mod verify;
 
 pub use events::{
@@ -74,6 +74,15 @@ pub mod ario_ant_escrow {
     /// Only callable by `escrow.depositor`.
     pub fn cancel_deposit(ctx: Context<CancelDeposit>) -> Result<()> {
         instructions::cancel::handler(ctx)
+    }
+
+    /// Burn an unclaimed escrow ANT after the 5-year grace period. Admin
+    /// only (signer must = `ArioConfig.authority`). Refunds the asset's
+    /// rent + the escrow PDA's rent to the admin. Implements
+    /// `ANT_ESCROW_DESIGN.md` §11 "Permissionless cleanup of abandoned
+    /// escrows" (originally deferred for v1).
+    pub fn admin_purge_unclaimed_ant(ctx: Context<AdminPurgeUnclaimedAnt>) -> Result<()> {
+        instructions::admin_purge_unclaimed::handler(ctx)
     }
 
     /// Re-target the escrow at a different recipient identity. Rotates the
@@ -203,15 +212,12 @@ pub mod ario_ant_escrow {
 
     /// Release escrowed vault tokens to `claimant` using an off-chain
     /// RSA-PSS attestation re-signed with Ed25519 by the AR.IO attestor
-    /// service. If the vault is still active, this ix releases tokens
-    /// to `payer_token_account` and requires a sibling
-    /// `ario_core::vaulted_transfer` ix in the same tx; if expired,
-    /// transfers liquid to `claimant_token_account`.
-    /// The transaction must include an Ed25519Program native sigverify
-    /// ix immediately preceding this one (introspected via sysvar);
-    /// for the active-vault path it must ALSO include a sibling
-    /// `ario_core::vaulted_transfer` ix anywhere in the tx. See
-    /// `instructions/claim_vault_arweave_attested.rs`.
+    /// service. Vaults are claimable **only after `vault_end_timestamp`**;
+    /// while still locked, this ix rejects with `VaultStillLocked`
+    /// (ADR-022 — the former active re-lock path was removed). The
+    /// transaction must include an Ed25519Program native sigverify ix
+    /// immediately preceding this one (introspected via
+    /// `instructions_sysvar`). See `instructions/claim_vault_arweave_attested.rs`.
     pub fn claim_vault_arweave_attested(
         ctx: Context<ClaimVaultArweaveAttested>,
         message_nonce: [u8; 32],
@@ -220,8 +226,10 @@ pub mod ario_ant_escrow {
     }
 
     /// Release escrowed vault tokens to `claimant` after on-chain
-    /// ECDSA secp256k1 + EIP-191 verification (Ethereum path). Same
-    /// active/expired branching as `claim_vault_arweave_attested`.
+    /// ECDSA secp256k1 + EIP-191 verification (Ethereum path). Vaults
+    /// are claimable only after `vault_end_timestamp` (post-ADR-022 the
+    /// active re-lock path was removed); still-locked claims reject
+    /// with `VaultStillLocked`.
     pub fn claim_vault_ethereum(
         ctx: Context<ClaimVaultEthereum>,
         message_nonce: [u8; 32],
@@ -243,4 +251,113 @@ pub mod ario_ant_escrow {
     ) -> Result<()> {
         instructions::update_vault_recipient::handler(ctx, new_protocol, new_pubkey)
     }
+
+    // =================================================================
+    // Schema Migration
+    // =================================================================
+
+    /// Migrate an `EscrowAnt` account to the latest schema version.
+    /// Since _reserved absorbs the size delta, no realloc is needed.
+    pub fn migrate_escrow_ant(ctx: Context<MigrateEscrowAnt>) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(
+            escrow.version < state::ESCROW_ANT_VERSION,
+            error::EscrowError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_escrow_ant_version(escrow)?;
+        msg!(
+            "EscrowAnt migrated to {}.{}.{}",
+            escrow.version.major,
+            escrow.version.minor,
+            escrow.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate an `EscrowToken` account to the latest schema version.
+    /// Since _reserved absorbs the size delta, no realloc is needed.
+    pub fn migrate_escrow_token(
+        ctx: Context<MigrateEscrowToken>,
+        _asset_id: [u8; 32],
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(
+            escrow.version < state::ESCROW_TOKEN_VERSION,
+            error::EscrowError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_escrow_token_version(escrow)?;
+        msg!(
+            "EscrowToken migrated to {}.{}.{}",
+            escrow.version.major,
+            escrow.version.minor,
+            escrow.version.patch,
+        );
+        Ok(())
+    }
+
+    /// Migrate an `EscrowToken` vault account to the latest schema version.
+    /// Uses ESCROW_VAULT_SEED for PDA derivation.
+    pub fn migrate_escrow_vault(
+        ctx: Context<MigrateEscrowVault>,
+        _asset_id: [u8; 32],
+    ) -> Result<()> {
+        let escrow = &mut ctx.accounts.escrow;
+        require!(
+            escrow.version < state::ESCROW_TOKEN_VERSION,
+            error::EscrowError::AlreadyLatestVersion
+        );
+        schema_migration::migrate_escrow_token_version(escrow)?;
+        msg!(
+            "EscrowVault migrated to {}.{}.{}",
+            escrow.version.major,
+            escrow.version.minor,
+            escrow.version.patch,
+        );
+        Ok(())
+    }
+}
+
+// =================================================================
+// Migration Account Contexts
+// =================================================================
+
+#[derive(Accounts)]
+pub struct MigrateEscrowAnt<'info> {
+    /// CHECK: ANT mint used to derive the escrow PDA
+    pub ant_mint: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ESCROW_ANT_SEED, ant_mint.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, state::EscrowAnt>,
+}
+
+#[derive(Accounts)]
+#[instruction(asset_id: [u8; 32])]
+pub struct MigrateEscrowToken<'info> {
+    /// CHECK: depositor whose escrow PDA we're migrating
+    pub depositor: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ESCROW_TOKEN_SEED, depositor.key().as_ref(), asset_id.as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, state::EscrowToken>,
+}
+
+#[derive(Accounts)]
+#[instruction(asset_id: [u8; 32])]
+pub struct MigrateEscrowVault<'info> {
+    /// CHECK: depositor whose vault escrow PDA we're migrating
+    pub depositor: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [state::ESCROW_VAULT_SEED, depositor.key().as_ref(), asset_id.as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, state::EscrowToken>,
 }

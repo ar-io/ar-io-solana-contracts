@@ -129,4 +129,43 @@ pub enum EscrowError {
     /// canonical claim message reconstructed from on-chain escrow state.
     #[msg("Attested message does not match canonical claim message")]
     AttestationMessageMismatch,
+
+    // ----- Schema migration errors -----
+    /// Account is already at the latest schema version.
+    #[msg("Account is already at the latest schema version")]
+    AlreadyLatestVersion,
+
+    /// Unknown schema version — no migration path exists from this version.
+    #[msg("Unknown schema version — no migration path exists from this version")]
+    UnknownSchemaVersion,
+
+    // ----- Admin purge errors -----
+    /// `admin_purge_unclaimed_ant`: signer is not `ArioConfig.authority`.
+    /// Only the protocol admin may purge abandoned escrows.
+    #[msg("Unauthorized: only the protocol authority may call this instruction")]
+    Unauthorized,
+
+    /// `admin_purge_unclaimed_ant`: the grace period
+    /// (`UNCLAIMED_PURGE_GRACE_SLOTS`, ~5 years) has not yet elapsed
+    /// since the escrow's `deposit_slot`. Retry later.
+    #[msg("Cannot purge yet: the 5-year unclaimed-grace period has not elapsed")]
+    PurgeGraceNotElapsed,
+
+    /// Revocable vaults are not supported by the escrow. The escrow has no
+    /// field for the legitimate revoker, so a revocable re-lock could only
+    /// assign control to an unbound party (the claim-tx payer) — a theft
+    /// vector. Rejected at `deposit_vault` and on the claim re-lock. See
+    /// ADR-021. (Direct `ario_core::vaulted_transfer` revocable vaults are
+    /// unaffected; only the escrow declines to produce/accept them.)
+    #[msg("Revocable vaults are not supported by the escrow (see ADR-021)")]
+    RevocableVaultUnsupported,
+
+    /// Active (still-locked) vault claims are disabled: a locked vault can only
+    /// be claimed after its `vault_end_timestamp`, at which point it is
+    /// delivered liquid to the claimant. The former active re-lock path was
+    /// removed because its sibling-`vaulted_transfer` introspection had no 1:1
+    /// claim↔re-lock binding (reuse / redirection). See the active-vault
+    /// re-lock removal ADR.
+    #[msg("Vault is still locked; claim is only available after the vault end timestamp")]
+    VaultStillLocked,
 }

@@ -9,8 +9,14 @@ use crate::error::ArnsError;
 use crate::state::*;
 
 /// Migration deadline: imports are rejected after this timestamp.
-// Migration deadline: 2026-06-18 00:00:00 UTC. Update before mainnet if migration date changes.
-pub const MIGRATION_DEADLINE: i64 = 1781884800;
+// 2112-04-20 00:01:09 UTC -- INTENTIONALLY far-future BY DESIGN. The AR.IO Solana migration uses no
+// time-based cutoff; finalize_migration (authority-gated, one-shot) is the sole control on the
+// migration-authority write window. The constant is retained so the existing deadline checks
+// compile and short-circuit harmlessly, and the far-future value (vs i64::MAX) keeps the time check
+// permanently inert without overflow risk in deadline arithmetic. Accepted resolution of audit
+// MIGRATION-001 (see docs/SECURITY_AUDIT_INDEPENDENT.md): the time-window risk is accepted, with
+// finalize_migration bounding the window operationally.
+pub const MIGRATION_DEADLINE: i64 = 4490553669;
 
 // =========================================
 // DISCRIMINATOR VALIDATION
@@ -150,24 +156,24 @@ pub fn import_registry_entry_handler(
         ArnsError::MigrationExpired
     );
 
-    let mut registry = ctx.accounts.registry.load_mut()?;
+    let registry_info = &ctx.accounts.registry;
+    let mut data = registry_info.try_borrow_mut_data()?;
 
+    let count_before = name_registry_header(&data).count as usize;
+    // registry_index must match the position being written
     require!(
-        (registry.count as usize) < NameRegistry::MAX_NAMES,
-        ArnsError::RegistryFull
+        registry_index == count_before as u32,
+        ArnsError::InvalidAccountData
     );
 
-    let idx = registry.count as usize;
-
-    // registry_index must match the position being written
-    require!(registry_index == idx as u32, ArnsError::InvalidAccountData);
-
-    registry.names[idx] = NameEntry {
-        name_hash,
-        registry_index,
-        _padding: [0u8; 4],
-    };
-    registry.count += 1;
+    let _written_idx = append_name_entry(
+        &mut data,
+        NameEntry {
+            name_hash,
+            registry_index,
+            _padding: [0u8; 4],
+        },
+    )?;
 
     Ok(())
 }
@@ -211,8 +217,12 @@ pub struct ImportRegistryEntry<'info> {
     )]
     pub config: Account<'info, ArnsConfig>,
     pub authority: Signer<'info>,
-    #[account(mut)]
-    pub registry: AccountLoader<'info, NameRegistry>,
+    /// CHECK: Variable-size NameRegistry account. Validated by PDA-seed
+    /// constraint; handler uses byte-offset helpers (`append_name_entry`,
+    /// `name_registry_header`) instead of `AccountLoader` because the
+    /// header is fixed-size but the slot array isn't (ADR-020).
+    #[account(mut, seeds = [crate::state::NAME_REGISTRY_SEED], bump)]
+    pub registry: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]

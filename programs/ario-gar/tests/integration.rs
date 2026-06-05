@@ -62,6 +62,26 @@ fn anchor_processor(
     }
 }
 
+/// Native-processor bridge for ario-core, used by the `distribute_epoch`
+/// lifecycle tests. `distribute_epoch` CPIs into
+/// `ario_core::release_treasury_to_recipient` to move the per-epoch reward
+/// pool out of the treasury (whose SPL authority lives on ario-core's
+/// `ArioConfig` PDA). The tests load ario-core in-process via
+/// `pt.add_program("ario_core", ario_gar::ARIO_CORE_PROGRAM_ID, ...)`; the
+/// gar source pins the CPI target to `ARIO_CORE_PROGRAM_ID`, which is the
+/// placeholder `declare_id!()` literal ario-core was compiled with, so the
+/// loaded-at address matches ario-core's runtime declared ID.
+fn ario_core_processor(
+    program_id: &Pubkey,
+    accounts: &[anchor_lang::prelude::AccountInfo],
+    data: &[u8],
+) -> anchor_lang::solana_program::entrypoint::ProgramResult {
+    unsafe {
+        let accounts: &[anchor_lang::prelude::AccountInfo] = std::mem::transmute(accounts);
+        ario_core::entry(program_id, accounts, data)
+    }
+}
+
 /// Create a ProgramTest with pre-initialized GAR state.
 ///
 /// In native processor mode, Anchor's `init` CPI to system_program is limited to
@@ -472,6 +492,54 @@ async fn setup_gar(
     }
 }
 
+/// Variant of `setup_gar` for the `distribute_epoch` lifecycle tests: the
+/// `protocol_token_account` (the treasury / transfer source) is created with
+/// its SPL `Owner` authority set to ario-core's `ArioConfig` PDA, matching
+/// production — `release_treasury_to_recipient` signs the SPL transfer FROM
+/// the treasury with the ArioConfig PDA as authority, so the treasury must be
+/// owned by that PDA, not by gar settings. The stake token account (transfer
+/// destination) stays owned by gar settings; SPL transfers don't require the
+/// destination's owner to sign.
+async fn setup_gar_with_core_treasury(
+    ctx: &mut ProgramTestContext,
+    mint: Keypair,
+    mint_authority: Keypair,
+    operator_token: Keypair,
+    stake_token: Keypair,
+    protocol_token: Keypair,
+) -> GarSetup {
+    create_mint(ctx, &mint, &mint_authority.pubkey()).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    create_token_account(ctx, &operator_token, &mint.pubkey(), &payer_pk).await;
+    mint_tokens(
+        ctx,
+        &mint.pubkey(),
+        &operator_token.pubkey(),
+        &mint_authority,
+        100_000_000_000,
+    )
+    .await;
+
+    let (settings_key, _) = settings_pda();
+    create_token_account(ctx, &stake_token, &mint.pubkey(), &settings_key).await;
+    // Treasury source: owned by the ArioConfig PDA (production parity).
+    let (ario_config_key, _) = ario_config_pda();
+    create_token_account(ctx, &protocol_token, &mint.pubkey(), &ario_config_key).await;
+
+    let (registry_key, _) = registry_pda();
+
+    GarSetup {
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+        registry_key,
+        settings_key,
+    }
+}
+
 /// Join a gateway with default params. Returns gateway PDA key.
 async fn join_gateway(
     ctx: &mut ProgramTestContext,
@@ -557,6 +625,295 @@ async fn test_gar_settings_initialized() {
     assert_eq!(settings.max_delegates_per_gateway, 10_000);
     assert_eq!(settings.stake_token_account, stake_token.pubkey());
     assert_eq!(settings.protocol_token_account, protocol_token.pubkey());
+}
+
+/// Verify `admin_set_withdrawal_period`:
+///   1. Authority signer succeeds; `settings.withdrawal_period` updates.
+///   2. Non-authority signer rejected with `Unauthorized`.
+///   3. `new_period_seconds < 60` rejected with `InvalidParameter` (matches
+///      the same bound on `admin_set_epoch_duration`).
+#[tokio::test]
+async fn test_admin_set_withdrawal_period() {
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar(
+        // payer is the authority for the GAR settings PDA in this fixture.
+        // We don't have `ctx.payer.pubkey()` yet (ProgramTest hasn't started),
+        // but ProgramTest's default payer is deterministic. Pre-set the
+        // authority to a placeholder we'll then replace below.
+        &Pubkey::new_unique(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    // Re-write the GatewaySettings PDA's `authority` field to `ctx.payer`
+    // so we can sign as authority. (Anchor processes the `has_one =
+    // authority` constraint at ix execution time, against on-chain state.)
+    let (settings_key, _) = settings_pda();
+    let mut settings_account = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    // authority is the first field after the 8-byte discriminator.
+    settings_account.data[8..40].copy_from_slice(ctx.payer.pubkey().as_ref());
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::AccountSharedData::from(settings_account),
+    );
+
+    // Step 1: authority signer succeeds, period updates from default to 120s.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: 120,
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings = GatewaySettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(settings.withdrawal_period, 120);
+
+    // Step 2: non-authority signer rejected.
+    let bad_signer = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: settings_key,
+                authority: bad_signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: 60,
+            }
+            .data(),
+        }],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::Unauthorized);
+
+    // Step 3: new_period_seconds < 60 rejected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let too_short_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: 30,
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let too_short_result = ctx.banks_client.process_transaction(too_short_tx).await;
+    assert_anchor_error!(too_short_result, GarError::InvalidParameter);
+}
+
+/// Verify `transfer_authority` (ADR-026):
+///   1. Null pubkey rejected (`InvalidParameter`).
+///   2. Non-authority signer rejected (`Unauthorized`).
+///   3. Current authority rotates; `settings.authority` updates and a sibling
+///      field (`mint`) is left byte-identical (single-step, no layout change).
+///   4. The OLD authority is dead immediately after rotation (`Unauthorized`).
+///   5. Rotation to an off-curve PDA (mirrors handing to the Squads vault) is
+///      accepted, signed by the (new) current authority.
+#[tokio::test]
+async fn test_transfer_authority() {
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &Pubkey::new_unique(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (settings_key, _) = settings_pda();
+    // Make ctx.payer the admin authority (authority = bytes 8..40).
+    let mut settings_account = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    settings_account.data[8..40].copy_from_slice(ctx.payer.pubkey().as_ref());
+    // Capture the `mint` sibling field (bytes 40..72) to prove it's untouched.
+    let mint_bytes_before = settings_account.data[40..72].to_vec();
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::AccountSharedData::from(settings_account),
+    );
+
+    let ta_ix = |new_authority: Pubkey, signer: Pubkey| Instruction {
+        program_id: ario_gar::ID,
+        accounts: ario_gar::accounts::TransferAuthority {
+            settings: settings_key,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_gar::instruction::TransferAuthority { new_authority }.data(),
+    };
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::default(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 2: non-authority signer rejected.
+    let bad = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_bad = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client
+        .process_transaction(fund_bad)
+        .await
+        .unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::new_unique(), bad.pubkey())],
+        Some(&bad.pubkey()),
+        &[&bad],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 3: current authority rotates to a real keypair (so we can sign as it).
+    let new_auth = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(new_auth.pubkey(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let s = GatewaySettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(s.authority, new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..72],
+        &mint_bytes_before[..],
+        "sibling field (mint) must be byte-identical after rotation"
+    );
+
+    // Step 4: old authority (ctx.payer) is now dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::new_unique(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 5: rotate to an off-curve PDA (mirrors handing to a Squads vault),
+    // signed by the current authority (new_auth).
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_new = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_auth.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client
+        .process_transaction(fund_new)
+        .await
+        .unwrap();
+    let pda_target = Pubkey::find_program_address(&[b"vault-like"], &ario_gar::ID).0;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(pda_target, new_auth.pubkey())],
+        Some(&new_auth.pubkey()),
+        &[&new_auth],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let s = GatewaySettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(s.authority, pda_target);
 }
 
 #[tokio::test]
@@ -1401,6 +1758,183 @@ async fn test_close_epoch_settings() {
 // the full `join_network` + `create_epoch` lifecycle to make a real Epoch
 // PDA) to validate something already covered by existing tests. Skipped
 // in favor of live devnet validation when the ix is first run.
+
+/// Verify `admin_set_current_epoch_index`:
+///   1. Authority signer with non-zero `new_index` succeeds — settings
+///      updates AND `genesis_timestamp` re-anchors to make the new
+///      index's epoch_start ≈ now.
+///   2. `new_index = 0` rejected with `InvalidParameter` (no point;
+///      0 is the default).
+///   3. Non-authority signer rejected with `Unauthorized`.
+///   4. One-shot: re-calling after a successful set rejects with
+///      `EpochCounterAlreadyAdvanced`.
+#[tokio::test]
+async fn test_admin_set_current_epoch_index() {
+    let mint = Keypair::new();
+    let dummy = Pubkey::new_unique();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    // initialize_epochs: starts with current_epoch_index=0, enabled=false.
+    let epoch_duration: i64 = 86_400;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InitializeEpochs {
+                epoch_settings: epoch_settings_key,
+                payer: upgrade_authority_keypair().pubkey(),
+                program_data: program_data_pda(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InitializeEpochs {
+                params: ario_gar::InitializeEpochParams {
+                    authority: ctx.payer.pubkey(),
+                    epoch_duration,
+                    observer_count: 50,
+                    name_count: 50,
+                    min_observer_stake: 50_000_000_000,
+                    slash_rate: 1000,
+                    tenure_weight_duration: 180 * 86_400,
+                    max_tenure_weight: 4,
+                },
+            }
+            .data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer, &upgrade_authority_keypair()],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Step 1: new_index = 0 rejected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let zero_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 0 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let zero_result = ctx.banks_client.process_transaction(zero_tx).await;
+    assert_anchor_error!(zero_result, GarError::InvalidParameter);
+
+    // Step 2: non-authority signer rejected.
+    let bad_signer = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: bad_signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 406 }.data(),
+        }],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::Unauthorized);
+
+    // Step 3: authority + valid new_index succeeds.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let ok_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 406 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(ok_tx).await.unwrap();
+
+    // Verify the state update.
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(settings.current_epoch_index, 406);
+    // Re-anchor invariant: epoch_start for index=406 ≈ now (i.e.
+    // `now - new_genesis ≈ new_index * epoch_duration`).
+    let clock_sysvar = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::sysvar::clock::Clock>()
+        .await
+        .unwrap();
+    let now = clock_sysvar.unix_timestamp;
+    let elapsed = now - settings.genesis_timestamp;
+    let expected_elapsed = 406i64 * epoch_duration;
+    // Allow a small slack for the slot/clock advance between the tx and
+    // this query (program-test slots advance every few ms).
+    assert!(
+        (elapsed - expected_elapsed).abs() < 60,
+        "expected genesis re-anchor to ~{}s ago (406 * {}), got {}s",
+        expected_elapsed,
+        epoch_duration,
+        elapsed
+    );
+
+    // Step 4: one-shot — calling again is rejected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let twice_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: ctx.payer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetCurrentEpochIndex { new_index: 500 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let twice_result = ctx.banks_client.process_transaction(twice_tx).await;
+    assert_anchor_error!(twice_result, GarError::EpochCounterAlreadyAdvanced);
+}
 
 // =========================================
 // NEW INTEGRATION TESTS
@@ -3730,6 +4264,117 @@ fn pre_create_epoch_settings(
     );
 }
 
+/// Canonical `ArioConfig` PDA address, derived from the placeholder
+/// `ARIO_CORE_PROGRAM_ID` that ario-core was compiled with (its
+/// `declare_id!()` literal). This is the address `distribute_epoch`'s
+/// `ario_config` account constraint resolves to
+/// (`seeds = [b"ario_config"], seeds::program = ARIO_CORE_PROGRAM_ID`).
+fn ario_config_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"ario_config"], &ario_gar::ARIO_CORE_PROGRAM_ID)
+}
+
+/// Pre-create ario-core's `ArioConfig` PDA so `distribute_epoch`'s CPI into
+/// `ario_core::release_treasury_to_recipient` can authenticate the transfer.
+///
+/// ario-core deserializes this as a typed `Account<ArioConfig>` and enforces:
+///   * `config.treasury == protocol_token_account` (transfer source)
+///   * `config.gar_program == ario_gar::ID` (caller authentication — the
+///     `gar_settings` signer must derive from this program ID)
+///
+/// The byte layout mirrors `ario_core::state::ArioConfig` exactly (borsh,
+/// sequential). Built WITHOUT the `migration-test` feature, so the struct
+/// has no `field_1/2/3` tail and `version` is the canonical 1.0.0.
+fn pre_create_ario_config(pt: &mut ProgramTest, treasury: &Pubkey, gar_program: &Pubkey) {
+    use anchor_lang::solana_program::hash::hash;
+
+    let (config_key, config_bump) = ario_config_pda();
+    // SIZE = disc(8) + authority(32) + mint(32) + arns_program(32)
+    //      + treasury(32) + 7*u64/i64(56) + migration_active(1)
+    //      + migration_authority(32) + bump(1) + gar_program(32)
+    //      + version(3) = 261
+    let size = 261usize;
+    let mut data = vec![0u8; size];
+
+    // Anchor account discriminator
+    let disc = hash(b"account:ArioConfig");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+
+    let mut offset = 8usize;
+    let dummy_authority = Pubkey::new_unique();
+    // authority: Pubkey
+    data[offset..offset + 32].copy_from_slice(dummy_authority.as_ref());
+    offset += 32;
+    // mint: Pubkey (unused by release_treasury_to_recipient)
+    data[offset..offset + 32].copy_from_slice(Pubkey::new_unique().as_ref());
+    offset += 32;
+    // arns_program: Pubkey (unused here)
+    data[offset..offset + 32].copy_from_slice(Pubkey::new_unique().as_ref());
+    offset += 32;
+    // treasury: Pubkey — pinned source; MUST equal protocol_token_account
+    data[offset..offset + 32].copy_from_slice(treasury.as_ref());
+    offset += 32;
+    // total_supply / protocol_balance / circulating_supply / locked_supply:
+    // u64 (4 * 8 = 32 bytes, all 0)
+    offset += 32;
+    // min_vault_duration / max_vault_duration / primary_name_request_expiry:
+    // i64 (3 * 8 = 24 bytes, all 0)
+    offset += 24;
+    // migration_active: bool — false (release ix is NOT gated on this)
+    data[offset] = 0;
+    offset += 1;
+    // migration_authority: Pubkey
+    data[offset..offset + 32].copy_from_slice(dummy_authority.as_ref());
+    offset += 32;
+    // bump: u8
+    data[offset] = config_bump;
+    offset += 1;
+    // gar_program: Pubkey — caller authentication, MUST equal ario_gar::ID
+    data[offset..offset + 32].copy_from_slice(gar_program.as_ref());
+    offset += 32;
+    // version: SchemaVersion { major, minor, patch } = 1.0.0
+    data[offset] = 1;
+    data[offset + 1] = 0;
+    data[offset + 2] = 0;
+    offset += 3;
+    debug_assert_eq!(offset, size, "ArioConfig hand-serialization length drift");
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        config_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(size),
+            data,
+            owner: ario_gar::ARIO_CORE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+}
+
+/// `program_test_with_gar`, plus the ario-core native processor and a
+/// pre-created `ArioConfig` PDA — the setup `distribute_epoch` needs to CPI
+/// into `ario_core::release_treasury_to_recipient`. `treasury` MUST be the
+/// same pubkey passed as `protocol_token_account` (the transfer source that
+/// ario-core pins against `ArioConfig.treasury`).
+fn program_test_with_gar_and_core(
+    authority: &Pubkey,
+    mint: &Pubkey,
+    stake_token_account: &Pubkey,
+    protocol_token_account: &Pubkey,
+) -> ProgramTest {
+    let mut pt =
+        program_test_with_gar(authority, mint, stake_token_account, protocol_token_account);
+    pt.add_program(
+        "ario_core",
+        ario_gar::ARIO_CORE_PROGRAM_ID,
+        processor!(ario_core_processor),
+    );
+    // gar_program in ArioConfig must be ario-gar's program ID so the
+    // gar_settings PDA signer (derived from ario_gar::ID) authenticates.
+    pre_create_ario_config(&mut pt, protocol_token_account, &ario_gar::ID);
+    pt
+}
+
 // -----------------------------------------
 // 1. test_epoch_create_and_tally
 // -----------------------------------------
@@ -3872,15 +4517,33 @@ async fn test_epoch_create_and_tally() {
     assert_eq!(epoch.weights_tallied, 1);
     assert_eq!(epoch.tally_index, 1);
     assert!(epoch.total_composite_weight() > 0);
+
+    // ADR-025 / BD-111: this gateway has no delegated stake, so tally must
+    // record `delegated_at_tally == 0` for its slot (no delegate carve-out at
+    // distribution). The positive case is covered by
+    // test_tally_snapshots_delegated_at_tally.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[0].delegated_at_tally, 0,
+        "no delegated stake at tally must snapshot the flag as 0"
+    );
 }
 
-// -----------------------------------------
-// 2. test_epoch_full_lifecycle
-// -----------------------------------------
-
+// ADR-025 / BD-111 regression: tally_weights must snapshot
+// GatewaySlot.delegated_at_tally = 1 when the gateway carries delegated stake,
+// so distribute_epoch carves the delegate share from this tally snapshot rather
+// than the operator-manipulable live total_delegated_stake. Without the
+// snapshot, an operator could disable delegation + crank every delegate out
+// between tally and distribution to redirect the delegate reward to itself.
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
-async fn test_epoch_full_lifecycle() {
+async fn test_tally_snapshots_delegated_at_tally() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
     let mut pt = program_test_with_gar(
@@ -3893,6 +4556,192 @@ async fn test_epoch_full_lifecycle() {
     let mut ctx = pt.start_with_context().await;
 
     let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000,
+    )
+    .await;
+
+    // clock 0 so gateway.start_timestamp (0) <= epoch.start (100)
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // Delegate to the gateway BEFORE tally so the stake contributes to weight.
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(
+        &mut ctx,
+        &delegator_token,
+        &setup.mint.pubkey(),
+        &delegator_pk,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let (delegation_key, _) = delegation_pda(&ctx.payer.pubkey(), &delegator_pk);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake {
+                amount: 20_000_000_000u64,
+            }
+            .data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Warp past epoch start, create epoch, tally.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: ctx.payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: ctx.payer.pubkey(),
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The gateway carried delegated stake at tally → flag must be 1.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[0].delegated_at_tally, 1,
+        "delegated stake present at tally must snapshot the flag as 1"
+    );
+    assert!(
+        registry.gateways[0].composite_weight > 0,
+        "tallied gateway should have nonzero weight"
+    );
+}
+
+// -----------------------------------------
+// 2. test_epoch_full_lifecycle
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_epoch_full_lifecycle() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -4093,8 +4942,8 @@ async fn test_epoch_full_lifecycle() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -4724,11 +5573,10 @@ async fn test_epoch_save_observations_not_prescribed() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_distribute_before_end() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -4737,6 +5585,8 @@ async fn test_epoch_distribute_before_end() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
+    // The `EpochInProgress` guard rejects before the treasury CPI, so the
+    // treasury SPL-owner doesn't matter here — plain setup_gar is fine.
     let setup = setup_gar(
         &mut ctx,
         mint,
@@ -4897,8 +5747,8 @@ async fn test_epoch_distribute_before_end() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -4926,11 +5776,10 @@ async fn test_epoch_distribute_before_end() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_close_before_retention() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -4939,7 +5788,7 @@ async fn test_epoch_close_before_retention() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -5107,8 +5956,8 @@ async fn test_epoch_close_before_retention() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -6622,13 +7471,12 @@ async fn test_stake_conservation_payment_paths() {
 }
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_epoch_reward_budget_not_exceeded() {
     // Verify that reward distribution never transfers more than epoch.total_eligible_rewards
     // from the protocol token account.
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -6637,7 +7485,7 @@ async fn test_epoch_reward_budget_not_exceeded() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -6825,8 +7673,8 @@ async fn test_epoch_reward_budget_not_exceeded() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -7730,12 +8578,137 @@ async fn test_compound_delegation_rewards() {
 }
 
 // -----------------------------------------
-// test_close_epoch_happy
+// test_import_account_rejects_epoch_settings_discriminator (audit M-4, 2026-05-30 follow-up)
+//
+// PR #81 added `epoch_settings_excluded_from_import_allowlist` as a unit test
+// that pins the `known_discriminator` helper returns None for EpochSettings.
+// But the helper returning None doesn't ALONE prove the on-chain
+// `import_account` handler actually rejects — Anchor's account-resolution
+// layer or a future refactor could conceivably bypass it. This test takes
+// the integration path: builds a real `import_account` ix with the
+// EpochSettings discriminator + valid PDA derivation, sends it signed by
+// the migration_authority, and asserts the handler rejects with
+// `InvalidAccountData`.
+//
+// Pre-fix (PR #81): EpochSettings was in the allowlist; this ix would have
+// succeeded and overwritten the EpochSettings account (the post-finalize
+// authority-hijack the audit flagged).
+// Post-fix: rejects at the `known_discriminator` check inside the handler.
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
-async fn test_close_epoch_happy() {
+async fn test_import_account_rejects_epoch_settings_discriminator() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let payer_pk = ctx.payer.pubkey();
+
+    // Pre-setup: GatewaySettings is created in program_test_with_gar with
+    // migration_active=false + migration_authority=&dummy. Flip both so
+    // `import_account`'s `constraint = settings.migration_active` AND
+    // `settings.migration_authority == authority.key()` constraints pass
+    // — that way we land on the discriminator gate (InvalidAccountData),
+    // which is what M-4 is testing, not MigrationInactive/Unauthorized.
+    //
+    // CodeRabbit nit #84: deserialize the typed struct + mutate + reserialize
+    // (vs. hardcoded byte offsets) so a future GatewaySettings layout change
+    // can't silently break this test.
+    let (settings_key, _) = settings_pda();
+    let settings_acc = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings = GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    settings.migration_active = true;
+    settings.migration_authority = payer_pk;
+    let mut new_data = Vec::with_capacity(settings_acc.data.len());
+    settings.try_serialize(&mut new_data).unwrap();
+    new_data.resize(settings_acc.data.len(), 0); // preserve the existing account size
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::Account {
+            lamports: settings_acc.lamports,
+            data: new_data,
+            owner: settings_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Build the EpochSettings discriminator (same way the handler computes it).
+    use anchor_lang::solana_program::hash::hash;
+    let es_disc = hash(b"account:EpochSettings");
+    let mut data = vec![0u8; 8 + 256];
+    data[..8].copy_from_slice(&es_disc.to_bytes()[..8]);
+
+    // PDA derivation MUST match what the handler computes with the supplied
+    // seeds, else we get InvalidPda before reaching the discriminator check.
+    let seeds: Vec<Vec<u8>> = vec![EPOCH_SETTINGS_SEED.to_vec()];
+    let (es_pda, _bump) = epoch_settings_pda();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::ImportAccount {
+                settings: settings_key,
+                authority: payer_pk, // migration_authority defaults to payer in setup
+                payer: payer_pk,
+                account: es_pda,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::ImportAccount { seeds, data }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    let result = ctx.banks_client.process_transaction(tx).await;
+
+    // M-4 assertion: the handler MUST reject EpochSettings at the
+    // discriminator-allowlist check. Pre-PR #81 this would have SUCCEEDED
+    // and overwritten EpochSettings — the exact post-finalize authority-
+    // hijack the audit flagged.
+    assert_anchor_error!(result, GarError::InvalidAccountData);
+}
+
+// -----------------------------------------
+// test_distribute_epoch_skips_cleared_registry_slots (audit M-1, 2026-05-29)
+//
+// CodeRabbit pushback on PR #79: add focused non-ignored test coverage
+// for the cleared-slot skip branch in distribute_epoch (mirrors the
+// GAR-009 pattern in tally_weights).
+//
+// Strategy: run the standard scaffold through `create_epoch`, then
+// directly mutate the GatewayRegistry + Epoch zero-copy accounts to
+// inject a state where every active slot is `Pubkey::default()`. With
+// no real gateways, pass 2 produces zero pending distributions →
+// `transfer_amount == 0` → the ario-core CPI is skipped, so this test
+// does NOT need ario-core loaded. (The other distribute_epoch tests
+// that DO reach the treasury CPI load ario-core as a native processor
+// via `program_test_with_gar_and_core` — see that helper.)
+//
+// Pre-fix the loop would hit the `registry.gateways[dist_idx].address
+// == gateway.operator` require! on the very first cleared slot and
+// reject the whole tx. Post-fix the loop skips each cleared slot,
+// advances `distribution_index`, and finishes cleanly with
+// `rewards_distributed = 1`.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_distribute_epoch_skips_cleared_registry_slots() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
     let mut pt = program_test_with_gar(
@@ -7744,10 +8717,407 @@ async fn test_close_epoch_happy() {
         &stake_token.pubkey(),
         &protocol_token.pubkey(),
     );
+    // epoch_duration=86_400s, enabled=true so create_epoch passes the gate
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
     let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Warp clock past genesis (100) so create_epoch can build a valid epoch.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // --- Create epoch (real ix; gives us a valid Epoch state to mutate) ---
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // --- Inject the cleared-slot state ---
+    //
+    // Bump registry.count to N so dist_idx iterates through slots, but
+    // leave each slot's address at the default `Pubkey::default()`
+    // (slots are zero-initialized by setup_gar / pre_create_epoch_settings).
+    let cleared_count: u32 = 2;
+    {
+        let reg_acc = ctx
+            .banks_client
+            .get_account(setup.registry_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = reg_acc.data.clone();
+        // GatewayRegistry layout: disc(8) + authority(32) + count(u32 LE @ 40)
+        data[40..44].copy_from_slice(&cleared_count.to_le_bytes());
+        ctx.set_account(
+            &setup.registry_key,
+            &solana_sdk::account::Account {
+                lamports: reg_acc.lamports,
+                data,
+                owner: reg_acc.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    // Mutate the Epoch state so distribute_epoch's guards pass:
+    //   prescriptions_done = 1  (else PrescriptionsNotDone)
+    //   end_timestamp = 0       (already in the past — clock is 200)
+    //   rewards_distributed = 0 (already zero from create_epoch)
+    //   active_gateway_count = cleared_count (so the loop iterates N times)
+    //   distribution_index = 0
+    {
+        let epoch_acc = ctx
+            .banks_client
+            .get_account(epoch_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = epoch_acc.data.clone();
+        // bytemuck::from_bytes_mut on the post-discriminator slice.
+        let epoch_bytes = &mut data[8..8 + std::mem::size_of::<Epoch>()];
+        let epoch: &mut Epoch = bytemuck::from_bytes_mut(epoch_bytes);
+        epoch.end_timestamp = 0;
+        epoch.prescriptions_done = 1;
+        epoch.rewards_distributed = 0;
+        epoch.active_gateway_count = cleared_count;
+        epoch.distribution_index = 0;
+        // Clear reward fields so transfer_amount stays 0 even if a slot somehow processed
+        epoch.per_gateway_reward = 0;
+        epoch.per_observer_reward = 0;
+        epoch.total_eligible_rewards = 0;
+
+        ctx.set_account(
+            &epoch_key,
+            &solana_sdk::account::Account {
+                lamports: epoch_acc.lamports,
+                data,
+                owner: epoch_acc.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    // Derive the ario_config PDA that the address constraint expects.
+    // Uses the placeholder ARIO_CORE_PROGRAM_ID baked into the build —
+    // sufficient for the constraint; no CPI to ario-core actually fires
+    // because all slots are cleared.
+    let (ario_config_pda, _) =
+        Pubkey::find_program_address(&[b"ario_config"], &ario_gar::ARIO_CORE_PROGRAM_ID);
+
+    // Two dummy account_infos for the remaining_accounts slot. The skip
+    // branch fires BEFORE any deserialization, so these accounts are
+    // never actually read — any system-owned address works.
+    let dummy_a = Pubkey::new_unique();
+    let dummy_b = Pubkey::new_unique();
+
+    let mut distribute_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        payer: payer_pk,
+        token_program: spl_token::id(),
+    }
+    .to_account_metas(None);
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(dummy_a, false));
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(dummy_b, false));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: distribute_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+
+    // M-1 assertion: distribute_epoch succeeds despite every registry slot
+    // being Pubkey::default(). Pre-fix this failed with InvalidGatewayAccount
+    // on the first slot because the registry-vs-operator equality check
+    // (now skipped) rejected default vs the dummy account's owner.
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("distribute_epoch must succeed when all registry slots are cleared (audit M-1)");
+
+    // Verify the loop advanced past both cleared slots and finalized the epoch.
+    let epoch_acc = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_acc.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.distribution_index, cleared_count,
+        "distribution_index must equal active_count after iterating past cleared slots"
+    );
+    assert_eq!(
+        epoch.rewards_distributed, 1,
+        "rewards_distributed must be set when dist_idx reaches active_count"
+    );
+}
+
+// -----------------------------------------
+// test_compound_delegation_rewards_permissionless (audit M-2, 2026-05-29)
+//
+// `compound_delegation_rewards` MUST be invokable by any signer — not just
+// the delegator themselves. INVARIANTS.md describes the ix as
+// "permissionless" because compounding only moves a delegate's pending
+// rewards into their active stake on their OWN balance; no funds move
+// between accounts and no authorization is required. Pre-this-fix the
+// account struct required `delegator: Signer<'info>`, contradicting the
+// documented model and blocking (a) the off-chain monitor's Invariant 1
+// health check and (b) `finalize_gone` for gateways with dormant pending
+// delegate rewards.
+//
+// This test pins the new behavior: a third-party signer (not the
+// delegator) calls compound on the delegator's behalf and the
+// instruction succeeds with the same state mutation.
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_compound_delegation_rewards_permissionless() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Set up a real delegator (the holder of the Delegation PDA).
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(
+        &mut ctx,
+        &delegator_token,
+        &setup.mint.pubkey(),
+        &delegator_pk,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let delegate_amount = 100_000_000u64;
+    let (delegation_key, _) = delegation_pda(&payer_pk, &delegator_pk);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake {
+                amount: delegate_amount,
+            }
+            .data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Inject pending reward (same simulation as test_compound_delegation_rewards).
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    gw.cumulative_reward_per_token = 1_000_000_000_000_000_000u128; // 1e18
+    let mut new_data = Vec::new();
+    gw.try_serialize(&mut new_data).unwrap();
+    let original_len = gw_account.data.len();
+    new_data.resize(original_len, 0);
+    ctx.set_account(
+        &gateway_key,
+        &solana_sdk::account::Account {
+            lamports: gw_account.lamports,
+            data: new_data,
+            owner: gw_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // ---- The permissionless invocation ----
+    // A THIRD-PARTY caller — not the delegator — invokes compound on the
+    // delegator's behalf. The `delegator` ACCOUNT in the metas is still the
+    // delegator's pubkey (it's a PDA-derivation source bound by the seeds
+    // constraint), but it is NOT a signer here. Pre-this-fix this fails
+    // with `MissingRequiredSignature`; post-fix it succeeds.
+    let third_party = Keypair::new();
+    let third_party_pk = third_party.pubkey();
+    // Fund the third party so they can pay tx fees.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &third_party_pk,
+            10_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CompoundDelegationRewards {
+                gateway: gateway_key,
+                delegation: delegation_key,
+                // `delegator` is now an UncheckedAccount (not a Signer);
+                // we pass its pubkey purely as a PDA-derivation seed.
+                delegator: delegator_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CompoundDelegationRewards {}.data(),
+        }],
+        Some(&third_party_pk),
+        &[&third_party], // ← signed by third party, NOT the delegator
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("permissionless compound must succeed (audit M-2)");
+
+    // State mutation is identical to the delegator-signed variant.
+    let delegation_account = ctx
+        .banks_client
+        .get_account(delegation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let delegation = Delegation::try_deserialize(&mut delegation_account.data.as_slice()).unwrap();
+    assert_eq!(delegation.amount, delegate_amount + 100_000_000);
+    assert_eq!(delegation.reward_debt, 1_000_000_000_000_000_000u128);
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    assert_eq!(gw.total_delegated_stake, delegate_amount + 100_000_000);
+}
+
+// -----------------------------------------
+// test_close_epoch_happy
+// -----------------------------------------
+
+#[tokio::test]
+async fn test_close_epoch_happy() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -7887,8 +9257,8 @@ async fn test_close_epoch_happy() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -8737,6 +10107,201 @@ async fn test_instant_withdrawal_decay_boundaries() {
     );
 }
 
+// -----------------------------------------
+// test_instant_withdrawal_decay_quarter_and_period_edge
+// -----------------------------------------
+
+/// Complements `test_instant_withdrawal_decay_boundaries` (which pins
+/// elapsed ∈ {0, half, total}) with the points that exercise the exact
+/// shape of the linear ramp and the inclusive `>=` boundary in
+/// `instant_withdrawal` (withdrawal.rs ~lines 84-103):
+///   * elapsed = period/4   -> max - (max-min)/4 = 40% (ramp is linear)
+///   * elapsed = period - 1 -> still decaying, fee strictly above the 10% min
+///   * elapsed = period + 1 -> min (10%), confirming the `>=` gate clamps
+///
+/// All three are charged by the real on-chain handler (not a mirror), so a
+/// regression in the interpolation or the boundary comparison fails here.
+#[tokio::test]
+async fn test_instant_withdrawal_decay_quarter_and_period_edge() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // 50k stake supports three 10k withdrawals while staying above the 20k
+    // operator minimum.
+    let initial_stake = 50_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, initial_stake).await;
+    let payer_pk = ctx.payer.pubkey();
+    let (withdrawal_counter_key, _) = withdrawal_counter_pda(&payer_pk);
+
+    let decrease_amount = 10_000_000_000u64;
+    let total_period = 30 * 86_400i64;
+
+    // Create three withdrawal vaults (ids 0,1,2) up front; capture each
+    // vault's created_at so the elapsed offset is exact.
+    let mut created_ats = [0i64; 3];
+    for (id, slot) in created_ats.iter_mut().enumerate() {
+        let (withdrawal_key, _) = withdrawal_pda(&payer_pk, id as u64);
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DecreaseOperatorStake {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    withdrawal_counter: withdrawal_counter_key,
+                    withdrawal: withdrawal_key,
+                    operator: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DecreaseOperatorStake {
+                    amount: decrease_amount,
+                }
+                .data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let acct = ctx
+            .banks_client
+            .get_account(withdrawal_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let w = Withdrawal::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        *slot = w.created_at;
+    }
+
+    // (elapsed offset, expected fee, expected payout) for each vault.
+    // rate(elapsed) = max - (max-min)*elapsed/period, clamped to [min,max].
+    //   quarter:  rate = 500_000 - 400_000/4 = 400_000 (40%) -> fee 4B, payout 6B
+    //   period+1: elapsed >= period -> min = 100_000 (10%)  -> fee 1B, payout 9B
+    let quarter = total_period / 4;
+    let cases = [
+        (0usize, quarter, 4_000_000_000u64, 6_000_000_000u64),
+        (1usize, total_period + 1, 1_000_000_000u64, 9_000_000_000u64),
+    ];
+
+    for (id, elapsed, expected_fee, expected_payout) in cases {
+        let (withdrawal_key, _) = withdrawal_pda(&payer_pk, id as u64);
+        let mut clock = ctx
+            .banks_client
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .await
+            .unwrap();
+        clock.unix_timestamp = created_ats[id] + elapsed;
+        ctx.set_sysvar(&clock);
+
+        let balance_before = get_token_balance(&mut ctx, &setup.operator_token.pubkey()).await;
+        let protocol_before = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::InstantWithdrawal {
+                    settings: setup.settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    owner_token_account: setup.operator_token.pubkey(),
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    owner: payer_pk,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::InstantWithdrawal {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let balance_after = get_token_balance(&mut ctx, &setup.operator_token.pubkey()).await;
+        let protocol_after = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+        assert_eq!(
+            balance_after - balance_before,
+            expected_payout,
+            "elapsed={elapsed}: payout mismatch"
+        );
+        assert_eq!(
+            protocol_after - protocol_before,
+            expected_fee,
+            "elapsed={elapsed}: fee mismatch"
+        );
+    }
+
+    // Vault 2 at elapsed = period - 1: still on the decaying ramp, so the
+    // fee must be strictly greater than the 10% floor (1B) — proving the
+    // boundary is `>=` (min only AT/after period), not `>` (min just before).
+    let (withdrawal_key_2, _) = withdrawal_pda(&payer_pk, 2);
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = created_ats[2] + total_period - 1;
+    ctx.set_sysvar(&clock);
+
+    let protocol_before = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::InstantWithdrawal {
+                settings: setup.settings_key,
+                withdrawal: withdrawal_key_2,
+                stake_token_account: setup.stake_token.pubkey(),
+                owner_token_account: setup.operator_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                owner: payer_pk,
+                token_program: spl_token::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::InstantWithdrawal {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let protocol_after = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+    let fee_at_period_minus_one = protocol_after - protocol_before;
+    // 10% floor on a 10k withdrawal is exactly 1B. At period-1 the rate is
+    // still above min, so the fee must exceed that floor.
+    assert!(
+        fee_at_period_minus_one > 1_000_000_000u64,
+        "at period-1 the penalty must still be above the 10% min (got fee {fee_at_period_minus_one}); \
+         a `>` boundary instead of `>=` would not change this point, but a fee == 1B would mean the \
+         min-clamp fired one second too early"
+    );
+    // And it must remain below the 50% ceiling (5B).
+    assert!(
+        fee_at_period_minus_one < 5_000_000_000u64,
+        "at period-1 the penalty must be below the 50% max"
+    );
+}
+
 // =========================================
 // COVERAGE GAP TESTS
 // =========================================
@@ -8746,12 +10311,11 @@ async fn test_instant_withdrawal_decay_boundaries() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_close_observation() {
     // After a distributed epoch, close an observation PDA to reclaim rent.
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -8760,7 +10324,7 @@ async fn test_close_observation() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -8929,8 +10493,8 @@ async fn test_close_observation() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -9234,6 +10798,362 @@ async fn test_set_epochs_enabled() {
     let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
     assert!(es.enabled); // Still enabled during timelock period
     assert!(es.disable_at > 0); // But disable_at is set for future
+}
+
+// -----------------------------------------
+// C2. admin_set_epoch_duration re-anchor invariant
+// -----------------------------------------
+
+/// `admin_set_epoch_duration` re-anchors `genesis_timestamp` so the
+/// current epoch's start lands at `now`
+/// (`new_genesis = now - current_epoch_index * new_duration`,
+/// epoch.rs ~lines 61-105). Assert:
+///   1. After the call, `genesis + current_epoch_index * new_duration == now`
+///      (±a few seconds of chain-clock drift), i.e. epoch[current] starts ≈now.
+///   2. An already-created (in-flight) Epoch PDA's stamped `end_timestamp`
+///      is NOT mutated by the duration change (timestamps are frozen at
+///      create time).
+#[tokio::test]
+async fn test_admin_set_epoch_duration_reanchors_genesis() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    // Authority keypair we control so it can sign admin_set_epoch_duration.
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // Epochs enabled, genesis=1_000, duration=86_400, current_epoch_index=0.
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    // Fund the authority so it can pay/sign.
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // Warp to a clock well past genesis so create_epoch(0) succeeds.
+    let create_time = 50_000i64;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = create_time;
+    ctx.set_sysvar(&clock);
+
+    // Create epoch 0 (current_epoch_index advances 0 -> 1 afterwards).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Record the in-flight epoch's stamped end_timestamp (epoch 0 was created
+    // with old genesis=1_000, duration=86_400 -> start=1_000, end=87_400).
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch0_before: &Epoch =
+        bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let end_before = epoch0_before.end_timestamp;
+    assert_eq!(epoch0_before.start_timestamp, 1_000);
+    assert_eq!(end_before, 1_000 + 86_400);
+
+    // Read current_epoch_index (should be 1 after creating epoch 0).
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es_before = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert_eq!(es_before.current_epoch_index, 1);
+
+    // Warp to a new "now" and change the duration. The re-anchor must make
+    // epoch[current_epoch_index=1] start at this new now.
+    let reanchor_time = 200_000i64;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = reanchor_time;
+    ctx.set_sysvar(&clock);
+
+    let new_duration = 3_600i64; // shrink 1 day -> 1 hour
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetEpochDuration { new_duration }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // (1) Re-anchor invariant: genesis + current_idx * new_duration ≈ now.
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es_after = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert_eq!(es_after.epoch_duration, new_duration);
+    let current_idx = es_after.current_epoch_index as i64;
+    let next_epoch_start = es_after.genesis_timestamp + current_idx * new_duration;
+    // Chain clock can drift a couple seconds from the sysvar we set; allow a
+    // small window.
+    let drift = (next_epoch_start - reanchor_time).abs();
+    assert!(
+        drift <= 5,
+        "epoch[current] start {next_epoch_start} should re-anchor to ~now {reanchor_time} (drift {drift}s)"
+    );
+
+    // (2) In-flight epoch 0's stamped end_timestamp is unchanged.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch0_after: &Epoch =
+        bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch0_after.end_timestamp, end_before,
+        "duration change must NOT mutate an already-created epoch's end_timestamp"
+    );
+    assert_eq!(epoch0_after.start_timestamp, 1_000);
+}
+
+// -----------------------------------------
+// C3. disable_at 7-day timelock fires inside create_epoch
+// -----------------------------------------
+
+/// `set_epochs_enabled(false)` only schedules a disable via
+/// `disable_at = now + 7d`; `enabled` stays true. Once `now >= disable_at`,
+/// `create_epoch` takes the disable branch (epoch.rs:251-255), which sets
+/// `enabled=false`, clears `disable_at`, then `return Err(EpochsNotEnabled)`.
+/// This test drives the full path: schedule the disable, warp past the
+/// timelock, call create_epoch, and assert it is rejected with
+/// `EpochsNotEnabled`.
+///
+/// FINDING (reported, NOT fixed — test-only task): the doc comment at
+/// epoch.rs:201-202 says the `enabled` flag "actually flips" once the
+/// timelock elapses and the next `create_epoch` runs. It does NOT: the
+/// handler mutates `enabled`/`disable_at` and then returns `Err` on the
+/// same instruction, so Solana discards those writes when the tx fails.
+/// `enabled` therefore never persists to `false` via this path; the
+/// EpochSettings keeps reading `enabled == true` with the original
+/// `disable_at`. The user-visible guarantee still holds — create_epoch is
+/// permanently blocked after the timelock because `disable_at` stays set
+/// and in the past — so this is a state-bookkeeping / documentation
+/// discrepancy rather than a security hole. The assertions below pin the
+/// ACTUAL observed behavior (per the task's "do not weaken assertions /
+/// do not edit the contract" rule).
+#[tokio::test]
+async fn test_disable_at_timelock_fires_in_create_epoch() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // Epochs enabled, genesis=1_000, duration=86_400.
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    // Set "now" before scheduling the disable.
+    let disable_time = 100_000i64;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = disable_time;
+    ctx.set_sysvar(&clock);
+
+    // Schedule the disable (timelocked).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::SetEpochsEnabled { enabled: false }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // During the timelock: still enabled, disable_at = now + 7d.
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert!(es.enabled, "enabled stays true during the 7-day timelock");
+    let seven_days = 7 * 24 * 60 * 60i64;
+    assert_eq!(es.disable_at, disable_time + seven_days);
+
+    // Warp PAST disable_at (timelock expired).
+    let after_timelock = es.disable_at + 1;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = after_timelock;
+    ctx.set_sysvar(&clock);
+
+    // create_epoch past the timelock takes the disable branch
+    // (epoch.rs:251-255) and rejects with EpochsNotEnabled.
+    let (epoch_key, _) = epoch_pda(0);
+    let make_create_tx = |blockhash| {
+        Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::CreateEpoch {
+                    epoch_settings: epoch_settings_key,
+                    epoch: epoch_key,
+                    registry: setup.registry_key,
+                    settings: setup.settings_key,
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    payer: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::CreateEpoch {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        )
+    };
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result = ctx
+        .banks_client
+        .process_transaction(make_create_tx(blockhash))
+        .await;
+    assert_anchor_error!(result, GarError::EpochsNotEnabled);
+
+    // IMPORTANT — observable on-chain behavior (see FINDING in this test's
+    // doc-block below): the handler sets `enabled = false` / `disable_at = 0`
+    // (epoch.rs:252-253) but then `return Err(..)` on the SAME instruction,
+    // so Solana's runtime DISCARDS those writes when the tx fails. The
+    // EpochSettings therefore still reads `enabled == true` and the original
+    // `disable_at` after the failed create_epoch — NOT the doc-comment's
+    // "the flag actually flips" wording (epoch.rs:201-202).
+    let es_data = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es_after = EpochSettings::try_deserialize(&mut es_data.data.as_slice()).unwrap();
+    assert!(
+        es_after.enabled,
+        "failed create_epoch tx reverts the in-handler enabled=false write (Solana discards \
+         account writes on Err); enabled stays true on chain"
+    );
+    assert_eq!(
+        es_after.disable_at,
+        disable_time + seven_days,
+        "disable_at write is likewise reverted by the failed tx"
+    );
+
+    // The user-visible *guarantee* the 7-day timelock promises still holds:
+    // because `disable_at` remains set and in the past, every subsequent
+    // create_epoch keeps failing with EpochsNotEnabled. New epochs are
+    // permanently blocked after the timelock, even though the `enabled`
+    // field itself never persists to false via this path.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let result2 = ctx
+        .banks_client
+        .process_transaction(make_create_tx(blockhash))
+        .await;
+    assert_anchor_error!(result2, GarError::EpochsNotEnabled);
 }
 
 // -----------------------------------------
@@ -9847,7 +11767,18 @@ async fn test_update_gateway_settings_all_fields() {
     assert!(matches!(gateway.protocol, Protocol::Http));
     assert_eq!(gateway.properties, valid_arweave_id);
     assert!(!gateway.settings.allow_delegated_staking);
-    assert_eq!(gateway.settings.delegate_reward_share_ratio, 5000); // 50 * 100
+    // Fix #7 (WP §6.3): the delegate_reward_share_ratio change is DEFERRED —
+    // the active value is unchanged (still the join value 10*100=1000) and the
+    // request is staged in `pending_delegate_reward_share_ratio` until the next
+    // tally_weights applies it.
+    assert_eq!(gateway.settings.delegate_reward_share_ratio, 1000);
+    assert_eq!(
+        gateway.settings.pending_delegate_reward_share_ratio,
+        Some(5000) // 50 * 100, staged for next epoch
+    );
+    // Fix #6 (WP §6.3): flipping allow_delegated_staking true→false records the
+    // disable timestamp that starts the re-enable cooldown.
+    assert!(gateway.settings.delegation_disabled_at.is_some());
     assert_eq!(gateway.settings.min_delegation_amount, 20_000_000);
 }
 
@@ -10687,11 +12618,10 @@ async fn test_redelegate_stake_with_fee() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_failed_gateway() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -10700,7 +12630,7 @@ async fn test_distribute_epoch_failed_gateway() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -10879,8 +12809,8 @@ async fn test_distribute_epoch_failed_gateway() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -10942,11 +12872,10 @@ async fn test_distribute_epoch_failed_gateway() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_twice_fails() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -10955,7 +12884,7 @@ async fn test_distribute_epoch_twice_fails() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -11117,8 +13046,8 @@ async fn test_distribute_epoch_twice_fails() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -11192,11 +13121,10 @@ async fn test_distribute_epoch_twice_fails() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_with_delegate_rewards() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -11205,7 +13133,7 @@ async fn test_distribute_epoch_with_delegate_rewards() {
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -11450,8 +13378,8 @@ async fn test_distribute_epoch_with_delegate_rewards() {
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
         payer: payer_pk,
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::id(),
     }
     .to_account_metas(None);
@@ -12216,13 +14144,12 @@ async fn test_save_observations_invalid_count() {
 // -----------------------------------------
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
 
     let operator2 = Keypair::new();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -12241,7 +14168,7 @@ async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
     );
     let mut ctx = pt.start_with_context().await;
 
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -12511,8 +14438,8 @@ async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
         settings: setup.settings_key,
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::ID,
         payer: payer_pk,
     }
@@ -12580,6 +14507,320 @@ async fn test_distribute_epoch_leaving_gateway_zero_rewards() {
     );
 
     // Epoch is fully distributed
+    let epoch_after = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch_after: &Epoch =
+        bytemuck::from_bytes(&epoch_after.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch_after.rewards_distributed, 1,
+        "distribute must complete"
+    );
+    assert_eq!(epoch_after.distribution_index, 2, "both slots advanced");
+}
+
+// -----------------------------------------
+// Late-joiner reward exclusion: a gateway that joins AFTER epoch.start_timestamp
+// (but before create_epoch) is forced to composite_weight = 0 in tally
+// (SHOULD-13), so it is excluded from the per_gateway reward DIVISOR
+// (joined_count). Pre-fix, distribute_epoch had no composite-eligibility gate,
+// so the late-joiner still collected a full per_gateway share — paying the
+// gateway pool to (J + late-joiners) while dividing it by J (over-allocation;
+// divisor != recipients). The fix gates the payout AND stats on
+// composite_weight > 0, matching Lua where the divisor set IS the recipient set.
+// -----------------------------------------
+#[tokio::test]
+async fn test_distribute_epoch_late_joiner_excluded_from_reward() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+
+    let operator2 = Keypair::new();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    pt.add_account(
+        operator2.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 50_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund protocol
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Gateway 1 joins BEFORE epoch start (clock 0 <= epoch_start 100) -> ELIGIBLE.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key1 = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // Gateway 2 joins AFTER epoch start (clock 150 > epoch_start 100) -> LATE-JOINER.
+    // tally forces its effective_composite to 0 (SHOULD-13), so it is excluded
+    // from the reward divisor but is otherwise a fresh, Joined gateway.
+    let op2_pk = operator2.pubkey();
+    let op2_token = Keypair::new();
+    create_token_account(&mut ctx, &op2_token, &setup.mint.pubkey(), &op2_pk).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &op2_token.pubkey(),
+        &setup.mint_authority,
+        100_000_000_000,
+    )
+    .await;
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 150;
+    ctx.set_sysvar(&clock);
+    let gateway_key2 = join_gateway_with_operator(
+        &mut ctx,
+        &setup,
+        &operator2,
+        &op2_token.pubkey(),
+        stake_amount,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // Pin slot for deterministic hashchain; clock still within epoch 0 [100, 86500].
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 150;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    // Create epoch (2 gateways in the registry).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Tally both: gw1 -> composite > 0 (eligible), gw2 -> composite 0 (late-joiner).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Prescribe — only gw1 has non-zero weight, so it is the only selectable
+    // observer; gw2 (weight 0) is never selected. Pass only gw1 (as the
+    // divisor test does), so no permutation retry is needed.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gateway_key1,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The late-joiner's stake before distribution (must be unchanged after).
+    let gw2_stake_before = {
+        let acct = ctx
+            .banks_client
+            .get_account(gateway_key2)
+            .await
+            .unwrap()
+            .unwrap();
+        Gateway::try_deserialize(&mut acct.data.as_slice())
+            .unwrap()
+            .operator_stake
+    };
+    assert_eq!(
+        gw2_stake_before, stake_amount,
+        "sanity: late-joiner's pre-distribution stake is its join stake"
+    );
+
+    // Warp past epoch end so distribute is allowed.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100 + 86_400 + 100; // epoch_start(100) + duration + buffer
+    ctx.set_sysvar(&clock);
+
+    // Distribute — cranker passes both slots in registry order.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut distribute_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    distribute_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: distribute_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("distribute_epoch must complete with a late-joiner in the registry");
+
+    // Late-joiner: composite 0 => excluded from the divisor => must receive ZERO
+    // reward, and its stats must NOT tick (it didn't participate this epoch).
+    // Pre-fix it collected a full per_gateway share (the over-allocation bug).
+    let gw2_after = ctx
+        .banks_client
+        .get_account(gateway_key2)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw2_after = Gateway::try_deserialize(&mut gw2_after.data.as_slice()).unwrap();
+    assert_eq!(
+        gw2_after.operator_stake,
+        gw2_stake_before,
+        "late-joiner (composite 0, excluded from the reward divisor) must receive \
+         ZERO reward; pre-fix it was paid a full per_gateway share (over-allocation). \
+         Got delta {}",
+        gw2_after.operator_stake.saturating_sub(gw2_stake_before),
+    );
+    assert_eq!(
+        gw2_after.stats.total_epochs, 0,
+        "late-joiner did not participate this epoch; its stats must not tick"
+    );
+
+    // Eligible gateway DID earn — proves the gateway pool was non-zero, so the
+    // late-joiner's zero is a real exclusion, not a vacuous all-zero epoch.
+    let gw1_after = ctx
+        .banks_client
+        .get_account(gateway_key1)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw1_after = Gateway::try_deserialize(&mut gw1_after.data.as_slice()).unwrap();
+    assert!(
+        gw1_after.operator_stake > stake_amount,
+        "eligible gateway must receive the per_gateway reward (got delta {})",
+        gw1_after.operator_stake.saturating_sub(stake_amount),
+    );
+    assert_eq!(
+        gw1_after.stats.total_epochs, 1,
+        "eligible gateway gets its epoch counted"
+    );
+
+    // Epoch fully distributed across both slots.
     let epoch_after = ctx
         .banks_client
         .get_account(epoch_key)
@@ -14123,9 +16364,10 @@ fn program_test_with_pre_refactor_settings(authority: &Pubkey, mint: &Pubkey) ->
 
     let (settings_key, settings_bump) = settings_pda();
     // Pre-refactor: 32 bytes shorter (no arns_program_id) AND 24 bytes shorter
-    // (no supply counters: total_staked, total_delegated, total_withdrawn).
-    // Matches handler's `old_size = new_size - 32 - 24`.
-    let pre_size = GatewaySettings::SIZE - 32 - 24;
+    // (no supply counters: total_staked, total_delegated, total_withdrawn) AND
+    // 3 bytes shorter (no SchemaVersion).
+    // Matches handler's `old_size = new_size - 32 - 24 - SCHEMA_VERSION_SIZE`.
+    let pre_size = GatewaySettings::SIZE - 32 - 24 - 3;
     let mut data = vec![0u8; pre_size];
     let disc = hash(b"account:GatewaySettings");
     data[..8].copy_from_slice(&disc.to_bytes()[..8]);
@@ -14187,7 +16429,7 @@ async fn test_migrate_settings_set_arns_program_id_backfills() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(pre.data.len(), GatewaySettings::SIZE - 32 - 24);
+    assert_eq!(pre.data.len(), GatewaySettings::SIZE - 32 - 24 - 3);
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -14224,7 +16466,10 @@ async fn test_migrate_settings_set_arns_program_id_backfills() {
     assert_eq!(settings.arns_program_id, arns_pid);
     assert_eq!(settings.authority, authority.pubkey());
     // bump must match what was at the OLD bump offset (we just shifted it)
-    assert_eq!(settings.bump, pre.data[GatewaySettings::SIZE - 32 - 24 - 1]);
+    assert_eq!(
+        settings.bump,
+        pre.data[GatewaySettings::SIZE - 32 - 24 - 3 - 1]
+    );
 }
 
 #[tokio::test]
@@ -15494,7 +17739,6 @@ async fn test_finalize_gone_blocks_with_outstanding_delegations() {
 // =====================================================================
 
 #[tokio::test]
-#[ignore = "requires ario-core program loaded for distribute_epoch CPI; tests re-enable in follow-up PR"]
 async fn test_close_epoch_blocks_unclosed_observations() {
     // close_epoch must reject when any Observation PDA is still open. Without
     // this gate the orphaned PDAs would lose their parent reference and rent
@@ -15507,7 +17751,7 @@ async fn test_close_epoch_blocks_unclosed_observations() {
     // with EpochObservationsNotClosed; close_observation then unlocks it.
     let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
     let dummy = Pubkey::new_unique();
-    let mut pt = program_test_with_gar(
+    let mut pt = program_test_with_gar_and_core(
         &dummy,
         &mint.pubkey(),
         &stake_token.pubkey(),
@@ -15515,7 +17759,7 @@ async fn test_close_epoch_blocks_unclosed_observations() {
     );
     pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
     let mut ctx = pt.start_with_context().await;
-    let setup = setup_gar(
+    let setup = setup_gar_with_core_treasury(
         &mut ctx,
         mint,
         mint_authority,
@@ -15678,8 +17922,8 @@ async fn test_close_epoch_blocks_unclosed_observations() {
         settings: setup.settings_key,
         protocol_token_account: setup.protocol_token.pubkey(),
         stake_token_account: setup.stake_token.pubkey(),
-        ario_config: solana_sdk::pubkey::Pubkey::default(),
-        ario_core_program: solana_sdk::pubkey::Pubkey::default(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
         token_program: spl_token::ID,
         payer: payer_pk,
     }
@@ -15826,7 +18070,7 @@ async fn test_join_network_registry_full() {
     let mut reg_data = vec![0u8; registry_size];
     let reg_disc = hash(b"account:GatewayRegistry");
     reg_data[..8].copy_from_slice(&reg_disc.to_bytes()[..8]);
-    // count at offset 40 = MAX_GATEWAYS (3000 production / 30 devnet-shrunk)
+    // count at offset 40 = MAX_GATEWAYS (3000, all clusters)
     reg_data[40..44].copy_from_slice(&(GatewayRegistry::MAX_GATEWAYS as u32).to_le_bytes());
 
     pt.add_account(
@@ -22407,4 +24651,1457 @@ async fn test_finalize_migration_emits_event() {
     );
     // slot is whatever the test runtime provides; just verify it's set.
     let _ = ev.slot;
+}
+
+// =========================================
+// MIGRATE EPOCH SETTINGS / OBSERVATION — realloc coverage
+// =========================================
+
+/// Inject an EpochSettings at the old on-chain size (8 + SIZE_without_version,
+/// due to the prior double-counted discriminator) with version bytes reading as
+/// SchemaVersion{0,0,0}, call migrate_epoch_settings, and assert the account
+/// shrinks to EpochSettings::SIZE with version set.
+#[tokio::test]
+async fn test_migrate_epoch_settings_realloc() {
+    use anchor_lang::solana_program::hash::hash;
+
+    let authority = Keypair::new();
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+
+    let (epoch_settings_key, epoch_settings_bump) = epoch_settings_pda();
+    // Old on-chain size: init used `space = 8 + SIZE_without_version` (double-counted disc).
+    // SIZE_without_version = EpochSettings::SIZE - SCHEMA_VERSION_SIZE.
+    let old_on_chain_size = 8 + (EpochSettings::SIZE - SCHEMA_VERSION_SIZE);
+    let mut data = vec![0u8; old_on_chain_size];
+
+    let disc = hash(b"account:EpochSettings");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+
+    let mut offset = 8;
+    data[offset..offset + 32].copy_from_slice(authority.pubkey().as_ref());
+    offset += 32; // authority
+    data[offset..offset + 8].copy_from_slice(&86_400i64.to_le_bytes());
+    offset += 8; // epoch_duration
+    data[offset] = 50;
+    offset += 1; // prescribed_observer_count
+    data[offset] = 2;
+    offset += 1; // prescribed_name_count
+    data[offset..offset + 8].copy_from_slice(&Gateway::MIN_OPERATOR_STAKE.to_le_bytes());
+    offset += 8; // min_observer_stake
+    data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+    offset += 2; // slash_rate
+    data[offset] = 1;
+    offset += 1; // enabled
+    data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    offset += 8; // current_epoch_index
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8; // genesis_timestamp
+    data[offset..offset + 8].copy_from_slice(&(180i64 * 86_400).to_le_bytes());
+    offset += 8; // tenure_weight_duration
+    data[offset..offset + 8].copy_from_slice(&4u64.to_le_bytes());
+    offset += 8; // max_tenure_weight
+    data[offset..offset + 8].copy_from_slice(&900_000u64.to_le_bytes());
+    offset += 8; // gateway_reward_ratio
+    data[offset..offset + 8].copy_from_slice(&100_000u64.to_le_bytes());
+    offset += 8; // observer_reward_ratio
+    data[offset..offset + 8].copy_from_slice(&250_000u64.to_le_bytes());
+    offset += 8; // missed_observation_penalty_rate
+    data[offset..offset + 8].copy_from_slice(&1_000u64.to_le_bytes());
+    offset += 8; // max_reward_rate
+    data[offset..offset + 8].copy_from_slice(&500u64.to_le_bytes());
+    offset += 8; // min_reward_rate
+    data[offset..offset + 8].copy_from_slice(&365u64.to_le_bytes());
+    offset += 8; // reward_decay_start_epoch
+    data[offset..offset + 8].copy_from_slice(&547u64.to_le_bytes());
+    offset += 8; // reward_decay_last_epoch
+    data[offset] = 30;
+    offset += 1; // max_consecutive_failures
+    data[offset..offset + 8].copy_from_slice(&1_000_000u64.to_le_bytes());
+    offset += 8; // failed_gateway_slash_rate
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8; // disable_at
+    data[offset] = epoch_settings_bump;
+    // Trailing bytes (from double-count) are zeros — version reads as {0,0,0}
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        epoch_settings_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(old_on_chain_size),
+            data,
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Verify pre-migration: oversized from old double-counted init
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), old_on_chain_size);
+
+    // Call migrate_epoch_settings
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateEpochSettings {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Verify post-migration: correct size and version
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), EpochSettings::SIZE);
+
+    let es = EpochSettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(es.version, EPOCH_SETTINGS_VERSION);
+    assert_eq!(es.bump, epoch_settings_bump);
+    assert_eq!(es.epoch_duration, 86_400);
+}
+
+/// Calling migrate_epoch_settings on an already-current account fails with
+/// AlreadyLatestVersion.
+#[tokio::test]
+async fn test_migrate_epoch_settings_already_latest() {
+    use anchor_lang::solana_program::hash::hash;
+
+    let authority = Keypair::new();
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+
+    let mut pt = program_test_with_gar_for_epoch_init(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+
+    // Inject EpochSettings at current SIZE with version already set to latest
+    let (epoch_settings_key, epoch_settings_bump) = epoch_settings_pda();
+    let size = EpochSettings::SIZE;
+    let mut data = vec![0u8; size];
+    let disc = hash(b"account:EpochSettings");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+    let mut offset = 8;
+    data[offset..offset + 32].copy_from_slice(authority.pubkey().as_ref());
+    offset += 32;
+    data[offset..offset + 8].copy_from_slice(&86_400i64.to_le_bytes());
+    offset += 8;
+    data[offset] = 50;
+    offset += 1;
+    data[offset] = 2;
+    offset += 1;
+    data[offset..offset + 8].copy_from_slice(&Gateway::MIN_OPERATOR_STAKE.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+    offset += 2;
+    data[offset] = 1;
+    offset += 1;
+    data[offset..offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&(180i64 * 86_400).to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&4u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&900_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&100_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&250_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&1_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&500u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&365u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&547u64.to_le_bytes());
+    offset += 8;
+    data[offset] = 30;
+    offset += 1;
+    data[offset..offset + 8].copy_from_slice(&1_000_000u64.to_le_bytes());
+    offset += 8;
+    data[offset..offset + 8].copy_from_slice(&0i64.to_le_bytes());
+    offset += 8;
+    data[offset] = epoch_settings_bump;
+    offset += 1;
+    // Write version = EPOCH_SETTINGS_VERSION (1.0.0)
+    data[offset] = EPOCH_SETTINGS_VERSION.major;
+    data[offset + 1] = EPOCH_SETTINGS_VERSION.minor;
+    data[offset + 2] = EPOCH_SETTINGS_VERSION.patch;
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        epoch_settings_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(size),
+            data,
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateEpochSettings {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, GarError::AlreadyLatestVersion);
+}
+
+/// Inject an Observation at the old on-chain size (8 + SIZE_without_version,
+/// due to the prior double-counted discriminator) with version bytes reading
+/// as SchemaVersion{0,0,0}, call migrate_observation, and assert account
+/// shrinks to Observation::SIZE with version set.
+#[tokio::test]
+async fn test_migrate_observation_realloc() {
+    use anchor_lang::solana_program::hash::hash;
+
+    let authority = Keypair::new();
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let observer = Keypair::new();
+    let epoch_index: u64 = 7;
+
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+
+    let (observation_key, observation_bump) = observation_pda(epoch_index, &observer.pubkey());
+    // Old on-chain size: init used `space = 8 + SIZE_without_version` (double-counted disc).
+    let old_on_chain_size = 8 + (Observation::SIZE - SCHEMA_VERSION_SIZE);
+    let mut data = vec![0u8; old_on_chain_size];
+
+    let disc = hash(b"account:Observation");
+    data[..8].copy_from_slice(&disc.to_bytes()[..8]);
+
+    let mut offset = 8;
+    data[offset..offset + 8].copy_from_slice(&epoch_index.to_le_bytes());
+    offset += 8; // epoch_index
+    data[offset..offset + 32].copy_from_slice(observer.pubkey().as_ref());
+    offset += 32; // observer
+                  // gateway_results: [u8; 375] — leave as zeroes
+    offset += 375;
+    data[offset..offset + 2].copy_from_slice(&10u16.to_le_bytes());
+    offset += 2; // gateway_count
+                 // report_tx_id: [u8; 32] — leave as zeroes
+    offset += 32;
+    data[offset..offset + 8].copy_from_slice(&1_000_000i64.to_le_bytes());
+    offset += 8; // submitted_at
+    data[offset] = observation_bump;
+    // Trailing bytes (from double-count) are zeros — version reads as {0,0,0}
+
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        observation_key,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(old_on_chain_size),
+            data,
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    // Fund observer so it can be passed as a non-signer account
+    pt.add_account(
+        observer.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+
+    // Verify pre-migration: oversized from old double-counted init
+    let acct = ctx
+        .banks_client
+        .get_account(observation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), old_on_chain_size);
+
+    // Call migrate_observation
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateObservation {
+                observer: observer.pubkey(),
+                observation: observation_key,
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateObservation { epoch_index }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Verify post-migration: correct size and version
+    let acct = ctx
+        .banks_client
+        .get_account(observation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.data.len(), Observation::SIZE);
+
+    let obs = Observation::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(obs.version, OBSERVATION_VERSION);
+    assert_eq!(obs.bump, observation_bump);
+    assert_eq!(obs.epoch_index, epoch_index);
+    assert_eq!(obs.observer, observer.pubkey());
+    assert_eq!(obs.gateway_count, 10);
+}
+
+// =========================================
+// Codex 2026-05-28: mid-epoch leave bias regression
+// =========================================
+//
+// Sets up three gateways in registry slots [small1, big_leaver, small2] where
+// `big_leaver` carries ~100x the composite weight of either small gateway.
+// After `tally_weights` accumulates the full pre-leave total into
+// `epoch.total_composite_weight`, `big_leaver` calls `leave_network`. That
+// zeroes its registry slot's `composite_weight` in place but does not
+// decrement the epoch total.
+//
+// Pre-fix `prescribe_epoch` sampled `random_value % stale_total` and the
+// "if !found" fallback attributed every dead-range hit (~99% of the
+// random_value space at 100x ratio) to the LAST non-zero slot — collapsing
+// observer selection onto `small2` and yielding `observer_count == 1` with
+// overwhelming probability across the 30-iteration roulette.
+//
+// Post-fix `prescribe_epoch` recomputes `total_weight` as a live walk of
+// current registry composite_weights, eliminating the dead range and the
+// fallback. With weights `[small1, 0, small2]` and balanced live total,
+// both surviving slots are selected and `observer_count == 2`.
+#[tokio::test]
+async fn test_prescribe_unbiased_after_mid_epoch_leave() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+
+    let big_op = Keypair::new();
+    let small2_op = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    for op in [&big_op, &small2_op] {
+        pt.add_account(
+            op.pubkey(),
+            solana_sdk::account::Account {
+                lamports: 50_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund the protocol token account so create_epoch reports non-zero
+    // total_eligible_rewards (otherwise reward calc is trivially zero and
+    // the test doesn't exercise the bias surface).
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Warp clock to 0 so all three gateways join BEFORE epoch.start_timestamp
+    // (set to 100 by pre_create_epoch_settings genesis_timestamp). Otherwise
+    // tally_weights would zero their effective_composite (SHOULD-13).
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    // Three gateways — registry slots fill in join order.
+    let payer_pk = ctx.payer.pubkey();
+    let small_stake = 20_000_000_000u64; // 20k ARIO (min_operator_stake)
+    let big_stake = 2_000_000_000_000u64; // 2M ARIO → ~100x stake_weight
+
+    // Slot 0: payer (small1).
+    let gw_small1_key = join_gateway(&mut ctx, &setup, small_stake).await;
+
+    // Slot 1: big_op (big_leaver). Mint enough to its ATA, fund SOL above.
+    let big_token = Keypair::new();
+    create_token_account(&mut ctx, &big_token, &setup.mint.pubkey(), &big_op.pubkey()).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &big_token.pubkey(),
+        &setup.mint_authority,
+        // 2x stake to ensure the join succeeds and leave_network's
+        // exit-vault rent overhead is covered.
+        big_stake.saturating_mul(2),
+    )
+    .await;
+    let gw_big_key =
+        join_gateway_with_operator(&mut ctx, &setup, &big_op, &big_token.pubkey(), big_stake).await;
+
+    // Slot 2: small2_op (accomplice / "last non-zero slot" in pre-fix fallback).
+    let small2_token = Keypair::new();
+    create_token_account(
+        &mut ctx,
+        &small2_token,
+        &setup.mint.pubkey(),
+        &small2_op.pubkey(),
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &small2_token.pubkey(),
+        &setup.mint_authority,
+        small_stake.saturating_mul(2),
+    )
+    .await;
+    let gw_small2_key = join_gateway_with_operator(
+        &mut ctx,
+        &setup,
+        &small2_op,
+        &small2_token.pubkey(),
+        small_stake,
+    )
+    .await;
+
+    // Warp past epoch.start (= 100) and pin slot so the hashchain is
+    // reproducible across test runs.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // create_epoch — active_gateway_count = 3.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally_weights — populates composite_weight for all 3 slots and
+    // accumulates the full pre-leave total into epoch.total_composite_weight.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gw_small1_key,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(gw_big_key, false));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gw_small2_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Snapshot the post-tally weights so we can prove (a) big_leaver
+    // dominates and (b) epoch.total_composite_weight reflects all three
+    // contributions — the exact precondition for the stale-total bias.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    let small1_weight = registry.gateways[0].composite_weight;
+    let big_weight = registry.gateways[1].composite_weight;
+    let small2_weight = registry.gateways[2].composite_weight;
+    assert!(
+        big_weight >= small1_weight.saturating_mul(50)
+            && big_weight >= small2_weight.saturating_mul(50),
+        "test setup invariant: big_leaver weight ({big_weight}) must dominate \
+         small1 ({small1_weight}) and small2 ({small2_weight}) by ≥50x so the \
+         bias surface is large enough to discriminate"
+    );
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let stale_total = epoch.total_composite_weight();
+    assert_eq!(
+        stale_total,
+        small1_weight as u128 + big_weight as u128 + small2_weight as u128,
+        "tally must accumulate every Joined slot's composite_weight"
+    );
+
+    // leave_network on big_leaver — between tally and prescribe. Zeroes its
+    // registry slot composite_weight in place; epoch.total_composite_weight
+    // stays at `stale_total` per gateway.rs::leave_network comment.
+    let (big_wd_counter, _) = withdrawal_counter_pda(&big_op.pubkey());
+    let (big_wd, _) = withdrawal_pda(&big_op.pubkey(), 0);
+    let (big_excess_wd, _) = withdrawal_pda(&big_op.pubkey(), 1);
+    let mut leave_accounts = ario_gar::accounts::LeaveNetwork {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_pda().0,
+        registry: setup.registry_key,
+        gateway: gw_big_key,
+        withdrawal_counter: big_wd_counter,
+        withdrawal: big_wd,
+        excess_withdrawal: Some(big_excess_wd),
+        operator: big_op.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let (big_observer_lookup, _) = observer_lookup_pda(&big_op.pubkey());
+    leave_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        big_observer_lookup,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: leave_accounts,
+            data: ario_gar::instruction::LeaveNetwork {}.data(),
+        }],
+        Some(&big_op.pubkey()),
+        &[&big_op],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Confirm the bias precondition: slot 1's composite_weight is now 0 but
+    // epoch.total_composite_weight is still the stale pre-leave total.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(
+        registry.gateways[1].composite_weight, 0,
+        "leave_network must zero the leaver's slot weight"
+    );
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.total_composite_weight(),
+        stale_total,
+        "leave_network must NOT decrement epoch.total_composite_weight \
+         (the snapshot the bias bug relied on)"
+    );
+
+    // prescribe_epoch — pass only the two SURVIVING gateway PDAs in
+    // remaining_accounts. Post-fix the live recompute samples modulo
+    // small1_weight + small2_weight, so both must be selected
+    // (observer_count == 2). Pre-fix the stale modulus + fallback would
+    // collapse selection onto small2 (last non-zero slot) with
+    // overwhelming probability, leaving observer_count == 1 and failing
+    // remaining_accounts validation (the unmatched gw_small1_key would be
+    // re-interpreted as a NameRegistry and fail the owner check).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gw_small1_key,
+        false,
+    ));
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gw_small2_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.prescriptions_done, 1,
+        "prescribe_epoch must flip prescriptions_done"
+    );
+    assert_eq!(
+        epoch.observer_count, 2,
+        "both surviving gateways must be selected; pre-fix the bias would \
+         collapse selection onto small2 and yield observer_count == 1"
+    );
+
+    let prescribed: std::collections::HashSet<Pubkey> = epoch.prescribed_observer_gateways
+        [..epoch.observer_count as usize]
+        .iter()
+        .copied()
+        .collect();
+    assert!(
+        prescribed.contains(&payer_pk),
+        "small1 (payer) must be prescribed — pre-fix the bias would leave it \
+         out with ~99.5% probability across the 30-iteration roulette"
+    );
+    assert!(
+        prescribed.contains(&small2_op.pubkey()),
+        "small2 must be prescribed"
+    );
+    assert!(
+        !prescribed.contains(&big_op.pubkey()),
+        "leaver (big_op) must never appear in prescribed_observer_gateways"
+    );
+}
+
+// ==========================================================================
+// Fix #6 (disable delegation → forced withdrawal + cooldown) and
+// Fix #7 (defer delegate_reward_share_ratio to next epoch). WP §6.3.
+// ==========================================================================
+
+/// Fund a fresh delegator (SOL + tokens) and delegate `amount` to `gateway_key`.
+/// Returns the delegator keypair and the delegation PDA.
+async fn f6_fund_and_delegate(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_operator: &Pubkey,
+    gateway_key: &Pubkey,
+    amount: u64,
+) -> (Keypair, Pubkey) {
+    let payer_pk = ctx.payer.pubkey();
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &delegator.pubkey(),
+            10_000_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let delegator_pk = delegator.pubkey();
+    create_token_account(ctx, &delegator_token, &setup.mint.pubkey(), &delegator_pk).await;
+    mint_tokens(
+        ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        50_000_000_000,
+    )
+    .await;
+
+    let (delegation_key, _) = delegation_pda(gateway_operator, &delegator_pk);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::DelegateStake {
+                settings: setup.settings_key,
+                gateway: *gateway_key,
+                delegation: delegation_key,
+                delegator_token_account: delegator_token.pubkey(),
+                stake_token_account: setup.stake_token.pubkey(),
+                delegator: delegator_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::DelegateStake { amount }.data(),
+        }],
+        Some(&delegator_pk),
+        &[&delegator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    (delegator, delegation_key)
+}
+
+/// Operator-only update of `allow_delegated_staking` (all other params None).
+/// Returns the raw tx result so callers can assert success or a specific error.
+async fn f6_set_allow_delegation(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: &Pubkey,
+    allow: bool,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewaySettings {
+                settings: setup.settings_key,
+                gateway: *gateway_key,
+                operator: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewaySettings {
+                params: ario_gar::UpdateGatewayParams {
+                    label: None,
+                    fqdn: None,
+                    port: None,
+                    protocol: None,
+                    properties: None,
+                    note: None,
+                    allow_delegated_staking: Some(allow),
+                    delegate_reward_share_ratio: None,
+                    min_delegate_stake: None,
+                },
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// Crank `claim_delegate_from_disabled_gateway` for `delegator`, paid by `payer`
+/// (use a third party to exercise the permissionless path). Returns the result.
+async fn f6_claim_disabled(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: &Pubkey,
+    delegation_key: &Pubkey,
+    delegator_pk: &Pubkey,
+    payer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let (counter_key, _) = withdrawal_counter_pda(delegator_pk);
+    let (withdrawal_key, _) = withdrawal_pda(delegator_pk, 0);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::ClaimDelegateFromDisabledGateway {
+                settings: setup.settings_key,
+                gateway: *gateway_key,
+                delegation: *delegation_key,
+                withdrawal_counter: counter_key,
+                withdrawal: withdrawal_key,
+                delegator: *delegator_pk,
+                payer: payer.pubkey(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::ClaimDelegateFromDisabledGateway {}.data(),
+        }],
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn f6_read_gateway(ctx: &mut ProgramTestContext, gateway_key: &Pubkey) -> Gateway {
+    let acct = ctx
+        .banks_client
+        .get_account(*gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap()
+}
+
+#[tokio::test]
+async fn test_claim_delegate_from_disabled_gateway() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    let delegate_amount = 20_000_000_000u64;
+    let (delegator, delegation_key) = f6_fund_and_delegate(
+        &mut ctx,
+        &setup,
+        &operator_pk,
+        &gateway_key,
+        delegate_amount,
+    )
+    .await;
+    let delegator_pk = delegator.pubkey();
+
+    // Operator disables delegation.
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+
+    // Crank the delegate out (delegate pays its own rent here).
+    f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &delegator,
+    )
+    .await
+    .unwrap();
+
+    // Withdrawal vault created with the full stake and the 30-day delegate lock.
+    let (withdrawal_key, _) = withdrawal_pda(&delegator_pk, 0);
+    let w_acct = ctx
+        .banks_client
+        .get_account(withdrawal_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let withdrawal = Withdrawal::try_deserialize(&mut w_acct.data.as_slice()).unwrap();
+    assert_eq!(withdrawal.owner, delegator_pk);
+    assert_eq!(withdrawal.amount, delegate_amount);
+    assert!(withdrawal.is_delegate);
+    assert!(!withdrawal.is_exit_vault);
+    assert!(!withdrawal.is_protected);
+    assert_eq!(withdrawal.available_at, withdrawal.created_at + 2_592_000);
+
+    // Delegation zeroed; gateway total decremented to 0.
+    let d_acct = ctx
+        .banks_client
+        .get_account(delegation_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let delegation = Delegation::try_deserialize(&mut d_acct.data.as_slice()).unwrap();
+    assert_eq!(delegation.amount, 0);
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.total_delegated_stake, 0);
+    // Gateway stays Joined (only delegation was disabled).
+    assert!(matches!(gw.status, GatewayStatus::Joined));
+}
+
+#[tokio::test]
+async fn test_claim_delegate_from_disabled_gateway_permissionless() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (delegator, delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+    let delegator_pk = delegator.pubkey();
+
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+
+    // A third party (not the delegate, not the operator) cranks the claim.
+    let cranker = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &operator_pk,
+            &cranker.pubkey(),
+            1_000_000_000,
+        )],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &cranker,
+    )
+    .await
+    .unwrap();
+
+    // Stake still routes to the delegate's own vault, not the cranker.
+    let (withdrawal_key, _) = withdrawal_pda(&delegator_pk, 0);
+    let w_acct = ctx
+        .banks_client
+        .get_account(withdrawal_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let withdrawal = Withdrawal::try_deserialize(&mut w_acct.data.as_slice()).unwrap();
+    assert_eq!(withdrawal.owner, delegator_pk);
+    assert_eq!(withdrawal.amount, 20_000_000_000);
+}
+
+#[tokio::test]
+async fn test_claim_delegate_from_disabled_gateway_rejects_when_enabled() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (delegator, delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+    let delegator_pk = delegator.pubkey();
+
+    // Delegation still ENABLED → claim must be rejected.
+    let result = f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &delegator,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::DelegationNotDisabled);
+}
+
+#[tokio::test]
+async fn test_disable_delegation_records_timestamp() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    // Joined with delegation enabled → disabled_at is None.
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert!(gw.settings.allow_delegated_staking);
+    assert!(gw.settings.delegation_disabled_at.is_none());
+
+    // Set a deterministic clock so we can assert the recorded timestamp.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 5_000;
+    ctx.set_sysvar(&clock);
+
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert!(!gw.settings.allow_delegated_staking);
+    assert_eq!(gw.settings.delegation_disabled_at, Some(5_000));
+
+    // Re-enabling (no delegates, cooldown elapsed) clears the timestamp.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 5_000 + 2_592_000;
+    ctx.set_sysvar(&clock);
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, true)
+        .await
+        .unwrap();
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert!(gw.settings.allow_delegated_staking);
+    assert!(gw.settings.delegation_disabled_at.is_none());
+}
+
+#[tokio::test]
+async fn test_reenable_delegation_rejects_with_remaining_delegates() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (_delegator, _delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+
+    // Disable, but DO NOT crank the delegate out → stake remains.
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+
+    let result = f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, true).await;
+    assert_anchor_error!(result, GarError::DelegatesStillActive);
+}
+
+#[tokio::test]
+async fn test_reenable_delegation_requires_cooldown() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let operator_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let (delegator, delegation_key) =
+        f6_fund_and_delegate(&mut ctx, &setup, &operator_pk, &gateway_key, 20_000_000_000).await;
+    let delegator_pk = delegator.pubkey();
+
+    // Disable; the timestamp is recorded.
+    f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, false)
+        .await
+        .unwrap();
+    assert!(f6_read_gateway(&mut ctx, &gateway_key)
+        .await
+        .settings
+        .delegation_disabled_at
+        .is_some());
+
+    // Crank the only delegate out → total_delegated_stake == 0.
+    f6_claim_disabled(
+        &mut ctx,
+        &setup,
+        &gateway_key,
+        &delegation_key,
+        &delegator_pk,
+        &delegator,
+    )
+    .await
+    .unwrap();
+
+    // Key assertion: even with every delegate cleared, re-enabling is STILL
+    // blocked by the 30-day cooldown until it elapses. (The cooldown-elapsed →
+    // re-enable-succeeds-and-clears path is covered by
+    // test_disable_delegation_records_timestamp, which warps past the window.)
+    let result = f6_set_allow_delegation(&mut ctx, &setup, &gateway_key, true).await;
+    assert_anchor_error!(result, GarError::DelegationCooldownActive);
+}
+
+/// Fix #7: update with a new ratio stages it (active unchanged); a second update
+/// overwrites the pending value (last write wins) before any tally applies it.
+#[tokio::test]
+async fn test_delegate_reward_share_ratio_pending_overwrite() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator_pk = ctx.payer.pubkey();
+
+    let send_ratio = |ratio: u8| ario_gar::instruction::UpdateGatewaySettings {
+        params: ario_gar::UpdateGatewayParams {
+            label: None,
+            fqdn: None,
+            port: None,
+            protocol: None,
+            properties: None,
+            note: None,
+            allow_delegated_staking: None,
+            delegate_reward_share_ratio: Some(ratio),
+            min_delegate_stake: None,
+        },
+    };
+
+    for ratio in [30u8, 70u8] {
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::UpdateGatewaySettings {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    operator: operator_pk,
+                }
+                .to_account_metas(None),
+                data: send_ratio(ratio).data(),
+            }],
+            Some(&operator_pk),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    // Active value never moved (still join value 10 * 100 = 1000).
+    assert_eq!(gw.settings.delegate_reward_share_ratio, 1000);
+    // Last write wins in the pending slot: 70 * 100 = 7000.
+    assert_eq!(gw.settings.pending_delegate_reward_share_ratio, Some(7000));
+}
+
+/// Fix #7: a deferred ratio change is applied at the next tally_weights, which
+/// runs at the start of the epoch before distribute_epoch reads the value.
+#[tokio::test]
+async fn test_delegate_reward_share_ratio_applied_at_tally() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000,
+    )
+    .await;
+
+    // Join at t=0 so the gateway is active for epoch 0 (starts at 100).
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator_pk = ctx.payer.pubkey();
+
+    // Stage a ratio change (50 → 5000 bps). Active stays at the join value.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewaySettings {
+                settings: setup.settings_key,
+                gateway: gateway_key,
+                operator: operator_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewaySettings {
+                params: ario_gar::UpdateGatewayParams {
+                    label: None,
+                    fqdn: None,
+                    port: None,
+                    protocol: None,
+                    properties: None,
+                    note: None,
+                    allow_delegated_staking: None,
+                    delegate_reward_share_ratio: Some(50),
+                    min_delegate_stake: None,
+                },
+            }
+            .data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.settings.delegate_reward_share_ratio, 1000); // active unchanged
+    assert_eq!(gw.settings.pending_delegate_reward_share_ratio, Some(5000));
+
+    // Warp to epoch start, create epoch, run tally.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: operator_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: operator_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&operator_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Tally applied pending → active and cleared the pending slot.
+    let gw = f6_read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.settings.delegate_reward_share_ratio, 5000);
+    assert_eq!(gw.settings.pending_delegate_reward_share_ratio, None);
 }

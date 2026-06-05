@@ -23,6 +23,53 @@ struct PendingDistribution<'a, 'info> {
     is_prescribed: bool,
     is_observed: bool,
     failed: bool,
+    /// Snapshot from the registry slot (`GatewaySlot::delegated_at_tally`): did
+    /// this gateway carry delegated stake when its epoch weight was tallied?
+    /// The delegate reward split below keys off THIS, not the live
+    /// `total_delegated_stake`, so post-tally forced delegate withdrawals can't
+    /// redirect the delegate share to the operator (ADR-025 / BD-111).
+    had_delegation_at_tally: bool,
+    /// Did this gateway have a non-zero composite weight at tally? A gateway
+    /// that joined after `epoch.start_timestamp` is forced to `composite = 0`
+    /// in tally (SHOULD-13) and is therefore EXCLUDED from the per-gateway
+    /// reward divisor (`joined_count` in prescribe_epoch). It must likewise be
+    /// excluded from the payout / stats here, or the gateway pool is paid to
+    /// more gateways than it was divided by (over-allocation; divisor ≠
+    /// recipients). Matches Lua, where the active set used for the divisor IS
+    /// the recipient set. Leavers and cleared slots also carry composite 0 but
+    /// are handled separately (`is_leaving` / address-default skip).
+    eligible: bool,
+}
+
+/// Split a gateway's (already treasury-scaled) epoch reward into the operator
+/// share and the delegate pool.
+///
+/// The delegate carve-out is gated on `had_delegation_at_tally` — the registry
+/// snapshot taken in `tally_weights` — NOT the live `total_delegated_stake`.
+/// Delegated stake inflated this gateway's epoch weight at tally, so the
+/// delegate share is owed even if every delegate was force-withdrawn before
+/// distribution (e.g. the operator disabled delegation mid-epoch and the
+/// permissionless `claim_delegate_from_disabled_gateway` crank emptied the
+/// pool). Gating on the *live* value let that pool collapse to 0 so the whole
+/// reward fell into `operator_stake` — the reward-theft race fixed in
+/// ADR-025 / BD-111.
+///
+/// Returns `(operator_reward, delegate_pool)`. The caller credits
+/// `operator_reward` to `operator_stake`; it disburses `delegate_pool` through
+/// the per-token accumulator when a live delegator remains, else holds it in
+/// the treasury (never the operator).
+fn split_scaled_reward(
+    scaled_reward: u64,
+    delegate_reward_share_ratio: u16,
+    had_delegation_at_tally: bool,
+) -> (u64, u64) {
+    let delegate_pool = if delegate_reward_share_ratio > 0 && had_delegation_at_tally {
+        ((scaled_reward as u128) * (delegate_reward_share_ratio as u128) / 10_000) as u64
+    } else {
+        0
+    };
+    let operator_reward = scaled_reward.saturating_sub(delegate_pool);
+    (operator_reward, delegate_pool)
 }
 
 /// Distribute rewards for an epoch in batches (replaces initialize_distribution + distribute_rewards_batch + credit_gateway_rewards + credit_delegate_rewards + record_epoch_failure).
@@ -81,6 +128,19 @@ pub fn distribute_epoch<'info>(
             break;
         }
 
+        // GAR-009 mirror (audit M-1, 2026-05-29): defense-in-depth skip for
+        // any registry slot whose address was cleared. The in-place departure
+        // model keeps slots occupied during the epoch, but `finalize_gone`'s
+        // swap-remove zeroes the tail slot — and `active_count` (snapshotted
+        // at epoch start) can outlive that shrink. Without this skip, the
+        // registry-vs-operator equality check below rejects (Pubkey::default()
+        // ≠ gateway.operator) and wedges the in-flight epoch's distribution.
+        // Mirrors the pattern in `tally_weights` at instructions/epoch.rs:381.
+        if registry.gateways[dist_idx].address == Pubkey::default() {
+            dist_idx += 1;
+            continue;
+        }
+
         require!(
             account_info.owner == ctx.program_id,
             GarError::InvalidGatewayAccount
@@ -135,6 +195,19 @@ pub fn distribute_epoch<'info>(
             false
         };
 
+        // Reward eligibility — mirror of the divisor. prescribe_epoch divides
+        // the gateway pool by `joined_count` = registry slots with
+        // composite_weight > 0; a late-joiner (joined after epoch_start →
+        // composite forced to 0 at tally, SHOULD-13 in epoch.rs) is excluded
+        // from that divisor. Its weights ARE fresh (it was tallied) so the
+        // freshness gate above passes — but it must NOT collect per_gateway, or
+        // the pool is paid to (J + late-joiners) while divided by J → systematic
+        // over-allocation of the gateway pool vs. total_eligible × ratio. Gating
+        // here aligns the recipient set with the divisor set, matching Lua where
+        // the active set used for the divisor IS the recipient set. (Leavers and
+        // cleared slots also carry composite 0 but are handled above.)
+        let is_eligible = registry.gateways[dist_idx].composite_weight > 0;
+
         // 6-scenario reward calculation (matches Lua exactly):
         //   1. passed + prescribed + observed  → per_gateway + per_observer
         //   2. passed + prescribed + !observed → per_gateway * (1 - penalty)
@@ -142,7 +215,7 @@ pub fn distribute_epoch<'info>(
         //   4. failed + prescribed + observed  → per_observer
         //   5. failed + prescribed + !observed → 0
         //   6. failed + !prescribed            → 0
-        let full_reward = if is_leaving {
+        let full_reward = if is_leaving || !is_eligible {
             0
         } else if !failed {
             if is_prescribed {
@@ -177,6 +250,8 @@ pub fn distribute_epoch<'info>(
             is_prescribed,
             is_observed,
             failed,
+            had_delegation_at_tally: registry.gateways[dist_idx].delegated_at_tally != 0,
+            eligible: is_eligible,
         });
 
         dist_idx += 1;
@@ -190,12 +265,18 @@ pub fn distribute_epoch<'info>(
     // so on-chain stake records stay consistent with the SPL transfer.
     // ----------------------------------------------------------------------
     let available = ctx.accounts.protocol_token_account.amount;
-    let transfer_amount = batch_total_reward.min(available);
+    let mut transfer_amount = batch_total_reward.min(available);
 
     // ----------------------------------------------------------------------
     // Pass 2 — scale, apply, serialize.
     // ----------------------------------------------------------------------
     let mut total_operator_rewards: u64 = 0;
+    // Delegate share that was earned at tally but has no live delegator left to
+    // receive it (every delegate was cranked out post-tally — e.g. delegation
+    // disabled mid-epoch). It is NOT credited to the operator (that was the
+    // reward-theft bug, ADR-025 / BD-111); instead it is held back from the
+    // treasury transfer so it stays in the protocol account.
+    let mut orphaned_delegate_pool: u64 = 0;
     for p in pending.iter_mut() {
         // Scale this gateway's reward proportionally. u128 to avoid overflow
         // on `full_reward * transfer_amount` (each up to ~5e15, product ~2.5e31).
@@ -207,17 +288,15 @@ pub fn distribute_epoch<'info>(
         };
 
         if scaled_reward > 0 {
-            // Re-split operator vs delegates from the SCALED reward so both
-            // halves shrink in the same ratio.
-            let delegate_pool = if p.gateway.settings.delegate_reward_share_ratio > 0
-                && p.gateway.total_delegated_stake > 0
-            {
-                ((scaled_reward as u128) * (p.gateway.settings.delegate_reward_share_ratio as u128)
-                    / 10_000) as u64
-            } else {
-                0
-            };
-            let operator_reward = scaled_reward.saturating_sub(delegate_pool);
+            // Split the SCALED reward into operator + delegate shares. The
+            // carve-out keys off the tally-time snapshot (`had_delegation_at_tally`),
+            // NOT the live `total_delegated_stake` — see `split_scaled_reward`
+            // (ADR-025 / BD-111).
+            let (operator_reward, delegate_pool) = split_scaled_reward(
+                scaled_reward,
+                p.gateway.settings.delegate_reward_share_ratio,
+                p.had_delegation_at_tally,
+            );
 
             // Operator: always compounds into operator_stake for Joined gateways.
             // (auto_stake was removed — rewards always compound on Solana;
@@ -251,22 +330,37 @@ pub fn distribute_epoch<'info>(
             // + Σ Withdrawal.amount` by exactly the unsettled-rewards amount.
             // See INVARIANTS.md §"Invariant 1 violation window" for the off-chain
             // health-check formula.
-            if delegate_pool > 0 && p.gateway.total_delegated_stake > 0 {
-                let increment = (delegate_pool as u128)
-                    .checked_mul(REWARD_PRECISION)
-                    .ok_or(GarError::ArithmeticOverflow)?
-                    .checked_div(p.gateway.total_delegated_stake as u128)
-                    .ok_or(GarError::ArithmeticOverflow)?;
-                p.gateway.cumulative_reward_per_token = p
-                    .gateway
-                    .cumulative_reward_per_token
-                    .saturating_add(increment);
+            if delegate_pool > 0 {
+                if p.gateway.total_delegated_stake > 0 {
+                    let increment = (delegate_pool as u128)
+                        .checked_mul(REWARD_PRECISION)
+                        .ok_or(GarError::ArithmeticOverflow)?
+                        .checked_div(p.gateway.total_delegated_stake as u128)
+                        .ok_or(GarError::ArithmeticOverflow)?;
+                    p.gateway.cumulative_reward_per_token = p
+                        .gateway
+                        .cumulative_reward_per_token
+                        .saturating_add(increment);
+                } else {
+                    // Delegated stake was present at tally (so the share is
+                    // owed) but every delegate has since been cranked out — the
+                    // per-token accumulator has no live denominator to credit.
+                    // Hold the share in the treasury rather than diverting it to
+                    // the operator. The force-claimed delegates settled against
+                    // the pre-distribution accumulator, so this epoch's share is
+                    // simply not paid out; critically, the operator does not
+                    // receive it (ADR-025 / BD-111).
+                    orphaned_delegate_pool = orphaned_delegate_pool.saturating_add(delegate_pool);
+                }
             }
         }
 
-        // Stats update — Lua-parity skip for leaving gateways. Only ticks
-        // when the gateway actually participated in this epoch.
-        if !p.is_leaving {
+        // Stats update — Lua-parity skip for gateways that did not participate
+        // in this epoch's active set: leavers AND composite-ineligible
+        // late-joiners (excluded from the reward divisor above). Ticking
+        // total/passed epochs for a late-joiner would inflate its future
+        // gateway_performance_ratio for an epoch it was excluded from earning.
+        if !p.is_leaving && p.eligible {
             p.gateway.stats.total_epochs = p.gateway.stats.total_epochs.saturating_add(1);
             if !p.failed {
                 p.gateway.stats.passed_epochs = p.gateway.stats.passed_epochs.saturating_add(1);
@@ -296,6 +390,13 @@ pub fn distribute_epoch<'info>(
             .serialize(&mut cursor)
             .map_err(|_| GarError::InvalidGatewayAccount)?;
     }
+
+    // Hold back any orphaned delegate share so it stays in the treasury
+    // instead of being moved to the stake pool with no on-chain accounting
+    // (operator_stake and the delegate accumulator together must equal the
+    // amount transferred — see INVARIANTS.md §"Invariant 1"). The held-back
+    // amount remains in `protocol_token_account` for a future epoch.
+    transfer_amount = transfer_amount.saturating_sub(orphaned_delegate_pool);
 
     // ----------------------------------------------------------------------
     // Single SPL transfer for the (possibly capped) batch total. The
@@ -355,12 +456,18 @@ pub fn distribute_epoch<'info>(
         )?;
     }
 
-    if transfer_amount < batch_total_reward {
+    if available < batch_total_reward {
         msg!(
             "WARNING: Insufficient protocol balance. Requested {} but only {} available; pro-rated to {}.",
             batch_total_reward,
             available,
             transfer_amount
+        );
+    }
+    if orphaned_delegate_pool > 0 {
+        msg!(
+            "Held {} delegate reward in treasury: delegated stake present at tally but no live delegator at distribution (delegation disabled + cranked out).",
+            orphaned_delegate_pool
         );
     }
 
@@ -472,4 +579,80 @@ pub struct DistributeEpoch<'info> {
     pub payer: Signer<'info>,
 
     pub token_program: Program<'info, Token>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_scaled_reward;
+
+    // Regression for the delegation-disable reward-theft race (ADR-025 / BD-111).
+    //
+    // Scenario from the PoC: a gateway with delegated stake is tallied (so its
+    // epoch weight, and thus `scaled_reward`, was earned partly by delegated
+    // stake), `delegate_reward_share_ratio = 1000` (10%), and `scaled_reward`
+    // is 1_000_000_000. The operator must receive at most the 900_000_000
+    // operator share — the 100_000_000 delegate share must NOT fold into the
+    // operator reward, even after the operator disables delegation and the
+    // forced-withdrawal crank drives live `total_delegated_stake` to 0.
+    #[test]
+    fn delegate_share_keyed_off_tally_not_live_stake() {
+        let scaled = 1_000_000_000u64;
+        let ratio = 1000u16; // 10% in basis points (/10_000)
+
+        // Tally recorded delegated stake → the share is owed regardless of how
+        // many delegates remain live at distribution. This is the fix: even if
+        // every delegate was cranked out (live stake 0), the split is unchanged.
+        let (operator_reward, delegate_pool) = split_scaled_reward(scaled, ratio, true);
+        assert_eq!(
+            operator_reward, 900_000_000,
+            "operator must not capture the delegate share"
+        );
+        assert_eq!(
+            delegate_pool, 100_000_000,
+            "delegate share must be carved out"
+        );
+        assert_eq!(
+            operator_reward + delegate_pool,
+            scaled,
+            "split must conserve the reward"
+        );
+
+        // Pre-fix behavior (gating on live stake == 0) would have produced
+        // (1_000_000_000, 0). Assert we are NOT that.
+        assert_ne!(
+            operator_reward, scaled,
+            "pre-fix theft value must not recur"
+        );
+    }
+
+    #[test]
+    fn no_delegation_at_tally_gives_operator_everything() {
+        // A gateway with no delegated stake at tally has no delegate share to
+        // carve out — the operator legitimately receives the whole reward.
+        let (operator_reward, delegate_pool) = split_scaled_reward(1_000_000_000, 1000, false);
+        assert_eq!(operator_reward, 1_000_000_000);
+        assert_eq!(delegate_pool, 0);
+    }
+
+    #[test]
+    fn zero_ratio_gives_operator_everything() {
+        // Delegated stake present but a 0% share ratio → no carve-out.
+        let (operator_reward, delegate_pool) = split_scaled_reward(1_000_000_000, 0, true);
+        assert_eq!(operator_reward, 1_000_000_000);
+        assert_eq!(delegate_pool, 0);
+    }
+
+    #[test]
+    fn full_ratio_and_rounding() {
+        // 100% share → entire reward is the delegate pool.
+        assert_eq!(
+            split_scaled_reward(1_000_000_000, 10_000, true),
+            (0, 1_000_000_000)
+        );
+        // Integer-division rounding leaves the remainder with the operator.
+        let (op, del) = split_scaled_reward(999, 1000, true); // 10% of 999 = 99.9 -> 99
+        assert_eq!(del, 99);
+        assert_eq!(op, 900);
+        assert_eq!(op + del, 999);
+    }
 }

@@ -14,6 +14,7 @@ pub fn allow_delegate(ctx: Context<AllowDelegate>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     entry.added_at = now;
     entry.bump = ctx.bumps.allowlist_entry;
+    entry.version = ALLOWLIST_ENTRY_VERSION;
 
     emit!(DelegateAllowlistedEvent {
         operator: entry.gateway,

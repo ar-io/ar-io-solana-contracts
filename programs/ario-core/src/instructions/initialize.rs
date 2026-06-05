@@ -25,6 +25,7 @@ pub fn handler(ctx: Context<Initialize>, params: InitializeParams) -> Result<()>
     config.migration_authority = params.migration_authority;
     config.bump = ctx.bumps.config;
     config.gar_program = params.gar_program;
+    config.version = ARIO_CONFIG_VERSION;
 
     msg!(
         "AR.IO protocol initialized with supply: {}",

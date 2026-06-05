@@ -6,7 +6,7 @@ use crate::error::GarError;
 use crate::state::*;
 use crate::{
     DelegationClosedEvent, DelegationDecreasedEvent, DelegationEvent, RedelegationEvent,
-    RewardsCompoundedEvent, RATE_SCALE, WITHDRAWAL_LOCK_PERIOD,
+    RewardsCompoundedEvent, RATE_SCALE,
 };
 
 pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
@@ -86,6 +86,7 @@ pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
         delegation.start_timestamp = clock.unix_timestamp;
         delegation.reward_debt = gateway.cumulative_reward_per_token;
         delegation.bump = ctx.bumps.delegation;
+        delegation.version = DELEGATION_VERSION;
     }
 
     // Update gateway totals
@@ -147,6 +148,11 @@ pub fn decrease_delegate_stake(ctx: Context<DecreaseDelegateStake>, amount: u64)
     // Create withdrawal
     let withdrawal = &mut ctx.accounts.withdrawal;
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.delegator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
 
     withdrawal.owner = ctx.accounts.delegator.key();
     withdrawal.withdrawal_id = counter.next_id;
@@ -161,6 +167,7 @@ pub fn decrease_delegate_stake(ctx: Context<DecreaseDelegateStake>, amount: u64)
     withdrawal.is_exit_vault = false;
     withdrawal.is_protected = false;
     withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
 
     counter.next_id = counter
         .next_id
@@ -228,20 +235,31 @@ pub fn claim_delegate_from_leaving_gateway(
     // Create withdrawal for delegate
     let withdrawal = &mut ctx.accounts.withdrawal;
     let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.delegator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
 
     withdrawal.owner = ctx.accounts.delegator.key();
     withdrawal.withdrawal_id = counter.next_id;
     withdrawal.gateway = gateway.operator;
     withdrawal.amount = amount;
     withdrawal.created_at = clock.unix_timestamp;
+    // Consistency fix: read from `settings.withdrawal_period` so the
+    // `admin_set_withdrawal_period` lever applies to this path too.
+    // Previously hardcoded to `WITHDRAWAL_LOCK_PERIOD` (the const), which
+    // had the same default value but couldn't be overridden for testing /
+    // ops. Mirrors the source `withdraw_delegation` handler (line 158).
     withdrawal.available_at = clock
         .unix_timestamp
-        .checked_add(WITHDRAWAL_LOCK_PERIOD)
+        .checked_add(ctx.accounts.settings.withdrawal_period)
         .ok_or(GarError::ArithmeticOverflow)?;
     withdrawal.is_delegate = true;
     withdrawal.is_exit_vault = false;
     withdrawal.is_protected = false;
     withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
 
     counter.next_id = counter
         .next_id
@@ -270,6 +288,98 @@ pub fn claim_delegate_from_leaving_gateway(
 
     msg!(
         "Delegate {} claimed {} from leaving gateway {}",
+        ctx.accounts.delegator.key(),
+        amount,
+        gateway.operator
+    );
+
+    Ok(())
+}
+
+/// Permissionless claim of a delegate's stake from a gateway that has DISABLED
+/// delegation (Fix #6 / WP §6.3).
+///
+/// On AO/Lua, turning off `allow_delegated_staking` auto-withdraws every
+/// delegate. Solana can't iterate delegate PDAs in a single tx, so this mirrors
+/// `claim_delegate_from_leaving_gateway` as a permissionless crank: anyone moves
+/// a delegate's stake into the delegate's OWN withdrawal vault (PDA-seeded by
+/// `delegator.key()`), so the caller can't redirect it. The operator cannot
+/// re-enable delegation until every delegate has been cranked out
+/// (`gateway.total_delegated_stake == 0`) AND the cooldown has elapsed — both
+/// enforced in `update_gateway_settings`. Unlike the leaving variant the gateway
+/// stays Joined/active; the gate is `!allow_delegated_staking`.
+pub fn claim_delegate_from_disabled_gateway(
+    ctx: Context<ClaimDelegateFromDisabledGateway>,
+) -> Result<()> {
+    let clock = Clock::get()?;
+    let gateway = &mut ctx.accounts.gateway;
+    let delegation = &mut ctx.accounts.delegation;
+
+    // Delegation must be disabled on this gateway (also enforced by the account
+    // context constraint; kept here as defense-in-depth).
+    require!(
+        !gateway.settings.allow_delegated_staking,
+        GarError::DelegationNotDisabled
+    );
+
+    // Settle pending rewards before claiming
+    settle_delegate_rewards(gateway, delegation);
+
+    let amount = delegation.amount;
+    require!(amount > 0, GarError::InvalidAmount);
+
+    // Create withdrawal for delegate
+    let withdrawal = &mut ctx.accounts.withdrawal;
+    let counter = &mut ctx.accounts.withdrawal_counter;
+    if counter.bump == 0 {
+        counter.owner = ctx.accounts.delegator.key();
+        counter.bump = ctx.bumps.withdrawal_counter;
+        counter.version = WITHDRAWAL_COUNTER_VERSION;
+    }
+
+    withdrawal.owner = ctx.accounts.delegator.key();
+    withdrawal.withdrawal_id = counter.next_id;
+    withdrawal.gateway = gateway.operator;
+    withdrawal.amount = amount;
+    withdrawal.created_at = clock.unix_timestamp;
+    // Same configurable lock as withdraw_delegation / the leaving variant.
+    withdrawal.available_at = clock
+        .unix_timestamp
+        .checked_add(ctx.accounts.settings.withdrawal_period)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    withdrawal.is_delegate = true;
+    withdrawal.is_exit_vault = false;
+    withdrawal.is_protected = false;
+    withdrawal.bump = ctx.bumps.withdrawal;
+    withdrawal.version = WITHDRAWAL_VERSION;
+
+    counter.next_id = counter
+        .next_id
+        .checked_add(1)
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    // Zero out delegation and reduce gateway totals
+    gateway.total_delegated_stake = gateway.total_delegated_stake.saturating_sub(amount);
+    delegation.amount = 0;
+
+    emit!(DelegationEvent {
+        delegator: ctx.accounts.delegator.key(),
+        gateway: gateway.operator,
+        amount: 0,
+        total: 0,
+        timestamp: clock.unix_timestamp,
+    });
+
+    // Supply counter: delegated stake moved to withdrawal
+    let settings = &mut ctx.accounts.settings;
+    settings.total_delegated = settings.total_delegated.saturating_sub(amount);
+    settings.total_withdrawn = settings
+        .total_withdrawn
+        .checked_add(amount)
+        .ok_or(GarError::ArithmeticOverflow)?;
+
+    msg!(
+        "Delegate {} claimed {} from gateway {} with delegation disabled",
         ctx.accounts.delegator.key(),
         amount,
         gateway.operator
@@ -416,6 +526,7 @@ pub fn redelegate_stake(ctx: Context<RedelegateStake>, amount: u64) -> Result<()
         target_delegation.start_timestamp = clock.unix_timestamp;
         target_delegation.reward_debt = target_gateway.cumulative_reward_per_token;
         target_delegation.bump = ctx.bumps.target_delegation;
+        target_delegation.version = DELEGATION_VERSION;
     }
     target_gateway.total_delegated_stake = target_gateway
         .total_delegated_stake
@@ -441,6 +552,10 @@ pub fn redelegate_stake(ctx: Context<RedelegateStake>, amount: u64) -> Result<()
     }
 
     // Update redelegation tracking
+    if redelegation.bump == 0 {
+        redelegation.bump = ctx.bumps.redelegation_record;
+        redelegation.version = REDELEGATION_RECORD_VERSION;
+    }
     if clock.unix_timestamp >= redelegation.fee_reset_at {
         redelegation.redelegation_count = 1;
     } else {
@@ -709,6 +824,66 @@ pub struct ClaimDelegateFromLeavingGateway<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Accounts for `claim_delegate_from_disabled_gateway` (Fix #6). Identical to
+/// `ClaimDelegateFromLeavingGateway` except the gateway gate is
+/// `!allow_delegated_staking` (the gateway is still Joined, not Leaving).
+#[derive(Accounts)]
+pub struct ClaimDelegateFromDisabledGateway<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, gateway.operator.as_ref()],
+        bump = gateway.bump,
+        constraint = !gateway.settings.allow_delegated_staking @ GarError::DelegationNotDisabled,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    #[account(
+        mut,
+        seeds = [DELEGATION_SEED, gateway.operator.as_ref(), delegator.key().as_ref()],
+        bump = delegation.bump,
+        constraint = delegation.delegator == delegator.key() @ GarError::NotDelegator,
+        constraint = delegation.amount > 0 @ GarError::InvalidAmount,
+    )]
+    pub delegation: Account<'info, Delegation>,
+
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = WithdrawalCounter::SIZE,
+        seeds = [WITHDRAWAL_COUNTER_SEED, delegator.key().as_ref()],
+        bump,
+    )]
+    pub withdrawal_counter: Account<'info, WithdrawalCounter>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = Withdrawal::SIZE,
+        seeds = [WITHDRAWAL_SEED, delegator.key().as_ref(), &withdrawal_counter.next_id.to_le_bytes()],
+        bump,
+    )]
+    pub withdrawal: Account<'info, Withdrawal>,
+
+    /// CHECK: the delegator's pubkey is bound by the delegation PDA seeds
+    /// (re-derived above); no signature required — the caller cannot redirect
+    /// anyone's stake by substituting a different pubkey here.
+    pub delegator: AccountInfo<'info>,
+
+    /// Pays rent on the withdrawal counter (`init_if_needed`) and vault
+    /// (`init`). Permissionless cranker.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 #[derive(Accounts)]
 pub struct RedelegateStake<'info> {
     #[account(
@@ -801,5 +976,16 @@ pub struct CompoundDelegationRewards<'info> {
     )]
     pub delegation: Account<'info, Delegation>,
 
-    pub delegator: Signer<'info>,
+    /// CHECK: This is purely a PDA-derivation seed source. The seeds-and-
+    /// constraint pair above pins `delegation.delegator == delegator.key()`,
+    /// which is enforced cryptographically by the PDA derivation itself —
+    /// substituting a different pubkey produces a different Delegation PDA
+    /// that won't match `delegation`. No `Signer` constraint because this
+    /// instruction is permissionless per docs/INVARIANTS.md (audit M-2,
+    /// 2026-05-29): compounding only writes pending → active stake on a
+    /// delegate's own pre-existing balance — no funds move between
+    /// accounts, no authorization is needed. Permissionless invocation
+    /// enables the off-chain monitor's Invariant 1 health check and
+    /// unblocks `finalize_gone` for gateways with dormant pending rewards.
+    pub delegator: UncheckedAccount<'info>,
 }

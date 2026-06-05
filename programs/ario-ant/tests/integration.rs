@@ -678,10 +678,12 @@ async fn send_migrate_ant(
     payer: &Keypair,
 ) -> std::result::Result<(), BanksClientError> {
     let (config_key, _) = config_pda(asset);
+    let (controllers_key, _) = controllers_pda(asset);
 
-    let accounts = ario_ant::accounts::MigrateAnt {
+    let accounts = ario_ant::accounts::AntMigration {
         asset: *asset,
         ant_config: config_key,
+        ant_controllers: controllers_key,
         payer: payer.pubkey(),
         system_program: system_program::ID,
     };
@@ -1034,17 +1036,17 @@ async fn test_add_controller_max_reached() {
 
     initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
 
-    // Owner is already controller #1. Add 9 more to reach MAX_CONTROLLERS (10).
-    for i in 0..9 {
+    // Owner is already controller #1. Add 3 more to reach MAX_CONTROLLERS (4).
+    for i in 0..3 {
         let controller = Pubkey::new_unique();
         send_add_controller(&mut ctx, &asset.pubkey(), &owner, controller)
             .await
             .unwrap_or_else(|e| panic!("Failed to add controller {}: {:?}", i + 2, e));
     }
 
-    // Verify we have 10
+    // Verify we have 4
     let controllers = fetch_controllers(&mut ctx, &asset.pubkey()).await;
-    assert_eq!(controllers.controllers.len(), 10);
+    assert_eq!(controllers.controllers.len(), 4);
 
     // Try to add the 11th — should fail
     let overflow_controller = Pubkey::new_unique();
@@ -1693,9 +1695,13 @@ async fn test_record_owner_reconciliation() {
 }
 
 // 22. Migrate ANT version — already at latest version should fail
-//     Because initialize sets version = ANT_CONFIG_VERSION (1), calling migrate_ant
-//     on a freshly initialized ANT should immediately fail with AlreadyLatestVersion.
-//     We also test the success path by pre-creating an AntConfig with version 0.
+//     Because initialize sets version = ANT_CONFIG_VERSION (1.0.0), calling
+//     migrate_ant on a freshly initialized ANT should immediately fail with
+//     AlreadyLatestVersion.  We also test that an account at an unknown old
+//     version (0.0.0) returns UnknownSchemaVersion (no production migration
+//     path exists below 1.0.0).  Multi-step migration success is covered by
+//     the dedicated `migration_e2e` integration test suite compiled with
+//     `--features migration-test`.
 #[tokio::test]
 async fn test_migrate_ant_version() {
     let owner = Keypair::new();
@@ -1722,8 +1728,9 @@ async fn test_migrate_ant_version() {
     let result = send_migrate_ant(&mut ctx, &asset.pubkey(), &owner).await;
     assert_anchor_error!(result, AntError::AlreadyLatestVersion);
 
-    // Now test the success path: pre-create a second ANT with version=0 by manually
-    // writing account data to simulate an ANT from before schema versioning.
+    // Now test with an account whose version is below any known migration arm.
+    // Construct an asset and a pre-existing AntConfig at version 0.0.0 +
+    // a minimal AntControllers so the transaction can reach the handler.
     let asset2 = Keypair::new();
     let asset2_data = create_fake_asset_data(&owner.pubkey());
     let rent = ctx.banks_client.get_rent().await.unwrap();
@@ -1739,7 +1746,9 @@ async fn test_migrate_ant_version() {
         .into(),
     );
 
-    // Build a version-0 AntConfig and write it directly as a pre-existing account
+    // Build a version-0.0.0 AntConfig directly using try_serialize, then
+    // overwrite the version bytes so Anchor's discriminator stays valid but
+    // the stored SchemaVersion reads as 0.0.0 (below the current 1.0.0).
     let (config2_key, config2_bump) = config_pda(&asset2.pubkey());
     let v0_config = AntConfig {
         mint: asset2.pubkey(),
@@ -1750,7 +1759,7 @@ async fn test_migrate_ant_version() {
         keywords: vec![],
         last_known_owner: owner.pubkey(),
         bump: config2_bump,
-        version: 0, // <-- old version, needs migration
+        version: SchemaVersion::new(0, 0, 0),
     };
     let mut v0_data = Vec::new();
     v0_config.try_serialize(&mut v0_data).unwrap();
@@ -1768,38 +1777,209 @@ async fn test_migrate_ant_version() {
         .into(),
     );
 
-    // Verify version is 0
-    let config2 = fetch_config(&mut ctx, &asset2.pubkey()).await;
-    assert_eq!(config2.version, 0, "Pre-created ANT should have version 0");
+    // Also create a minimal AntControllers for asset2 so AntMigration can load it.
+    let (controllers2_key, controllers2_bump) = controllers_pda(&asset2.pubkey());
+    let v0_controllers = AntControllers {
+        mint: asset2.pubkey(),
+        controllers: vec![],
+        bump: controllers2_bump,
+        version: SchemaVersion::new(1, 0, 0),
+    };
+    let mut ctrl_data = Vec::new();
+    v0_controllers.try_serialize(&mut ctrl_data).unwrap();
+    ctrl_data.resize(AntControllers::SIZE, 0);
 
-    // Migrate the v0 ANT — should succeed
-    send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner)
-        .await
-        .unwrap();
-
-    // Verify version is now at latest
-    let config2 = fetch_config(&mut ctx, &asset2.pubkey()).await;
-    assert_eq!(config2.version, ANT_CONFIG_VERSION);
-    // Verify other fields survived the migration intact
-    assert_eq!(config2.name, "Old ANT");
-    assert_eq!(config2.ticker, "OLD");
-    assert_eq!(config2.mint, asset2.pubkey());
-
-    // Verify calling migrate again fails. We use a separate payer (funded user) since
-    // migrate_ant is permissionless — anyone can call it.
-    let another_payer = Keypair::new();
     ctx.set_account(
-        &another_payer.pubkey(),
+        &controllers2_key,
         &solana_sdk::account::Account {
-            lamports: 10_000_000_000,
-            data: vec![],
-            owner: solana_sdk::system_program::ID,
+            lamports: rent.minimum_balance(AntControllers::SIZE),
+            data: ctrl_data,
+            owner: ario_ant::ID,
             executable: false,
             rent_epoch: 0,
         }
         .into(),
     );
-    let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &another_payer).await;
+
+    // Verify version is 0.0.0
+    let config2 = fetch_config(&mut ctx, &asset2.pubkey()).await;
+    assert_eq!(
+        config2.version,
+        SchemaVersion::new(0, 0, 0),
+        "Pre-created ANT should have version 0.0.0"
+    );
+
+    // Migrate the 0.0.0 account — the bootstrap arm in `migrate_config_version`
+    // stamps it at the post-#53 baseline 1.0.0. This models the pre-#53 upgrade
+    // path: accounts created before versioning existed get the version field
+    // zero-filled by realloc, then this migration brings them to 1.0.0.
+    let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner).await;
+    assert!(
+        result.is_ok(),
+        "Bootstrap migration from 0.0.0 should succeed, got: {:?}",
+        result
+    );
+    let config2_after = fetch_config(&mut ctx, &asset2.pubkey()).await;
+    assert_eq!(
+        config2_after.version,
+        SchemaVersion::new(1, 0, 0),
+        "Bootstrap migration should bring account to 1.0.0"
+    );
+}
+
+#[tokio::test]
+async fn test_migrate_ant_controllers_only_when_config_is_current() {
+    // Audit M-6 (2026-05-29) regression test. Pre-fix, `migrate_ant`'s
+    // version gate checked ONLY config.version and bailed with
+    // AlreadyLatestVersion if config was at the latest. That made
+    // controllers-only migrations unreachable any time
+    // ANT_CONTROLLERS_VERSION was bumped without a parallel
+    // ANT_CONFIG_VERSION bump.
+    //
+    // Today both versions are (1,0,0) so the latent bug doesn't fire,
+    // but the fix is mandatory before the next ANT controllers-only
+    // schema change. This test synthesizes the broken state directly:
+    // config at the current ANT_CONFIG_VERSION (1.0.0), controllers at
+    // the pre-version baseline (0.0.0). With M-6's fix the migration
+    // succeeds and brings controllers to (1,0,0); pre-fix it errors
+    // with AlreadyLatestVersion.
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    pt.add_account(
+        owner.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    // Construct an asset + AntConfig at the CURRENT version + AntControllers
+    // at version 0.0.0. The bootstrap migration arm in
+    // `migrate_controllers_version` stamps (0,0,0) → (1,0,0).
+    let asset2 = Keypair::new();
+    let asset2_data = create_fake_asset_data(&owner.pubkey());
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    ctx.set_account(
+        &asset2.pubkey(),
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(asset2_data.len()),
+            data: asset2_data,
+            owner: MPL_CORE_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (config2_key, config2_bump) = config_pda(&asset2.pubkey());
+    let current_config = AntConfig {
+        mint: asset2.pubkey(),
+        name: "Current-Config Old-Controllers".to_string(),
+        ticker: "M6T".to_string(),
+        logo: test_arweave_id(),
+        description: String::new(),
+        keywords: vec![],
+        last_known_owner: owner.pubkey(),
+        bump: config2_bump,
+        version: ANT_CONFIG_VERSION, // already at latest
+    };
+    let mut cfg_data = Vec::new();
+    current_config.try_serialize(&mut cfg_data).unwrap();
+    cfg_data.resize(AntConfig::SIZE, 0);
+    ctx.set_account(
+        &config2_key,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(AntConfig::SIZE),
+            data: cfg_data,
+            owner: ario_ant::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (controllers2_key, controllers2_bump) = controllers_pda(&asset2.pubkey());
+    let stale_controllers = AntControllers {
+        mint: asset2.pubkey(),
+        controllers: vec![],
+        bump: controllers2_bump,
+        version: SchemaVersion::new(0, 0, 0), // below latest — needs migration
+    };
+    let mut ctrl_data = Vec::new();
+    stale_controllers.try_serialize(&mut ctrl_data).unwrap();
+    ctrl_data.resize(AntControllers::SIZE, 0);
+    ctx.set_account(
+        &controllers2_key,
+        &solana_sdk::account::Account {
+            lamports: rent.minimum_balance(AntControllers::SIZE),
+            data: ctrl_data,
+            owner: ario_ant::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // M-6: migration MUST succeed because controllers needs migration even
+    // though config is current. Pre-fix this returned AlreadyLatestVersion.
+    let result = send_migrate_ant(&mut ctx, &asset2.pubkey(), &owner).await;
+    assert!(
+        result.is_ok(),
+        "controllers-only migration must succeed when config is already at \
+         the latest version (audit M-6); got: {:?}",
+        result
+    );
+
+    // Verify controllers were actually migrated and config was left alone.
+    let config_after = fetch_config(&mut ctx, &asset2.pubkey()).await;
+    assert_eq!(
+        config_after.version, ANT_CONFIG_VERSION,
+        "config version must be unchanged after a controllers-only migration"
+    );
+    let controllers_after_acc = ctx
+        .banks_client
+        .get_account(controllers2_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let controllers_after =
+        AntControllers::try_deserialize(&mut controllers_after_acc.data.as_slice()).unwrap();
+    assert_eq!(
+        controllers_after.version, ANT_CONTROLLERS_VERSION,
+        "controllers version must be brought to ANT_CONTROLLERS_VERSION"
+    );
+}
+
+#[tokio::test]
+async fn test_migrate_ant_both_current_still_rejects() {
+    // Belt-and-braces for M-6: when BOTH config and controllers are at the
+    // latest, the combined gate must still reject with AlreadyLatestVersion.
+    // The fix relaxed the gate to (EITHER needs migration) — must not
+    // accidentally relax further to "always-succeed".
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    pt.add_account(
+        owner.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let config = fetch_config(&mut ctx, &asset.pubkey()).await;
+    assert_eq!(config.version, ANT_CONFIG_VERSION);
+
+    let result = send_migrate_ant(&mut ctx, &asset.pubkey(), &owner).await;
     assert_anchor_error!(result, AntError::AlreadyLatestVersion);
 }
 
@@ -1892,7 +2072,7 @@ async fn test_initialize_description_too_long() {
         target: test_arweave_id(),
         target_protocol: None,
         logo: String::new(),
-        description: "x".repeat(513), // MAX_DESCRIPTION_LENGTH = 512
+        description: "x".repeat(129), // exceeds MAX_DESCRIPTION_LENGTH = 128
         keywords: vec![],
     };
     let result = send_initialize(&mut ctx, &asset.pubkey(), &owner, params).await;
@@ -2321,8 +2501,8 @@ async fn test_set_record_invalid_keywords() {
         display_name: None,
         record_logo: None,
         record_description: None,
-        // MAX_KEYWORDS = 8; 9 → InvalidKeyword
-        record_keywords: Some((0..9).map(|i| format!("kw{}", i)).collect()),
+        // MAX_KEYWORDS = 3; 4 → InvalidKeyword
+        record_keywords: Some((0..4).map(|i| format!("kw{}", i)).collect()),
     };
     let result = send_set_record_metadata(&mut ctx, &asset.pubkey(), &owner, params).await;
     assert_anchor_error!(result, AntError::InvalidKeyword);
@@ -5896,4 +6076,812 @@ async fn test_close_orphaned_record_metadata_rejects_when_record_alive() {
     let result =
         send_close_orphaned_record_metadata(&mut ctx, &asset.pubkey(), &stranger, "blog").await;
     assert_anchor_error!(result, AntError::RecordStillExists);
+}
+
+// =========================================================================
+// RENT RECLAIM — user-callable close ixs + admin orphan cleanup
+// =========================================================================
+// Coverage:
+//   - close_ant_record (happy + non-owner rejected)
+//   - close_ant_record_metadata_for_owner (non-owner rejected)
+//   - close_ant_controllers (happy + non-owner rejected)
+//   - close_ant_config (happy + non-owner rejected)
+//   - admin_close_orphaned_ant_state (asset-still-alive rejected)
+//   - End-to-end: owner closes records → controllers → config
+
+/// Fund a fresh keypair as a system-owned account so it can pay tx fees.
+/// Matches the pattern used by `test_initialize_ant`.
+fn fund_user(pt: &mut ProgramTest, who: &Pubkey) {
+    pt.add_account(
+        *who,
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+}
+
+async fn send_close_ant_record(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+    undername: &str,
+) -> std::result::Result<(), BanksClientError> {
+    let (record_key, _) = record_pda(asset, undername);
+    let accounts = ario_ant::accounts::CloseAntRecord {
+        asset: *asset,
+        record: record_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntRecord {
+            _undername: undername.to_string(),
+        }
+        .data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_close_ant_record_metadata_for_owner(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+    undername: &str,
+) -> std::result::Result<(), BanksClientError> {
+    let (meta_key, _) = record_metadata_pda(asset, undername);
+    let accounts = ario_ant::accounts::CloseAntRecordMetadataForOwner {
+        asset: *asset,
+        record_metadata: meta_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntRecordMetadataForOwner {
+            _undername: undername.to_string(),
+        }
+        .data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_close_ant_controllers(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (controllers_key, _) = controllers_pda(asset);
+    let accounts = ario_ant::accounts::CloseAntControllers {
+        asset: *asset,
+        controllers: controllers_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntControllers {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn send_close_ant_config(
+    ctx: &mut ProgramTestContext,
+    asset: &Pubkey,
+    caller: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (config_key, _) = config_pda(asset);
+    let accounts = ario_ant::accounts::CloseAntConfig {
+        asset: *asset,
+        config: config_key,
+        caller: caller.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::CloseAntConfig {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&[ix], Some(&caller.pubkey()), &[caller], blockhash);
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_close_ant_record_succeeds_for_owner() {
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    // Add a non-@ record so closing it doesn't fight @-record protection
+    let params = SetRecordParams {
+        undername: "blog".to_string(),
+        target: test_arweave_id(),
+        target_protocol: 0,
+        ttl_seconds: 900,
+        priority: None,
+        record_owner: None,
+    };
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
+
+    let (record_key, _) = record_pda(&asset.pubkey(), "blog");
+    let rent_before = ctx
+        .banks_client
+        .get_account(record_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    let owner_lamports_before = ctx
+        .banks_client
+        .get_account(owner.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    send_close_ant_record(&mut ctx, &asset.pubkey(), &owner, "blog")
+        .await
+        .unwrap();
+
+    // PDA is closed (data empty + System-owned)
+    let acct = ctx.banks_client.get_account(record_key).await.unwrap();
+    assert!(acct.is_none() || acct.unwrap().data.is_empty());
+
+    // Refund went to owner (modulo tx fees the owner also paid as payer)
+    let owner_lamports_after = ctx
+        .banks_client
+        .get_account(owner.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert!(
+        owner_lamports_after > owner_lamports_before - rent_before / 2,
+        "owner should net-positive after closing record (refund={}, before={}, after={})",
+        rent_before,
+        owner_lamports_before,
+        owner_lamports_after,
+    );
+}
+
+#[tokio::test]
+async fn test_close_ant_record_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    let params = SetRecordParams {
+        undername: "blog".to_string(),
+        target: test_arweave_id(),
+        target_protocol: 0,
+        ttl_seconds: 900,
+        priority: None,
+        record_owner: None,
+    };
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
+
+    let result = send_close_ant_record(&mut ctx, &asset.pubkey(), &stranger, "blog").await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_ant_controllers_succeeds_for_owner() {
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let exists_before = ctx
+        .banks_client
+        .get_account(controllers_key)
+        .await
+        .unwrap()
+        .is_some();
+    assert!(exists_before);
+
+    send_close_ant_controllers(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    let after = ctx.banks_client.get_account(controllers_key).await.unwrap();
+    assert!(after.is_none() || after.unwrap().data.is_empty());
+}
+
+#[tokio::test]
+async fn test_close_ant_controllers_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let result = send_close_ant_controllers(&mut ctx, &asset.pubkey(), &stranger).await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_ant_config_succeeds_for_owner() {
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    assert!(ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .is_some());
+
+    send_close_ant_config(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    let after = ctx.banks_client.get_account(config_key).await.unwrap();
+    assert!(after.is_none() || after.unwrap().data.is_empty());
+}
+
+#[tokio::test]
+async fn test_close_ant_config_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let result = send_close_ant_config(&mut ctx, &asset.pubkey(), &stranger).await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_ant_record_metadata_rejects_non_owner() {
+    let owner = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    for who in [owner.pubkey(), stranger.pubkey()] {
+        pt.add_account(
+            who,
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    // Add a record + metadata so there's something to attempt to close
+    let params = SetRecordParams {
+        undername: "blog".to_string(),
+        target: test_arweave_id(),
+        target_protocol: 0,
+        ttl_seconds: 900,
+        priority: None,
+        record_owner: None,
+    };
+    send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+        .await
+        .unwrap();
+    let meta_params = SetRecordMetadataParams {
+        undername: "blog".to_string(),
+        display_name: Some("Blog".to_string()),
+        record_logo: None,
+        record_description: None,
+        record_keywords: None,
+    };
+    send_set_record_metadata(&mut ctx, &asset.pubkey(), &owner, meta_params)
+        .await
+        .unwrap();
+
+    let result =
+        send_close_ant_record_metadata_for_owner(&mut ctx, &asset.pubkey(), &stranger, "blog")
+            .await;
+    assert_anchor_error!(result, AntError::NotNftHolder);
+}
+
+#[tokio::test]
+async fn test_close_all_then_records_order_independent() {
+    // End-to-end: owner closes records → controllers → config, in that
+    // order. Verifies each ix independently doesn't block the next.
+    let owner = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    // 2 records
+    for undername in &["blog", "docs"] {
+        let params = SetRecordParams {
+            undername: undername.to_string(),
+            target: test_arweave_id(),
+            target_protocol: 0,
+            ttl_seconds: 900,
+            priority: None,
+            record_owner: None,
+        };
+        send_set_record(&mut ctx, &asset.pubkey(), &owner, params)
+            .await
+            .unwrap();
+    }
+
+    // Close records first
+    for undername in &["blog", "docs"] {
+        send_close_ant_record(&mut ctx, &asset.pubkey(), &owner, undername)
+            .await
+            .unwrap();
+    }
+
+    // Then controllers (no record dependency)
+    send_close_ant_controllers(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    // Then config (no controllers dependency)
+    send_close_ant_config(&mut ctx, &asset.pubkey(), &owner)
+        .await
+        .unwrap();
+
+    // All four PDAs closed
+    for key in &[
+        config_pda(&asset.pubkey()).0,
+        controllers_pda(&asset.pubkey()).0,
+        record_pda(&asset.pubkey(), "blog").0,
+        record_pda(&asset.pubkey(), "docs").0,
+    ] {
+        let acct = ctx.banks_client.get_account(*key).await.unwrap();
+        assert!(acct.is_none() || acct.unwrap().data.is_empty());
+    }
+}
+
+/// Pre-populate an `AntMigrationConfig` PDA with `authority` set to the
+/// given pubkey. Used by `admin_close_orphaned_ant_state` tests so the
+/// ix's `has_one = authority` gate can be verified end-to-end without
+/// running through `initialize_migration`.
+fn seed_migration_config(pt: &mut ProgramTest, authority: &Pubkey) -> Pubkey {
+    use anchor_lang::{AnchorSerialize, Discriminator};
+    let (pda, bump) = migration_config_pda();
+    let cfg = ario_ant::state::AntMigrationConfig {
+        authority: *authority,
+        migration_authority: Pubkey::new_unique(),
+        migration_active: true,
+        bump,
+        version: ario_ant::state::ANT_MIGRATION_CONFIG_VERSION,
+    };
+    let mut data = ario_ant::state::AntMigrationConfig::DISCRIMINATOR.to_vec();
+    cfg.serialize(&mut data).unwrap();
+    data.resize(ario_ant::state::AntMigrationConfig::SIZE, 0);
+    let rent = solana_sdk::rent::Rent::default();
+    pt.add_account(
+        pda,
+        solana_sdk::account::Account {
+            lamports: rent.minimum_balance(data.len()),
+            data,
+            owner: ario_ant::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    pda
+}
+
+#[tokio::test]
+async fn test_admin_close_orphaned_rejects_when_asset_alive() {
+    // The asset has NOT been burned — admin_close_orphaned must refuse
+    // with AssetStillExists (after passing the new authority gate).
+    let owner = Keypair::new();
+    let authority = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &authority.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: authority.pubkey(),
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&authority.pubkey()),
+        &[&authority],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, AntError::AssetStillExists);
+}
+
+/// Audit fix: admin_close_orphaned_ant_state previously had no authority
+/// gate — any signer could route per-ANT rent to themselves. The
+/// `has_one = authority @ Unauthorized` constraint added in this fix
+/// must reject non-authority signers BEFORE the AssetStillExists check.
+/// Without this regression test, the original bug would silently
+/// re-enter on any refactor.
+#[tokio::test]
+async fn test_admin_close_orphaned_rejects_non_authority() {
+    let owner = Keypair::new();
+    let real_authority = Keypair::new();
+    let attacker = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &real_authority.pubkey());
+    fund_user(&mut pt, &attacker.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &real_authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: attacker.pubkey(), // ← NOT real_authority
+    };
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: accounts.to_account_metas(None),
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, AntError::Unauthorized);
+}
+
+/// Helper: rewrite `asset` to the post-burn state (System-owned, empty)
+/// so `admin_close_orphaned_ant_state` passes the AssetStillExists check
+/// and reaches the remaining_accounts close loop.
+async fn set_asset_post_burn(ctx: &mut ProgramTestContext, asset: &Pubkey) {
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let post_burn = solana_sdk::account::Account {
+        lamports: rent.minimum_balance(0),
+        data: vec![],
+        owner: solana_sdk::system_program::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(asset, &post_burn.into());
+}
+
+/// Helper: seed a minimal `AntRecord`-shaped account for `mint` at
+/// `addr`. Only the 8-byte discriminator + 32-byte `mint` field matter —
+/// the close loop reads those raw and never borsh-deserializes the rest.
+async fn seed_raw_ant_record(ctx: &mut ProgramTestContext, addr: &Pubkey, mint: &Pubkey) {
+    use anchor_lang::Discriminator;
+    let rent = ctx.banks_client.get_rent().await.unwrap();
+    let mut data = ario_ant::state::AntRecord::DISCRIMINATOR.to_vec();
+    data.extend_from_slice(mint.as_ref());
+    data.resize(ario_ant::state::AntRecord::SIZE, 0);
+    let account = solana_sdk::account::Account {
+        lamports: rent.minimum_balance(data.len()),
+        data,
+        owner: ario_ant::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    ctx.set_account(addr, &account.into());
+}
+
+/// Audit follow-up (Codex finding #3): the remaining_accounts close loop
+/// closes AntRecord / AntRecordMetadata by discriminator. Even though the
+/// ix is now authority-gated, the migration authority must not be able to
+/// (accidentally) close a record belonging to a DIFFERENT asset and
+/// refund its rent here. Each record's stored `mint` must equal
+/// `asset.key()`, else OrphanRecordAssetMismatch — the whole tx reverts.
+#[tokio::test]
+async fn test_admin_close_orphaned_rejects_foreign_record() {
+    let owner = Keypair::new();
+    let authority = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &authority.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    // Real config + controllers for `asset`, then transition asset to
+    // post-burn so the handler reaches the close loop.
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    set_asset_post_burn(&mut ctx, &asset.pubkey()).await;
+
+    // A record for a DIFFERENT asset, wrongly included in the cleanup.
+    let foreign_mint = Pubkey::new_unique();
+    let (foreign_record, _) = record_pda(&foreign_mint, "sub");
+    seed_raw_ant_record(&mut ctx, &foreign_record, &foreign_mint).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: authority.pubkey(),
+    };
+    let mut metas = accounts.to_account_metas(None);
+    metas.push(solana_sdk::instruction::AccountMeta::new(
+        foreign_record,
+        false,
+    ));
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: metas,
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&authority.pubkey()),
+        &[&authority],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, AntError::OrphanRecordAssetMismatch);
+
+    // The foreign record must be untouched (tx reverted), not drained.
+    let still_there = ctx.banks_client.get_account(foreign_record).await.unwrap();
+    assert!(still_there.is_some(), "foreign record must NOT be closed");
+}
+
+/// Happy-path counterpart: a record whose `mint == asset` is a legitimate
+/// orphan and IS closed (rent refunded to the authority). Guards against
+/// the mint-binding check being too strict / wrong byte offset, which no
+/// existing test would otherwise catch.
+#[tokio::test]
+async fn test_admin_close_orphaned_closes_matching_record() {
+    let owner = Keypair::new();
+    let authority = Keypair::new();
+    let (mut pt, asset) = program_test_with_asset(&owner.pubkey());
+    fund_user(&mut pt, &owner.pubkey());
+    fund_user(&mut pt, &authority.pubkey());
+    let migration_config = seed_migration_config(&mut pt, &authority.pubkey());
+    let mut ctx = pt.start_with_context().await;
+    initialize_default_ant(&mut ctx, &asset.pubkey(), &owner).await;
+    set_asset_post_burn(&mut ctx, &asset.pubkey()).await;
+
+    // A record that genuinely belongs to `asset` (mint == asset).
+    let (orphan_record, _) = record_pda(&asset.pubkey(), "sub");
+    seed_raw_ant_record(&mut ctx, &orphan_record, &asset.pubkey()).await;
+
+    let (config_key, _) = config_pda(&asset.pubkey());
+    let (controllers_key, _) = controllers_pda(&asset.pubkey());
+    let accounts = ario_ant::accounts::AdminCloseOrphanedAntState {
+        asset: asset.pubkey(),
+        migration_config,
+        config: config_key,
+        controllers: controllers_key,
+        authority: authority.pubkey(),
+    };
+    let mut metas = accounts.to_account_metas(None);
+    metas.push(solana_sdk::instruction::AccountMeta::new(
+        orphan_record,
+        false,
+    ));
+    let ix = Instruction {
+        program_id: ario_ant::ID,
+        accounts: metas,
+        data: ario_ant::instruction::AdminCloseOrphanedAntState {}.data(),
+    };
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&authority.pubkey()),
+        &[&authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The matching record was closed (drained to 0 lamports → GC'd).
+    let closed = ctx.banks_client.get_account(orphan_record).await.unwrap();
+    assert!(closed.is_none(), "matching record should have been closed");
+}
+
+/// Verify `transfer_authority` (ADR-026) on `AntMigrationConfig`: null
+/// rejected (`InvalidAuthority`), non-authority rejected (`Unauthorized`),
+/// rotation succeeds with the `migration_authority` sibling field
+/// byte-identical, old authority dead after, rotation to an off-curve PDA
+/// (Squads vault shape) accepted.
+#[tokio::test]
+async fn test_transfer_authority() {
+    let upgrade_auth = Keypair::new();
+    let admin_auth = Keypair::new();
+    let mig_auth = Keypair::new();
+    let new_auth = Keypair::new();
+    let bad = Keypair::new();
+
+    let mut pt = program_test_with_program_data(&upgrade_auth.pubkey());
+    for kp in [&upgrade_auth, &admin_auth, &new_auth, &bad] {
+        pt.add_account(
+            kp.pubkey(),
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+
+    // Init migration config: admin authority = admin_auth, migration_authority = mig_auth.
+    send_initialize_migration(
+        &mut ctx,
+        &upgrade_auth,
+        admin_auth.pubkey(),
+        mig_auth.pubkey(),
+    )
+    .await
+    .unwrap();
+
+    let (mig_key, _) = migration_config_pda();
+    // Sibling field `migration_authority` lives at bytes 40..72 — assert untouched.
+    let mig_auth_bytes = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[40..72]
+        .to_vec();
+    assert_eq!(&mig_auth_bytes[..], mig_auth.pubkey().as_ref());
+
+    let ta_tx = |new_authority: Pubkey, signer: &Keypair, bh| {
+        Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_ant::ID,
+                accounts: ario_ant::accounts::TransferAuthority {
+                    migration_config: mig_key,
+                    authority: signer.pubkey(),
+                }
+                .to_account_metas(None),
+                data: ario_ant::instruction::TransferAuthority { new_authority }.data(),
+            }],
+            Some(&signer.pubkey()),
+            &[signer],
+            bh,
+        )
+    };
+    let read_authority = |data: &[u8]| Pubkey::new_from_array(data[8..40].try_into().unwrap());
+
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(ta_tx(Pubkey::default(), &admin_auth, bh))
+            .await,
+        AntError::InvalidAuthority
+    );
+
+    // Step 2: non-authority rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(ta_tx(Pubkey::new_unique(), &bad, bh))
+            .await,
+        AntError::Unauthorized
+    );
+
+    // Step 3: rotate to new_auth; sibling field intact.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(ta_tx(new_auth.pubkey(), &admin_auth, bh))
+        .await
+        .unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_authority(&acct.data), new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..72],
+        &mig_auth_bytes[..],
+        "migration_authority sibling field must be byte-identical after rotation"
+    );
+
+    // Step 4: old authority dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(ta_tx(Pubkey::new_unique(), &admin_auth, bh))
+            .await,
+        AntError::Unauthorized
+    );
+
+    // Step 5: rotate to an off-curve PDA (Squads-vault shape), signed by new_auth.
+    let pda_target = Pubkey::find_program_address(&[b"vault-like"], &ario_ant::ID).0;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(ta_tx(pda_target, &new_auth, bh))
+        .await
+        .unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_authority(&acct.data), pda_target);
 }

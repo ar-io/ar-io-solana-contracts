@@ -792,11 +792,6 @@ pub mod extend_lease_from_withdrawal {
     use super::*;
 
     pub fn handler(ctx: Context<ExtendLeaseFromWithdrawal>, years: u8) -> Result<()> {
-        require!(
-            years >= 1 && years <= MAX_LEASE_LENGTH_YEARS as u8,
-            ArnsError::InvalidLeaseDuration
-        );
-
         let clock = Clock::get()?;
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
@@ -811,24 +806,33 @@ pub mod extend_lease_from_withdrawal {
             ArnsError::RecordExpired
         );
 
-        let current_end = record.end_timestamp.ok_or(ArnsError::InvalidParameter)?;
-        let new_end = current_end
+        // Cap aligned with `extend_lease`, `extend_lease_from_delegation`, and
+        // `extend_lease_from_operator_stake` (audit M-3, 2026-05-29). Pre-fix
+        // this path used a total-duration-since-start cap that under-permitted
+        // legitimate extensions for old leases purchased for less than the
+        // maximum — inconsistent with the other 3 paths and with the Lua
+        // reference (`arns.lua` extendLease). Aligning to the remaining-years-
+        // from-now policy: an extension is allowed iff (remaining + extension)
+        // fits within MAX_LEASE_LENGTH_YEARS, regardless of how long ago the
+        // original lease started. See BD-103 / docs/BEHAVIORAL_DIFFERENCES.md.
+        require!(years >= 1, ArnsError::InvalidLeaseDuration);
+        let end_ts = record.end_timestamp.ok_or(ArnsError::InvalidParameter)?;
+        let remaining_seconds = end_ts.saturating_sub(timestamp).max(0);
+        let remaining_years =
+            (remaining_seconds as u64 + ONE_YEAR_SECONDS as u64 - 1) / ONE_YEAR_SECONDS as u64;
+        let max_extension = (MAX_LEASE_LENGTH_YEARS as u64).saturating_sub(remaining_years);
+        require!(
+            years as u64 <= max_extension,
+            ArnsError::ExtensionExceedsMax
+        );
+
+        let new_end = end_ts
             .checked_add(
                 (years as i64)
                     .checked_mul(ONE_YEAR_SECONDS)
                     .ok_or(ArnsError::ArithmeticOverflow)?,
             )
             .ok_or(ArnsError::ArithmeticOverflow)?;
-        let total_lease_duration = new_end
-            .checked_sub(record.start_timestamp)
-            .ok_or(ArnsError::ArithmeticUnderflow)?;
-        let max_total = (MAX_LEASE_LENGTH_YEARS as i64)
-            .checked_mul(ONE_YEAR_SECONDS)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
-        require!(
-            total_lease_duration <= max_total,
-            ArnsError::InvalidLeaseDuration
-        );
 
         crate::instructions::demand::maybe_roll_demand_period(
             &mut ctx.accounts.demand_factor,
@@ -1103,10 +1107,6 @@ pub mod extend_lease_from_funding_plan {
         discount_account_count: u8,
         residue_vault_count: u8,
     ) -> Result<()> {
-        require!(
-            years >= 1 && years <= MAX_LEASE_LENGTH_YEARS as u8,
-            ArnsError::InvalidLeaseDuration
-        );
         require!(discount_account_count <= 1, ArnsError::InvalidParameter);
 
         let clock = Clock::get()?;
@@ -1123,24 +1123,30 @@ pub mod extend_lease_from_funding_plan {
             ArnsError::RecordExpired
         );
 
-        let current_end = record.end_timestamp.ok_or(ArnsError::InvalidParameter)?;
-        let new_end = current_end
+        // Cap aligned with `extend_lease`, `extend_lease_from_delegation`,
+        // `extend_lease_from_operator_stake`, and (post-this-PR)
+        // `extend_lease_from_withdrawal` (audit M-3, 2026-05-29). See the
+        // sibling comment in `extend_lease_from_withdrawal` above for the
+        // rationale; this is the same change applied to the funding-plan
+        // path so all 5 extend-lease entry points share one policy.
+        require!(years >= 1, ArnsError::InvalidLeaseDuration);
+        let end_ts = record.end_timestamp.ok_or(ArnsError::InvalidParameter)?;
+        let remaining_seconds = end_ts.saturating_sub(timestamp).max(0);
+        let remaining_years =
+            (remaining_seconds as u64 + ONE_YEAR_SECONDS as u64 - 1) / ONE_YEAR_SECONDS as u64;
+        let max_extension = (MAX_LEASE_LENGTH_YEARS as u64).saturating_sub(remaining_years);
+        require!(
+            years as u64 <= max_extension,
+            ArnsError::ExtensionExceedsMax
+        );
+
+        let new_end = end_ts
             .checked_add(
                 (years as i64)
                     .checked_mul(ONE_YEAR_SECONDS)
                     .ok_or(ArnsError::ArithmeticOverflow)?,
             )
             .ok_or(ArnsError::ArithmeticOverflow)?;
-        let total_lease_duration = new_end
-            .checked_sub(record.start_timestamp)
-            .ok_or(ArnsError::ArithmeticUnderflow)?;
-        let max_total = (MAX_LEASE_LENGTH_YEARS as i64)
-            .checked_mul(ONE_YEAR_SECONDS)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
-        require!(
-            total_lease_duration <= max_total,
-            ArnsError::InvalidLeaseDuration
-        );
 
         crate::instructions::demand::maybe_roll_demand_period(
             &mut ctx.accounts.demand_factor,

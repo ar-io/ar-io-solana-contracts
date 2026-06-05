@@ -33,11 +33,17 @@ pub struct AntMigrationConfig {
     pub migration_active: bool,
     /// PDA bump
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl AntMigrationConfig {
-    // discriminator(8) + authority(32) + migration_authority(32) + migration_active(1) + bump(1)
-    pub const SIZE: usize = 8 + 32 + 32 + 1 + 1;
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE       // authority
+        + PUBKEY_SIZE       // migration_authority
+        + 1                 // migration_active: bool
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -59,19 +65,28 @@ pub const MAX_TTL_SECONDS: u32 = 86400;
 /// Maximum ANT name / display name length (matches Lua MAX_NAME_LENGTH = 61)
 pub const MAX_NAME_LENGTH: usize = 61;
 
-/// Maximum description length (reduced from Lua's 512 for rent savings; 256 is
-/// generous for a domain-name blurb).
-pub const MAX_DESCRIPTION_LENGTH: usize = 256;
+/// Maximum description length. Tightened from 256 → 128 (2026-05-21) after
+/// snapshot audit showed p99=107 chars across 1,040 source descriptions —
+/// 128 covers 99% without truncation. Save ~3.2 SOL of rent across a
+/// mainnet-scale migration. Lua's was 512; protocol has been progressively
+/// shrinking this as real usage patterns clarify.
+pub const MAX_DESCRIPTION_LENGTH: usize = 128;
 
-/// Maximum number of keywords (reduced from Lua's 16 for rent savings;
-/// 8 is sufficient for discovery/tagging use cases).
-pub const MAX_KEYWORDS: usize = 8;
+/// Maximum number of keywords. Tightened from 8 → 3 (2026-05-21) after
+/// snapshot audit showed p99=4 keywords (1% of ANTs have more). 3 covers
+/// the typical-use case while saving 180 bytes per AntConfig × 3,551 ANTs
+/// ≈ 4.5 SOL of mainnet rent. Lua's was 16.
+pub const MAX_KEYWORDS: usize = 3;
 
 /// Maximum keyword length (matches Lua MAX_KEYWORD_LENGTH = 32)
 pub const MAX_KEYWORD_LENGTH: usize = 32;
 
-/// Maximum number of controllers
-pub const MAX_CONTROLLERS: usize = 10;
+/// Maximum number of controllers. Tightened from 10 → 4 (2026-05-21) after
+/// snapshot audit showed p99=2 controllers (exactly 1 ANT in 3,551 has 7;
+/// loses 3 on migration — acceptable, manually surfaced via the
+/// migration's pre-flight check). Save 128 bytes per AntControllers ×
+/// 3,551 ≈ 3.2 SOL of mainnet rent.
+pub const MAX_CONTROLLERS: usize = 4;
 
 /// Maximum number of ACL entries per `AclPage` (ADR-012).
 ///
@@ -97,6 +112,31 @@ pub const ARWEAVE_TX_ID_LENGTH: usize = 43;
 /// IPFS CIDv1 ~59, generous headroom for future protocols).
 pub const MAX_TARGET_LENGTH: usize = 128;
 
+// =========================================
+// BORSH / ACCOUNT LAYOUT SIZING CONSTANTS
+// =========================================
+
+/// Anchor account discriminator (first 8 bytes of SHA-256("account:<Name>")).
+pub const ANCHOR_DISCRIMINATOR_SIZE: usize = 8;
+
+/// Solana `Pubkey` serialized size.
+pub const PUBKEY_SIZE: usize = 32;
+
+/// Borsh `u32` length prefix used for `String` and `Vec<T>`.
+pub const BORSH_LEN_PREFIX: usize = 4;
+
+/// Borsh `Option<T>` discriminant byte (0 = None, 1 = Some).
+pub const BORSH_OPTION_PREFIX: usize = 1;
+
+/// Bump seed (single `u8`).
+pub const BUMP_SIZE: usize = 1;
+
+/// `SchemaVersion { major, minor, patch }` — 3 consecutive u8s.
+pub const SCHEMA_VERSION_SIZE: usize = 3;
+
+/// Borsh-serialized max size of a single keyword: length prefix + MAX_KEYWORD_LENGTH.
+pub const KEYWORD_BORSH_SIZE: usize = BORSH_LEN_PREFIX + MAX_KEYWORD_LENGTH;
+
 /// IPFS CIDv0: always exactly 46 base58btc characters starting with "Qm".
 pub const CIDV0_LENGTH: usize = 46;
 
@@ -106,16 +146,63 @@ pub const PROTOCOL_ARWEAVE: u8 = 0;
 pub const PROTOCOL_IPFS: u8 = 1;
 
 // =========================================
+// SCHEMA VERSION
+// =========================================
+
+/// Semantic version for ANT on-chain account schemas.
+///
+/// Stored as three consecutive `u8` bytes (3 bytes on the wire).
+/// `Ord` is derived lexicographically over `(major, minor, patch)`, which
+/// matches semver precedence: major is compared first, then minor, then
+/// patch. This means `config.version < ANT_CONFIG_VERSION` is a valid
+/// "needs migration" guard.
+///
+/// Bump rules:
+///   - `major`: breaking layout change (field removed, type changed, reorder)
+///   - `minor`: additive layout change (new field appended, default = zero)
+///   - `patch`: logic-only change (no layout change; bump optional for audits)
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug,
+)]
+pub struct SchemaVersion {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl SchemaVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+// =========================================
 // ACCOUNTS
 // =========================================
 
-/// Current schema version for each ANT-side account type. Bump the
-/// corresponding constant when adding fields or changing layout; future
-/// migration instructions key off these to discriminate v1 vs vN data.
-pub const ANT_CONFIG_VERSION: u8 = 1;
-pub const ANT_CONTROLLERS_VERSION: u8 = 1;
-pub const ANT_RECORD_VERSION: u8 = 1;
-pub const ANT_RECORD_METADATA_VERSION: u8 = 1;
+/// Current schema version for each ANT-side account type.
+///
+/// Bump the appropriate constant when changing the on-chain layout; the
+/// `schema_migration` module's dispatch functions key off the stored version
+/// to walk an account through every intermediate step up to the new current.
+///
+/// When the `migration-test` feature is active the constant is bumped to
+/// 1.3.0 so that the four-schema migration E2E suite exercises a real
+/// multi-step upgrade path.  Production builds always compile at 1.0.0.
+#[cfg(not(feature = "migration-test"))]
+pub const ANT_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+#[cfg(feature = "migration-test")]
+pub const ANT_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 3, 0);
+pub const ANT_CONTROLLERS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ANT_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ANT_RECORD_METADATA_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ANT_MIGRATION_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ACL_CONFIG_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const ACL_PAGE_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 /// Per-ANT configuration and metadata stored alongside the Metaplex Core asset.
 /// Seeds: ["ant_config", mint]
@@ -137,25 +224,53 @@ pub struct AntConfig {
     pub last_known_owner: Pubkey,
     /// PDA bump
     pub bump: u8,
-    /// Schema version — used for per-ANT data migrations
-    pub version: u8,
+    /// Schema version — used for per-ANT data migrations; see `ANT_CONFIG_VERSION`
+    /// and `schema_migration::migrate_config_version` for the dispatch chain.
+    pub version: SchemaVersion,
+    /// Schema v1.1.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.0.0→1.1.0 migration arm with a default of 1000.
+    #[cfg(feature = "migration-test")]
+    pub field_1: u64,
+    /// Schema v1.2.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.1.0→1.2.0 migration arm with a default of 42.
+    #[cfg(feature = "migration-test")]
+    pub field_2: u32,
+    /// Schema v1.3.0 — migration-test sentinel, not emitted in production builds.
+    /// Populated by the 1.2.0→1.3.0 migration arm with a default of true.
+    #[cfg(feature = "migration-test")]
+    pub field_3: bool,
 }
 
 impl AntConfig {
-    /// Conservative max size accounting for variable-length fields
-    /// 8 (discriminator) + 32 (mint) + (4+61) name + (4+16) ticker + (4+43) logo
-    /// + (4+MAX_DESCRIPTION_LENGTH) description + (4 + MAX_KEYWORDS*(4+32)) keywords
-    /// + 32 (last_known_owner) + 1 (bump) + 1 (version)
-    pub const SIZE: usize = 8
-        + 32
-        + 65
-        + (4 + MAX_TICKER_LENGTH)
-        + 47
-        + (4 + MAX_DESCRIPTION_LENGTH)
-        + (4 + MAX_KEYWORDS * 36)
-        + 32
-        + 1
-        + 1;
+    /// Conservative max size accounting for variable-length fields.
+    #[cfg(not(feature = "migration-test"))]
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE                                       // mint
+        + (BORSH_LEN_PREFIX + MAX_NAME_LENGTH)              // name
+        + (BORSH_LEN_PREFIX + MAX_TICKER_LENGTH)            // ticker
+        + (BORSH_LEN_PREFIX + ARWEAVE_TX_ID_LENGTH)         // logo
+        + (BORSH_LEN_PREFIX + MAX_DESCRIPTION_LENGTH)       // description
+        + (BORSH_LEN_PREFIX + MAX_KEYWORDS * KEYWORD_BORSH_SIZE) // keywords
+        + PUBKEY_SIZE                                       // last_known_owner
+        + BUMP_SIZE                                         // bump
+        + SCHEMA_VERSION_SIZE; // version
+
+    /// Extended size used by the `migration-test` feature:
+    /// baseline (760) + field_1: u64 (8) + field_2: u32 (4) + field_3: bool (1) = 773.
+    #[cfg(feature = "migration-test")]
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE                                       // mint
+        + (BORSH_LEN_PREFIX + MAX_NAME_LENGTH)              // name
+        + (BORSH_LEN_PREFIX + MAX_TICKER_LENGTH)            // ticker
+        + (BORSH_LEN_PREFIX + ARWEAVE_TX_ID_LENGTH)         // logo
+        + (BORSH_LEN_PREFIX + MAX_DESCRIPTION_LENGTH)       // description
+        + (BORSH_LEN_PREFIX + MAX_KEYWORDS * KEYWORD_BORSH_SIZE) // keywords
+        + PUBKEY_SIZE                                       // last_known_owner
+        + BUMP_SIZE                                         // bump
+        + SCHEMA_VERSION_SIZE                               // version
+        + 8                                                 // field_1: u64
+        + 4                                                 // field_2: u32
+        + 1; // field_3: bool
 }
 
 /// Controller list for an ANT.
@@ -168,15 +283,17 @@ pub struct AntControllers {
     pub controllers: Vec<Pubkey>,
     /// PDA bump
     pub bump: u8,
-    /// Schema version — see `ANT_CONTROLLERS_VERSION`. Forward-compat marker
-    /// for future schema migrations; production handlers don't currently
-    /// branch on it.
-    pub version: u8,
+    /// Schema version — see `ANT_CONTROLLERS_VERSION` and
+    /// `schema_migration::migrate_controllers_version`.
+    pub version: SchemaVersion,
 }
 
 impl AntControllers {
-    /// 8 (disc) + 32 (mint) + (4 + 10*32) controllers + 1 (bump) + 1 (version)
-    pub const SIZE: usize = 8 + 32 + (4 + MAX_CONTROLLERS * 32) + 1 + 1;
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE                               // mint
+        + (BORSH_LEN_PREFIX + MAX_CONTROLLERS * PUBKEY_SIZE) // controllers
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -228,7 +345,7 @@ pub struct AclEntry {
 
 impl AclEntry {
     /// Serialized size: `Pubkey + u8 = 33 bytes`.
-    pub const SIZE: usize = 32 + 1;
+    pub const SIZE: usize = PUBKEY_SIZE + 1;
 }
 
 /// Head record for a user's paginated ACL (ADR-012).
@@ -251,11 +368,14 @@ pub struct AclConfig {
     pub total_entries: u64,
     /// PDA bump.
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl AclConfig {
-    /// Discriminator(8) + user(32) + page_count(8) + total_entries(8) + bump(1).
-    pub const SIZE: usize = 8 + 32 + 8 + 8 + 1;
+    /// Discriminator + user + page_count(u64) + total_entries(u64) + bump + version.
+    pub const SIZE: usize =
+        ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + 8 + 8 + BUMP_SIZE + SCHEMA_VERSION_SIZE;
 }
 
 /// One page of ACL entries for a user (ADR-012).
@@ -279,11 +399,18 @@ pub struct AclPage {
     pub entries: Vec<AclEntry>,
     /// PDA bump.
     pub bump: u8,
+    /// Schema version for forward-compatible migrations.
+    pub version: SchemaVersion,
 }
 
 impl AclPage {
-    /// Minimum on-chain size: discriminator + user + page_idx + vec_len(0) + bump.
-    pub const MIN_SIZE: usize = 8 + 32 + 8 + 4 + 1;
+    /// Minimum on-chain size: discriminator + user + page_idx(u64) + vec_len(0) + bump + version.
+    pub const MIN_SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE
+        + 8
+        + BORSH_LEN_PREFIX
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 
     /// Maximum on-chain size: `MIN_SIZE + MAX_ACL_PAGE_ENTRIES * AclEntry::SIZE`.
     pub const MAX_SIZE: usize = Self::MIN_SIZE + MAX_ACL_PAGE_ENTRIES * AclEntry::SIZE;
@@ -332,15 +459,26 @@ pub struct AntRecord {
     pub last_reconciled_owner: Pubkey,
     /// PDA bump
     pub bump: u8,
-    /// Schema version — see `ANT_RECORD_VERSION`.
-    pub version: u8,
+    /// Schema version — see `ANT_RECORD_VERSION` and
+    /// `schema_migration::migrate_record_version`.
+    pub version: SchemaVersion,
 }
 
 impl AntRecord {
     /// 8 (disc) + 32 (mint) + (4+61) undername + (4+128) target + 1 (target_protocol)
     /// + 4 (ttl) + (1+4) priority + (1+32) owner + 32 (last_reconciled_owner)
-    /// + 1 (bump) + 1 (version)
-    pub const SIZE: usize = 8 + 32 + 65 + (4 + MAX_TARGET_LENGTH) + 1 + 4 + 5 + 33 + 32 + 1 + 1;
+    /// + 1 (bump) + 3 (SchemaVersion)
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE                                       // mint
+        + (BORSH_LEN_PREFIX + MAX_UNDERNAME_LENGTH)         // undername
+        + (BORSH_LEN_PREFIX + MAX_TARGET_LENGTH)            // target
+        + 1                                                 // target_protocol: u8
+        + 4                                                 // ttl_seconds: u32
+        + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX)          // priority: Option<u32>
+        + (BORSH_OPTION_PREFIX + PUBKEY_SIZE)               // owner: Option<Pubkey>
+        + PUBKEY_SIZE                                       // last_reconciled_owner
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 /// Optional per-record metadata, stored in a separate PDA to save rent on
@@ -362,23 +500,24 @@ pub struct AntRecordMetadata {
     pub record_keywords: Option<Vec<String>>,
     /// PDA bump
     pub bump: u8,
-    /// Schema version — see `ANT_RECORD_METADATA_VERSION`.
-    pub version: u8,
+    /// Schema version — see `ANT_RECORD_METADATA_VERSION` and
+    /// `schema_migration::migrate_record_metadata_version`.
+    pub version: SchemaVersion,
 }
 
 impl AntRecordMetadata {
     /// 8 (disc) + 32 (mint) + 32 (undername_hash) + (1+4+61) display_name
     /// + (1+4+43) record_logo + (1+4+MAX_DESCRIPTION_LENGTH) record_description
-    /// + (1+4+MAX_KEYWORDS*(4+32)) record_keywords + 1 (bump) + 1 (version)
-    pub const SIZE: usize = 8
-        + 32
-        + 32
-        + 66
-        + 48
-        + (1 + 4 + MAX_DESCRIPTION_LENGTH)
-        + (1 + 4 + MAX_KEYWORDS * 36)
-        + 1
-        + 1;
+    /// + (1+4+MAX_KEYWORDS*(4+32)) record_keywords + 1 (bump) + 3 (SchemaVersion)
+    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE
+        + PUBKEY_SIZE                                             // mint
+        + PUBKEY_SIZE                                             // undername_hash ([u8;32])
+        + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + MAX_UNDERNAME_LENGTH) // display_name: Option<String>
+        + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + ARWEAVE_TX_ID_LENGTH) // record_logo: Option<String>
+        + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + MAX_DESCRIPTION_LENGTH) // record_description
+        + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + MAX_KEYWORDS * KEYWORD_BORSH_SIZE) // record_keywords
+        + BUMP_SIZE
+        + SCHEMA_VERSION_SIZE;
 }
 
 // =========================================
@@ -539,6 +678,12 @@ mod tests {
             last_known_owner: owner,
             bump: 0,
             version: ANT_CONFIG_VERSION,
+            #[cfg(feature = "migration-test")]
+            field_1: 0,
+            #[cfg(feature = "migration-test")]
+            field_2: 0,
+            #[cfg(feature = "migration-test")]
+            field_3: false,
         }
     }
 
@@ -855,11 +1000,12 @@ mod tests {
     }
 
     #[test]
-    fn test_keywords_max_8() {
-        let kws: Vec<String> = (0..8).map(|i| format!("kw{}", i)).collect();
+    fn test_keywords_max_count() {
+        // MAX_KEYWORDS = 3 (tightened from 8 for mainnet rent shrink).
+        let kws: Vec<String> = (0..3).map(|i| format!("kw{}", i)).collect();
         assert!(validate_keywords(&kws));
 
-        let too_many: Vec<String> = (0..9).map(|i| format!("kw{}", i)).collect();
+        let too_many: Vec<String> = (0..4).map(|i| format!("kw{}", i)).collect();
         assert!(!validate_keywords(&too_many));
     }
 
@@ -889,11 +1035,11 @@ mod tests {
 
     #[test]
     fn test_keyword_valid_special_chars() {
+        // MAX_KEYWORDS = 3 — pick three to verify special-char acceptance.
         assert!(validate_keywords(&[
             "hello-world".to_string(),
             "foo_bar".to_string(),
             "#trending".to_string(),
-            "@mention".to_string(),
         ]));
     }
 
@@ -942,8 +1088,9 @@ mod tests {
         assert_eq!(DEFAULT_TTL_SECONDS, 900);
         assert_eq!(MAX_TTL_SECONDS, 86400);
         assert_eq!(MAX_NAME_LENGTH, 61);
-        assert_eq!(MAX_DESCRIPTION_LENGTH, 256); // reduced from Lua's 512
-        assert_eq!(MAX_KEYWORDS, 8); // reduced from Lua's 16
+        assert_eq!(MAX_DESCRIPTION_LENGTH, 128); // reduced from 256 → 128 (mainnet rent shrink, 2026-05-21)
+        assert_eq!(MAX_KEYWORDS, 3); // reduced from 8 → 3 (mainnet rent shrink, 2026-05-21)
+        assert_eq!(MAX_CONTROLLERS, 4); // reduced from 10 → 4 (mainnet rent shrink, 2026-05-21)
         assert_eq!(MAX_KEYWORD_LENGTH, 32);
         assert_eq!(ARWEAVE_TX_ID_LENGTH, 43);
     }
@@ -957,7 +1104,7 @@ mod tests {
 
     #[test]
     fn test_controller_limit() {
-        assert_eq!(MAX_CONTROLLERS, 10);
+        assert_eq!(MAX_CONTROLLERS, 4);
     }
 
     // =========================================
@@ -966,27 +1113,37 @@ mod tests {
 
     #[test]
     fn test_ant_config_size_sufficient() {
-        // 8 disc + 32 mint + (4+61) name + (4+16) ticker + (4+43) logo
-        // + (4+MAX_DESCRIPTION_LENGTH) desc + (4+MAX_KEYWORDS*(4+32)) keywords
-        // + 32 owner + 1 bump + 1 version
-        let expected = 8
-            + 32
-            + 65
-            + (4 + MAX_TICKER_LENGTH)
-            + 47
-            + (4 + MAX_DESCRIPTION_LENGTH)
-            + (4 + MAX_KEYWORDS * 36)
-            + 32
-            + 1
-            + 1;
+        let base = ANCHOR_DISCRIMINATOR_SIZE
+            + PUBKEY_SIZE
+            + (BORSH_LEN_PREFIX + MAX_NAME_LENGTH)
+            + (BORSH_LEN_PREFIX + MAX_TICKER_LENGTH)
+            + (BORSH_LEN_PREFIX + ARWEAVE_TX_ID_LENGTH)
+            + (BORSH_LEN_PREFIX + MAX_DESCRIPTION_LENGTH)
+            + (BORSH_LEN_PREFIX + MAX_KEYWORDS * KEYWORD_BORSH_SIZE)
+            + PUBKEY_SIZE
+            + BUMP_SIZE
+            + SCHEMA_VERSION_SIZE;
+        #[cfg(not(feature = "migration-test"))]
+        let expected = base;
+        #[cfg(feature = "migration-test")]
+        let expected = base + 8 + 4 + 1; // field_1: u64 + field_2: u32 + field_3: bool
         assert_eq!(AntConfig::SIZE, expected);
-        assert_eq!(AntConfig::SIZE, 758); // sanity check
+        // Tightened from 760 → 452 (-308 bytes) on 2026-05-21:
+        //   description: 256→128 (-128 b)
+        //   keywords: 8×32 → 3×32 (-180 b)
+        #[cfg(not(feature = "migration-test"))]
+        assert_eq!(AntConfig::SIZE, 452);
+        #[cfg(feature = "migration-test")]
+        assert_eq!(AntConfig::SIZE, 465);
     }
 
     #[test]
     fn test_ant_controllers_size_sufficient() {
-        // 8 disc + 32 mint + (4 + 10*32) controllers + 1 bump + 1 version
-        let expected = 8 + 32 + (4 + 10 * 32) + 1 + 1;
+        let expected = ANCHOR_DISCRIMINATOR_SIZE
+            + PUBKEY_SIZE
+            + (BORSH_LEN_PREFIX + MAX_CONTROLLERS * PUBKEY_SIZE)
+            + BUMP_SIZE
+            + SCHEMA_VERSION_SIZE;
         assert_eq!(AntControllers::SIZE, expected);
     }
 
@@ -1017,14 +1174,14 @@ mod tests {
 
     #[test]
     fn test_acl_config_size() {
-        // disc(8) + user(32) + page_count(8) + total_entries(8) + bump(1)
-        assert_eq!(AclConfig::SIZE, 8 + 32 + 8 + 8 + 1);
+        // disc(8) + user(32) + page_count(8) + total_entries(8) + bump(1) + version(3)
+        assert_eq!(AclConfig::SIZE, 8 + 32 + 8 + 8 + 1 + 3);
     }
 
     #[test]
     fn test_acl_page_min_and_max_size() {
-        // disc(8) + user(32) + page_idx(8) + vec_len(4) + bump(1)
-        assert_eq!(AclPage::MIN_SIZE, 8 + 32 + 8 + 4 + 1);
+        // disc(8) + user(32) + page_idx(8) + vec_len(4) + bump(1) + version(3)
+        assert_eq!(AclPage::MIN_SIZE, 8 + 32 + 8 + 4 + 1 + 3);
         assert_eq!(
             AclPage::MAX_SIZE,
             AclPage::MIN_SIZE + MAX_ACL_PAGE_ENTRIES * AclEntry::SIZE
@@ -1063,6 +1220,7 @@ mod tests {
             page_idx: 0,
             entries: entries.clone(),
             bump: 0,
+            version: ACL_PAGE_VERSION,
         };
         assert_eq!(page.current_size(), AclPage::size_for(entries.len()));
     }
@@ -1090,6 +1248,7 @@ mod tests {
                 },
             ],
             bump: 0,
+            version: ACL_PAGE_VERSION,
         };
         assert_eq!(page.position_of(&asset_a, AclRole::Owner as u8), Some(0));
         assert_eq!(
@@ -1283,8 +1442,9 @@ mod tests {
     }
 
     #[test]
-    fn test_keywords_exactly_8() {
-        let kws: Vec<String> = (0..8).map(|i| format!("kw{}", i)).collect();
+    fn test_keywords_exactly_max() {
+        // MAX_KEYWORDS = 3
+        let kws: Vec<String> = (0..3).map(|i| format!("kw{}", i)).collect();
         assert!(validate_keywords(&kws));
     }
 
@@ -1376,6 +1536,12 @@ mod tests {
             last_known_owner: owner,
             bump: 0,
             version: ANT_CONFIG_VERSION,
+            #[cfg(feature = "migration-test")]
+            field_1: 0,
+            #[cfg(feature = "migration-test")]
+            field_2: 0,
+            #[cfg(feature = "migration-test")]
+            field_3: false,
         };
         assert_eq!(config.name, "My Cool ANT");
         assert_eq!(config.ticker, "COOL");
@@ -1483,11 +1649,12 @@ mod tests {
     }
 
     #[test]
-    fn test_description_max_length_256() {
-        assert_eq!(MAX_DESCRIPTION_LENGTH, 256);
-        let valid = "a".repeat(256);
+    fn test_description_max_length() {
+        // MAX_DESCRIPTION_LENGTH = 128 (tightened from 256 on 2026-05-21)
+        assert_eq!(MAX_DESCRIPTION_LENGTH, 128);
+        let valid = "a".repeat(128);
         assert!(valid.len() <= MAX_DESCRIPTION_LENGTH);
-        let too_long = "a".repeat(257);
+        let too_long = "a".repeat(129);
         assert!(too_long.len() > MAX_DESCRIPTION_LENGTH);
     }
 
@@ -1502,30 +1669,36 @@ mod tests {
 
     #[test]
     fn test_ant_record_size_sufficient() {
-        // 8 disc + 32 mint + (4+61) undername + (4+128) target + 1 target_protocol
-        // + 4 ttl + (1+4) priority + (1+32) owner + 32 last_reconciled_owner
-        // + 1 bump + 1 version
-        let expected = 8 + 32 + 65 + (4 + MAX_TARGET_LENGTH) + 1 + 4 + 5 + 33 + 32 + 1 + 1;
+        let expected = ANCHOR_DISCRIMINATOR_SIZE
+            + PUBKEY_SIZE
+            + (BORSH_LEN_PREFIX + MAX_UNDERNAME_LENGTH)
+            + (BORSH_LEN_PREFIX + MAX_TARGET_LENGTH)
+            + 1  // target_protocol: u8
+            + 4  // ttl_seconds: u32
+            + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX)   // priority: Option<u32>
+            + (BORSH_OPTION_PREFIX + PUBKEY_SIZE)        // owner: Option<Pubkey>
+            + PUBKEY_SIZE                                // last_reconciled_owner
+            + BUMP_SIZE
+            + SCHEMA_VERSION_SIZE;
         assert_eq!(AntRecord::SIZE, expected);
-        assert_eq!(AntRecord::SIZE, 314); // sanity check
+        assert_eq!(AntRecord::SIZE, 316);
     }
 
     #[test]
     fn test_ant_record_metadata_size_sufficient() {
-        // 8 disc + 32 mint + 32 undername_hash + (1+4+61) display_name
-        // + (1+4+43) record_logo + (1+4+MAX_DESCRIPTION_LENGTH) record_description
-        // + (1+4+MAX_KEYWORDS*(4+32)) record_keywords + 1 bump + 1 version
-        let expected = 8
-            + 32
-            + 32
-            + 66
-            + 48
-            + (1 + 4 + MAX_DESCRIPTION_LENGTH)
-            + (1 + 4 + MAX_KEYWORDS * 36)
-            + 1
-            + 1;
+        let expected = ANCHOR_DISCRIMINATOR_SIZE
+            + PUBKEY_SIZE                                             // mint
+            + PUBKEY_SIZE                                             // undername_hash
+            + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + MAX_UNDERNAME_LENGTH) // display_name
+            + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + ARWEAVE_TX_ID_LENGTH) // record_logo
+            + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + MAX_DESCRIPTION_LENGTH)
+            + (BORSH_OPTION_PREFIX + BORSH_LEN_PREFIX + MAX_KEYWORDS * KEYWORD_BORSH_SIZE)
+            + BUMP_SIZE
+            + SCHEMA_VERSION_SIZE;
         assert_eq!(AntRecordMetadata::SIZE, expected);
-        assert_eq!(AntRecordMetadata::SIZE, 742); // sanity check
+        // Tightened from 744 → 436 (-308 b) on 2026-05-21 via the same
+        // description (256→128) + keywords (8×32→3×32) shrinks as AntConfig.
+        assert_eq!(AntRecordMetadata::SIZE, 436);
     }
 
     // =========================================
