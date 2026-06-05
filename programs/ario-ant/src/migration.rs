@@ -354,6 +354,55 @@ pub fn finalize_migration_handler(ctx: Context<FinalizeMigration>) -> Result<()>
     Ok(())
 }
 
+/// Single-step rotation of the admin `authority` on `AntMigrationConfig`
+/// (ADR-026). Gated on the CURRENT admin `authority` (never
+/// `migration_authority`). Rejects the null pubkey; any other pubkey is
+/// allowed, including off-curve PDAs (the Squads vault). No `migration_active`
+/// constraint — the admin authority (which gates
+/// `admin_close_orphaned_ant_state`) must stay rotatable after migration is
+/// finalized.
+pub fn transfer_authority_handler(
+    ctx: Context<TransferAuthority>,
+    new_authority: Pubkey,
+) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        AntError::InvalidAuthority
+    );
+
+    let config = &mut ctx.accounts.migration_config;
+    let old_authority = config.authority;
+    config.authority = new_authority;
+
+    emit!(crate::AuthorityTransferredEvent {
+        old_authority,
+        new_authority,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    msg!(
+        "AntMigrationConfig.authority {} → {} (admin rotation)",
+        old_authority,
+        new_authority
+    );
+    Ok(())
+}
+
+/// Context for `transfer_authority`. `has_one = authority` binds the signer to
+/// the CURRENT admin authority — the only load-bearing check. No
+/// `migration_active` gate so rotation works post-finalize.
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [ANT_MIGRATION_CONFIG_SEED],
+        bump = migration_config.bump,
+        has_one = authority @ AntError::Unauthorized,
+    )]
+    pub migration_config: Account<'info, AntMigrationConfig>,
+    pub authority: Signer<'info>,
+}
+
 // =========================================
 // ACCOUNT CONTEXTS
 // =========================================

@@ -397,3 +397,51 @@ pub struct AdminSetWithdrawalPeriod<'info> {
 
     pub authority: Signer<'info>,
 }
+
+/// Single-step rotation of the admin `authority` (ADR-026). Gated on the
+/// CURRENT admin `authority` (never `migration_authority`). Rejects the null
+/// pubkey so a fat-fingered renounce cannot brick admin into an unspendable
+/// address; any other pubkey is allowed, including off-curve PDAs such as the
+/// Squads vault. No `migration_active` constraint — recovery / hand-off must
+/// work post-migration.
+pub fn transfer_authority(ctx: Context<TransferAuthority>, new_authority: Pubkey) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        crate::error::GarError::InvalidParameter
+    );
+
+    let settings = &mut ctx.accounts.settings;
+    let old_authority = settings.authority;
+    settings.authority = new_authority;
+
+    let clock = Clock::get()?;
+    emit!(crate::AuthorityTransferredEvent {
+        old_authority,
+        new_authority,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "GatewaySettings.authority {} → {} (admin rotation)",
+        old_authority,
+        new_authority
+    );
+
+    Ok(())
+}
+
+/// Context for `transfer_authority`. `has_one = authority` binds the signer to
+/// the CURRENT admin authority — the only load-bearing check. Mirrors
+/// `admin_set_withdrawal_period`'s gate.
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
+    )]
+    pub settings: Account<'info, GatewaySettings>,
+
+    pub authority: Signer<'info>,
+}

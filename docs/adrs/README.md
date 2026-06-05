@@ -96,6 +96,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-023 | `prescribe_epoch` Roulette Modulus Is the Live Registry Sum | accepted | [`0023-prescribe-live-total-weight.md`](0023-prescribe-live-total-weight.md) |
 | ADR-024 | Retire `devnet-shrunk`, Standardize Full-Size Registries | accepted | [`0024-retire-devnet-shrunk-standardize-full-size-registries.md`](0024-retire-devnet-shrunk-standardize-full-size-registries.md) |
 | ADR-025 | Delegate Reward Share Is Keyed Off the Tally Snapshot, Not Live Delegated Stake | accepted | [`0025-delegate-share-keyed-off-tally-snapshot.md`](0025-delegate-share-keyed-off-tally-snapshot.md) |
+| ADR-026 | Single-Step `transfer_authority` for the Admin Authority Across All Programs | accepted | [`0026-admin-authority-transfer.md`](0026-admin-authority-transfer.md) |
 
 ### Numbering anomalies
 

@@ -6755,3 +6755,133 @@ async fn test_admin_close_orphaned_closes_matching_record() {
     let closed = ctx.banks_client.get_account(orphan_record).await.unwrap();
     assert!(closed.is_none(), "matching record should have been closed");
 }
+
+/// Verify `transfer_authority` (ADR-026) on `AntMigrationConfig`: null
+/// rejected (`InvalidAuthority`), non-authority rejected (`Unauthorized`),
+/// rotation succeeds with the `migration_authority` sibling field
+/// byte-identical, old authority dead after, rotation to an off-curve PDA
+/// (Squads vault shape) accepted.
+#[tokio::test]
+async fn test_transfer_authority() {
+    let upgrade_auth = Keypair::new();
+    let admin_auth = Keypair::new();
+    let mig_auth = Keypair::new();
+    let new_auth = Keypair::new();
+    let bad = Keypair::new();
+
+    let mut pt = program_test_with_program_data(&upgrade_auth.pubkey());
+    for kp in [&upgrade_auth, &admin_auth, &new_auth, &bad] {
+        pt.add_account(
+            kp.pubkey(),
+            solana_sdk::account::Account {
+                lamports: 10_000_000_000,
+                data: vec![],
+                owner: system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+
+    // Init migration config: admin authority = admin_auth, migration_authority = mig_auth.
+    send_initialize_migration(
+        &mut ctx,
+        &upgrade_auth,
+        admin_auth.pubkey(),
+        mig_auth.pubkey(),
+    )
+    .await
+    .unwrap();
+
+    let (mig_key, _) = migration_config_pda();
+    // Sibling field `migration_authority` lives at bytes 40..72 — assert untouched.
+    let mig_auth_bytes = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[40..72]
+        .to_vec();
+    assert_eq!(&mig_auth_bytes[..], mig_auth.pubkey().as_ref());
+
+    let ta_tx = |new_authority: Pubkey, signer: &Keypair, bh| {
+        Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_ant::ID,
+                accounts: ario_ant::accounts::TransferAuthority {
+                    migration_config: mig_key,
+                    authority: signer.pubkey(),
+                }
+                .to_account_metas(None),
+                data: ario_ant::instruction::TransferAuthority { new_authority }.data(),
+            }],
+            Some(&signer.pubkey()),
+            &[signer],
+            bh,
+        )
+    };
+    let read_authority = |data: &[u8]| Pubkey::new_from_array(data[8..40].try_into().unwrap());
+
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(ta_tx(Pubkey::default(), &admin_auth, bh))
+            .await,
+        AntError::InvalidAuthority
+    );
+
+    // Step 2: non-authority rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(ta_tx(Pubkey::new_unique(), &bad, bh))
+            .await,
+        AntError::Unauthorized
+    );
+
+    // Step 3: rotate to new_auth; sibling field intact.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(ta_tx(new_auth.pubkey(), &admin_auth, bh))
+        .await
+        .unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_authority(&acct.data), new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..72],
+        &mig_auth_bytes[..],
+        "migration_authority sibling field must be byte-identical after rotation"
+    );
+
+    // Step 4: old authority dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(ta_tx(Pubkey::new_unique(), &admin_auth, bh))
+            .await,
+        AntError::Unauthorized
+    );
+
+    // Step 5: rotate to an off-curve PDA (Squads-vault shape), signed by new_auth.
+    let pda_target = Pubkey::find_program_address(&[b"vault-like"], &ario_ant::ID).0;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(ta_tx(pda_target, &new_auth, bh))
+        .await
+        .unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_authority(&acct.data), pda_target);
+}

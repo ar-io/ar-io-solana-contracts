@@ -129,6 +129,16 @@ pub mod ario_gar {
         instructions::initialize::admin_set_withdrawal_period(ctx, new_period_seconds)
     }
 
+    /// Rotate the admin `authority` to `new_authority` (ADR-026). Gated on the
+    /// current admin authority; rejects the null pubkey. Used to hand
+    /// governance to the Squads multisig vault post-migration.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::transfer_authority(ctx, new_authority)
+    }
+
     // =========================================
     // GATEWAY LIFECYCLE (F10-F12)
     // =========================================
@@ -1418,6 +1428,15 @@ pub struct WithdrawalPeriodUpdatedEvent {
     pub admin: Pubkey,
     pub old_period_seconds: i64,
     pub new_period_seconds: i64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `transfer_authority` (ADR-026) when the admin `authority` is
+/// rotated. `old_authority` is the signer that authorized the rotation.
+#[event]
+pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
     pub timestamp: i64,
 }
 

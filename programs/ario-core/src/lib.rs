@@ -367,6 +367,18 @@ pub mod ario_core {
         instructions::admin::update_config::handler(ctx, params)
     }
 
+    /// Rotate the admin `authority` to `new_authority` (ADR-026). Dedicated
+    /// single-step instruction (equivalent to `update_config` with only
+    /// `new_authority`); rejects the null pubkey. Also rotates the admin gate
+    /// that `ario-ant-escrow` reads from `ArioConfig.authority`. Used to hand
+    /// governance to the Squads multisig vault post-migration.
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::admin::transfer_authority::handler(ctx, new_authority)
+    }
+
     /// Admin recovery — repair `ArioConfig.mint` / `.treasury` when devnet
     /// genesis was partially-initialized (e.g., devnet-setup.ts crashed
     /// between `initializeCore` and `initializeArns` and a re-run created

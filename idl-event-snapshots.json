@@ -1,6 +1,33 @@
 {
   "ario_core": [
     {
+      "name": "AuthorityTransferredEvent",
+      "discriminator": [
+        54,
+        31,
+        118,
+        237,
+        152,
+        5,
+        201,
+        11
+      ],
+      "fields": [
+        {
+          "name": "old_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "ConfigUpdatedEvent",
       "discriminator": [
         245,
@@ -446,6 +473,33 @@
         {
           "name": "enabled",
           "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AuthorityTransferredEvent",
+      "discriminator": [
+        54,
+        31,
+        118,
+        237,
+        152,
+        5,
+        201,
+        11
+      ],
+      "fields": [
+        {
+          "name": "old_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_authority",
+          "type": "pubkey"
         },
         {
           "name": "timestamp",
@@ -1505,6 +1559,33 @@
   ],
   "ario_arns": [
     {
+      "name": "AuthorityTransferredEvent",
+      "discriminator": [
+        54,
+        31,
+        118,
+        237,
+        152,
+        5,
+        201,
+        11
+      ],
+      "fields": [
+        {
+          "name": "old_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "DemandFactorUpdatedEvent",
       "discriminator": [
         102,
@@ -2001,6 +2082,60 @@
       ]
     },
     {
+      "name": "AntConfigClosedEvent",
+      "discriminator": [
+        34,
+        153,
+        45,
+        22,
+        250,
+        22,
+        128,
+        65
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "closer",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AntControllersClosedEvent",
+      "discriminator": [
+        156,
+        214,
+        33,
+        118,
+        122,
+        154,
+        40,
+        177
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "closer",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "AntMetadataUpdatedEvent",
       "discriminator": [
         25,
@@ -2063,6 +2198,68 @@
         {
           "name": "controllers_cleared",
           "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AntRecordClosedEvent",
+      "discriminator": [
+        74,
+        147,
+        237,
+        212,
+        113,
+        36,
+        217,
+        4
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername_hash",
+          "type": "bytes"
+        },
+        {
+          "name": "closer",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "AntRecordMetadataClosedEvent",
+      "discriminator": [
+        242,
+        165,
+        93,
+        172,
+        100,
+        227,
+        243,
+        231
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "undername_hash",
+          "type": "bytes"
+        },
+        {
+          "name": "closer",
+          "type": "pubkey"
         },
         {
           "name": "timestamp",
@@ -2160,6 +2357,33 @@
       ]
     },
     {
+      "name": "AuthorityTransferredEvent",
+      "discriminator": [
+        54,
+        31,
+        118,
+        237,
+        152,
+        5,
+        201,
+        11
+      ],
+      "fields": [
+        {
+          "name": "old_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "ControllerAddedEvent",
       "discriminator": [
         182,
@@ -2213,6 +2437,41 @@
         },
         {
           "name": "controller",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "OrphanedAntStateClosedEvent",
+      "discriminator": [
+        110,
+        210,
+        203,
+        232,
+        41,
+        54,
+        114,
+        125
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "closed_records",
+          "type": "u32"
+        },
+        {
+          "name": "closed_metadata",
+          "type": "u32"
+        },
+        {
+          "name": "closer",
           "type": "pubkey"
         },
         {
@@ -2439,6 +2698,45 @@
     }
   ],
   "ario_ant_escrow": [
+    {
+      "name": "EscrowAntPurgedEvent",
+      "discriminator": [
+        42,
+        215,
+        127,
+        110,
+        150,
+        211,
+        139,
+        181
+      ],
+      "fields": [
+        {
+          "name": "ant_mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "depositor",
+          "type": "pubkey"
+        },
+        {
+          "name": "deposit_slot",
+          "type": "u64"
+        },
+        {
+          "name": "purged_at_slot",
+          "type": "u64"
+        },
+        {
+          "name": "elapsed_slots",
+          "type": "u64"
+        },
+        {
+          "name": "authority",
+          "type": "pubkey"
+        }
+      ]
+    },
     {
       "name": "EscrowCancelledEvent",
       "discriminator": [
