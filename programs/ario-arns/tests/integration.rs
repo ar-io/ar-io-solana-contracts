@@ -12496,3 +12496,140 @@ async fn test_demand_factor_halving_boundary_seven_vs_eight() {
         "the entire fee table is halved exactly once on the halving period"
     );
 }
+
+/// Verify `transfer_authority` (ADR-026): null rejected, non-authority
+/// rejected, rotation succeeds with the `mint` sibling field byte-identical,
+/// old authority dead after, rotation to an off-curve PDA (the Squads vault
+/// shape) accepted. `setup_arns` sets `config.authority = ctx.payer`.
+#[tokio::test]
+async fn test_transfer_authority() {
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_arns(&mut ctx).await;
+    let config_key = setup.config_key;
+
+    let mint_bytes_before = ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[40..72]
+        .to_vec();
+
+    let ta_ix = |new_authority: Pubkey, signer: Pubkey| Instruction {
+        program_id: ario_arns::ID,
+        accounts: ario_arns::accounts::TransferAuthority {
+            config: config_key,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_arns::instruction::TransferAuthority { new_authority }.data(),
+    };
+    let read_authority = |data: &[u8]| Pubkey::new_from_array(data[8..40].try_into().unwrap());
+
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::default(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        ArnsError::InvalidParameter
+    );
+
+    // Step 2: non-authority rejected.
+    let bad = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_bad = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund_bad).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::new_unique(), bad.pubkey())],
+        Some(&bad.pubkey()),
+        &[&bad],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        ArnsError::Unauthorized
+    );
+
+    // Step 3: rotate to a real keypair; sibling field intact.
+    let new_auth = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(new_auth.pubkey(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_authority(&acct.data), new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..72],
+        &mint_bytes_before[..],
+        "sibling field (mint) must be byte-identical after rotation"
+    );
+
+    // Step 4: old authority dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(Pubkey::new_unique(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        ArnsError::Unauthorized
+    );
+
+    // Step 5: rotate to an off-curve PDA (Squads-vault shape), signed by new_auth.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_new = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_auth.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund_new).await.unwrap();
+    let pda_target = Pubkey::find_program_address(&[b"vault-like"], &ario_arns::ID).0;
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ta_ix(pda_target, new_auth.pubkey())],
+        Some(&new_auth.pubkey()),
+        &[&new_auth],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(config_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_authority(&acct.data), pda_target);
+}
