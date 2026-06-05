@@ -189,7 +189,9 @@ feature branch ─PR─▶ develop ─PR─▶ main
   Squads V3 multisig vault (authority index 1), attach a buffer manifest
   to a draft GitHub release. The multisig signers vote and execute the
   upgrade separately from the legacy Squads (V3) app (CI never holds the
-  upgrade key).
+  upgrade key). Step-by-step admin ceremonies (program upgrades **and**
+  privileged admin instructions) are in
+  [`docs/SQUADS_OPS.md`](docs/SQUADS_OPS.md).
 
 ### Day-to-day commands
 
