@@ -6785,9 +6785,14 @@ async fn test_transfer_authority() {
     let mut ctx = pt.start_with_context().await;
 
     // Init migration config: admin authority = admin_auth, migration_authority = mig_auth.
-    send_initialize_migration(&mut ctx, &upgrade_auth, admin_auth.pubkey(), mig_auth.pubkey())
-        .await
-        .unwrap();
+    send_initialize_migration(
+        &mut ctx,
+        &upgrade_auth,
+        admin_auth.pubkey(),
+        mig_auth.pubkey(),
+    )
+    .await
+    .unwrap();
 
     let (mig_key, _) = migration_config_pda();
     // Sibling field `migration_authority` lives at bytes 40..72 — assert untouched.
@@ -6843,7 +6848,12 @@ async fn test_transfer_authority() {
         .process_transaction(ta_tx(new_auth.pubkey(), &admin_auth, bh))
         .await
         .unwrap();
-    let acct = ctx.banks_client.get_account(mig_key).await.unwrap().unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read_authority(&acct.data), new_auth.pubkey());
     assert_eq!(
         &acct.data[40..72],
@@ -6867,6 +6877,11 @@ async fn test_transfer_authority() {
         .process_transaction(ta_tx(pda_target, &new_auth, bh))
         .await
         .unwrap();
-    let acct = ctx.banks_client.get_account(mig_key).await.unwrap().unwrap();
+    let acct = ctx
+        .banks_client
+        .get_account(mig_key)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read_authority(&acct.data), pda_target);
 }

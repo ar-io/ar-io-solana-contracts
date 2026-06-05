@@ -404,10 +404,7 @@ pub struct AdminSetWithdrawalPeriod<'info> {
 /// address; any other pubkey is allowed, including off-curve PDAs such as the
 /// Squads vault. No `migration_active` constraint — recovery / hand-off must
 /// work post-migration.
-pub fn transfer_authority(
-    ctx: Context<TransferAuthority>,
-    new_authority: Pubkey,
-) -> Result<()> {
+pub fn transfer_authority(ctx: Context<TransferAuthority>, new_authority: Pubkey) -> Result<()> {
     require!(
         new_authority != Pubkey::default(),
         crate::error::GarError::InvalidParameter

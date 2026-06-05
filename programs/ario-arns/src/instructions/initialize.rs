@@ -303,10 +303,7 @@ pub struct AdminExpandNameRegistry<'info> {
 /// pubkey; any other pubkey is allowed, including off-curve PDAs (the Squads
 /// vault). No `migration_active` constraint so recovery / hand-off works
 /// post-migration.
-pub fn transfer_authority(
-    ctx: Context<TransferAuthority>,
-    new_authority: Pubkey,
-) -> Result<()> {
+pub fn transfer_authority(ctx: Context<TransferAuthority>, new_authority: Pubkey) -> Result<()> {
     require!(
         new_authority != Pubkey::default(),
         crate::error::ArnsError::InvalidParameter

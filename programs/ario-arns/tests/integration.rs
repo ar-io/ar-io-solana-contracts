@@ -12554,7 +12554,10 @@ async fn test_transfer_authority() {
         &[&ctx.payer],
         bh,
     );
-    ctx.banks_client.process_transaction(fund_bad).await.unwrap();
+    ctx.banks_client
+        .process_transaction(fund_bad)
+        .await
+        .unwrap();
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
         &[ta_ix(Pubkey::new_unique(), bad.pubkey())],
@@ -12615,7 +12618,10 @@ async fn test_transfer_authority() {
         &[&ctx.payer],
         bh,
     );
-    ctx.banks_client.process_transaction(fund_new).await.unwrap();
+    ctx.banks_client
+        .process_transaction(fund_new)
+        .await
+        .unwrap();
     let pda_target = Pubkey::find_program_address(&[b"vault-like"], &ario_arns::ID).0;
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
