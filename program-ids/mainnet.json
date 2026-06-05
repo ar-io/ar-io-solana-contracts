@@ -22,6 +22,6 @@
     "mpl_core": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
   },
   "upgrade_authority": null,
-  "upgrade_authority_kind": "squads-v4-multisig",
+  "upgrade_authority_kind": "squads-v3-multisig-vault",
   "attestor_pubkey": "7XtUnotZAeYZNzVSYV5nb7S9YH9qHXyVFM6NeNMu6efE"
 }

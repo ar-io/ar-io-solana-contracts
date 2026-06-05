@@ -3,23 +3,30 @@
 # AR.IO Solana Contracts — Mainnet Upgrade Preparation
 # ============================================================
 #
-# Mainnet program-upgrade authority is a Squads V4 multisig (see
-# repo README → "Release flow"). CI never holds the upgrade key, and
-# we never run `anchor deploy` against mainnet directly. Instead we:
+# Mainnet program-upgrade authority is a Squads **V3** multisig (the SMPL
+# program SMPLecH534NA9acpos4G6x7uf3LWbCAwZQE9e8ZekMu), NOT V4. The thing
+# that actually signs the BPFLoaderUpgradeable Upgrade is the V3 **vault =
+# authority index 1** PDA (the default vault, also what program upgrade
+# authority is set to per Squads' docs; index 0 is reserved). The multisig
+# *config* account (SMPL-owned) never signs and never holds assets — we set
+# buffer authority to the VAULT, never the config account. CI never holds
+# the upgrade key, and we never run `anchor deploy` against mainnet directly.
+# Instead we:
 #
 #   1. Build the .so files with mainnet feature flags.
-#   2. Pre-upload each .so to a write buffer using a transient buffer
-#      authority that this script controls (a hot wallet that pays
-#      buffer rent).
-#   3. Transfer buffer authority to the multisig.
-#   4. Print the parameters needed to draft an
-#      `Upgrade(program, buffer, spill, authority)` instruction inside
-#      the multisig — signers then approve and execute.
+#   2. If a new .so is larger than the program's on-chain ProgramData
+#      capacity, `program extend` it first (permissionless — no upgrade
+#      authority needed), so the multisig's Execute can't fail on size.
+#   3. Pre-upload each .so to a write buffer using a transient buffer
+#      authority that this script controls (a hot wallet that pays rent).
+#   4. Transfer buffer authority to the VAULT.
+#   5. Print the parameters for the multisig signers to propose / approve /
+#      execute the upgrade from the legacy (V3) Squads app.
 #
-# Pattern reference: solana program write-buffer + solana program
-# set-buffer-authority + Squads V4 transaction proposal:
+# Pattern reference: solana program write-buffer + set-buffer-authority +
+# Squads V3 (legacy) program upgrade:
 #   https://docs.solanalabs.com/cli/examples/deploy-a-program#redeploy-a-program
-#   https://docs.squads.so/main/development/dapps-integrations/squads-v4-protocol
+#   https://docs.squads.so/main/squads-legacy/navigating-your-squad/developers/programs
 #
 # This script does the offline / preparation pieces. The proposal step
 # is intentionally manual / done from the multisig dashboard — we want
@@ -34,8 +41,15 @@
 #                                 BUFFER_AUTHORITY_KEYPAIR if both set.
 #   BUFFER_AUTHORITY_KEYPAIR    # fallback for local runs: path to the
 #                                 hot wallet keypair file on disk.
-#   SQUADS_MULTISIG_PUBKEY      # the multisig PDA that owns the upgrade
-#                                 authority on each program
+#   SQUADS_V3_VAULT             # the V3 vault PDA (authority index 1) that
+#                                 holds upgrade authority and receives buffer
+#                                 authority. Falls back to the legacy
+#                                 SQUADS_MULTISIG_PUBKEY var if unset. Verified
+#                                 System-owned before use (a multisig CONFIG
+#                                 account is SMPL-owned and would be rejected).
+#   SQUADS_V3_MULTISIG          # optional: the multisig config account. When
+#                                 set, verified SMPL-owned (i.e. genuinely V3).
+#   SQUADS_V3_PROGRAM           # default SMPLecH534NA9acpos4G6x7uf3LWbCAwZQE9e8ZekMu
 #   PROGRAM_IDS_PATH            # default: program-ids/mainnet.json
 #   RPC_URL                     # default: https://api.mainnet-beta.solana.com
 #   PROGRAMS                    # space-separated subset (default: all 5)
@@ -57,10 +71,39 @@ cd "$REPO_ROOT"
 
 BUFFER_AUTHORITY_KEY_JSON="${BUFFER_AUTHORITY_KEY_JSON:-}"
 BUFFER_AUTHORITY_KEYPAIR="${BUFFER_AUTHORITY_KEYPAIR:-}"
-SQUADS_MULTISIG_PUBKEY="${SQUADS_MULTISIG_PUBKEY:?must set SQUADS_MULTISIG_PUBKEY (transferred buffer authority)}"
+# Buffer-authority target = the V3 vault (authority index 1). Prefer
+# SQUADS_V3_VAULT; fall back to the legacy SQUADS_MULTISIG_PUBKEY var (which
+# the upgrade-mainnet workflow still passes) so existing CI keeps working.
+SQUADS_V3_VAULT="${SQUADS_V3_VAULT:-${SQUADS_MULTISIG_PUBKEY:-}}"
+[[ -n "$SQUADS_V3_VAULT" ]] || { echo "ERROR: set SQUADS_V3_VAULT (the V3 vault PDA, authority index 1) — or the legacy SQUADS_MULTISIG_PUBKEY." >&2; exit 1; }
+SQUADS_V3_MULTISIG="${SQUADS_V3_MULTISIG:-}"
+SQUADS_V3_PROGRAM="${SQUADS_V3_PROGRAM:-SMPLecH534NA9acpos4G6x7uf3LWbCAwZQE9e8ZekMu}"
+SYSTEM_PROGRAM="11111111111111111111111111111111"
 PROGRAM_IDS_PATH="${PROGRAM_IDS_PATH:-program-ids/mainnet.json}"
 RPC_URL="${RPC_URL:-https://api.mainnet-beta.solana.com}"
 PROGRAMS="${PROGRAMS:-ario_core ario_gar ario_arns ario_ant ario_ant_escrow}"
+
+# Read-only owner lookup (no signer needed).
+account_owner() { solana --url "$RPC_URL" account "$1" --output json 2>/dev/null | jq -r '.account.owner // ""' 2>/dev/null || true; }
+
+# Verify the buffer-authority target is a real V3 vault before we hand any
+# buffer to it: the vault is a System-owned signing PDA; a multisig CONFIG
+# account is SMPL-owned and handing a buffer there would brick the upgrade.
+verify_v3_vault() {
+  local vowner; vowner="$(account_owner "$SQUADS_V3_VAULT")"
+  if [[ "$vowner" != "$SYSTEM_PROGRAM" ]]; then
+    echo "ERROR: SQUADS_V3_VAULT $SQUADS_V3_VAULT is owned by '${vowner:-<not found>}', expected the System program ($SYSTEM_PROGRAM)." >&2
+    echo "       A V3 vault is System-owned. If this is SMPL-owned it is the multisig CONFIG account, not the vault — abort." >&2
+    exit 1
+  fi
+  if [[ -n "$SQUADS_V3_MULTISIG" ]]; then
+    local mowner; mowner="$(account_owner "$SQUADS_V3_MULTISIG")"
+    [[ "$mowner" == "$SQUADS_V3_PROGRAM" ]] || { echo "ERROR: SQUADS_V3_MULTISIG $SQUADS_V3_MULTISIG is owned by '${mowner:-<not found>}', expected the Squads V3 SMPL program ($SQUADS_V3_PROGRAM). A V4 multisig?" >&2; exit 1; }
+    echo "[mainnet-prepare] V3 multisig $SQUADS_V3_MULTISIG confirmed SMPL-owned; vault $SQUADS_V3_VAULT is System-owned. Confirm the vault is its authority index 1."
+  else
+    echo "[mainnet-prepare] WARN: SQUADS_V3_MULTISIG not set — vault is System-owned (good) but not cross-checked against the multisig. Verify it is authority index 1 in the Squads V3 app."
+  fi
+}
 
 [[ -f "$PROGRAM_IDS_PATH" ]] || { echo "ERROR: $PROGRAM_IDS_PATH missing — populate program IDs before mainnet runs" >&2; exit 1; }
 command -v solana >/dev/null || { echo "solana CLI required" >&2; exit 1; }
@@ -104,6 +147,9 @@ buffer_authority_pubkey() {
 # attestor key to mainnet; pin the mainnet attestor pubkey there first.
 "$REPO_ROOT/scripts/check-attestor-pubkey.sh" --strict --cluster mainnet
 
+# Verify the V3 vault target before staging any buffers.
+verify_v3_vault
+
 # Build with mainnet feature flags.
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   echo "[mainnet-prepare] building (BUILD_NETWORK=mainnet)..."
@@ -142,6 +188,24 @@ for prog in $PROGRAMS; do
 
   echo
   echo "[mainnet-prepare] $prog ($prog_id)"
+
+  # A Squads/BPFLoaderUpgradeable Upgrade CANNOT grow the program — it fails
+  # to EXECUTE if the new .so exceeds the on-chain ProgramData capacity (Agave
+  # deploy allocates exactly the program size). Extend FIRST. `program extend`
+  # is permissionless (no upgrade-authority signer), so the buffer-authority
+  # hot wallet can pay/run it even though the vault holds upgrade authority.
+  new_size="$(stat -f%z "$so" 2>/dev/null || stat -c%s "$so")"
+  pd_addr="$(solana --url "$RPC_URL" program show "$prog_id" 2>/dev/null | awk '/ProgramData Address/{print $NF}')"
+  if [[ -n "$pd_addr" ]]; then
+    pd_cap="$(solana --url "$RPC_URL" account "$pd_addr" 2>/dev/null | awk '/Length/{print $2}')"
+    need=$(( new_size + 45 ))   # 45-byte ProgramData header
+    if [[ -n "$pd_cap" && "$need" -gt "$pd_cap" ]]; then
+      extra=$(( need - pd_cap + 4096 ))
+      echo "[mainnet-prepare]   new .so ($new_size B) > ProgramData capacity ($pd_cap B); extending by $extra B (buffer-authority-paid)."
+      solana_buf program extend "$prog_id" "$extra"
+    fi
+  fi
+
   echo "[mainnet-prepare]   write-buffer..."
   # The buffer keypair is a single-use signer for the buffer account
   # itself (not the authority). After set-buffer-authority transfers
@@ -156,9 +220,9 @@ for prog in $PROGRAMS; do
     --buffer "$buffer_kp" \
     --output json > "$OUT_DIR/${prog}-write-buffer.json"
 
-  echo "[mainnet-prepare]   set-buffer-authority -> $SQUADS_MULTISIG_PUBKEY"
+  echo "[mainnet-prepare]   set-buffer-authority -> $SQUADS_V3_VAULT (V3 vault)"
   solana_buf program set-buffer-authority "$buffer_id" \
-    --new-buffer-authority "$SQUADS_MULTISIG_PUBKEY"
+    --new-buffer-authority "$SQUADS_V3_VAULT"
 
   buffer_sha="$(shasum -a 256 "$so" | awk '{print $1}')"
   size="$(stat -f%z "$so" 2>/dev/null || stat -c%s "$so")"
@@ -178,23 +242,27 @@ echo
 jq . "$MANIFEST"
 echo
 cat <<NEXT
-NEXT STEPS for the multisig signers
------------------------------------
-For EACH program in the manifest above:
+NEXT STEPS for the multisig signers (Squads V3 / legacy app)
+------------------------------------------------------------
+Use the LEGACY Squads app (V3), NOT app.squads.so (that is V4). Each
+program's upgrade authority is the V3 vault ($SQUADS_V3_VAULT). Buffer
+authority was already set to that vault above. For EACH program:
 
-  1. In Squads (https://app.squads.so), open the multisig and propose
-     an "Upgrade Program" transaction with parameters:
-        program     = <program_id from manifest>
-        buffer      = <buffer from manifest>
-        spill       = the authority address (gets reclaimed lamports)
-        authority   = the multisig itself
+  1. Open the squad -> Developers -> Programs. If the program isn't listed,
+     "Add Program" (it should "Verify authority" immediately since the vault
+     already holds upgrade authority).
 
-  2. Independently verify the buffer .so before voting:
+  2. Click the program -> "Add upgrade":
+        buffer = <buffer from manifest>
+        spill  = the buffer-authority / treasury address (reclaimed lamports)
+     Buffer authority is already the vault -> "Verify authority" passes.
+
+  3. Independently verify the buffer .so before voting:
         solana program dump <buffer> /tmp/<prog>.so
         shasum -a 256 /tmp/<prog>.so          # must match buffer_sha256 above
 
-  3. Approve once threshold reached. Execute. The program is now
-     running the new .so.
+  4. Click "Upgrade" to create the transaction; approve to threshold;
+     Execute. The program now runs the new .so.
 
 If the upgrade is canceled / abandoned, reclaim the buffer rent:
         solana program close <buffer> --recipient <treasury>
