@@ -49,6 +49,14 @@ const ANCHOR_IDL_DIR = resolve(REPO_ROOT, 'target/idl');
 const VENDORED_IDL_DIR = resolve(CLIENT_ROOT, 'idls');
 const OUT_ROOT = resolve(CLIENT_ROOT, 'src');
 
+// Rust amount/scaled types whose range can exceed Number.MAX_SAFE_INTEGER
+// (2^53-1); these are emitted as `bigint` literals so consumers never silently
+// lose precision. Count/index/enum types (`usize`, `u8`, `u16`, `u32`) carry
+// array-length/indexing semantics and realistically never overflow, so they
+// stay ergonomic `number`s. (Module-level `const`, declared before the codegen
+// loop that consumes it — `const` is not hoisted.)
+const RUST_BIGINT_TYPES = new Set(['u64', 'i64', 'u128', 'i128']);
+
 // Target cluster — retained only for logging and the defensive dedup
 // tie-break. Since devnet-shrunk was retired (ADR-024) all clusters share
 // full-size registries, so the IDL no longer emits cfg-conditional
@@ -76,6 +84,7 @@ console.log(`[codegen] CLUSTER=${CLUSTER}`);
  *   rename?: string,
  *   patch?: (idl: object) => void,
  *   prunePrograms?: boolean,
+ *   constants?: { rust: string, names: string[] },
  * }} ProgramSpec
  *
  *   `idl`:            basename of the IDL JSON (no extension)
@@ -85,11 +94,45 @@ console.log(`[codegen] CLUSTER=${CLUSTER}`);
  *   `patch`:          optional in-memory IDL surgery before Codama lowering
  *   `prunePrograms`:  if true, drop the `programs/` folder and extract a
  *                     `program-address.ts` shim (SDK-style slim output)
+ *   `constants`:      derive a `constants.ts` module from `pub const`
+ *                     declarations in a Rust source file (relative to the
+ *                     repo root) and re-export it from the program barrel.
+ *                     Anchor only emits `#[constant]`-annotated consts into
+ *                     the IDL, and `@codama/nodes-from-anchor` ignores the
+ *                     IDL `constants` array entirely — so program constants
+ *                     never reach the Codama tree. This lifts them straight
+ *                     from the Rust source-of-truth instead, failing the
+ *                     build if a named const is missing (so the values can
+ *                     never silently drift from the on-chain program).
  */
 const PROGRAMS = [
   { idl: 'ario_core', out: 'core' },
   { idl: 'ario_gar', out: 'gar' },
-  { idl: 'ario_arns', out: 'arns' },
+  {
+    idl: 'ario_arns',
+    out: 'arns',
+    constants: {
+      rust: 'programs/ario-arns/src/state/mod.rs',
+      names: [
+        'DEMAND_FACTOR_SCALE',
+        'DEMAND_FACTOR_MIN',
+        'MAX_DEMAND_FACTOR',
+        'DEMAND_FACTOR_UP_ADJUSTMENT',
+        'DEMAND_FACTOR_DOWN_ADJUSTMENT',
+        'MAX_PERIODS_AT_MIN_DEMAND_FACTOR',
+        'MOVING_AVG_PERIOD_COUNT',
+        'PERIOD_LENGTH_SECONDS',
+        'ANNUAL_PERCENTAGE_FEE',
+        'PERMABUY_LEASE_FEE_LENGTH_YEARS',
+        'UNDERNAME_LEASE_FEE_PCT',
+        'UNDERNAME_PERMABUY_FEE_PCT',
+        'GRACE_PERIOD_SECONDS',
+        'RETURNED_NAME_DURATION_SECONDS',
+        'RETURNED_NAME_MAX_MULTIPLIER',
+        'MAX_LEASE_LENGTH_YEARS',
+      ],
+    },
+  },
   { idl: 'ario_ant', out: 'ant' },
   { idl: 'ario_ant_escrow', out: 'ant-escrow' },
   {
@@ -127,7 +170,15 @@ if (missingVendored.length > 0) {
   process.exit(1);
 }
 
-for (const { idl, out, vendored, rename, patch, prunePrograms } of PROGRAMS) {
+for (const {
+  idl,
+  out,
+  vendored,
+  rename,
+  patch,
+  prunePrograms,
+  constants,
+} of PROGRAMS) {
   const idlPath = vendored
     ? resolve(VENDORED_IDL_DIR, `${idl}.json`)
     : resolve(ANCHOR_IDL_DIR, `${idl}.json`);
@@ -218,6 +269,16 @@ for (const { idl, out, vendored, rename, patch, prunePrograms } of PROGRAMS) {
   // which TS `nodenext` + Node ESM both reject. Rewrite filesystem-aware.
   addJsExtensions(outPath);
 
+  // Lift `pub const`s from the Rust source-of-truth into a generated
+  // `constants.ts` and re-export it from the (Codama-generated) barrel.
+  if (constants) {
+    emitRustConstantsModule({
+      rustPath: resolve(REPO_ROOT, constants.rust),
+      names: constants.names,
+      outPath,
+    });
+  }
+
   console.log(`[codegen] ${idl} ✓`);
 }
 
@@ -279,6 +340,155 @@ function arraySize(t) {
     return typeof t.array[1] === 'number' ? t.array[1] : null;
   }
   return null;
+}
+
+/**
+ * Evaluate a (small, integer) Rust const expression to a BigInt. Supports
+ * underscore-separated integer literals, `+ - *`, parentheses, and references
+ * to other consts via `resolveRef`. Deliberately tiny — it only needs to cover
+ * the const-expression forms that actually appear (e.g.
+ * `1_000 * DEMAND_FACTOR_SCALE`, `14 * 86_400`).
+ */
+function evalRustConstExpr(expr, resolveRef) {
+  const tokens = expr.match(/[0-9][0-9_]*|[A-Za-z_][A-Za-z0-9_]*|[*+\-()]/g);
+  if (!tokens) throw new Error(`[codegen] cannot tokenize const expr: "${expr}"`);
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const eat = () => tokens[pos++];
+  const primary = () => {
+    const t = eat();
+    if (t === '(') {
+      const v = addSub();
+      if (eat() !== ')') throw new Error(`[codegen] unbalanced parens in "${expr}"`);
+      return v;
+    }
+    if (/^[0-9]/.test(t)) return BigInt(t.replace(/_/g, ''));
+    if (/^[A-Za-z_]/.test(t)) return resolveRef(t);
+    throw new Error(`[codegen] unexpected token "${t}" in "${expr}"`);
+  };
+  const mul = () => {
+    let v = primary();
+    while (peek() === '*') {
+      eat();
+      v *= primary();
+    }
+    return v;
+  };
+  const addSub = () => {
+    let v = mul();
+    while (peek() === '+' || peek() === '-') {
+      const op = eat();
+      const r = mul();
+      v = op === '+' ? v + r : v - r;
+    }
+    return v;
+  };
+  const value = addSub();
+  if (pos !== tokens.length) {
+    throw new Error(`[codegen] trailing tokens in const expr: "${expr}"`);
+  }
+  return value;
+}
+
+/**
+ * Parse `pub const NAME: TYPE = EXPR;` declarations (with leading `///` doc
+ * comments) out of a Rust source file and write a generated `constants.ts`
+ * into `outPath`, re-exported from the program barrel `index.ts`.
+ *
+ * Only the consts in `names` are emitted; a missing name is a hard error so
+ * the published client can never drift from (or silently drop) an on-chain
+ * value. `u64/i64/usize`-class consts are emitted as `bigint` literals.
+ */
+function emitRustConstantsModule({ rustPath, names, outPath }) {
+  if (!existsSync(rustPath)) {
+    throw new Error(`[codegen] Rust constants source not found: ${rustPath}`);
+  }
+  const src = readFileSync(rustPath, 'utf-8');
+
+  // First pass: collect every `pub const` with its preceding doc block, so
+  // expressions can reference consts declared anywhere in the file.
+  const declared = new Map(); // name -> { type, expr, doc }
+  let doc = [];
+  for (const line of src.split('\n')) {
+    const docMatch = line.match(/^\s*\/\/\/\s?(.*)$/);
+    if (docMatch) {
+      doc.push(docMatch[1].trimEnd());
+      continue;
+    }
+    const constMatch = line.match(
+      /^\s*pub const ([A-Z][A-Z0-9_]*)\s*:\s*(\w+)\s*=\s*(.+?);/,
+    );
+    if (constMatch) {
+      const [, name, type, expr] = constMatch;
+      declared.set(name, { type, expr: expr.trim(), doc: doc.join('\n') });
+    }
+    if (line.trim() !== '') doc = [];
+  }
+
+  // Resolve requested consts (memoized; supports references between consts).
+  const resolved = new Map(); // name -> BigInt
+  const resolve_ = (name) => {
+    if (resolved.has(name)) return resolved.get(name);
+    const decl = declared.get(name);
+    if (!decl) {
+      throw new Error(
+        `[codegen] required const "${name}" not found in ${rustPath}`,
+      );
+    }
+    const value = evalRustConstExpr(decl.expr, resolve_);
+    resolved.set(name, value);
+    return value;
+  };
+
+  const blocks = names.map((name) => {
+    const decl = declared.get(name);
+    if (!decl) {
+      throw new Error(
+        `[codegen] required const "${name}" not found in ${rustPath}`,
+      );
+    }
+    const value = resolve_(name);
+    const isBig = RUST_BIGINT_TYPES.has(decl.type);
+    const tsType = isBig ? 'bigint' : 'number';
+    const literal = isBig ? `${value.toString()}n` : value.toString();
+    const docLines = decl.doc
+      ? decl.doc
+          .split('\n')
+          .map((l) => ` * ${l}`.trimEnd())
+          .join('\n') + '\n'
+      : '';
+    return (
+      `/**\n${docLines} *\n * Rust: \`${name}: ${decl.type}\` (${rustPath.split('/').slice(-3).join('/')})\n */\n` +
+      `export const ${name}: ${tsType} = ${literal};`
+    );
+  });
+
+  const banner =
+    '/**\n' +
+    ' * AUTOGENERATED by clients/ts/scripts/codegen.mjs — do not edit by hand.\n' +
+    ' *\n' +
+    ' * Program constants lifted from the Rust source-of-truth. These do NOT\n' +
+    ' * appear in the Anchor IDL, so Codama cannot generate them; re-run\n' +
+    ' * `yarn codegen` to refresh after changing the Rust consts.\n' +
+    ' */\n\n';
+
+  const file = banner + blocks.join('\n\n') + '\n';
+  writeFileSync(resolve(outPath, 'constants.ts'), file);
+
+  // Append the re-export to the (Codama-generated) program barrel.
+  const indexPath = resolve(outPath, 'index.ts');
+  const exportLine = "export * from './constants.js';\n";
+  if (existsSync(indexPath)) {
+    const idx = readFileSync(indexPath, 'utf-8');
+    if (!idx.includes(exportLine.trim())) {
+      const sep = idx.endsWith('\n') ? '' : '\n';
+      writeFileSync(indexPath, idx + sep + exportLine);
+    }
+  } else {
+    writeFileSync(indexPath, exportLine);
+  }
+
+  console.log(`[codegen]   + constants.ts (${names.length} consts)`);
 }
 
 /**
