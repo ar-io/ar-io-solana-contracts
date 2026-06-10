@@ -1767,9 +1767,9 @@ pub struct InitializeAntParams {
     pub target_protocol: Option<u8>,
     /// Logo (Arweave TX ID, 43 chars) — empty for default
     pub logo: String,
-    /// Description (max 256 chars)
+    /// Description (max 128 chars)
     pub description: String,
-    /// Keywords (max 8)
+    /// Keywords (max 3)
     pub keywords: Vec<String>,
 }
 
@@ -1797,9 +1797,9 @@ pub struct SetRecordMetadataParams {
     pub display_name: Option<String>,
     /// Optional logo (Arweave TX ID, 43 chars)
     pub record_logo: Option<String>,
-    /// Optional description (max 256 chars)
+    /// Optional description (max 128 chars)
     pub record_description: Option<String>,
-    /// Optional keywords (max 8)
+    /// Optional keywords (max 3)
     pub record_keywords: Option<Vec<String>>,
 }
 

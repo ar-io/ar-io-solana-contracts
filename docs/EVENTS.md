@@ -150,7 +150,7 @@ ConfigUpdated/AntMetadataUpdated, add `expires_at` to NameReserved.
 minor SDK release. The IDL snapshot at
 `contracts/idl-event-snapshots.json` becomes a CI freeze gate.
 
-Full rationale: `ADR-017` in [`DECISIONS.md`](./DECISIONS.md).
+Full rationale: `ADR-018` in [`DECISIONS.md`](./DECISIONS.md).
 
 ## Subscribing live (consumer patterns)
 
@@ -353,7 +353,7 @@ Yes. Add it to:
 ## Cross-references
 
 - **Catalog:** [`BEHAVIORAL_DIFFERENCES.md` § BD-103](./BEHAVIORAL_DIFFERENCES.md)
-- **ABI policy:** [`DECISIONS.md` § ADR-017](./DECISIONS.md)
+- **ABI policy:** [`DECISIONS.md` § ADR-018](./DECISIONS.md)
 - **Gap analysis (rollout history):** [`EVENT_EMISSION_AUDIT.md`](./EVENT_EMISSION_AUDIT.md)
 - **Build plan (rollout history):** [`EVENT_EMISSION_IMPLEMENTATION_PLAN.md`](./EVENT_EMISSION_IMPLEMENTATION_PLAN.md)
 - **Superseded original draft:** [`EVENT_EMISSION_PLAN.md`](./EVENT_EMISSION_PLAN.md) (kept for context)
