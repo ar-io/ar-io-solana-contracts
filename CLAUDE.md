@@ -127,7 +127,7 @@ an indexer:
 
 * `GatewayRegistry` (ario-gar) — 3,000 slots / 120KB, used for observer
   selection.
-* `NameRegistry` (ario-arns) — 200,000 slots / 2MB, used for epoch name
+* `NameRegistry` (ario-arns) — 50,000 slots (~2 MB initial; expandable via `admin_expand_name_registry`), used for epoch name
   prescription.
 
 Too large to create via `init` (exceeds Solana's 10KB
@@ -498,7 +498,7 @@ repeating it. Applies to `#[account]` structs in `state.rs` /
 
 ### Anchor `#[event]` ABI policy
 
-Per ADR-017: shipped events are append-only. The borsh layout (field
+Per ADR-018: shipped events are append-only. The borsh layout (field
 name + type + order + discriminator) of any event that has been emitted
 on a public cluster is **permanent** — every indexer / decoder
 subscribed to the event depends on it. To change a shipped event's

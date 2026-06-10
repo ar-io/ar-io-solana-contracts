@@ -654,10 +654,10 @@ Operations: O(1) add (append), O(1) remove (swap-with-last), O(n) enumeration.
 
 | Property | Value |
 |----------|-------|
-| Max slots | 200,000 |
+| Max slots (initial) | 50,000 — expandable via `admin_expand_name_registry` |
 | Entry size | 40 bytes (32 name_hash + 4 registry_index + 4 padding) |
 | Header | 40 bytes (32 authority + 4 count + 4 padding) |
-| Total size | 8,000,040 bytes |
+| Total size (initial) | 2,000,040 bytes |
 | Zero-copy | Yes (`#[account(zero_copy(unsafe))]`) |
 | Requires pre-allocation | Yes |
 
