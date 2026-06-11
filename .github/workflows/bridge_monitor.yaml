@@ -79,10 +79,17 @@ jobs:
             return 1
           }
 
+          # check_balance exit codes: 0 = healthy, 1 = confirmed drift,
+          # 2 = could not fetch chain state (RPC failure). An RPC failure must
+          # NOT be reported as a balance mismatch, and must not export the
+          # (possibly stale) values from an earlier attempt.
+
           # First attempt
           if check_balance; then
             echo "match=true" >> $GITHUB_OUTPUT
             exit 0
+          else
+            STATUS=$?
           fi
 
           echo ""
@@ -93,9 +100,20 @@ jobs:
           if check_balance; then
             echo "match=true" >> $GITHUB_OUTPUT
             exit 0
+          else
+            STATUS=$?
           fi
 
-          # Both attempts failed -- surface values for the Slack alert.
+          # The last attempt decides how we fail. If it could not fetch chain
+          # state, flag an RPC failure rather than a (false) mismatch.
+          if [ "$STATUS" -eq 2 ]; then
+            echo "status=rpc_failure" >> $GITHUB_OUTPUT
+            echo "::error::Bridge monitor could not fetch chain state (RPC failure)"
+            exit 1
+          fi
+
+          # Confirmed drift -- surface the last attempt's values for the alert.
+          echo "status=mismatch" >> $GITHUB_OUTPUT
           echo "match=false" >> $GITHUB_OUTPUT
           echo "solana_mario=$SOLANA_MARIO" >> $GITHUB_OUTPUT
           echo "base_mario=$BASE_MARIO" >> $GITHUB_OUTPUT
@@ -106,7 +124,7 @@ jobs:
         shell: bash
 
       - name: Notify Failure
-        if: failure()
+        if: failure() && steps.check.outputs.status == 'mismatch'
         uses: rtCamp/action-slack-notify@v2.3.2
         env:
           SLACK_COLOR: danger
@@ -156,13 +174,39 @@ jobs:
               ]
             }
 
+      - name: Notify Monitor Error
+        if: failure() && steps.check.outputs.status != 'mismatch'
+        uses: rtCamp/action-slack-notify@v2.3.2
+        env:
+          SLACK_COLOR: warning
+          SLACK_TITLE: Bridge Monitor Error
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CUSTOM_PAYLOAD: |
+            {
+              "attachments": [
+                {
+                  "fallback": "Bridge Monitor Error",
+                  "color": "warning",
+                  "title": "Bridge Monitor Error (Solana <-> Base)",
+                  "text": "The bridge monitor failed to fetch chain state (RPC or config error). Balances were NOT compared -- this is not a confirmed mismatch.",
+                  "fields": [
+                    {
+                      "title": "GitHub Action",
+                      "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+
       - name: Check previous run status
         id: previous
         if: success()
         run: |
           # Get the previous completed run of this workflow (excluding current run)
           PREVIOUS_CONCLUSION=$(gh api \
-            "/repos/${{ github.repository }}/actions/workflows/bridge_monitor.yaml/runs?status=completed&per_page=1&exclude_pull_requests=true" \
+            "/repos/${{ github.repository }}/actions/workflows/bridge_monitor.yaml/runs?status=completed&per_page=1&exclude_pull_requests=true&branch=${{ github.ref_name }}" \
             --jq '.workflow_runs[0].conclusion // "none"')
           echo "Previous run conclusion: $PREVIOUS_CONCLUSION"
           echo "conclusion=$PREVIOUS_CONCLUSION" >> $GITHUB_OUTPUT

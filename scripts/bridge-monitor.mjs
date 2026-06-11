@@ -165,10 +165,13 @@ async function main() {
     getBaseSupply(),
   ]);
 
-  if (solana.decimals !== base.decimals) {
+  // Both sides must be 6-decimal to compare as mARIO. Equality alone isn't
+  // enough: if both RPCs were pointed at a 9- or 18-decimal asset, the units
+  // would line up with each other but mean something other than mARIO.
+  if (solana.decimals !== 6 || base.decimals !== 6) {
     throw new Error(
-      `Decimals mismatch: Solana=${solana.decimals} Base=${base.decimals} ` +
-        `-- mARIO comparison would be invalid`,
+      `Unexpected decimals: Solana=${solana.decimals} Base=${base.decimals} ` +
+        `-- expected both sides to use 6-decimal mARIO units`,
     );
   }
   const decimals = solana.decimals;
