@@ -5,16 +5,23 @@ name: Bridge Balance Monitor
 # custody side (it replaced AO when the token was forked from AO to Solana);
 # Base holds the wrapped representation.
 #
-# Invariant (exact equality): sum of ARIO token accounts owned by the Solana
-# bridge wallet (mARIO) == Base ARIO ERC-20 totalSupply() (mARIO).
+# Invariant: (sum of ARIO token accounts owned by the Solana bridge wallet,
+# mARIO) - (Base ARIO ERC-20 totalSupply(), mARIO) == EXPECTED_DELTA_MARIO.
+# A known, intentional steady-state offset is expected, so the check alerts on
+# drift away from that expected delta rather than on raw inequality.
 #
-# Config (all optional -- scripts/bridge-monitor.mjs carries mainnet defaults):
-#   secrets.SOLANA_RPC_URL   Private Solana RPC (falls back to public mainnet-beta)
-#   secrets.SLACK_WEBHOOK    Slack incoming webhook for alerts
-#   vars.BRIDGE_WALLET       Solana bridge custody wallet (system account)
-#   vars.ARIO_MINT           ARIO SPL mint
-#   vars.BASE_RPC_URL        Base RPC endpoint
-#   vars.BASE_TOKEN_ADDRESS  Base ARIO ERC-20 contract
+# Config (all optional -- scripts/bridge-monitor.mjs carries mainnet defaults).
+# NOTE: secrets vs vars is significant -- the workflow reads each from the
+# matching context; storing one in the wrong namespace makes it read as empty.
+#   secrets.SOLANA_RPC_URL      Private Solana RPC (falls back to public mainnet-beta)
+#   secrets.BASE_RPC_URL        Base RPC endpoint (secret: may embed an API key)
+#   secrets.SLACK_WEBHOOK       Slack incoming webhook for alerts
+#   vars.BRIDGE_WALLET          Solana bridge custody wallet (system account)
+#   vars.ARIO_MINT              ARIO SPL mint
+#   vars.BASE_TOKEN_ADDRESS     Base ARIO ERC-20 contract
+#   vars.EXPECTED_DELTA_MARIO   Expected (Solana - Base) offset, mARIO, signed
+#                               (default 0). Must be a VARIABLE, not a secret --
+#                               secrets are masked in logs, hiding the figures.
 
 on:
   workflow_dispatch:
@@ -47,7 +54,7 @@ jobs:
           SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
           BRIDGE_WALLET: ${{ vars.BRIDGE_WALLET }}
           ARIO_MINT: ${{ vars.ARIO_MINT }}
-          BASE_RPC_URL: ${{ vars.BASE_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
           BASE_TOKEN_ADDRESS: ${{ vars.BASE_TOKEN_ADDRESS }}
           EXPECTED_DELTA_MARIO: ${{ vars.EXPECTED_DELTA_MARIO }}
         run: |
