@@ -1,0 +1,240 @@
+name: Bridge Balance Monitor
+
+# Confirms the AR.IO Solana bridge custody wallet holds enough ARIO to back
+# the circulating bridged ARIO ERC-20 supply on Base. Solana is the canonical
+# custody side (it replaced AO when the token was forked from AO to Solana);
+# Base holds the wrapped representation.
+#
+# Invariant (exact equality): sum of ARIO token accounts owned by the Solana
+# bridge wallet (mARIO) == Base ARIO ERC-20 totalSupply() (mARIO).
+#
+# Config (all optional -- scripts/bridge-monitor.mjs carries mainnet defaults):
+#   secrets.SOLANA_RPC_URL   Private Solana RPC (falls back to public mainnet-beta)
+#   secrets.SLACK_WEBHOOK    Slack incoming webhook for alerts
+#   vars.BRIDGE_WALLET       Solana bridge custody wallet (system account)
+#   vars.ARIO_MINT           ARIO SPL mint
+#   vars.BASE_RPC_URL        Base RPC endpoint
+#   vars.BASE_TOKEN_ADDRESS  Base ARIO ERC-20 contract
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *' # Run every 60 minutes (at the top of each hour)
+
+concurrency:
+  group: bridge-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    environment: mainnet
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check Bridge Balance
+        id: check
+        env:
+          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+          BRIDGE_WALLET: ${{ vars.BRIDGE_WALLET }}
+          ARIO_MINT: ${{ vars.ARIO_MINT }}
+          BASE_RPC_URL: ${{ vars.BASE_RPC_URL }}
+          BASE_TOKEN_ADDRESS: ${{ vars.BASE_TOKEN_ADDRESS }}
+          EXPECTED_DELTA_MARIO: ${{ vars.EXPECTED_DELTA_MARIO }}
+        run: |
+          # Runs the monitor (zero-dependency, raw JSON-RPC). The script exits
+          # non-zero only on a fetch/RPC failure; a balance mismatch still
+          # exits 0 with `"match": false`, so we distinguish the two.
+          check_balance() {
+            echo "Running bridge balance check..."
+            if ! RESULT=$(node scripts/bridge-monitor.mjs); then
+              echo "::warning::Bridge monitor failed to fetch balances (RPC error)"
+              return 2
+            fi
+            SOLANA_MARIO=$(echo "$RESULT" | jq -r '.solana.mARIO')
+            BASE_MARIO=$(echo "$RESULT" | jq -r '.base.mARIO')
+            DELTA=$(echo "$RESULT" | jq -r '.deltaMARIO')
+            EXPECTED_DELTA=$(echo "$RESULT" | jq -r '.expectedDeltaMARIO')
+            DRIFT=$(echo "$RESULT" | jq -r '.driftMARIO')
+            MATCH=$(echo "$RESULT" | jq -r '.match')
+            echo "Solana custody (mARIO) : $SOLANA_MARIO"
+            echo "Base supply    (mARIO) : $BASE_MARIO"
+            echo "Delta (Solana - Base)  : $DELTA mARIO"
+            echo "Expected delta (mARIO) : $EXPECTED_DELTA mARIO"
+            echo "Drift from expected    : $DRIFT mARIO"
+            if [ "$MATCH" = "true" ]; then
+              echo "✅ Delta matches expected ($EXPECTED_DELTA mARIO)"
+              return 0
+            fi
+            echo "❌ Bridge balance drift detected!"
+            return 1
+          }
+
+          # check_balance exit codes: 0 = healthy, 1 = confirmed drift,
+          # 2 = could not fetch chain state (RPC failure). An RPC failure must
+          # NOT be reported as a balance mismatch, and must not export the
+          # (possibly stale) values from an earlier attempt.
+
+          # First attempt
+          if check_balance; then
+            echo "match=true" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            STATUS=$?
+          fi
+
+          echo ""
+          echo "Retrying in 30 seconds to avoid race conditions (in-flight bridging)..."
+          sleep 30
+
+          # Second attempt
+          if check_balance; then
+            echo "match=true" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            STATUS=$?
+          fi
+
+          # The last attempt decides how we fail. If it could not fetch chain
+          # state, flag an RPC failure rather than a (false) mismatch.
+          if [ "$STATUS" -eq 2 ]; then
+            echo "status=rpc_failure" >> $GITHUB_OUTPUT
+            echo "::error::Bridge monitor could not fetch chain state (RPC failure)"
+            exit 1
+          fi
+
+          # Confirmed drift -- surface the last attempt's values for the alert.
+          echo "status=mismatch" >> $GITHUB_OUTPUT
+          echo "match=false" >> $GITHUB_OUTPUT
+          echo "solana_mario=$SOLANA_MARIO" >> $GITHUB_OUTPUT
+          echo "base_mario=$BASE_MARIO" >> $GITHUB_OUTPUT
+          echo "delta_mario=$DELTA" >> $GITHUB_OUTPUT
+          echo "expected_delta_mario=$EXPECTED_DELTA" >> $GITHUB_OUTPUT
+          echo "drift_mario=$DRIFT" >> $GITHUB_OUTPUT
+          exit 1
+        shell: bash
+
+      - name: Notify Failure
+        if: failure() && steps.check.outputs.status == 'mismatch'
+        uses: rtCamp/action-slack-notify@v2.3.2
+        env:
+          SLACK_COLOR: danger
+          SLACK_TITLE: Bridge Balance Mismatch Detected!
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CUSTOM_PAYLOAD: |
+            {
+              "attachments": [
+                {
+                  "fallback": "Bridge Balance Mismatch Detected",
+                  "color": "danger",
+                  "title": "Bridge Monitor Alert (Solana <-> Base)",
+                  "text": "A balance mismatch was detected between the Solana bridge custody wallet and the Base bridged ARIO supply.",
+                  "fields": [
+                    {
+                      "title": "Solana Custody (mARIO)",
+                      "value": "${{ steps.check.outputs.solana_mario }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Base Supply (mARIO)",
+                      "value": "${{ steps.check.outputs.base_mario }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Delta (Solana - Base, mARIO)",
+                      "value": "${{ steps.check.outputs.delta_mario }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Expected Delta (mARIO)",
+                      "value": "${{ steps.check.outputs.expected_delta_mario }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Drift from Expected (mARIO)",
+                      "value": "${{ steps.check.outputs.drift_mario }}",
+                      "short": false
+                    },
+                    {
+                      "title": "GitHub Action",
+                      "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Notify Monitor Error
+        if: failure() && steps.check.outputs.status != 'mismatch'
+        uses: rtCamp/action-slack-notify@v2.3.2
+        env:
+          SLACK_COLOR: warning
+          SLACK_TITLE: Bridge Monitor Error
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CUSTOM_PAYLOAD: |
+            {
+              "attachments": [
+                {
+                  "fallback": "Bridge Monitor Error",
+                  "color": "warning",
+                  "title": "Bridge Monitor Error (Solana <-> Base)",
+                  "text": "The bridge monitor failed to fetch chain state (RPC or config error). Balances were NOT compared -- this is not a confirmed mismatch.",
+                  "fields": [
+                    {
+                      "title": "GitHub Action",
+                      "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+
+      - name: Check previous run status
+        id: previous
+        if: success()
+        run: |
+          # Get the previous completed run of this workflow (excluding current run)
+          PREVIOUS_CONCLUSION=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows/bridge_monitor.yaml/runs?status=completed&per_page=1&exclude_pull_requests=true&branch=${{ github.ref_name }}" \
+            --jq '.workflow_runs[0].conclusion // "none"')
+          echo "Previous run conclusion: $PREVIOUS_CONCLUSION"
+          echo "conclusion=$PREVIOUS_CONCLUSION" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Notify Recovery
+        if: success() && steps.previous.outputs.conclusion == 'failure'
+        uses: rtCamp/action-slack-notify@v2.3.2
+        env:
+          SLACK_COLOR: good
+          SLACK_TITLE: Bridge Balance Realigned
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CUSTOM_PAYLOAD: |
+            {
+              "attachments": [
+                {
+                  "fallback": "Bridge Balance Realigned",
+                  "color": "good",
+                  "title": "Bridge Monitor Realigned (Solana <-> Base)",
+                  "text": "The bridge balance mismatch has been resolved. The Solana bridge custody wallet now matches the Base bridged ARIO supply.",
+                  "fields": [
+                    {
+                      "title": "GitHub Action",
+                      "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
