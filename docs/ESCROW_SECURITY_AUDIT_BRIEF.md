@@ -52,19 +52,41 @@ the off-chain attestor service.
   pinned by a cross-toolchain test that re-runs every CI build.
 
 ### Vault claim pattern
-Vaults are claimable **only after** `vault_end_timestamp` and deliver
-**liquid** tokens to the claimant. A claim while still locked is rejected
-with `VaultStillLocked`.
+Vaults are claimable **at any time** (ADR-027). Settlement branches on the
+remaining lock, read against ario-core's **live** `min_vault_duration`:
 
-> **ADR-022 (2026-05-28):** the **active-vault re-lock path was removed.** It
-> previously released tokens to the payer's ATA and used `sysvar::instructions`
-> introspection to confirm a sibling `ario_core::vaulted_transfer` re-locked
-> them for the claimant. That introspection had no 1:1 claim↔re-lock binding,
-> so one `vaulted_transfer` could satisfy multiple batched claims (lock bypass
-> / relayer skim; Codex finding). The path was disabled (not reworked) because
-> it granted no liquidity, nothing depended on it, and escrow is pre-mainnet.
-> `vault_introspect.rs` is gone. See ADR-022 / BD-107. The revocable-controller
-> variant was independently closed by ADR-021 / BD-105.
+- `remaining >= min_vault_duration`: **re-lock** — inside one instruction the
+  handler transfers exactly `amount` from escrow custody to
+  `payer_token_account` (escrow-PDA-signed) and CPIs
+  `ario_core::vaulted_transfer(amount, remaining, revocable=false)` with
+  `sender = payer`, `recipient = claimant` (or `create_vault` when
+  `payer == claimant`, since `vaulted_transfer` rejects sender == recipient).
+  The claimant gets a native, non-revocable ario-core vault unlocking at the
+  escrow's exact original `vault_end_timestamp`.
+- `remaining < min_vault_duration` (including expired): **liquid** transfer
+  to the claimant — i.e. a deliberate, bounded early-liquidity window of up
+  to `min_vault_duration` (ADR-027).
+
+**Trust argument for the pass-through** (vs. the removed introspection): each
+claim performs its *own* CPI, so the credit and the equal-amount debit are
+1:1 by construction and atomic — a CPI failure reverts the release, the payer
+nets zero, and there is no consumable sibling to reuse. The claimant is bound
+into the vault owner/recipient by the attested canonical message;
+`revocable = false` is hardwired at the call site (ADR-021). Pinned by
+`tests/cross_program_vault_claim.rs` (N-claims→N-vaults, payer-net-zero,
+wrong-vault-PDA revert).
+
+> **History — ADR-022 (2026-05-28):** the original active path used
+> `sysvar::instructions` introspection of a sibling `vaulted_transfer`, which
+> had no 1:1 claim↔re-lock binding — one sibling could satisfy multiple
+> batched claims (lock bypass / relayer skim; Codex finding) — so it was
+> removed (`VaultStillLocked`). **ADR-027 (2026-07-01)** restored the
+> capability as the direct CPI above, against ario-core's unmodified ABI.
+> `vault_introspect.rs` stays gone; `VaultStillLocked` is retained but
+> unreachable (append-only error ABI); a still-locked claim submitted without
+> the six trailing optional re-lock accounts fails `RelockAccountsMissing`
+> before any token movement. The revocable-controller variant was
+> independently closed by ADR-021 / BD-105.
 
 ### Account types
 - `EscrowAnt`: 661 bytes — holds ANT custody metadata
@@ -96,7 +118,8 @@ contracts/programs/ario-ant-escrow/src/
     ├── claim_ethereum.rs             — claim_ant_ethereum
     ├── claim_tokens_arweave_attested.rs — claim_tokens_arweave_attested
     ├── claim_tokens_ethereum.rs      — claim_tokens_ethereum
-    ├── claim_vault_arweave_attested.rs — claim_vault_arweave_attested (expired→liquid; active→VaultStillLocked, ADR-022)
+    ├── claim_vault_arweave_attested.rs — claim_vault_arweave_attested (re-lock via CPI / liquid, ADR-027)
+    ├── claim_vault_common.rs         — shared settle logic (re-lock CPI + liquid branches) for both vault claims
     ├── claim_vault_ethereum.rs       — claim_vault_ethereum
     ├── cancel.rs                     — cancel_deposit (ANT)
     ├── cancel_token_deposit.rs       — cancel_token_deposit
@@ -146,7 +169,7 @@ contracts/programs/ario-ant-escrow/fuzz/fuzz_targets/
 3. **MEV resistance:** anyone can submit, only named claimant receives
 4. **PKCS#1 v1.5 downgrade prevention:** attestor's `node:crypto` verifier uses `RSA_PKCS1_PSS_PADDING` exclusively (the only RSA verifier left after the on-chain path was removed)
 5. **ECDSA malleability prevention:** EIP-2 low-S enforcement
-6. **Vault lock enforcement:** still-locked claims rejected with `VaultStillLocked`; vaults claimable liquid only after `vault_end_timestamp` (active re-lock path removed — ADR-022)
+6. **Vault lock enforcement:** still-locked claims re-lock 1:1 into a claimant-owned non-revocable ario-core vault preserving the original unlock time via direct CPI (ADR-027); sub-`min_vault_duration` remainders deliver liquid (deliberate bounded window); a still-locked claim without the re-lock accounts fails `RelockAccountsMissing` before any token movement
 7. **Token theft prevention:** `claimant_token_account.owner == claimant.key()` constraint
 8. **Ed25519 introspection bounds-checking:** all offsets via `checked_add`; `*_ix_index` must equal `0xFFFF` (DATA_IN_SAME_IX) so the program rejects sigs/pubkeys/messages stored in *other* instructions
 9. **Attestor pubkey baked into program:** `ATTESTOR_PUBKEY` constant in `state.rs` is verified byte-for-byte in `verify_attested_signature`; rotation requires a `BPFLoaderUpgradeable` upgrade (no runtime authority)
@@ -196,11 +219,20 @@ contracts/programs/ario-ant-escrow/fuzz/fuzz_targets/
    - The program tolerates only the documented Ed25519Program ix layout
      (see Solana docs / SDK constants).
 
-3. **Vault claim gating (ADR-022)** — The active-vault re-lock path and its
-   `vault_introspect` were removed (the introspection lacked a 1:1 claim↔re-lock
-   binding → reuse/skim; Codex finding). Verify active claims are rejected with
-   `VaultStillLocked` before any token movement/close, and that the expired
-   liquid path + attestation are otherwise unchanged.
+3. **Vault re-lock pass-through (ADR-027)** — The active path returned as a
+   direct CPI with an atomic payer pass-through (the ADR-022 introspection and
+   its reuse/skim hole stay gone). Verify: (a) the pass-through credit and the
+   CPI debit are the same `amount` inside one instruction, with no path that
+   leaves funds in `payer_token_account` on success or failure; (b) the CPI
+   targets are pinned (`ario_core_program` `address = ario_core::ID`) and
+   `revocable = false` is hardwired (ADR-021); (c) `min_vault_duration` is
+   read from the ario-core config PDA (`seeds::program`-validated), not
+   hardcoded; (d) the liquid fallback below the minimum is the intended,
+   documented early-liquidity window; (e) a still-locked claim without the
+   optional account set fails `RelockAccountsMissing` before any token
+   movement. Known/pre-existing (unchanged by ADR-027): dust injected into
+   `escrow_token_account` can DoS the claim-path `close_account` (no C1
+   live-balance sweep here, unlike `ario_core::release_vault`).
 
 4. **Canonical message reconstruction** — Cross-language byte-equivalence
    between Rust and TypeScript. Two surfaces: SDK

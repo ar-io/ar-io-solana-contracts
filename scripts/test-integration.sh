@@ -67,8 +67,11 @@ fi
 mkdir -p "$FIXTURES_DIR"
 
 # Stage mpl_core.so into the test-only lookup dir. Idempotent.
-src_size=$(stat -c%s "$MPL_CORE_SRC")
-dst_size=$(stat -c%s "$FIXTURES_DIR/mpl_core.so" 2>/dev/null || echo 0)
+# `wc -c` instead of `stat` — GNU stat wants -c%s, BSD/macOS stat wants
+# -f%z; wc is portable to both.
+file_size() { wc -c < "$1" | tr -d '[:space:]'; }
+src_size=$(file_size "$MPL_CORE_SRC")
+dst_size=$(file_size "$FIXTURES_DIR/mpl_core.so" 2>/dev/null || echo 0)
 if [[ "$src_size" != "$dst_size" ]]; then
     cp "$MPL_CORE_SRC" "$FIXTURES_DIR/mpl_core.so"
 fi

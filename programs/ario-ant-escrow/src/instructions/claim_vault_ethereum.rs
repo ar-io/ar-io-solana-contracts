@@ -1,23 +1,29 @@
+//! Release escrowed vault tokens after Ethereum ECDSA verification.
+//!
+//! Ethereum auth is secp256k1 `verify_personal_sign` (no sysvar — the
+//! signature is passed as an instruction argument). Mirrors
+//! `claim_vault_arweave_attested` aside from the verification scheme.
+//!
+//! Settlement branches on the remaining lock (ADR-0027; see
+//! `claim_vault_common`): still-locked vaults re-lock into a native
+//! ario-core vault preserving the original unlock time via direct CPI;
+//! expired (or sub-`min_vault_duration`) vaults deliver liquid tokens to
+//! the claimant. The trailing optional accounts carry the re-lock set and
+//! are omitted entirely on liquid claims.
+
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, CloseAccount, Token, TokenAccount, Transfer as SplTransfer};
+use anchor_spl::token::{Token, TokenAccount};
 
 use crate::{
     canonical::build_escrow_claim_message,
     error::EscrowError,
+    instructions::claim_vault_common::{settle_vault_claim, VaultClaimCtx},
     state::{
         EscrowToken, ASSET_TYPE_VAULT, ESCROW_VAULT_SEED, ETHEREUM_PUBKEY_LEN, PROTOCOL_ETHEREUM,
     },
     verify::ethereum::verify_personal_sign,
-    EscrowClaimedEvent,
 };
 
-/// Release escrowed vault tokens after Ethereum ECDSA verification.
-///
-/// Active (still-locked) vault claims are rejected (`VaultStillLocked`). Only
-/// expired vaults are claimable, delivering liquid tokens directly to the
-/// claimant's ATA. The former active re-lock path (release-to-payer + sibling
-/// `vaulted_transfer` introspection) was removed — see the active-vault re-lock
-/// removal ADR. Ethereum auth is secp256k1 `verify_personal_sign` (no sysvar).
 pub fn handler(
     ctx: Context<ClaimVaultEthereum>,
     message_nonce: [u8; 32],
@@ -58,7 +64,7 @@ pub fn handler(
     );
     verify_personal_sign(&message, &signature, expected_address)?;
 
-    // 6. Sig is good — transfer tokens.
+    // 6. Sig is good — settle (re-lock or liquid).
     let depositor_key = escrow.depositor;
     let asset_id = escrow.asset_id;
     let bump = escrow.bump;
@@ -74,66 +80,46 @@ pub fn handler(
         &bump_bytes,
     ]];
 
-    let clock = Clock::get()?;
-
-    // Active (still-locked) vault claims are DISABLED. The legacy active path
-    // released tokens to a wallet and only *introspected* the tx for a matching
-    // `ario_core::vaulted_transfer` re-lock — a check with no 1:1 binding
-    // between a claim and the re-lock it credited, so one `vaulted_transfer`
-    // could satisfy multiple claims (lock bypass / relayer skim; Codex finding).
-    // A locked vault must now wait until `vault_end_timestamp` and is then
-    // claimed liquid, exactly like any expired vault. See ADR-022 (and BD-107).
-    // The revocable-controller variant was already closed by ADR-021 / BD-105.
-    //
-    // To revive "claim early, stay locked": see
-    // `docs/RESTORE_ACTIVE_VAULT_RELOCK.md` for the step-by-step direct-CPI
-    // restoration playbook.
-    require!(
-        clock.unix_timestamp >= vault_end_timestamp,
-        EscrowError::VaultStillLocked
-    );
-
-    // Expired vault — liquid SPL transfer directly to claimant.
-    let cpi_ctx = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
-        SplTransfer {
-            from: ctx.accounts.escrow_token_account.to_account_info(),
-            to: ctx.accounts.claimant_token_account.to_account_info(),
-            authority: ctx.accounts.escrow.to_account_info(),
+    settle_vault_claim(
+        VaultClaimCtx {
+            escrow: ctx.accounts.escrow.to_account_info(),
+            escrow_token_account: ctx.accounts.escrow_token_account.to_account_info(),
+            claimant_token_account: ctx.accounts.claimant_token_account.to_account_info(),
+            claimant: ctx.accounts.claimant.to_account_info(),
+            depositor: ctx.accounts.depositor.to_account_info(),
+            payer: ctx.accounts.payer.to_account_info(),
+            token_program: ctx.accounts.token_program.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+            payer_token_account: ctx
+                .accounts
+                .payer_token_account
+                .as_ref()
+                .map(|a| a.to_account_info()),
+            ario_core_config: ctx.accounts.ario_core_config.as_deref(),
+            recipient_vault_counter: ctx
+                .accounts
+                .recipient_vault_counter
+                .as_ref()
+                .map(|a| a.to_account_info()),
+            vault: ctx.accounts.vault.as_ref().map(|a| a.to_account_info()),
+            vault_token_account: ctx
+                .accounts
+                .vault_token_account
+                .as_ref()
+                .map(|a| a.to_account_info()),
+            ario_core_program: ctx
+                .accounts
+                .ario_core_program
+                .as_ref()
+                .map(|a| a.to_account_info()),
         },
-        signer_seeds,
-    );
-    token::transfer(cpi_ctx, amount)?;
-
-    // 7. Close escrow token account.
-    let cpi_close = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
-        CloseAccount {
-            account: ctx.accounts.escrow_token_account.to_account_info(),
-            destination: ctx.accounts.depositor.to_account_info(),
-            authority: ctx.accounts.escrow.to_account_info(),
-        },
-        signer_seeds,
-    );
-    token::close_account(cpi_close)?;
-
-    emit!(EscrowClaimedEvent {
-        escrow: escrow_pda,
-        claimer: ctx.accounts.claimant.key(),
-        asset_id: Pubkey::new_from_array(asset_id),
-        asset_type: ASSET_TYPE_VAULT,
         amount,
-        claim_protocol: PROTOCOL_ETHEREUM,
-        timestamp: clock.unix_timestamp,
-    });
-
-    msg!(
-        "escrow: claimed expired vault (ethereum) amount={} claimant={}",
-        amount,
-        ctx.accounts.claimant.key()
-    );
-
-    Ok(())
+        vault_end_timestamp,
+        escrow_pda,
+        asset_id,
+        PROTOCOL_ETHEREUM,
+        signer_seeds,
+    )
 }
 
 #[derive(Accounts)]
@@ -156,7 +142,7 @@ pub struct ClaimVaultEthereum<'info> {
     )]
     pub escrow_token_account: Account<'info, TokenAccount>,
 
-    /// Claimant's ARIO token account (destination for expired-vault path).
+    /// Claimant's ARIO token account (destination for the liquid path).
     #[account(
         mut,
         constraint = claimant_token_account.mint == escrow.ario_mint @ EscrowError::MintMismatch,
@@ -179,4 +165,50 @@ pub struct ClaimVaultEthereum<'info> {
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+
+    // --- Optional re-lock account set (ADR-0027) ---
+    // Trailing optionals: omitted entirely on expired/liquid claims, so the
+    // pre-ADR-0027 claim ABI keeps working. Pass ALL six when the escrow is
+    // still locked (`vault_end_timestamp > now`).
+    //
+    /// Payer's ARIO ATA — atomic pass-through leg of the active re-lock:
+    /// receives `amount` from escrow and is drained by the
+    /// same-instruction CPI into ario-core. Net-zero for the payer.
+    #[account(
+        mut,
+        constraint = payer_token_account.mint == escrow.ario_mint @ EscrowError::MintMismatch,
+        constraint = payer_token_account.owner == payer.key() @ EscrowError::TokenAccountOwnerMismatch,
+    )]
+    pub payer_token_account: Option<Box<Account<'info, TokenAccount>>>,
+
+    /// ario-core `ArioConfig` PDA — read for the live `min_vault_duration`
+    /// at claim time; `mut` because the re-lock CPI updates its supply
+    /// tracking (Anchor never writes back foreign-owned accounts).
+    #[account(
+        mut,
+        seeds = [b"ario_config"],
+        bump,
+        seeds::program = ario_core::ID,
+    )]
+    pub ario_core_config: Option<Box<Account<'info, ario_core::state::ArioConfig>>>,
+
+    /// CHECK: seeds `[VAULT_COUNTER_SEED, claimant]` validated (and
+    /// init-if-needed) by ario-core during the re-lock CPI.
+    #[account(mut)]
+    pub recipient_vault_counter: Option<UncheckedAccount<'info>>,
+
+    /// CHECK: seeds `[VAULT_SEED, claimant, counter.next_id]` validated and
+    /// initialized by ario-core during the re-lock CPI. The caller derives
+    /// it from the counter's current `next_id` (see ANT_ESCROW_PROTOCOL_SPEC).
+    #[account(mut)]
+    pub vault: Option<UncheckedAccount<'info>>,
+
+    /// CHECK: pre-created token account owned by the new vault PDA;
+    /// owner/mint validated by ario-core during the re-lock CPI.
+    #[account(mut)]
+    pub vault_token_account: Option<UncheckedAccount<'info>>,
+
+    /// CHECK: pinned by address constraint to the canonical ario-core id.
+    #[account(address = ario_core::ID)]
+    pub ario_core_program: Option<AccountInfo<'info>>,
 }

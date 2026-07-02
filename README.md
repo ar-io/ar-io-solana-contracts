@@ -10,7 +10,7 @@ graphs, and release tooling can treat them as a single deployable unit.
 | `ario-gar`          | `programs/ario-gar`  | Gateway Address Registry — operator + delegate staking, withdrawals, epoch lifecycle, observer selection, batched reward distribution |
 | `ario-arns`         | `programs/ario-arns` | ArNS name registry — buy / lease / permabuy, demand-factor pricing, reserved + returned names |
 | `ario-ant`          | `programs/ario-ant`  | Arweave Name Token (ANT) as a Metaplex Core NFT with Attributes plugin, undername records, controller ACL |
-| `ario-ant-escrow`   | `programs/ario-ant-escrow` | Multi-protocol trustless escrow for ANTs, ARIO tokens, and time-locked vaults — Arweave (Ed25519 attestor), Ethereum (`secp256k1_recover`), and instruction-introspection vault claims |
+| `ario-ant-escrow`   | `programs/ario-ant-escrow` | Multi-protocol trustless escrow for ANTs, ARIO tokens, and time-locked vaults — Arweave (Ed25519 attestor), Ethereum (`secp256k1_recover`); still-locked vault claims re-lock into native ario-core vaults via CPI (ADR-027) |
 
 CPI graph (`A → B` means A invokes B):
 
@@ -25,7 +25,7 @@ ario-core ──cpi──▶ ario-gar     (primary-name fund-from-stake variants
 
 ario-ant  ──reads──▶ ario-arns  (ArnsRecord PDA — Attributes plugin sync)
 
-ario-ant-escrow ──introspects──▶ ario-core::vaulted_transfer  (vault claims)
+ario-ant-escrow ──cpi──▶ ario-core (vaulted_transfer / create_vault — active-vault re-lock, ADR-027)
                 ──cpi──▶ Metaplex Core            (transfer ANT to claimant)
                 ──cpi──▶ Ed25519 / Secp256k1 native programs (sigverify)
 ```

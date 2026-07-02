@@ -900,15 +900,15 @@ Same as `claim_tokens_arweave` but with Ethereum ECDSA + EIP-191 verification. F
 
 #### `claim_vault_arweave`
 
-Release an escrowed vault to a claimant after Arweave RSA-PSS verification. Behavior depends on vault expiry:
-- **Active vault** (`end_timestamp > now`): **rejected with `VaultStillLocked`** (ADR-022). The former active re-lock path was removed — see §11.5.
-- **Expired vault** (`end_timestamp <= now`): Performs a liquid SPL transfer directly to the claimant (same as `claim_tokens_arweave`).
+Release an escrowed vault to a claimant after Arweave RSA-PSS verification. Settlement branches on the remaining lock (ADR-027 — see §11.5):
+- **Re-lock** (`remaining >= ArioConfig.min_vault_duration`): atomic payer pass-through + direct CPI into ario-core, creating a claimant-owned non-revocable vault that unlocks at the escrow's original `end_timestamp`. Requires the six trailing optional re-lock accounts; without them the claim fails `RelockAccountsMissing`.
+- **Liquid** (`remaining < min_vault_duration`, including expired): SPL transfer directly to the claimant (same as `claim_tokens_arweave`).
 
 Requires `SetComputeUnitLimit(400_000)`.
 
 #### `claim_vault_ethereum`
 
-Same as `claim_vault_arweave` but with Ethereum ECDSA + EIP-191 verification. Active vaults are rejected with `VaultStillLocked`; expired vaults do a liquid transfer.
+Same as `claim_vault_arweave` but with Ethereum ECDSA + EIP-191 verification.
 
 #### `cancel_token_deposit`
 
@@ -946,32 +946,42 @@ Including the depositor in the PDA seeds (unlike ANT escrows which use only the 
 
 ### 11.5 Vault Claim Behavior
 
-Vault escrows have two outcomes depending on the vault's lock status at claim time:
+Vault escrows settle in one of three ways depending on the remaining lock at claim time (`remaining = end_timestamp - clock.unix_timestamp`), per **ADR-027**:
 
-**Active vault** (`end_timestamp > clock.unix_timestamp`): **rejected with `VaultStillLocked`.** The claim must wait until the vault unlocks.
+| Condition | Outcome |
+|---|---|
+| `remaining >= ArioConfig.min_vault_duration` | **Re-lock**: claimant-owned non-revocable ario-core vault, unlocking at the escrow's original `end_timestamp` |
+| `0 < remaining < min_vault_duration` | **Liquid**: SPL transfer to the claimant (bounded early-liquidity window — ADR-027) |
+| `remaining <= 0` (expired) | **Liquid**: SPL transfer to the claimant |
 
-**Expired vault** (`end_timestamp <= clock.unix_timestamp`): liquid SPL transfer directly to the claimant, then the escrow PDA + token account are closed (rent to depositor).
+In all cases the escrow PDA + token account are then closed (rent to depositor). `min_vault_duration` is read live from ario-core's `ArioConfig` at claim time (default 14 days; admin-mutable).
 
-> **ADR-022 (2026-05-28) — active re-lock path removed.** Previously, an active
-> vault claim released tokens to the payer's ATA and used `sysvar::instructions`
-> introspection to confirm a sibling `ario_core::vaulted_transfer` re-locked
-> them for the claimant (20-instruction loop, 60s tolerance, non-revocable per
-> ADR-021). That introspection had **no 1:1 binding** between a claim and the
-> re-lock it credited — it matched amount/duration/recipient and scanned
-> read-only without consuming — so one `vaulted_transfer` could satisfy multiple
-> batched claims for the same claimant + identical amount, locking once and
-> leaving the rest liquid (lock bypass / relayer skim; Codex finding). Since the
-> re-lock granted the claimant no liquidity, nothing depended on it (the
-> migration claims vaults liquid-after-expiry), token/vault escrows are never
-> purged, and escrow is pre-mainnet, the path was disabled (not reworked). The
-> heavier **direct-CPI** alternative that would preserve early-claim-with-
-> preserved-lock is recorded in ADR-022 as the way to revive it. The
-> revocable-controller variant was independently closed by ADR-021 / BD-105.
-> See ADR-022 / BD-107.
+**Re-lock mechanics.** Inside the single claim instruction the handler (1) transfers exactly `amount` from the escrow's token account to `payer_token_account` (escrow-PDA-signed), then (2) CPIs `ario_core::vaulted_transfer(amount, remaining, revocable = false)` with `sender = payer`, `recipient = claimant`. When `payer == claimant` (the claimant pays their own claim), the handler CPIs `ario_core::create_vault(amount, remaining)` instead, since `vaulted_transfer` rejects `sender == recipient`. Both branches are 1:1 and atomic: the pass-through credit and the CPI debit happen in one instruction, so any CPI failure reverts the release — the payer nets zero by construction.
 
-**Expired vault** (`end_timestamp <= clock.unix_timestamp`):
+**Re-lock account set (six trailing optional accounts on both claim ixs).** Omitted entirely on liquid/expired claims (the pre-ADR-027 ABI keeps working); ALL six must be passed when the escrow is still locked, else `RelockAccountsMissing`:
 
-The vault's lock has expired, so the tokens are effectively liquid. The claim instruction performs a standard SPL token transfer directly to the claimant's associated token account. No `vaulted_transfer` instruction is needed in the transaction.
+| Account | Notes |
+|---|---|
+| `payer_token_account` | Payer's ARIO token account (pass-through leg; mint/owner checked by escrow) |
+| `ario_core_config` | ario-core `ArioConfig` PDA (`["ario_config"]`, `seeds::program = ario_core`) — read for `min_vault_duration`, mutated by the CPI's supply tracking |
+| `recipient_vault_counter` | `[VAULT_COUNTER_SEED, claimant]` — validated/init-if-needed by ario-core |
+| `vault` | `[VAULT_SEED, claimant, next_id_le]` — validated/initialized by ario-core |
+| `vault_token_account` | Pre-created token account owned by the (not-yet-initialized) vault PDA |
+| `ario_core_program` | Pinned `address = ario_core::ID` |
+
+**Caller contract.** For a still-locked claim the client must: read the claimant's `VaultCounter.next_id` (0 if the counter doesn't exist yet) → derive the `vault` PDA from it → create the vault's token account (owner = the derived vault PDA) in an earlier instruction of the same transaction → pass the six accounts. If the claimant gains another vault between read and land, ario-core fails seed validation and the whole claim reverts atomically — re-derive and retry. A `SetComputeUnitLimit(400_000)` is recommended on re-lock claims. Claims where `remaining > ArioConfig.max_vault_duration` fail with ario-core's `LockDurationTooLong` until the remainder decays under the cap (unreachable at the 200-year default).
+
+> **History (ADR-022 → ADR-027).** The original active path released tokens to
+> the payer's ATA and used `sysvar::instructions` introspection to confirm a
+> sibling `ario_core::vaulted_transfer` — which had **no 1:1 binding** between
+> a claim and the re-lock it credited, so one sibling could satisfy multiple
+> batched claims (lock bypass / relayer skim; Codex finding). ADR-022
+> (2026-05-28) removed it (`VaultStillLocked` on active claims). ADR-027
+> (2026-07-01) restored the capability as the direct CPI described above,
+> against ario-core's existing, unmodified ABI. `VaultStillLocked` is retained
+> in the error enum (append-only ABI) but is no longer emitted. The
+> revocable-controller variant was independently closed by ADR-021 / BD-105;
+> the re-lock CPI hardwires `revocable = false`.
 
 The `end_timestamp` is recorded in the `EscrowToken` account at deposit time and checked at claim time. The canonical message includes the `amount` but not the timestamps -- the on-chain account is the source of truth for lock status.
 

@@ -2622,13 +2622,13 @@ async fn test_update_vault_recipient_non_depositor_fails() {
 //    `claimant_token_account` (liquid). We warp the test clock past
 //    `vault_end_timestamp` and assert the claim succeeds.
 //
-//  - **Active-vault path** (rejected): while `clock < vault_end_timestamp`,
-//    the handler rejects with `VaultStillLocked`. The former active
-//    re-lock path (release-to-payer + sibling `vaulted_transfer`
-//    introspection) was REMOVED — its introspection had no 1:1
-//    claim↔re-lock binding (reuse / redirection; Codex finding). See the
-//    active-vault re-lock removal ADR / ACTIVE_VAULT_DISABLE_ROLLOUT.md.
-//    A locked vault must wait until expiry, then claims liquid.
+//  - **Active-vault path** (ADR-0027): while `clock < vault_end_timestamp`,
+//    the handler re-locks into a native ario-core vault via direct CPI
+//    (atomic payer pass-through), or delivers liquid when the remainder is
+//    under ario-core's `min_vault_duration`. Both need ario-core loaded in
+//    the runtime, so the happy paths live in cross_program_vault_claim.rs.
+//    Here (no core loaded) we assert the pre-CPI gate: a still-locked claim
+//    without the trailing re-lock account set fails `RelockAccountsMissing`.
 
 async fn claim_vault_ethereum_tx(
     ctx: &mut ProgramTestContext,
@@ -2653,6 +2653,15 @@ async fn claim_vault_ethereum_tx(
         payer: payer.pubkey(),
         token_program: spl_token::id(),
         system_program: solana_sdk::system_program::ID,
+        // Re-lock account set omitted — this runtime has no ario-core
+        // loaded, so these tests only exercise the liquid paths (the
+        // re-lock happy paths live in cross_program_vault_claim.rs).
+        payer_token_account: None,
+        ario_core_config: None,
+        recipient_vault_counter: None,
+        vault: None,
+        vault_token_account: None,
+        ario_core_program: None,
     }
     .to_account_metas(None);
     let data = ario_ant_escrow::instruction::ClaimVaultEthereum {
@@ -2855,10 +2864,12 @@ async fn test_claim_vault_ethereum_active_rejected() {
         vec![],
     )
     .await;
-    // Active (still-locked) vault claims are disabled — rejected regardless of
-    // any sibling instruction. (Pre-ADR this returned
-    // MissingVaultedTransferInstruction.)
-    assert_anchor_error!(result, EscrowError::VaultStillLocked);
+    // A still-locked claim submitted WITHOUT the trailing re-lock account
+    // set is rejected before any token movement (ADR-0027; the check fires
+    // pre-CPI, so it's testable in this core-less runtime). Pre-ADR-0027
+    // this was VaultStillLocked; the re-lock happy paths live in
+    // cross_program_vault_claim.rs.
+    assert_anchor_error!(result, EscrowError::RelockAccountsMissing);
 
     // Belt-and-braces: nothing moved. Atomic-reject implies these, but pin
     // them so a future refactor that accidentally moves token logic before
@@ -4578,6 +4589,15 @@ async fn claim_vault_arweave_attested_tx(
         instructions_sysvar: solana_sdk::sysvar::instructions::id(),
         token_program: spl_token::id(),
         system_program: solana_sdk::system_program::ID,
+        // Re-lock account set omitted — this runtime has no ario-core
+        // loaded, so these tests only exercise the liquid paths (the
+        // re-lock happy paths live in cross_program_vault_claim.rs).
+        payer_token_account: None,
+        ario_core_config: None,
+        recipient_vault_counter: None,
+        vault: None,
+        vault_token_account: None,
+        ario_core_program: None,
     }
     .to_account_metas(None);
     let data = ario_ant_escrow::instruction::ClaimVaultArweaveAttested {
@@ -4690,11 +4710,12 @@ async fn test_claim_vault_arweave_attested_expired_happy_path() {
     );
 }
 
-/// Active (still-locked) Arweave-attested vault claim is rejected with
-/// `VaultStillLocked`, even with a valid attestation. The attestation is
-/// verified FIRST (so this proves the rejection is the lock gate, not an
-/// attestation failure), then the still-locked gate fires. Mirror of
-/// `test_claim_vault_ethereum_active_rejected`.
+/// Active (still-locked) Arweave-attested vault claim WITHOUT the re-lock
+/// account set is rejected with `RelockAccountsMissing`, even with a valid
+/// attestation. The attestation is verified FIRST (so this proves the
+/// rejection is the missing-accounts gate, not an attestation failure).
+/// Mirror of `test_claim_vault_ethereum_active_rejected`. The re-lock
+/// happy paths live in cross_program_vault_claim.rs (ADR-0027).
 #[tokio::test]
 async fn test_claim_vault_arweave_attested_active_rejected() {
     if skip_if_no_bpf_artifacts() {
@@ -4770,7 +4791,7 @@ async fn test_claim_vault_arweave_attested_active_rejected() {
         vec![],
     )
     .await;
-    assert_anchor_error!(result, EscrowError::VaultStillLocked);
+    assert_anchor_error!(result, EscrowError::RelockAccountsMissing);
 
     // Escrow must remain open and funded — nothing moved.
     let escrow_acct = ctx.banks_client.get_account(escrow_addr).await.unwrap();
@@ -4854,6 +4875,13 @@ async fn measure_cu_claim_vault_arweave_attested_expired() {
         instructions_sysvar: solana_sdk::sysvar::instructions::id(),
         token_program: spl_token::id(),
         system_program: solana_sdk::system_program::ID,
+        // Expired claim — the re-lock account set is not needed.
+        payer_token_account: None,
+        ario_core_config: None,
+        recipient_vault_counter: None,
+        vault: None,
+        vault_token_account: None,
+        ario_core_program: None,
     }
     .to_account_metas(None);
     let claim_ix = Ix {

@@ -384,4 +384,22 @@ SBF_FEATURE_ARGS=(--no-default-features --features "network-${FEATURE_NETWORK}")
 echo "[build-sbf] anchor build -- ${SBF_FEATURE_ARGS[*]}"
 anchor build -- "${SBF_FEATURE_ARGS[@]}"
 
+# LOCALNET ONLY: rebuild escrow with the deterministic test attestor key
+# (public seed [1u8; 32]) so a locally-run attestor service can sign
+# claims. Must run here — inside the --sync window — so the .so embeds the
+# keypair-derived declare_id!() values (escrow's own + ario_core::ID for
+# the ADR-027 re-lock CPI target), not the placeholders restored on EXIT.
+#
+# WARNING: this leaves a test-key escrow .so in target/deploy. NEVER
+# deploy that artifact to a real cluster — anyone can forge attestations
+# against the public seed. `scripts/check-attestor-pubkey.sh` (wired into
+# devnet-deploy.sh Phase 0) blocks such a deploy; rebuild without this
+# env var before any real-network use.
+if [[ "${LOCALNET_TEST_ATTESTOR:-0}" == "1" ]]; then
+  echo "[build-sbf] LOCALNET_TEST_ATTESTOR=1 — rebuilding ario_ant_escrow.so with unsafe-allow-test-attestor-pubkey (test key; localnet only)"
+  cargo build-sbf --manifest-path programs/ario-ant-escrow/Cargo.toml \
+    --no-default-features \
+    --features "network-${FEATURE_NETWORK},unsafe-allow-test-attestor-pubkey"
+fi
+
 ls -la target/deploy/*.so target/idl/*.json 2>/dev/null || ls -la target/deploy/*.so

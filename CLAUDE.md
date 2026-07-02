@@ -74,15 +74,18 @@ scope here:
   service that re-signs the canonical claim with Ed25519, verified
   on-chain via the native sigverify program + sysvar
   instruction-introspection (ADR-017). Ethereum verifies on-chain via
-  `secp256k1_recover`. Vault claims use instruction introspection to
-  enforce time-locks via `ario-core::vaulted_transfer`. The earlier
+  `secp256k1_recover`. Still-locked vault claims re-lock into native
+  ario-core vaults via direct CPI (`vaulted_transfer` / `create_vault`,
+  atomic payer pass-through — ADR-027); sub-`min_vault_duration`
+  remainders and expired vaults deliver liquid. The earlier
   on-chain RSA-PSS path was removed because `sol_big_mod_exp` is
   feature-gated on devnet/mainnet.
 
 **CPI flow:** ario-gar and ario-arns call into ario-core for token ops.
 ario-arns calls into ario-gar for stake-funded ArNS purchases
-(fund-from-stakes). ario-ant reads `ArnsRecord` PDAs (owned by
-ario-arns) when syncing the Metaplex Core Attributes plugin.
+(fund-from-stakes). ario-ant-escrow calls into ario-core for
+active-vault re-lock claims (ADR-027). ario-ant reads `ArnsRecord` PDAs
+(owned by ario-arns) when syncing the Metaplex Core Attributes plugin.
 
 **Program structure.** ario-core / ario-gar / ario-arns are modularized
 with `lib.rs` dispatching to `src/instructions/` modules (each with
@@ -421,9 +424,10 @@ the cpi edge. If B (or anything B transitively pulls in like
 function or constant named DISCRIMINATOR found for struct
 anchor_spl::token::TokenAccount` and the build aborts. **Fix:** in A's
 `Cargo.toml`, ensure `idl-build = ["anchor-lang/idl-build", ...,
-"<B>/idl-build"]`. Current chain: `ario-ant/idl-build →
-ario-arns/idl-build → ario-gar/idl-build → anchor-spl/idl-build`. New
-program-to-program cpi deps need a parallel entry.
+"<B>/idl-build"]`. Current chains: `ario-ant/idl-build →
+ario-arns/idl-build → ario-gar/idl-build → anchor-spl/idl-build`, and
+`ario-ant-escrow/idl-build → ario-core/idl-build` (vault re-lock CPI,
+ADR-027). New program-to-program cpi deps need a parallel entry.
 
 ## Toolchain
 
