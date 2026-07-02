@@ -30,8 +30,8 @@ CU usage measured per instruction via `solana-program-test` simulation
 | `deposit_vault`                              |   ~35,000     | 200K   | Account init + vault metadata copy; similar to `deposit_tokens` |
 | `claim_vault_arweave_attested` (expired/liquid) | 50,204     | 200K   | **Arweave production path, liquid delivery.** SPL transfer to claimant. |
 | `claim_vault_ethereum` (expired/liquid)      |    same as `claim_tokens_ethereum` | 200K | Liquid SPL transfer to claimant. |
-| `claim_vault_arweave_attested` (active re-lock) | 92,973    | 400K   | **ADR-027.** Pass-through SPL transfer + `vaulted_transfer` CPI (two account inits + SPL transfer + supply math) + config PDA derivation. Measured in `cross_program_vault_claim.rs`. |
-| `claim_vault_ethereum` (active re-lock)      |   119,784     | 400K   | Same settle path; secp256k1 recovery on-instruction instead of Ed25519 introspection (hence heavier than Arweave). |
+| `claim_vault_arweave_attested` (active re-lock) | 97,601    | 400K   | **ADR-027.** Pass-through SPL transfer + `vaulted_transfer` CPI (two account inits + SPL transfer + supply math) + config PDA derivation + C1 dust-sweep balance read. Measured in `cross_program_vault_claim.rs`. |
+| `claim_vault_ethereum` (active re-lock)      |   123,467     | 400K   | Same settle path; secp256k1 recovery on-instruction instead of Ed25519 introspection (hence heavier than Arweave). |
 
 > **ADR-027 (2026-07-01):** active (still-locked) vault claims re-lock into a
 > native ario-core vault via direct CPI (the ADR-022-era `VaultStillLocked`
