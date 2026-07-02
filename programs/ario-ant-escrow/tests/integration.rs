@@ -2622,7 +2622,7 @@ async fn test_update_vault_recipient_non_depositor_fails() {
 //    `claimant_token_account` (liquid). We warp the test clock past
 //    `vault_end_timestamp` and assert the claim succeeds.
 //
-//  - **Active-vault path** (ADR-0027): while `clock < vault_end_timestamp`,
+//  - **Active-vault path** (ADR-027): while `clock < vault_end_timestamp`,
 //    the handler re-locks into a native ario-core vault via direct CPI
 //    (atomic payer pass-through), or delivers liquid when the remainder is
 //    under ario-core's `min_vault_duration`. Both need ario-core loaded in
@@ -2865,8 +2865,8 @@ async fn test_claim_vault_ethereum_active_rejected() {
     )
     .await;
     // A still-locked claim submitted WITHOUT the trailing re-lock account
-    // set is rejected before any token movement (ADR-0027; the check fires
-    // pre-CPI, so it's testable in this core-less runtime). Pre-ADR-0027
+    // set is rejected before any token movement (ADR-027; the check fires
+    // pre-CPI, so it's testable in this core-less runtime). Pre-ADR-027
     // this was VaultStillLocked; the re-lock happy paths live in
     // cross_program_vault_claim.rs.
     assert_anchor_error!(result, EscrowError::RelockAccountsMissing);
@@ -4715,7 +4715,7 @@ async fn test_claim_vault_arweave_attested_expired_happy_path() {
 /// attestation. The attestation is verified FIRST (so this proves the
 /// rejection is the missing-accounts gate, not an attestation failure).
 /// Mirror of `test_claim_vault_ethereum_active_rejected`. The re-lock
-/// happy paths live in cross_program_vault_claim.rs (ADR-0027).
+/// happy paths live in cross_program_vault_claim.rs (ADR-027).
 #[tokio::test]
 async fn test_claim_vault_arweave_attested_active_rejected() {
     if skip_if_no_bpf_artifacts() {

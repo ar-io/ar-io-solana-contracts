@@ -69,10 +69,13 @@ both `claim_vault_arweave_attested` and `claim_vault_ethereum`):
 The re-lock account set rides as **six trailing `Option<...>` accounts**
 on both claim instructions (`payer_token_account`, `ario_core_config`,
 `recipient_vault_counter`, `vault`, `vault_token_account`,
-`ario_core_program` pinned `address = ario_core::ID`). Expired/liquid
-claims omit them entirely, so the pre-existing claim ABI keeps working
-unchanged. A still-locked claim submitted without them fails with the new
-appended error `RelockAccountsMissing` before any token movement.
+`ario_core_program` pinned `address = ario_core::ID`). **Expired** claims
+omit them entirely, so the pre-existing claim ABI keeps working
+unchanged. Any **still-locked** claim must carry them — even one that
+settles liquid via the sub-minimum fallback, since the handler reads
+`ario_core_config.min_vault_duration` to decide the branch. A
+still-locked claim submitted without them fails with the new appended
+error `RelockAccountsMissing` before any token movement.
 `VaultStillLocked` becomes unreachable but is retained (append-only error
 ABI).
 

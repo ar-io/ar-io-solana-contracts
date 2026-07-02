@@ -12,7 +12,7 @@
 > fallback when the remaining lock is under `min_vault_duration`. The
 > current source of truth is ADR-027, `ANT_ESCROW_PROTOCOL_SPEC.md` §11.5,
 > and `programs/ario-ant-escrow/src/instructions/claim_vault_common.rs`.
-
+>
 > **Status (historical):** Playbook only. The active re-lock path is currently **disabled**
 > (ADR-022). This document captures the design + concrete steps needed if the
 > "claim a still-locked vault and keep it locked for the remaining duration on

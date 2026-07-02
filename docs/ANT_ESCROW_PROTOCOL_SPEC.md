@@ -958,7 +958,7 @@ In all cases the escrow PDA + token account are then closed (rent to depositor).
 
 **Re-lock mechanics.** Inside the single claim instruction the handler (1) transfers exactly `amount` from the escrow's token account to `payer_token_account` (escrow-PDA-signed), then (2) CPIs `ario_core::vaulted_transfer(amount, remaining, revocable = false)` with `sender = payer`, `recipient = claimant`. When `payer == claimant` (the claimant pays their own claim), the handler CPIs `ario_core::create_vault(amount, remaining)` instead, since `vaulted_transfer` rejects `sender == recipient`. Both branches are 1:1 and atomic: the pass-through credit and the CPI debit happen in one instruction, so any CPI failure reverts the release — the payer nets zero by construction.
 
-**Re-lock account set (six trailing optional accounts on both claim ixs).** Omitted entirely on liquid/expired claims (the pre-ADR-027 ABI keeps working); ALL six must be passed when the escrow is still locked, else `RelockAccountsMissing`:
+**Re-lock account set (six trailing optional accounts on both claim ixs).** Omitted entirely on **expired** claims (the pre-ADR-027 ABI keeps working); ALL six must be passed whenever the escrow is **still locked** — including claims that settle liquid via the sub-minimum fallback, since the handler reads `min_vault_duration` from `ario_core_config` to decide the branch — else `RelockAccountsMissing`:
 
 | Account | Notes |
 |---|---|

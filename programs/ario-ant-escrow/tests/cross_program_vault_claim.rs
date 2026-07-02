@@ -1,5 +1,5 @@
 //! Cross-program integration tests for the **active-vault re-lock** claim
-//! path (ADR-0027: direct CPI into ario-core, restoring what ADR-022
+//! path (ADR-027: direct CPI into ario-core, restoring what ADR-022
 //! disabled).
 //!
 //! Why this lives in its own file (not `integration.rs`):
@@ -1120,7 +1120,7 @@ async fn test_claim_vault_active_payer_equals_claimant() {
 
 /// A still-locked claim whose remainder is UNDER `min_vault_duration`
 /// delivers liquid immediately — even with the full re-lock account set
-/// passed. No vault is created (ADR-0027's bounded early-liquidity window).
+/// passed. No vault is created (ADR-027's bounded early-liquidity window).
 #[tokio::test]
 async fn test_claim_vault_near_expiry_liquid_fallback() {
     if skip_if_no_bpf_artifacts() {
@@ -1671,4 +1671,263 @@ async fn test_claim_vault_active_wrong_vault_pda_fails() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// C1 dust-DoS regression (liquid path): stray mARIO donated to the escrow
+/// token account must NOT brick the claim — the liquid settle sweeps the
+/// FULL live balance (principal + dust) to the claimant so `close_account`'s
+/// zero-balance precondition holds.
+#[tokio::test]
+async fn test_claim_vault_expired_with_dust_sweeps_to_claimant() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test_with_core().start_with_context().await;
+
+    let amount = 500_000_000u64;
+    let dust = 5_000_000u64;
+    let asset_id = [0xA7u8; 32];
+    let setup = setup_with_initialized_core(&mut ctx, amount).await;
+    let (escrow_pda, _) = escrow_vault_pda(&setup.depositor.pubkey(), &asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_pda, &setup.mint_kp.pubkey()).await;
+
+    let secret_key = test_eth_secret_key();
+    let (_, eth_addr) = sign_ethereum(b"dummy", &secret_key);
+
+    deposit_vault(
+        &mut ctx,
+        &setup,
+        asset_id,
+        escrow_ata.pubkey(),
+        amount,
+        14 * 86_400,
+        PROTOCOL_ETHEREUM,
+        eth_addr.to_vec(),
+    )
+    .await;
+
+    // Attacker donates dust straight into the escrow's token account.
+    mint_tokens(
+        &mut ctx,
+        &setup.mint_kp.pubkey(),
+        &escrow_ata.pubkey(),
+        &setup.mint_authority,
+        dust,
+    )
+    .await;
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_pda).await;
+    warp_clock_to(&mut ctx, escrow_state.vault_end_timestamp + 1).await;
+
+    let claimant = Keypair::new();
+    let payer = Keypair::new();
+    let claimant_ata = Keypair::new();
+    airdrop(&mut ctx, &payer.pubkey(), 5_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+
+    let msg = build_escrow_canonical(
+        "vault",
+        &asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &eth_addr,
+    );
+    let (signature, _) = sign_ethereum(&msg, &secret_key);
+    let claim_ix = build_claim_vault_ethereum_ix(
+        escrow_pda,
+        escrow_ata.pubkey(),
+        claimant_ata.pubkey(),
+        claimant.pubkey(),
+        setup.depositor.pubkey(),
+        payer.pubkey(),
+        escrow_state.nonce,
+        signature,
+        None, // expired — no re-lock accounts
+    );
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            claim_ix,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("dusted expired claim must still succeed (full-balance sweep)");
+
+    assert_eq!(
+        get_token_balance(&mut ctx, &claimant_ata.pubkey()).await,
+        amount + dust,
+        "claimant must receive principal + donated dust"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(escrow_ata.pubkey())
+            .await
+            .unwrap()
+            .is_none(),
+        "escrow token account must be closed"
+    );
+}
+
+/// C1 dust-DoS regression (re-lock path): dust donated to the escrow token
+/// account must not brick a re-lock claim — exactly `amount` re-locks into
+/// the new vault, and the dust surplus is swept liquid to the claimant.
+#[tokio::test]
+async fn test_claim_vault_relock_with_dust_sweeps_surplus() {
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test_with_core().start_with_context().await;
+
+    let amount = 500_000_000u64;
+    let dust = 7_000_000u64;
+    let asset_id = [0xA8u8; 32];
+    let setup = setup_with_initialized_core(&mut ctx, amount).await;
+    let (escrow_pda, _) = escrow_vault_pda(&setup.depositor.pubkey(), &asset_id);
+    let escrow_ata =
+        create_escrow_token_account(&mut ctx, &escrow_pda, &setup.mint_kp.pubkey()).await;
+
+    let secret_key = test_eth_secret_key();
+    let (_, eth_addr) = sign_ethereum(b"dummy", &secret_key);
+
+    deposit_vault(
+        &mut ctx,
+        &setup,
+        asset_id,
+        escrow_ata.pubkey(),
+        amount,
+        30 * 86_400,
+        PROTOCOL_ETHEREUM,
+        eth_addr.to_vec(),
+    )
+    .await;
+
+    mint_tokens(
+        &mut ctx,
+        &setup.mint_kp.pubkey(),
+        &escrow_ata.pubkey(),
+        &setup.mint_authority,
+        dust,
+    )
+    .await;
+
+    let escrow_state = fetch_escrow_token(&mut ctx, escrow_pda).await;
+
+    let claimant = Keypair::new();
+    let payer = Keypair::new();
+    let claimant_ata = Keypair::new();
+    let payer_ata = Keypair::new();
+    airdrop(&mut ctx, &claimant.pubkey(), 1_000_000_000).await;
+    airdrop(&mut ctx, &payer.pubkey(), 5_000_000_000).await;
+    create_token_account(
+        &mut ctx,
+        &claimant_ata,
+        &setup.mint_kp.pubkey(),
+        &claimant.pubkey(),
+    )
+    .await;
+    create_token_account(
+        &mut ctx,
+        &payer_ata,
+        &setup.mint_kp.pubkey(),
+        &payer.pubkey(),
+    )
+    .await;
+
+    let (counter_pda, new_vault_pda) = derive_relock_pdas(&claimant.pubkey(), 0);
+    let new_vault_ata = Keypair::new();
+    create_token_account(
+        &mut ctx,
+        &new_vault_ata,
+        &setup.mint_kp.pubkey(),
+        &new_vault_pda,
+    )
+    .await;
+
+    let msg = build_escrow_canonical(
+        "vault",
+        &asset_id,
+        amount,
+        &claimant.pubkey(),
+        &escrow_state.nonce,
+        &eth_addr,
+    );
+    let (signature, _) = sign_ethereum(&msg, &secret_key);
+    let relock = RelockAccounts {
+        payer_token_account: payer_ata.pubkey(),
+        ario_core_config: setup.config_pda,
+        recipient_vault_counter: counter_pda,
+        vault: new_vault_pda,
+        vault_token_account: new_vault_ata.pubkey(),
+    };
+    let claim_ix = build_claim_vault_ethereum_ix(
+        escrow_pda,
+        escrow_ata.pubkey(),
+        claimant_ata.pubkey(),
+        claimant.pubkey(),
+        setup.depositor.pubkey(),
+        payer.pubkey(),
+        escrow_state.nonce,
+        signature,
+        Some(&relock),
+    );
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            claim_ix,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("dusted re-lock claim must still succeed (surplus sweep)");
+
+    // Exactly `amount` re-locked; dust surplus delivered liquid to claimant;
+    // payer still nets zero; escrow token account closed.
+    assert_relocked_vault(
+        &mut ctx,
+        new_vault_pda,
+        &claimant.pubkey(),
+        amount,
+        escrow_state.vault_end_timestamp,
+        0,
+    )
+    .await;
+    assert_eq!(
+        get_token_balance(&mut ctx, &new_vault_ata.pubkey()).await,
+        amount
+    );
+    assert_eq!(
+        get_token_balance(&mut ctx, &claimant_ata.pubkey()).await,
+        dust,
+        "dust surplus must be swept liquid to the claimant"
+    );
+    assert_eq!(get_token_balance(&mut ctx, &payer_ata.pubkey()).await, 0);
+    assert!(
+        ctx.banks_client
+            .get_account(escrow_ata.pubkey())
+            .await
+            .unwrap()
+            .is_none(),
+        "escrow token account must be closed"
+    );
 }

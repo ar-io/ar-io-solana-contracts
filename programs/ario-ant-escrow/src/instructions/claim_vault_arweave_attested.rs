@@ -7,12 +7,14 @@
 //! message. Mirrors `claim_vault_ethereum` aside from swapping the secp256k1
 //! verification for Ed25519 introspection.
 //!
-//! Settlement branches on the remaining lock (ADR-0027; see
+//! Settlement branches on the remaining lock (ADR-027; see
 //! `claim_vault_common`): still-locked vaults re-lock into a native
 //! ario-core vault preserving the original unlock time via direct CPI;
 //! expired (or sub-`min_vault_duration`) vaults deliver liquid tokens to
-//! the claimant. The trailing optional accounts carry the re-lock set and
-//! are omitted entirely on liquid claims.
+//! the claimant. The trailing optional accounts carry the re-lock set:
+//! omitted entirely on EXPIRED claims, required whenever the escrow is
+//! still locked — even when the sub-minimum fallback delivers liquid,
+//! the handler must read `ario_core_config.min_vault_duration` to decide.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount};
@@ -157,10 +159,11 @@ pub struct ClaimVaultArweaveAttested<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 
-    // --- Optional re-lock account set (ADR-0027) ---
-    // Trailing optionals: omitted entirely on expired/liquid claims, so the
-    // pre-ADR-0027 claim ABI keeps working. Pass ALL six when the escrow is
-    // still locked (`vault_end_timestamp > now`).
+    // --- Optional re-lock account set (ADR-027) ---
+    // Trailing optionals: omitted entirely on EXPIRED claims, so the
+    // pre-ADR-027 claim ABI keeps working. Pass ALL six whenever the escrow
+    // is still locked (`vault_end_timestamp > now`) — including claims that
+    // will settle liquid via the sub-`min_vault_duration` fallback.
     //
     /// Payer's ARIO ATA — atomic pass-through leg of the active re-lock:
     /// receives `amount` from escrow and is drained by the
