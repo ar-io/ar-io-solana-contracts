@@ -28,16 +28,19 @@ CU usage measured per instruction via `solana-program-test` simulation
 | Instruction                                  | Measured (CU) | Budget | Notes |
 |----------------------------------------------|---------------|--------|-------|
 | `deposit_vault`                              |   ~35,000     | 200K   | Account init + vault metadata copy; similar to `deposit_tokens` |
-| `claim_vault_arweave_attested` (expired)     |    50,204     | 200K   | **Arweave production path, expired vault.** Liquid SPL transfer. |
-| `claim_vault_ethereum` (expired)             |    same as `claim_tokens_ethereum` | 200K | Expired vaults use liquid SPL transfer. |
+| `claim_vault_arweave_attested` (expired/liquid) | 50,204     | 200K   | **Arweave production path, liquid delivery.** SPL transfer to claimant. |
+| `claim_vault_ethereum` (expired/liquid)      |    same as `claim_tokens_ethereum` | 200K | Liquid SPL transfer to claimant. |
+| `claim_vault_arweave_attested` (active re-lock) | 97,601    | 400K   | **ADR-027.** Pass-through SPL transfer + `vaulted_transfer` CPI (two account inits + SPL transfer + supply math) + config PDA derivation + C1 dust-sweep balance read. Measured in `cross_program_vault_claim.rs`. |
+| `claim_vault_ethereum` (active re-lock)      |   123,467     | 400K   | Same settle path; secp256k1 recovery on-instruction instead of Ed25519 introspection (hence heavier than Arweave). |
 
-> **ADR-022 (2026-05-28):** active (still-locked) vault claims are now rejected
-> early with `VaultStillLocked` (cheap; no token movement). The former active
-> re-lock path and its `sysvar::instructions` loop were removed, so the prior
-> "(active)" rows (~80K Arweave / ~150K Ethereum) no longer exist.
+> **ADR-027 (2026-07-01):** active (still-locked) vault claims re-lock into a
+> native ario-core vault via direct CPI (the ADR-022-era `VaultStillLocked`
+> rejection is gone; sub-`min_vault_duration` remainders deliver liquid). The
+> "(active)" rows are back, now costed by the CPI rather than the removed
+> `sysvar::instructions` loop.
 
-All claim paths fit comfortably within the 200K default CU budget — no
-`SetComputeUnitLimit(400_000)` needed. The earlier on-chain RSA-PSS
+Liquid claim paths fit comfortably within the 200K default CU budget. Re-lock
+claims should carry `SetComputeUnitLimit(400_000)`. The earlier on-chain RSA-PSS
 variants (`claim_*_arweave`) were removed in commit 4ce73e4 because they
 referenced the feature-gated `sol_big_mod_exp` syscall which prevented
 the BPF loader from accepting the .so on devnet/mainnet. See ADR-017

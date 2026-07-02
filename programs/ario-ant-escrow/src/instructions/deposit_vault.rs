@@ -24,13 +24,12 @@ pub const MIN_VAULT_AMOUNT: u64 = 100_000_000;
 /// duration and revocability flag. Uses `ESCROW_VAULT_SEED` for PDA
 /// derivation instead of `ESCROW_TOKEN_SEED`.
 ///
-/// When the recipient claims:
-/// - If the vault is still active (clock < vault_end_timestamp), the claim
-///   instruction rejects with `VaultStillLocked` (ADR-022 — the former active
-///   re-lock path was removed; see `docs/RESTORE_ACTIVE_VAULT_RELOCK.md` for
-///   how to revive it via direct CPI if ever needed).
-/// - If the vault has expired, the claim instruction does a liquid SPL
-///   transfer to the claimant (same as token claim).
+/// When the recipient claims (ADR-027; see `claim_vault_common`):
+/// - If the remaining lock is >= ario-core's `min_vault_duration`, the claim
+///   re-locks into a native ario-core vault (direct CPI) preserving the
+///   original `vault_end_timestamp`.
+/// - Otherwise (near-expiry or expired), the claim instruction does a liquid
+///   SPL transfer to the claimant (same as token claim).
 pub fn handler(
     ctx: Context<DepositVault>,
     asset_id: [u8; 32],

@@ -1,14 +1,20 @@
 # Rollout: disable the escrow active-vault re-lock path
 
+> **REVERSED by ADR-027 (2026-07-01).** The active re-lock path this rollout
+> disabled has been **restored** via direct CPI into ario-core's existing ABI
+> (no introspection, no ario-core change) — see
+> [`adrs/0027-escrow-restore-active-vault-relock-direct-cpi.md`](adrs/0027-escrow-restore-active-vault-relock-direct-cpi.md)
+> and BD-113. This document remains as the historical record of the disable
+> rollout; the restoration's cross-repo lockstep is ADR-027's consequences
+> (this sequence in reverse). The playbook that guided restoration is archived
+> at [`archive/RESTORE_ACTIVE_VAULT_RELOCK.md`](archive/RESTORE_ACTIVE_VAULT_RELOCK.md)
+> — note the shipped design deviates from it (existing ABI + payer
+> pass-through instead of a new ario-core instruction).
+
 Working tracker for the multi-repo change that disables the active
 (still-locked) vault-claim re-lock path in `ario-ant-escrow`, closing the
 reused / unbound `vaulted_transfer` finding (Codex). Pairs with the ADR
-(see `docs/adrs/0022-...`). Delete or archive once all repos have shipped.
-
-> **Want to bring active re-lock back later?** See
-> [`RESTORE_ACTIVE_VAULT_RELOCK.md`](RESTORE_ACTIVE_VAULT_RELOCK.md) for the
-> step-by-step direct-CPI restoration playbook (ario-core + escrow + SDK +
-> frontend + docs).
+(see `docs/adrs/0022-...`).
 
 ## Why
 

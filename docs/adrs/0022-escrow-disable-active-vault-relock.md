@@ -1,6 +1,6 @@
 # ADR-022: Disable the Escrow Active-Vault Re-lock Path
 
-- Status: accepted
+- Status: superseded by [ADR-027](0027-escrow-restore-active-vault-relock-direct-cpi.md) (2026-07-01) — the active path is restored via direct CPI; this ADR's security analysis of the introspection design remains authoritative
 - Date: 2026-05-28
 - Deciders: protocol engineering
 - Related: ADR-014 (trustless escrow), ADR-017 (off-chain attestor), ADR-021
