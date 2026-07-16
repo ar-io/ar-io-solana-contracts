@@ -1075,6 +1075,19 @@ pub const REWARD_DECAY_START_EPOCH: u64 = 365;
 pub const REWARD_DECAY_LAST_EPOCH: u64 = 547;
 pub const MISSED_OBSERVATION_PENALTY: u64 = 250_000; // 25% (scaled by RATE_SCALE)
 
+/// Floor/ceiling band for each side of the governable epoch reward split
+/// (`admin_set_reward_ratios`). Each of `gateway_reward_ratio` /
+/// `observer_reward_ratio` must land within `[MIN_REWARD_RATIO,
+/// MAX_REWARD_RATIO]` — i.e. neither side below 10% nor above 90% (scaled by
+/// `RATE_SCALE`). This prevents the authority from zeroing out one side's
+/// incentive (e.g. gateway=1_000_000 / observer=0, which would strip all
+/// observer rewards). The `sum == RATE_SCALE` invariant makes the two bounds
+/// symmetric: 90% on one side forces 10% on the other, so both the genesis
+/// 90/10 (900_000 / 100_000) and the intended 80/20 (800_000 / 200_000)
+/// splits fall INSIDE the band.
+pub const MIN_REWARD_RATIO: u64 = 100_000; // 10% (scaled by RATE_SCALE)
+pub const MAX_REWARD_RATIO: u64 = 900_000; // 90% (scaled by RATE_SCALE)
+
 // =========================================
 // GATEWAY SETTINGS FIELD BITMASK
 // =========================================

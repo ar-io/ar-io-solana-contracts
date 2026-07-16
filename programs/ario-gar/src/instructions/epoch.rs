@@ -5,7 +5,8 @@ use crate::error::GarError;
 use crate::state::*;
 use crate::{
     EpochClosedEvent, EpochCreatedEvent, EpochDurationUpdatedEvent, EpochPrescribedEvent,
-    EpochWeightsTalliedEvent, EpochsToggledEvent, RewardRatiosUpdatedEvent, RATE_SCALE,
+    EpochWeightsTalliedEvent, EpochsToggledEvent, RewardRatiosUpdatedEvent, MAX_REWARD_RATIO,
+    MIN_REWARD_RATIO, RATE_SCALE,
 };
 
 /// Enable/disable epoch processing.
@@ -122,6 +123,13 @@ pub fn admin_set_epoch_duration(
 /// A split that does not sum to `RATE_SCALE` is rejected with
 /// `InvalidParameter`.
 ///
+/// **Band:** each ratio must also fall within `[MIN_REWARD_RATIO,
+/// MAX_REWARD_RATIO]` = `[100_000, 900_000]` — neither side below 10% nor
+/// above 90% — so the authority cannot zero out one side's incentive
+/// (e.g. gateway=1_000_000 / observer=0). Both the genesis 90/10 and the
+/// intended 80/20 splits land inside the band. Out-of-band values are
+/// rejected with `InvalidParameter`.
+///
 /// **Timing:** takes effect at the NEXT epoch prescription. The ratios are
 /// read when `create_epoch` → `prescribe_epoch` computes
 /// `per_gateway_reward` / `per_observer_reward`; any epoch already
@@ -142,6 +150,18 @@ pub fn admin_set_reward_ratios(
     require!(gateway_reward_ratio <= RATE_SCALE, GarError::InvalidParameter);
     require!(
         observer_reward_ratio <= RATE_SCALE,
+        GarError::InvalidParameter
+    );
+    // Floor/ceiling band: neither side may fall below MIN_REWARD_RATIO (10%)
+    // nor above MAX_REWARD_RATIO (90%), so the authority cannot zero out one
+    // side's incentive (e.g. gateway=1_000_000 / observer=0). Genesis 90/10
+    // and the intended 80/20 both land inside the band.
+    require!(
+        gateway_reward_ratio >= MIN_REWARD_RATIO && gateway_reward_ratio <= MAX_REWARD_RATIO,
+        GarError::InvalidParameter
+    );
+    require!(
+        observer_reward_ratio >= MIN_REWARD_RATIO && observer_reward_ratio <= MAX_REWARD_RATIO,
         GarError::InvalidParameter
     );
     // The split must account for exactly 100% of the epoch reward pool.

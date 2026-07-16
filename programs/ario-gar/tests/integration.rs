@@ -757,13 +757,19 @@ async fn test_admin_set_withdrawal_period() {
 
 /// Verify `admin_set_reward_ratios` (the governable epoch reward-split lever):
 ///   1. Authority signer succeeds; `EpochSettings.gateway_reward_ratio` /
-///      `observer_reward_ratio` update to 800_000 / 200_000.
+///      `observer_reward_ratio` update to 800_000 / 200_000 (inside the band).
 ///   2. Non-authority signer rejected with `Unauthorized`.
 ///   3. A split that does NOT sum to `RATE_SCALE` rejected with
 ///      `InvalidParameter`.
 ///   4. A single ratio above `RATE_SCALE` rejected with `InvalidParameter`
-///      (the per-ratio sanity bound). The stored fields are untouched by the
+///      (the per-ratio sanity bound).
+///   5. Band floor/ceiling: `gateway=1_000_000 / observer=0` and
+///      `gateway=0 / observer=1_000_000` are REJECTED (`InvalidParameter`)
+///      even though they sum to `RATE_SCALE` — one side is out of the
+///      `[100_000, 900_000]` band. The stored fields are untouched by all the
 ///      rejected updates.
+///   6. Band edge: `gateway=900_000 / observer=100_000` (both at a band
+///      boundary) is ACCEPTED and updates the stored split.
 #[tokio::test]
 async fn test_admin_set_reward_ratios() {
     let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
@@ -882,6 +888,34 @@ async fn test_admin_set_reward_ratios() {
         GarError::InvalidParameter
     );
 
+    // Step 5a: gateway=1_000_000 / observer=0 rejected by the band floor even
+    // though it sums to RATE_SCALE and each ratio is <= RATE_SCALE (observer
+    // below MIN_REWARD_RATIO, gateway above MAX_REWARD_RATIO).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let zero_observer_tx = Transaction::new_signed_with_payer(
+        &[set_ix(1_000_000, 0, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(zero_observer_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 5b: gateway=0 / observer=1_000_000 rejected by the band (mirror).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let zero_gateway_tx = Transaction::new_signed_with_payer(
+        &[set_ix(0, 1_000_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(zero_gateway_tx).await,
+        GarError::InvalidParameter
+    );
+
     // The rejected updates left the stored split at Step 1's 800_000 / 200_000.
     let account = ctx
         .banks_client
@@ -892,6 +926,27 @@ async fn test_admin_set_reward_ratios() {
     let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
     assert_eq!(es.gateway_reward_ratio, 800_000);
     assert_eq!(es.observer_reward_ratio, 200_000);
+
+    // Step 6: gateway=900_000 / observer=100_000 sits exactly on the band
+    // boundary (MAX / MIN) — ACCEPTED, and updates the stored split.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let edge_tx = Transaction::new_signed_with_payer(
+        &[set_ix(900_000, 100_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(edge_tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, 900_000);
+    assert_eq!(es.observer_reward_ratio, 100_000);
 }
 
 /// Verify `transfer_authority` (ADR-026):
