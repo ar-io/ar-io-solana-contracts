@@ -5147,7 +5147,8 @@ async fn test_epoch_full_lifecycle() {
             accounts: ario_gar::accounts::CloseObservation {
                 epoch: epoch_key,
                 observation: observation_key,
-                payer: payer_pk,
+                observer: payer_pk,
+                caller: payer_pk,
             }
             .to_account_metas(None),
             data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
@@ -10654,22 +10655,30 @@ async fn test_close_observation() {
     );
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Verify observation account exists
-    let obs_account = ctx.banks_client.get_account(observation_key).await.unwrap();
-    assert!(
-        obs_account.is_some(),
-        "Observation should exist before closing"
-    );
+    // Verify observation account exists and capture its rent lamports.
+    // In this test the observer is `payer_pk` (gateway operator == observer).
+    let obs_account = ctx
+        .banks_client
+        .get_account(observation_key)
+        .await
+        .unwrap()
+        .expect("Observation should exist before closing");
+    let observation_rent = obs_account.lamports;
+    assert!(observation_rent > 0, "Observation should hold rent lamports");
 
-    // Close observation
+    // --- Negative: a wrong `observer` account (!= observation.observer) is
+    // rejected, so a scavenger cannot redirect the rent to an account of
+    // their choosing.
+    let wrong_observer = Pubkey::new_unique();
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(
+    let bad_tx = Transaction::new_signed_with_payer(
         &[Instruction {
             program_id: ario_gar::ID,
             accounts: ario_gar::accounts::CloseObservation {
                 epoch: epoch_key,
                 observation: observation_key,
-                payer: payer_pk,
+                observer: wrong_observer,
+                caller: payer_pk,
             }
             .to_account_metas(None),
             data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
@@ -10678,13 +10687,125 @@ async fn test_close_observation() {
         &[&ctx.payer],
         blockhash,
     );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::WrongObserverAccount);
+
+    // The observation must survive the rejected close.
+    assert!(
+        ctx.banks_client
+            .get_account(observation_key)
+            .await
+            .unwrap()
+            .is_some(),
+        "Observation must survive a rejected close"
+    );
+
+    // --- Permissionless close signed by a DIFFERENT wallet than the observer.
+    // Fund a separate `caller` that signs + pays the tx fee but is NOT the
+    // observer; the reclaimed rent must flow back to the observer, and the
+    // caller must only be out the tx fee (never the rent it would have
+    // pocketed under the old `close = payer`).
+    let caller = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &caller.pubkey(),
+            100_000_000, // 0.1 SOL for fees
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    // Balances immediately before the close (observer == payer_pk is NOT the
+    // tx fee payer here, so its only delta will be the refunded rent).
+    let observer_before = ctx
+        .banks_client
+        .get_account(payer_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    let caller_before = ctx
+        .banks_client
+        .get_account(caller.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseObservation {
+                epoch: epoch_key,
+                observation: observation_key,
+                observer: payer_pk,
+                caller: caller.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
+        }],
+        Some(&caller.pubkey()),
+        &[&caller],
+        blockhash,
+    );
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Verify observation account is closed
+    // Verify observation account is closed.
     let obs_account = ctx.banks_client.get_account(observation_key).await.unwrap();
     assert!(
         obs_account.is_none(),
         "Observation should be closed after close_observation"
+    );
+
+    // Rent refunded to the OBSERVER, exactly.
+    let observer_after = ctx
+        .banks_client
+        .get_account(payer_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert_eq!(
+        observer_after,
+        observer_before + observation_rent,
+        "Observer should receive exactly the reclaimed observation rent"
+    );
+
+    // Caller only paid the tx fee — it did NOT receive the rent.
+    let caller_after = ctx
+        .banks_client
+        .get_account(caller.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert!(
+        caller_after < caller_before,
+        "Caller should have paid the tx fee"
+    );
+    let caller_spent = caller_before - caller_after;
+    assert!(
+        caller_spent < observation_rent,
+        "Caller pays only the small tx fee, never the ~rent it would have \
+         pocketed under the old close = payer"
+    );
+
+    // epoch.observations_closed incremented.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.observations_closed, 1,
+        "observations_closed should increment on close"
     );
 }
 
@@ -18369,7 +18490,8 @@ async fn test_close_epoch_blocks_unclosed_observations() {
             accounts: ario_gar::accounts::CloseObservation {
                 epoch: epoch_key,
                 observation: observation_key,
-                payer: payer_pk,
+                observer: payer_pk,
+                caller: payer_pk,
             }
             .to_account_metas(None),
             data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
