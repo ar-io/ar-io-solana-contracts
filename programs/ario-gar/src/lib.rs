@@ -315,6 +315,29 @@ pub mod ario_gar {
         instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
     }
 
+    /// Override the epoch reward split — `EpochSettings.gateway_reward_ratio`
+    /// / `observer_reward_ratio` (each scaled by `RATE_SCALE`; genesis default
+    /// 900_000 / 100_000 = 90% / 10%). The two ratios must sum to `RATE_SCALE`
+    /// (100%). Authority-only; NOT migration-gated (survives
+    /// `finalize_migration`), making the split a governable parameter.
+    ///
+    /// Takes effect at the NEXT epoch prescription (`create_epoch` →
+    /// `prescribe_epoch`); already-computed epochs keep their stamped
+    /// per-gateway / per-observer rewards. See
+    /// `instructions::epoch::admin_set_reward_ratios` for the full motivation
+    /// + the sum-must-equal-`RATE_SCALE` invariant.
+    pub fn admin_set_reward_ratios(
+        ctx: Context<UpdateEpochSettings>,
+        gateway_reward_ratio: u64,
+        observer_reward_ratio: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_reward_ratios(
+            ctx,
+            gateway_reward_ratio,
+            observer_reward_ratio,
+        )
+    }
+
     /// Authority-gated one-shot to set `current_epoch_index` to a non-zero
     /// starting value (and re-anchor `genesis_timestamp` so the first
     /// `create_epoch` fires immediately for that index). Use case:
@@ -1428,6 +1451,25 @@ pub struct WithdrawalPeriodUpdatedEvent {
     pub admin: Pubkey,
     pub old_period_seconds: i64,
     pub new_period_seconds: i64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_reward_ratios`. The epoch reward split
+/// (`EpochSettings.gateway_reward_ratio` / `observer_reward_ratio`) governs
+/// how each epoch's `total_eligible_rewards` is divided between gateway
+/// operators and prescribed observers. Indexers tracking reward economics
+/// need this to know the split changed. The new ratios take effect at the
+/// NEXT epoch prescription (`create_epoch` → `prescribe_epoch`), so
+/// already-computed epochs are unaffected. The two ratios always sum to
+/// `RATE_SCALE` (100%); `admin` is the authority signer that authorized the
+/// change.
+#[event]
+pub struct RewardRatiosUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_gateway_ratio: u64,
+    pub old_observer_ratio: u64,
+    pub new_gateway_ratio: u64,
+    pub new_observer_ratio: u64,
     pub timestamp: i64,
 }
 

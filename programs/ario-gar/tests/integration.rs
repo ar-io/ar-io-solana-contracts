@@ -755,6 +755,145 @@ async fn test_admin_set_withdrawal_period() {
     assert_anchor_error!(too_short_result, GarError::InvalidParameter);
 }
 
+/// Verify `admin_set_reward_ratios` (the governable epoch reward-split lever):
+///   1. Authority signer succeeds; `EpochSettings.gateway_reward_ratio` /
+///      `observer_reward_ratio` update to 800_000 / 200_000.
+///   2. Non-authority signer rejected with `Unauthorized`.
+///   3. A split that does NOT sum to `RATE_SCALE` rejected with
+///      `InvalidParameter`.
+///   4. A single ratio above `RATE_SCALE` rejected with `InvalidParameter`
+///      (the per-ratio sanity bound). The stored fields are untouched by the
+///      rejected updates.
+#[tokio::test]
+async fn test_admin_set_reward_ratios() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    // Authority keypair we control so it can sign admin_set_reward_ratios.
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // The reward-split fields live on `EpochSettings`; pre-create it with our
+    // authority. genesis/duration/enabled are irrelevant to this lever.
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    // Fund the authority so it can co-sign.
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    let set_ix =
+        |gateway_reward_ratio: u64, observer_reward_ratio: u64, signer: Pubkey| Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: signer,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetRewardRatios {
+                gateway_reward_ratio,
+                observer_reward_ratio,
+            }
+            .data(),
+        };
+
+    // Step 1: authority sets 800_000 / 200_000 (sum == RATE_SCALE) — succeeds.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[set_ix(800_000, 200_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, 800_000);
+    assert_eq!(es.observer_reward_ratio, 200_000);
+
+    // Step 2: non-authority signer rejected.
+    let bad_signer = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[set_ix(700_000, 300_000, bad_signer.pubkey())],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(bad_tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 3: split that does not sum to RATE_SCALE rejected (sum = 900_000).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_sum_tx = Transaction::new_signed_with_payer(
+        &[set_ix(800_000, 100_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(bad_sum_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 4: a single ratio above RATE_SCALE rejected (per-ratio sanity bound).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let over_tx = Transaction::new_signed_with_payer(
+        &[set_ix(2_000_000, 0, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(over_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // The rejected updates left the stored split at Step 1's 800_000 / 200_000.
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, 800_000);
+    assert_eq!(es.observer_reward_ratio, 200_000);
+}
+
 /// Verify `transfer_authority` (ADR-026):
 ///   1. Null pubkey rejected (`InvalidParameter`).
 ///   2. Non-authority signer rejected (`Unauthorized`).
@@ -17119,6 +17258,242 @@ async fn test_per_gateway_reward_excludes_leaving_from_divisor() {
     assert_ne!(
         epoch.per_gateway_reward, expected_diluted_pre_fix,
         "regression: leaver was counted in divisor, halving rewards"
+    );
+}
+
+/// End-to-end proof that the `admin_set_reward_ratios` lever flows into epoch
+/// prescription: after the authority changes the split to 800_000 / 200_000,
+/// a subsequent `create_epoch` → `tally_weights` → `prescribe_epoch` computes
+/// `per_gateway_reward` / `per_observer_reward` with the NEW ratios, NOT the
+/// 900_000 / 100_000 genesis default. Reuses the 1-Joined / 1-Leaving fixture
+/// so the gateway divisor is a deterministic `joined_count == 1`.
+#[tokio::test]
+async fn test_reward_ratios_applied_in_prescription() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    // Authority keypair we control so it can sign admin_set_reward_ratios.
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 100, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund protocol with a known amount so the reward numbers are predictable.
+    let protocol_balance: u64 = 1_000_000_000_000; // 1M ARIO
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        protocol_balance,
+    )
+    .await;
+
+    let (gateway_key1, gateway_key2, _op2_pk) =
+        setup_two_gateways_with_leaver(&mut ctx, &setup).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // Change the reward split to 800_000 / 200_000 BEFORE prescription.
+    let new_gateway_ratio: u64 = 800_000;
+    let new_observer_ratio: u64 = 200_000;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let set_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetRewardRatios {
+                gateway_reward_ratio: new_gateway_ratio,
+                observer_reward_ratio: new_observer_ratio,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(set_tx).await.unwrap();
+
+    // Warp past epoch start.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    // create_epoch
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally_weights — Leaving slot gets composite_weight=0 internally.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // prescribe_epoch — only the Joined gateway is reward-eligible + selected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gateway_key1,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Read the prescribed epoch + the on-chain split that was live at prescription.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let total = epoch.total_eligible_rewards as u128;
+    assert!(total > 0, "need non-zero eligible rewards to exercise the split");
+
+    let es_account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut es_account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, new_gateway_ratio);
+    assert_eq!(es.observer_reward_ratio, new_observer_ratio);
+
+    // per_gateway_reward = total * NEW gateway ratio / RATE_SCALE / joined_count(=1).
+    let joined_count: u64 = 1;
+    let expected_gateway = total
+        .saturating_mul(new_gateway_ratio as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / joined_count;
+    assert_eq!(
+        epoch.per_gateway_reward, expected_gateway,
+        "per_gateway_reward must use the NEW gateway_reward_ratio (800_000)"
+    );
+    // Prove it is the NEW ratio, not the 900_000 genesis default.
+    let default_gateway = total
+        .saturating_mul(ario_gar::GATEWAY_OPERATOR_REWARD_RATE as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / joined_count;
+    assert_ne!(
+        epoch.per_gateway_reward, default_gateway,
+        "per_gateway_reward still reflects the 90% default — lever did not take effect"
+    );
+
+    // per_observer_reward = total * NEW observer ratio / RATE_SCALE / selected_count.
+    let selected_count = epoch.observer_count as u64;
+    assert!(selected_count > 0, "expected at least one selected observer");
+    let expected_observer = total
+        .saturating_mul(new_observer_ratio as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / selected_count;
+    assert_eq!(
+        epoch.per_observer_reward, expected_observer,
+        "per_observer_reward must use the NEW observer_reward_ratio (200_000)"
+    );
+    let default_observer = total
+        .saturating_mul(ario_gar::OBSERVER_REWARD_RATE as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / selected_count;
+    assert_ne!(
+        epoch.per_observer_reward, default_observer,
+        "per_observer_reward still reflects the 10% default — lever did not take effect"
     );
 }
 
