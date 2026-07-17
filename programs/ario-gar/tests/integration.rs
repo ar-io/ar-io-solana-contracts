@@ -10719,7 +10719,10 @@ async fn test_close_observation() {
         .unwrap()
         .expect("Observation should exist before closing");
     let observation_rent = obs_account.lamports;
-    assert!(observation_rent > 0, "Observation should hold rent lamports");
+    assert!(
+        observation_rent > 0,
+        "Observation should hold rent lamports"
+    );
 
     // --- Negative: a wrong `observer` account (!= observation.observer) is
     // rejected, so a scavenger cannot redirect the rent to an account of
@@ -17616,7 +17619,10 @@ async fn test_reward_ratios_applied_in_prescription() {
         .unwrap();
     let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
     let total = epoch.total_eligible_rewards as u128;
-    assert!(total > 0, "need non-zero eligible rewards to exercise the split");
+    assert!(
+        total > 0,
+        "need non-zero eligible rewards to exercise the split"
+    );
 
     let es_account = ctx
         .banks_client
@@ -17652,7 +17658,10 @@ async fn test_reward_ratios_applied_in_prescription() {
 
     // per_observer_reward = total * NEW observer ratio / RATE_SCALE / selected_count.
     let selected_count = epoch.observer_count as u64;
-    assert!(selected_count > 0, "expected at least one selected observer");
+    assert!(
+        selected_count > 0,
+        "expected at least one selected observer"
+    );
     let expected_observer = total
         .saturating_mul(new_observer_ratio as u128)
         .checked_div(ario_gar::RATE_SCALE as u128)
@@ -18831,7 +18840,10 @@ async fn test_close_observation_program_owned_observer() {
         .unwrap()
         .expect("real observation should exist after distribute");
     let observation_rent = real_obs.lamports;
-    assert!(observation_rent > 0, "observation should hold rent lamports");
+    assert!(
+        observation_rent > 0,
+        "observation should hold rent lamports"
+    );
 
     // A program-owned rent recipient: owned by ario_gar (NOT the System
     // Program) — the exact account shape a `SystemAccount` bound would reject.

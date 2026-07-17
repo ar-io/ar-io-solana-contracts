@@ -147,7 +147,10 @@ pub fn admin_set_reward_ratios(
 ) -> Result<()> {
     // Sanity-bound each ratio individually first — a single value above
     // RATE_SCALE is nonsensical regardless of the sum.
-    require!(gateway_reward_ratio <= RATE_SCALE, GarError::InvalidParameter);
+    require!(
+        gateway_reward_ratio <= RATE_SCALE,
+        GarError::InvalidParameter
+    );
     require!(
         observer_reward_ratio <= RATE_SCALE,
         GarError::InvalidParameter
