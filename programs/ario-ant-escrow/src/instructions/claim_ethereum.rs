@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 use crate::{
     canonical::build_ant_escrow_claim_message,
     error::EscrowError,
-    mpl_core_cpi::transfer_asset_signed_by_pda,
+    mpl_core_cpi::{set_update_authority_signed_by_pda, transfer_asset_signed_by_pda},
     state::{
         assert_mpl_core_asset_v1, EscrowAnt, ASSET_TYPE_ANT, ESCROW_ANT_SEED, ETHEREUM_PUBKEY_LEN,
         MPL_CORE_PROGRAM_ID, PROTOCOL_ETHEREUM,
@@ -69,9 +69,17 @@ pub fn handler(
         signer_seeds,
     )?;
 
-    // UpdateAuthority is NOT rotated (ADR-028): UA lives permanently at the
-    // ario-ant `ant_authority` PDA, so the claimant receives Owner only. See
-    // claim_arweave_attested.rs for the full rationale.
+    // Audit L23: rotate UpdateAuthority to claimant atomically. See
+    // claim_arweave.rs for full rationale.
+    set_update_authority_signed_by_pda(
+        &ctx.accounts.ant_asset,
+        &ctx.accounts.payer.to_account_info(),
+        &ctx.accounts.escrow.to_account_info(),
+        &ctx.accounts.claimant.key(),
+        &ctx.accounts.system_program.to_account_info(),
+        &ctx.accounts.mpl_core_program,
+        signer_seeds,
+    )?;
 
     // Note: ario_ant::reconcile CPI intentionally omitted — see
     // claim_arweave.rs comment. Lazy reconciliation by ario-ant is safe.

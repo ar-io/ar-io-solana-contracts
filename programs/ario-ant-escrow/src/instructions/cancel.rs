@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 use crate::{
     error::EscrowError,
     events::ASSET_TYPE_ANT,
-    mpl_core_cpi::transfer_asset_signed_by_pda,
+    mpl_core_cpi::{set_update_authority_signed_by_pda, transfer_asset_signed_by_pda},
     state::{assert_mpl_core_asset_v1, EscrowAnt, ESCROW_ANT_SEED, MPL_CORE_PROGRAM_ID},
     EscrowCancelledEvent,
 };
@@ -42,9 +42,19 @@ pub fn handler(ctx: Context<CancelDeposit>) -> Result<()> {
         signer_seeds,
     )?;
 
-    // UpdateAuthority is NOT touched (ADR-028): deposit no longer moves UA, so
-    // there is nothing to move back. UA stays permanently at the ario-ant
-    // `ant_authority` PDA across the whole deposit → cancel lifecycle.
+    // Audit L23 mirror: deposit moves UA to the escrow PDA, so cancel
+    // must move UA back to the depositor — otherwise UA stays at the now-
+    // closed escrow PDA forever and the depositor loses the ability to
+    // update their own asset's metadata URI.
+    set_update_authority_signed_by_pda(
+        &ctx.accounts.ant_asset,
+        &ctx.accounts.depositor.to_account_info(),
+        &ctx.accounts.escrow.to_account_info(),
+        &ctx.accounts.depositor.key(),
+        &ctx.accounts.system_program.to_account_info(),
+        &ctx.accounts.mpl_core_program,
+        signer_seeds,
+    )?;
 
     // Note: ario_ant::reconcile CPI intentionally omitted — see
     // claim_arweave.rs comment. Lazy reconciliation by ario-ant is safe.

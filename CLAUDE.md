@@ -134,12 +134,14 @@ via the PDA and is **permissionless** for program-controlled ANTs (guarded
 by the ArnsRecord owner/seeds/`record.ant == asset` checks);
 `clear_attributes` stays owner-gated but PDA-signed. Legacy ANTs (UA ≠
 PDA, plugin authority `Owner`) keep the owner-signed fallback and can opt
-in via the owner-signed `adopt_authority`. **Escrow moves Owner only** —
-it no longer rotates UpdateAuthority (that resolved audit-L23 structurally).
-`TransferV1` / `BurnV1` are Owner-gated, so custody, marketplace transfers,
-and escrow are unaffected by where UA lives. Schema versioning uses a
-trailing `SchemaVersion` field and grow-then-deserialize migrations
-(`migrate_ant`, ADR-020). See ADR-028 / ADR-012 / BD-096 / BD-114.
+in via the owner-signed `adopt_authority`. `TransferV1` / `BurnV1` are
+Owner-gated, so custody and marketplace transfers are unaffected by where
+UA lives. **`ario-ant-escrow` is NOT changed by ADR-028** and still rotates
+UpdateAuthority via the depositor's signature — so program-controlled ANTs
+can't be deposited into the current escrow (legacy ANTs still can); escrow
+compatibility is deferred. Schema versioning uses a trailing `SchemaVersion`
+field and grow-then-deserialize migrations (`migrate_ant`, ADR-020). See
+ADR-028 / ADR-012 / BD-096 / BD-114.
 
 ### Zero-copy registries
 

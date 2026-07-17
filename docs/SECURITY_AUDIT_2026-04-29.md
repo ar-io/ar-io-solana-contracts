@@ -246,22 +246,6 @@ ADR-013 (`docs/DECISIONS.md:500-547`) states that AR.IO ANTs are minted with `Ow
 
 **Recommendation**: Add `UpdateV1(newUpdateAuthority = claimant)` to both `claim_arweave` and `claim_ethereum` CPIs. Mirror `migration/import/src/claim-transfers.ts::transferNft`. Cancel-deposit unaffected (depositor reclaims UA they already had).
 
-> **RESOLVED (2026-07-16, ADR-028) — superseded approach.** The escrow no
-> longer custodies or rotates UpdateAuthority at all. New ANTs mint with UA held
-> permanently by the ario-ant `ant_authority` PDA (owner stays the holder), so a
-> depositor **never** holds UA at any point and cannot rewrite metadata
-> post-claim. The interim PR-5 UA-rotation CPIs (deposit/claim/cancel) and the
-> escrow `UpdateV1` helpers were removed; escrow now moves Owner only.
->
-> **The resolution depends on an enforced admission rule:** `deposit_ant`
-> rejects any ANT whose UpdateAuthority is not the per-asset `ant_authority` PDA
-> (`EscrowError::AntNotProgramControlled`, derived under the pinned
-> `ARIO_ANT_PROGRAM_ID`). Without it, a legacy/foreign-UA ANT could be escrowed
-> and the depositor would retain UA after claim — reintroducing L23. Legacy ANTs
-> must `ario_ant::adopt_authority` before deposit. This resolves L23 structurally
-> rather than via the atomic-rotation recommendation above. See
-> `docs/adrs/0028-ant-program-update-authority.md` and BD-114.
-
 ---
 
 ## 6. Informational Findings (summary table)

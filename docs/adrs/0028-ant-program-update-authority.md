@@ -8,7 +8,8 @@
 > Attributes-plugin authority) set to a per-asset `ant_authority` PDA owned by
 > the ario-ant program, so attribute syncs and other MPL Core updates route
 > through the program (signed by the PDA) instead of the holder's wallet. The
-> user keeps `Owner` (custody). Escrow stops rotating UpdateAuthority.
+> user keeps `Owner` (custody). **Escrow (`ario-ant-escrow`) is out of scope for
+> this ADR** — see "Escrow compatibility (deferred)" below.
 
 ## Context and problem statement
 
@@ -31,8 +32,12 @@ updates on ANTs, so trait syncs (and future metadata control) are signed by the
 program, and permissionless reconciliation becomes possible.
 
 The `Owner == UpdateAuthority` coupling was an unchecked convention (ADR-013),
-relied on by `ario-ant-escrow`'s deposit/claim/cancel flows, which rotated
-UpdateAuthority alongside Owner (audit L23) but never asserted the equality.
+relied on by `ario-ant-escrow`'s deposit/claim/cancel flows, which rotate
+UpdateAuthority alongside Owner (audit L23). Decoupling them means a
+program-controlled ANT is **not** compatible with the current escrow deposit
+path (which rotates UA via the depositor's signature, assuming the depositor
+*is* the UA) — this ADR deliberately leaves escrow untouched and defers that
+compatibility work (see "Escrow compatibility (deferred)").
 
 ## Decision drivers
 
@@ -40,8 +45,8 @@ UpdateAuthority alongside Owner (audit L23) but never asserted the equality.
   ideally permissionlessly (a cranker, not only the holder).
 * The user must retain **custody** — the program must never own the NFT, so
   holders can still transfer/sell on marketplaces.
-* Minimize blast radius on the audited escrow flow, but accept reworking it
-  where the model demands.
+* **Do not touch the audited escrow flow** in this change — keep the blast
+  radius on `ario-ant` only; handle escrow compatibility as separate, later work.
 * Existing (already-minted) ANTs must keep working, with an opt-in path onto the
   new model.
 
@@ -54,7 +59,8 @@ UpdateAuthority alongside Owner (audit L23) but never asserted the equality.
 2. **Program PDA holds the asset UpdateAuthority** (chosen) — the PDA is the
    asset UpdateAuthority *and* (via `Authority::UpdateAuthority`) the
    Attributes-plugin authority. The program controls all UpdateAuthority-gated
-   MPL Core operations. Requires reworking escrow.
+   MPL Core operations. Trade-off: program-controlled ANTs become incompatible
+   with the current escrow deposit until escrow is updated separately (deferred).
 3. **Do nothing** — keep owner-signed syncs.
 
 ## Decision
@@ -67,14 +73,13 @@ UpdateAuthority alongside Owner (audit L23) but never asserted the equality.
 > `sync_attributes` becomes **permissionless** (its existing `ArnsRecord`
 > validation — owner + PDA seeds + `record.ant == asset` — is what keeps it
 > safe). `clear_attributes` stays owner-gated (it removes live traits). Existing
-> ANTs opt in via a new owner-signed `adopt_authority` instruction. Escrow is
-> reworked to move **Owner only**; UpdateAuthority stays at the `ant_authority`
-> PDA for the whole deposit → claim/cancel lifecycle.
+> ANTs opt in via a new owner-signed `adopt_authority` instruction. **Escrow is
+> unchanged** by this ADR — escrow compatibility with program-controlled ANTs is
+> deferred (see below).
 
 `Owner` custody stays with the user, satisfying the custody driver: MPL Core
 `TransferV1` and `BurnV1` are **Owner-gated** and never consult UpdateAuthority,
-so holders keep full transfer/sell rights and escrow (which signs as Owner)
-keeps working with UA parked at the PDA. UpdateAuthority in MPL Core cannot
+so holders keep full transfer/sell rights. UpdateAuthority in MPL Core cannot
 transfer ownership — it can update metadata (name/uri), add/remove plugins, and
 sign plugins whose authority is `UpdateAuthority` — so parking it at the program
 PDA gives the program metadata/plugin control without any custody risk.
@@ -99,8 +104,23 @@ integration tests), both load-bearing for correctness:**
    the plugin to its `UpdateAuthority` default, which is exactly the state new
    ANTs mint into.
 
-This supersedes the escrow UpdateAuthority-rotation portion of ADR-013 / audit
-L23 (see below).
+## Escrow compatibility (deferred)
+
+This ADR changes **`ario-ant` only**; `ario-ant-escrow` is untouched and still
+rotates UpdateAuthority with the depositor's signature at deposit (assuming
+`Owner == UpdateAuthority`, per ADR-013 / audit L23). Consequences:
+
+* **Legacy ANTs** (UA = owner wallet) deposit into escrow exactly as before.
+* **Program-controlled ANTs** (UA = `ant_authority` PDA) **cannot** be deposited
+  into the current escrow: `deposit_ant`'s wallet-signed `UpdateV1` requires the
+  depositor to be the UA, which it no longer is, so the CPI reverts. Escrow's
+  existing UA-rotation resolution of audit L23 is unaffected for the ANTs it
+  actually handles.
+
+Making escrow accept program-controlled ANTs (e.g. an admission check that the
+UA is the `ant_authority` PDA + dropping the now-redundant UA rotation) is a
+**separate, later change**, coordinated with the migration importer
+(`solana-ar-io`) that mints + deposits ANTs.
 
 ## Consequences
 
@@ -108,17 +128,15 @@ L23 (see below).
 
 * ArNS attribute syncs run through the program and are permissionless for
   program-controlled ANTs — a name bought by a non-owner reconciles immediately.
-* Escrow is simpler: three UpdateAuthority-rotation CPIs (deposit/claim/cancel)
-  and the entire escrow `UpdateV1` helper block are deleted.
-* Audit L23 (a depositor retaining UA to rewrite metadata on a claimed ANT) is
-  resolved **structurally** — no wallet ever holds UA; it lives at the program
-  PDA permanently.
+* The Attributes-plugin surface is program-locked: only `ario-ant` can write it,
+  and `sync_attributes` whole-list-replaces with exactly the canonical ArNS
+  traits (+ the preserved `ANT Program` routing trait).
 
 ### Negative / risks
 
-* The `Owner == UpdateAuthority` invariant (ADR-013) is intentionally broken.
-  Any future code must not assume it. The escrow deposit owner check remains
-  (Owner-gated), so nothing silently depends on the old coupling.
+* The `Owner == UpdateAuthority` invariant (ADR-013) is intentionally broken for
+  program-controlled ANTs. Any future code must not assume it — most notably the
+  escrow deposit path, which is why escrow compatibility is deferred (above).
 * The asset's on-chain `name`/`uri` (`UpdateV1`) become mutable only by the
   program, and there is currently **no** ario-ant instruction that signs
   `UpdateV1` for name/uri. ANT display metadata lives in the `AntConfig` PDA
@@ -142,10 +160,8 @@ L23 (see below).
   signing + `RevokePluginAuthorityV1` (`0A 06`) and `UpdateV1` set-UA
   encoders + `read_mpl_core_update_authority` in ario-ant `mpl_core_cpi.rs` /
   `lib.rs`; new `adopt_authority` instruction + `AuthorityAdoptedEvent`.
-* Escrow: removed the UpdateAuthority rotations from `deposit.rs`,
-  `claim_arweave_attested.rs`, `claim_ethereum.rs`, `cancel.rs` and the dead
-  `UpdateV1` block from `mpl_core_cpi.rs`. `admin_purge_unclaimed_ant`
-  (`BurnV1`) is unchanged (Owner-gated).
+* Escrow (`ario-ant-escrow`): **not modified** by this ADR — see "Escrow
+  compatibility (deferred)".
 * MPL Core wire facts (from `clients/ts/idls/mpl_core.json`): plugin `Authority`
   enum `None=0, Owner=1, UpdateAuthority=2, Address=3` — distinct from the
   *asset* UpdateAuthority enum used by `UpdateV1` (`None=0, Address=1,
