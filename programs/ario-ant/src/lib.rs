@@ -1617,7 +1617,7 @@ fn adopt_authority_handler(ctx: Context<AdoptAuthority>) -> Result<()> {
 
     // The owner signer must be the asset's current MPL Core owner. On legacy
     // ANTs Owner == UpdateAuthority, so this same signature also authorizes both
-    // the ApprovePluginAuthorityV1 (current plugin authority = Owner) and the
+    // the RevokePluginAuthorityV1 (current plugin authority = Owner) and the
     // UpdateV1 UA rotation (current UA = Owner).
     {
         let asset_data = ctx.accounts.asset.try_borrow_data()?;
@@ -2771,7 +2771,7 @@ pub struct AdoptAuthority<'info> {
 
     /// Must equal the asset's current MPL Core owner. On legacy ANTs Owner ==
     /// UpdateAuthority == plugin authority, so this one signature authorizes both
-    /// the ApprovePluginAuthorityV1 and the UpdateV1 UA rotation.
+    /// the RevokePluginAuthorityV1 and the UpdateV1 UA rotation.
     pub owner: Signer<'info>,
 
     /// CHECK: per-asset program-signer PDA (ADR-028) — the target of the UA

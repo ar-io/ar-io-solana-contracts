@@ -5,10 +5,11 @@ use crate::{
     events::{encode_recipient_pubkey_for_event, ASSET_TYPE_ANT},
     mpl_core_cpi::transfer_asset_signed_by_wallet,
     state::{
-        derive_initial_nonce, read_mpl_core_owner, validated_protocol_and_len, EscrowAnt,
-        ESCROW_ANT_SEED, ESCROW_ANT_VERSION, MPL_CORE_PROGRAM_ID, RECIPIENT_PUBKEY_MAX_LEN,
+        derive_initial_nonce, read_mpl_core_owner, read_mpl_core_update_authority,
+        validated_protocol_and_len, EscrowAnt, ESCROW_ANT_SEED, ESCROW_ANT_VERSION,
+        MPL_CORE_PROGRAM_ID, RECIPIENT_PUBKEY_MAX_LEN,
     },
-    EscrowDepositedEvent,
+    EscrowDepositedEvent, ANT_AUTHORITY_SEED, ARIO_ANT_PROGRAM_ID,
 };
 
 /// Lock an ANT into escrow targeted at a specific Arweave or Ethereum
@@ -48,11 +49,28 @@ pub fn handler(
     //    guaranteed to revert.
     let asset_data = ctx.accounts.ant_asset.try_borrow_data()?;
     let nft_owner = read_mpl_core_owner(&asset_data)?;
+    let current_ua = read_mpl_core_update_authority(&asset_data)?;
     drop(asset_data);
     require_keys_eq!(
         nft_owner,
         ctx.accounts.depositor.key(),
         EscrowError::NotAntOwner
+    );
+
+    // 2b. ADR-028 admission rule: only accept PROGRAM-CONTROLLED ANTs — the
+    //     asset's UpdateAuthority must be the per-asset `ant_authority` PDA
+    //     under ario-ant. Escrow no longer rotates UA, so this is what makes
+    //     the L23 resolution hold: for an accepted asset UA lives at a program
+    //     PDA, never a wallet, so no depositor can rewrite metadata after claim.
+    //     A legacy/foreign-UA ANT is rejected; the owner must
+    //     `ario_ant::adopt_authority` first.
+    let (ant_authority, _) = Pubkey::find_program_address(
+        &[ANT_AUTHORITY_SEED, ctx.accounts.ant_asset.key().as_ref()],
+        &ARIO_ANT_PROGRAM_ID,
+    );
+    require!(
+        current_ua == Some(ant_authority),
+        EscrowError::AntNotProgramControlled
     );
 
     // 3. Capture deposit slot now — used both for the on-chain record and
@@ -72,12 +90,13 @@ pub fn handler(
         &ctx.accounts.mpl_core_program,
     )?;
 
-    // 4b. UpdateAuthority is NOT touched (ADR-028). Program-controlled ANTs keep
-    //     UA permanently at the ario-ant `ant_authority` PDA, so escrow only ever
-    //     moves Owner. This structurally resolves the original audit-L23 concern
-    //     (a depositor retaining UA to rewrite metadata post-claim): the depositor
-    //     never holds UA at any point. TransferV1/BurnV1 are Owner-gated and are
-    //     unaffected by where UA lives.
+    // 4b. UpdateAuthority is NOT touched (ADR-028). The admission check (step 2b)
+    //     already guaranteed UA is the ario-ant `ant_authority` PDA, so escrow
+    //     only ever moves Owner and UA stays at that program PDA for the whole
+    //     lifecycle. This is what structurally resolves the original audit-L23
+    //     concern (a depositor retaining UA to rewrite metadata post-claim): the
+    //     depositor never holds UA at any point. TransferV1/BurnV1 are Owner-gated
+    //     and are unaffected by where UA lives.
 
     // 5. Populate the EscrowAnt record. Pubkey blob is left-aligned and
     //    zero-padded to RECIPIENT_PUBKEY_MAX_LEN; verifiers slice via

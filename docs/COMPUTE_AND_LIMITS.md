@@ -126,7 +126,7 @@ runs ~80K CU on surfpool, well below the budget. See `programs/ario-arns/src/mpl
 | `AntControllers`    | 365         | `["ant_controllers", asset_pubkey]` | Per-ANT controller list; max 10 controllers |
 | `AntRecord`         | 313         | `["ant_record", asset_pubkey, hash(undername.to_lowercase())]` | Per-undername core record (target, ttl, protocol) |
 | `AntRecordMetadata` | 741         | `["ant_record_meta", asset_pubkey, hash(undername.to_lowercase())]` | Optional per-record metadata (display_name, logo, description, keywords); only created when needed |
-| `ant_authority` (PDA, no account) | 0 | `["ant_authority", asset_pubkey]` | ADR-028 program-signer PDA; holds the Metaplex Core UpdateAuthority (and, via `Authority::UpdateAuthority`, the Attributes-plugin authority). Signer-only — no account is ever created at this address |
+| `ant_authority` (PDA, no account) | 0 | `["ant_authority", asset_pubkey]` | ADR-028 program-signer PDA; holds the Metaplex Core UpdateAuthority (and, via `Authority::UpdateAuthority`, the Attributes-plugin authority). Signer-only — no account is ever created at this address, so the canonical bump is **not stored**: Anchor re-derives it per asset (`seeds = [ANT_AUTHORITY_SEED, asset], bump`, ~1.5k CU) and the program signs `invoke_signed` with it |
 
 **Metaplex Core Attributes plugin:** Each ANT's Core asset also carries an Attributes plugin with DAS-queryable traits (ArNS Name, Type, Undername Limit). This adds ~200 bytes to the Metaplex Core asset account (header + 3 key-value pairs). Additional rent: ~0.00125 SOL per ANT. The `AntConfig` PDA remains the source of truth for extended metadata; the Attributes plugin is a marketplace projection. See ADR-012.
 
@@ -396,7 +396,7 @@ Given the ~64 account limit, **practical batch sizes** are:
 | AntConfig | `["ant_config", asset_pubkey]` | ario-ant |
 | AntControllers | `["ant_controllers", asset_pubkey]` | ario-ant |
 | AntRecord | `["ant_record", asset_pubkey, SHA256(undername.to_lowercase())]` | ario-ant |
-| ant_authority (signer-only, ADR-028) | `["ant_authority", asset_pubkey]` | ario-ant |
+| ant_authority (signer-only, ADR-028; bump re-derived per asset, not stored) | `["ant_authority", asset_pubkey]` | ario-ant |
 
 ### Name hashing convention
 

@@ -251,9 +251,16 @@ ADR-013 (`docs/DECISIONS.md:500-547`) states that AR.IO ANTs are minted with `Ow
 > permanently by the ario-ant `ant_authority` PDA (owner stays the holder), so a
 > depositor **never** holds UA at any point and cannot rewrite metadata
 > post-claim. The interim PR-5 UA-rotation CPIs (deposit/claim/cancel) and the
-> escrow `UpdateV1` helpers were removed; escrow now moves Owner only. This
-> resolves L23 structurally rather than via the atomic-rotation recommendation
-> above. See `docs/adrs/0028-ant-program-update-authority.md` and BD-114.
+> escrow `UpdateV1` helpers were removed; escrow now moves Owner only.
+>
+> **The resolution depends on an enforced admission rule:** `deposit_ant`
+> rejects any ANT whose UpdateAuthority is not the per-asset `ant_authority` PDA
+> (`EscrowError::AntNotProgramControlled`, derived under the pinned
+> `ARIO_ANT_PROGRAM_ID`). Without it, a legacy/foreign-UA ANT could be escrowed
+> and the depositor would retain UA after claim — reintroducing L23. Legacy ANTs
+> must `ario_ant::adopt_authority` before deposit. This resolves L23 structurally
+> rather than via the atomic-rotation recommendation above. See
+> `docs/adrs/0028-ant-program-update-authority.md` and BD-114.
 
 ---
 

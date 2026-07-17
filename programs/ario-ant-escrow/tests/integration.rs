@@ -165,10 +165,37 @@ async fn airdrop(ctx: &mut ProgramTestContext, to: &Pubkey, lamports: u64) {
     ctx.banks_client.process_transaction(tx).await.unwrap();
 }
 
-/// Mint a real Metaplex Core asset. Owner = `owner.pubkey()`. Uses raw
-/// CreateV1 wire bytes (kinobi-validated), same encoding as
-/// programs/ario-arns/tests/integration.rs::mint_test_ant.
+/// Mint a real Metaplex Core asset the ADR-028 way: Owner = `owner.pubkey()`,
+/// UpdateAuthority = the per-asset `ant_authority` PDA, plugin authority =
+/// `UpdateAuthority`. This is what `deposit_ant` requires.
 async fn mint_test_ant(ctx: &mut ProgramTestContext, asset_keypair: &Keypair, owner: &Keypair) {
+    let ua = ant_authority_pda(&asset_keypair.pubkey());
+    mint_ant_with_ua(ctx, asset_keypair, owner, ua, /* plugin_ua */ true).await;
+}
+
+/// Mint a LEGACY (pre-ADR-028) ANT: Owner == UpdateAuthority == `owner`, plugin
+/// authority = `Owner`. `deposit_ant` must reject this (UA is not the
+/// `ant_authority` PDA).
+async fn mint_legacy_test_ant(
+    ctx: &mut ProgramTestContext,
+    asset_keypair: &Keypair,
+    owner: &Keypair,
+) {
+    let ua = owner.pubkey();
+    mint_ant_with_ua(ctx, asset_keypair, owner, ua, /* plugin_ua */ false).await;
+}
+
+/// Inner mint helper. `update_authority` is written to the CreateV1
+/// updateAuthority slot; `plugin_ua` selects the Attributes plugin authority
+/// (`UpdateAuthority`=2 when true, `Owner`=1 when false). Uses raw CreateV1
+/// wire bytes (kinobi-validated).
+async fn mint_ant_with_ua(
+    ctx: &mut ProgramTestContext,
+    asset_keypair: &Keypair,
+    owner: &Keypair,
+    update_authority: Pubkey,
+    plugin_ua: bool,
+) {
     let name = b"escrow-test-ant";
     let uri = b"ar://escrow-test";
 
@@ -184,12 +211,7 @@ async fn mint_test_ant(ctx: &mut ProgramTestContext, asset_keypair: &Keypair, ow
     data.push(6); // Plugin::Attributes
     data.extend_from_slice(&0u32.to_le_bytes()); // attribute_list len = 0
     data.push(1); // plugin authority Option = Some
-    data.push(2); // plugin Authority::UpdateAuthority (ADR-028; was Owner=1)
-
-    // ADR-028: new ANTs mint with UpdateAuthority = the per-asset ario-ant
-    // `ant_authority` PDA (owner stays the user). Escrow only ever moves Owner,
-    // so UA parks here for the whole lifecycle.
-    let ant_authority = ant_authority_pda(&asset_keypair.pubkey());
+    data.push(if plugin_ua { 2 } else { 1 }); // Authority::UpdateAuthority(2) or Owner(1)
 
     let placeholder = MPL_CORE_PROGRAM_ID;
     let metas = vec![
@@ -198,10 +220,9 @@ async fn mint_test_ant(ctx: &mut ProgramTestContext, asset_keypair: &Keypair, ow
         AccountMeta::new_readonly(owner.pubkey(), true), // 2 authority (signer)
         AccountMeta::new(ctx.payer.pubkey(), true),     // 3 payer (signer, writable)
         AccountMeta::new_readonly(owner.pubkey(), false), // 4 owner (explicit; None defaults to payer, not authority)
-        // 5 updateAuthority — the ant_authority PDA (ADR-028). Owner != UA now.
-        AccountMeta::new_readonly(ant_authority, false),
+        AccountMeta::new_readonly(update_authority, false), // 5 updateAuthority
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false), // 6 system_program
-        AccountMeta::new_readonly(placeholder, false),                    // 7 logWrapper (None)
+        AccountMeta::new_readonly(placeholder, false),    // 7 logWrapper (None)
     ];
 
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
@@ -515,6 +536,33 @@ async fn test_deposit_invalid_protocol() {
     )
     .await;
     assert_anchor_error!(result, EscrowError::InvalidRecipientProtocol);
+}
+
+#[tokio::test]
+async fn test_deposit_rejects_legacy_ant() {
+    // ADR-028 admission rule: deposit only accepts program-controlled ANTs
+    // (UpdateAuthority == the ant_authority PDA). A legacy ANT whose UA is a
+    // wallet must be rejected, otherwise the depositor would retain UA after
+    // claim and could rewrite the claimant's metadata (audit L23).
+    if skip_if_no_bpf_artifacts() {
+        return;
+    }
+    let mut ctx = program_test().start_with_context().await;
+    let depositor = Keypair::new();
+    airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
+    let asset_kp = Keypair::new();
+    // Legacy mint: owner == UpdateAuthority == depositor (NOT the ant_authority PDA).
+    mint_legacy_test_ant(&mut ctx, &asset_kp, &depositor).await;
+
+    let result = deposit_tx(
+        &mut ctx,
+        asset_kp.pubkey(),
+        &depositor,
+        PROTOCOL_ARWEAVE,
+        arweave_pubkey_fixture(0x11),
+    )
+    .await;
+    assert_anchor_error!(result, EscrowError::AntNotProgramControlled);
 }
 
 #[tokio::test]

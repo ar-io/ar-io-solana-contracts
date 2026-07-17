@@ -424,6 +424,30 @@ pub fn read_mpl_core_owner(data: &[u8]) -> Result<Pubkey> {
     Ok(Pubkey::from(owner_bytes))
 }
 
+/// Read the asset-level UpdateAuthority from a Metaplex Core AssetV1 raw
+/// account buffer. Returns `Some(pubkey)` for the `Address` variant, `None`
+/// for `None`/`Collection`. Byte layout: `[0]` = key (1), `[1..33]` = owner,
+/// `[33]` = UpdateAuthority enum variant (0=None, 1=Address(Pubkey),
+/// 2=Collection(Pubkey)). Mirrors
+/// `ario_ant::read_mpl_core_update_authority`; used by `deposit_ant` to enforce
+/// the ADR-028 admission rule (UA must be the `ant_authority` PDA).
+pub fn read_mpl_core_update_authority(data: &[u8]) -> Result<Option<Pubkey>> {
+    use crate::error::EscrowError;
+    require!(data.len() >= 34, EscrowError::InvalidAsset);
+    require!(data[0] == 1, EscrowError::InvalidAsset);
+
+    match data[33] {
+        1 => {
+            require!(data.len() >= 66, EscrowError::InvalidAsset);
+            let ua_bytes: [u8; 32] = data[34..66]
+                .try_into()
+                .map_err(|_| error!(EscrowError::InvalidAsset))?;
+            Ok(Some(Pubkey::from(ua_bytes)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Audit L22: validate that an account passed as an MPL Core ANT really is
 /// an `AssetV1` (not a `HashedAssetV1`, collection, or other Core variant).
 /// The account's program-owner is already pinned by the Anchor `constraint`

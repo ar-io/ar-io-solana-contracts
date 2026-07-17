@@ -30,6 +30,22 @@ pub const NETWORK: &[u8] = b"solana-devnet";
 // full flow.
 declare_id!("ARioAntEscrowXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
 
+// ADR-028 admission rule: `deposit_ant` only accepts program-controlled ANTs —
+// those whose Metaplex Core UpdateAuthority is the per-asset `ant_authority` PDA
+// under the ario-ant program. Deriving that PDA needs ario-ant's program id, so
+// we pin it here as a `pub const` (single-line, `#[rustfmt::skip]`-tagged),
+// mirroring ario-gar's `ARIO_CORE_PROGRAM_ID`. The placeholder matches
+// ario-ant's `declare_id!()`; `./build-sbf.sh --sync` patches it to the deployed
+// ario-ant program id (see the `EXTRA_HARDCODED` entry in build-sbf.sh).
+// Without the admission check a legacy/foreign-UA ANT could be escrowed and the
+// depositor would retain UA after claim, recreating audit L23.
+#[rustfmt::skip]
+pub const ARIO_ANT_PROGRAM_ID: Pubkey = anchor_lang::solana_program::pubkey!("ARioAntProgXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+
+/// Seed for the ario-ant per-asset `ant_authority` PDA (ADR-028). Must match
+/// `ario_ant::state::ANT_AUTHORITY_SEED`.
+pub const ANT_AUTHORITY_SEED: &[u8] = b"ant_authority";
+
 pub mod canonical;
 pub mod error;
 pub mod events;

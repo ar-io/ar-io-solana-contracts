@@ -481,6 +481,11 @@ fn read_update_authority(blob: &[u8]) -> Option<Pubkey> {
     }
 }
 
+/// Read the asset Owner (bytes 1..33) from a Metaplex Core AssetV1 blob.
+fn read_owner(blob: &[u8]) -> Pubkey {
+    Pubkey::new_from_array(blob[1..33].try_into().unwrap())
+}
+
 /// Build an `adopt_authority` instruction (owner-signed).
 fn build_adopt_ix(asset: &Pubkey, payer: &Pubkey, owner: &Pubkey) -> Instruction {
     let metas = ario_ant::accounts::AdoptAuthority {
@@ -540,6 +545,13 @@ async fn adopt_authority_makes_legacy_ant_program_controlled() {
         Some(ant_authority),
         "adopt must move UA to the ant_authority PDA"
     );
+    // Custody invariant: Owner is unchanged — adoption only rotates UA, never
+    // the NFT owner.
+    assert_eq!(
+        read_owner(&post.data),
+        ctx.payer.pubkey(),
+        "adopt must NOT change the asset Owner"
+    );
 
     // And a permissionless (non-owner) sync now works.
     let name = "adopted";
@@ -566,6 +578,48 @@ async fn adopt_authority_makes_legacy_ant_program_controlled() {
         .unwrap()
         .unwrap();
     assert_attribute_present(&asset_after.data, "ArNS Name", "adopted");
+}
+
+#[tokio::test]
+async fn adopt_authority_rejects_non_owner() {
+    // Only the current owner may adopt. A non-owner attempt is rejected with
+    // NotNftHolder (owner-controlled migration contract).
+    let mut ctx = program_test().start_with_context().await;
+
+    let asset = Keypair::new();
+    mint_legacy_test_ant(&mut ctx, &asset).await; // owner == UA == ctx.payer
+
+    let intruder = Keypair::new();
+    fund(&mut ctx, &intruder.pubkey()).await;
+
+    // Intruder passes itself as `owner` and signs — the handler's
+    // `owner == nft_owner` check rejects it.
+    let ix = build_adopt_ix(&asset.pubkey(), &intruder.pubkey(), &intruder.pubkey());
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&intruder.pubkey()),
+        &[&intruder],
+        blockhash,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+
+    let expected = anchor_lang::error::ERROR_CODE_OFFSET + AntError::NotNftHolder as u32;
+    match result {
+        Err(BanksClientError::TransactionError(
+            solana_sdk::transaction::TransactionError::InstructionError(
+                _,
+                solana_sdk::instruction::InstructionError::Custom(code),
+            ),
+        )) => {
+            assert_eq!(
+                code, expected,
+                "expected NotNftHolder (code {}), got {}",
+                expected, code
+            );
+        }
+        other => panic!("expected NotNftHolder (code {}), got {:?}", expected, other),
+    }
 }
 
 #[tokio::test]

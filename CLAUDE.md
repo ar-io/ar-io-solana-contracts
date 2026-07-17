@@ -137,9 +137,9 @@ PDA, plugin authority `Owner`) keep the owner-signed fallback and can opt
 in via the owner-signed `adopt_authority`. **Escrow moves Owner only** —
 it no longer rotates UpdateAuthority (that resolved audit-L23 structurally).
 `TransferV1` / `BurnV1` are Owner-gated, so custody, marketplace transfers,
-and escrow are unaffected by where UA lives. Schema versioning via
-`migrate_ant` (`version: u8` + `realloc`). See ADR-028 / ADR-012 / BD-096
-/ BD-114.
+and escrow are unaffected by where UA lives. Schema versioning uses a
+trailing `SchemaVersion` field and grow-then-deserialize migrations
+(`migrate_ant`, ADR-020). See ADR-028 / ADR-012 / BD-096 / BD-114.
 
 ### Zero-copy registries
 

@@ -92,8 +92,15 @@ PROGRAMS=(
 # Without this entry the placeholder could ship to a real cluster and
 # only fail at runtime on the first epoch distribution with
 # `InvalidProgramId`. Audit M-5 (2026-05-29).
+#
+# ario-ant-escrow pins `ARIO_ANT_PROGRAM_ID` the same way (ADR-028): it derives
+# the per-asset `ant_authority` PDA under ario-ant to enforce the deposit
+# admission rule (UpdateAuthority must be that PDA). An un-patched placeholder
+# would reject every real program-controlled ANT at deposit, so this must sync
+# to the deployed ario-ant program id.
 EXTRA_HARDCODED=(
   "target/deploy/ario_core-keypair.json:programs/ario-gar/src/lib.rs:ARioCoreProgramXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+  "target/deploy/ario_ant-keypair.json:programs/ario-ant-escrow/src/lib.rs:ARioAntProgXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 )
 # `${arr[@]}` errors under `set -u` for empty arrays on bash 3.x (macOS).
 # All loops use the `${EXTRA_HARDCODED[@]+"${EXTRA_HARDCODED[@]}"}` guard

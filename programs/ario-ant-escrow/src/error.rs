@@ -183,4 +183,13 @@ pub enum EscrowError {
     /// balance arithmetic (see `claim_vault_common::settle_vault_claim`).
     #[msg("Escrow token account state is invalid")]
     InvalidEscrowTokenAccountState,
+
+    /// ADR-028: `deposit_ant` only accepts program-controlled ANTs — the
+    /// asset's Metaplex Core UpdateAuthority must be the per-asset
+    /// `ant_authority` PDA. A legacy/foreign-UA ANT is rejected because the
+    /// depositor would otherwise retain UA after claim and could rewrite the
+    /// claimant's metadata (audit L23). Adopt the ANT (`ario_ant::adopt_authority`)
+    /// before depositing.
+    #[msg("ANT is not program-controlled: UpdateAuthority must be the ant_authority PDA (adopt first)")]
+    AntNotProgramControlled,
 }
