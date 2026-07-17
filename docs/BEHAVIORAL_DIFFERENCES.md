@@ -477,13 +477,13 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | **Solana extensions vs Lua** | `'withdrawal'` mode (vault-only path, no Lua equivalent), `OperatorStake` source via opt-in `fundAsOperator` (Lua never funds from operator stake), and operator-side `Withdrawal` PDAs (`is_delegate: false`) included in the `'any'`/`'stakes'` pool (Lua's `planVaultsDrawdown` only iterates delegate vaults). The third item is what surfaces the open contract-level gap below. |
 | **Closed gap** | The leave-vault split landed (BD-102, 2026-05-04): `leave_network` and `prune_gateway` now produce a protected exit vault (min portion, `is_protected: true`) + an optional excess vault (above-min portion, `is_protected: false`). The protected vault is rejected by `instant_withdrawal` and `deduct_withdrawal_for_payment` so the 90-day lock on the operator min stake is enforced. SDK funding-plan filters `is_protected: true` from the discovered source pool. |
 
-### BD-077: Registry Caps — 3,000 Gateways, 200,000 Names
+### BD-077: Registry Caps — 3,000 Gateways, 50,000 Names (expandable)
 
 | | |
 |---|---|
 | **Lua Behavior** | No hard cap on the number of gateways or names. The Lua tables grow dynamically. |
-| **Solana Behavior** | `GatewayRegistry` has `MAX_GATEWAYS = 3,000` slots (120KB account). `NameRegistry` has `MAX_NAMES = 200,000` slots (8MB account). `join_network` fails with `RegistryFull` if the gateway cap is reached. Name purchase fails if the name registry is full. Both are well under Solana's 10MB account limit. |
-| **Rationale** | Zero-copy accounts must be pre-allocated with a fixed size. 3,000 gateways is the maximum that keeps the Epoch account under Solana's 10KB `MAX_PERMITTED_DATA_INCREASE` limit (Epoch embeds `failure_counts: [u16; 3000]`). 200,000 names provides multi-year runway under aggressive growth assumptions; the next ceiling is ~225K (10MB account limit), at which point sharded registries become required. Both can be increased further via program upgrade + incremental `realloc`. |
+| **Solana Behavior** | `GatewayRegistry` has `MAX_GATEWAYS = 3,000` slots (120KB account). `NameRegistry` deploys at `INITIAL_CAPACITY = 50,000` slots (~2 MB account; `MAX_NAMES` aliases this) and is grown on demand via `admin_expand_name_registry` (ADR-024 / dynamic capacity per ADR-020). `join_network` fails with `RegistryFull` if the gateway cap is reached. Name purchase fails if the name registry is full (until expanded). Both stay under Solana's 10MB account limit. |
+| **Rationale** | The `GatewayRegistry` is fixed-size (zero-copy pre-allocation): 3,000 gateways is the maximum that keeps the Epoch account under Solana's 10KB `MAX_PERMITTED_DATA_INCREASE` limit (Epoch embeds `failure_counts: [u16; 3000]`). The `NameRegistry` is dynamic-capacity (ADR-020): it deploys small (50,000 slots, ~2 MB) and is reallocated upward via `admin_expand_name_registry` as the registry fills — ADR-024 documents a 50K→200K growth path. Its hard ceiling is ~225K (10MB account limit), beyond which sharded registries become required. The gateway registry can be increased via program upgrade + incremental `realloc`. |
 
 ### BD-078: Slashing Implemented via prune_gateway
 
