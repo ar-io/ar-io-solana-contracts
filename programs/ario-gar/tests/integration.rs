@@ -18598,6 +18598,428 @@ async fn test_close_epoch_blocks_unclosed_observations() {
     );
 }
 
+// =====================================================================
+// close_observation — program-owned (non-System) observer
+// =====================================================================
+
+#[tokio::test]
+async fn test_close_observation_program_owned_observer() {
+    // Regression for the CodeRabbit-flagged epoch-close brick: a gateway's
+    // `observer_address` may be a PDA / multisig (Squads) / smart-contract
+    // wallet — i.e. an account OWNED BY A PROGRAM, not the System Program —
+    // that still signs `save_observations` via CPI. When `CloseObservation`
+    // typed the rent recipient as `SystemAccount`, closing such an
+    // observer's Observation PDA failed `AccountOwnedByWrongProgram`; the PDA
+    // could never close, and since `close_epoch` requires every observation
+    // closed, that epoch would be PERMANENTLY unclosable (stranded rent).
+    //
+    // With the rent recipient typed as `UncheckedAccount` (validated only by
+    // `address = observation.observer`), a program-owned observer closes
+    // cleanly, the rent lands on that observer, `observations_closed`
+    // increments, and `close_epoch` can then proceed.
+    //
+    // `save_observations` requires the observer to SIGN, so a program-owned
+    // observer can't submit one directly in a test. We drive the real flow to
+    // a distributed epoch (observer == payer), then relocate that Observation
+    // PDA to one whose recorded `observer` is a program-owned pubkey and close
+    // THAT — exercising exactly the account shape the old `SystemAccount`
+    // rejected.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Baseline clock + slot.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // create_epoch
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // prescribe — pass the Joined gateway as the prescribed observer
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // submit one observation (observer == payer, which signs)
+    let (real_observation_key, _) = observation_pda(0, &payer_pk);
+    let mut gateway_results = [0u8; 375];
+    gateway_results[0] = 0b00000001;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::SaveObservations {
+                epoch: epoch_key,
+                observation: real_observation_key,
+                observer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::SaveObservations {
+                _epoch_index: 0,
+                gateway_results,
+                gateway_count: 1,
+                report_tx_id: [1u8; 32],
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // warp past epoch end + distribute
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200 + 86_400;
+    ctx.set_sysvar(&clock);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut dist_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    dist_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: dist_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // --- Relocate the just-created Observation PDA onto a PROGRAM-OWNED
+    // observer. `save_observations` won't let a program-owned account sign,
+    // so we take the real Observation's bytes and rewrite its `observer`
+    // (and canonical `bump`) to a program-owned pubkey, then re-seat it at
+    // the PDA that pubkey derives. epoch.observations_submitted stays 1.
+    let real_obs = ctx
+        .banks_client
+        .get_account(real_observation_key)
+        .await
+        .unwrap()
+        .expect("real observation should exist after distribute");
+    let observation_rent = real_obs.lamports;
+    assert!(observation_rent > 0, "observation should hold rent lamports");
+
+    // A program-owned rent recipient: owned by ario_gar (NOT the System
+    // Program) — the exact account shape a `SystemAccount` bound would reject.
+    let prog_observer = Pubkey::new_unique();
+    let (relocated_observation_key, relocated_bump) = observation_pda(0, &prog_observer);
+
+    // Rewrite the borsh Observation: observer @ [16..48], bump @ [465].
+    let mut relocated_data = real_obs.data.clone();
+    relocated_data[16..48].copy_from_slice(prog_observer.as_ref());
+    relocated_data[465] = relocated_bump;
+    ctx.set_account(
+        &relocated_observation_key,
+        &solana_sdk::account::Account {
+            lamports: observation_rent,
+            data: relocated_data,
+            owner: real_obs.owner, // ario_gar::ID
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Drop the original (payer-derived) Observation so exactly one observation
+    // exists for the epoch, keeping observations_submitted (1) coherent.
+    ctx.set_account(
+        &real_observation_key,
+        &solana_sdk::account::Account {
+            lamports: 0,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Seed the program-owned observer account (owner = ario_gar, NOT System).
+    let prog_observer_start_lamports = 1_000_000_000u64;
+    ctx.set_account(
+        &prog_observer,
+        &solana_sdk::account::Account {
+            lamports: prog_observer_start_lamports,
+            data: vec![],
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Sanity: the rent recipient really is program-owned (would trip the old
+    // SystemAccount ownership check).
+    let prog_observer_acct = ctx
+        .banks_client
+        .get_account(prog_observer)
+        .await
+        .unwrap()
+        .expect("program-owned observer should exist");
+    assert_ne!(
+        prog_observer_acct.owner,
+        system_program::id(),
+        "observer must be program-owned for this regression"
+    );
+
+    // close_observation with a PROGRAM-OWNED observer must succeed.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseObservation {
+                epoch: epoch_key,
+                observation: relocated_observation_key,
+                observer: prog_observer,
+                caller: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("close_observation must succeed for a program-owned observer");
+
+    // Observation PDA closed.
+    assert!(
+        ctx.banks_client
+            .get_account(relocated_observation_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "Observation should be closed"
+    );
+
+    // Reclaimed rent landed on the program-owned observer.
+    let prog_observer_after = ctx
+        .banks_client
+        .get_account(prog_observer)
+        .await
+        .unwrap()
+        .expect("program-owned observer should still exist")
+        .lamports;
+    assert_eq!(
+        prog_observer_after,
+        prog_observer_start_lamports + observation_rent,
+        "rent must be refunded to the program-owned observer"
+    );
+
+    // observations_closed incremented → equals observations_submitted.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.observations_closed, 1,
+        "observations_closed should increment on close"
+    );
+    assert_eq!(
+        epoch.observations_closed, epoch.observations_submitted,
+        "all observations must be accounted closed"
+    );
+
+    // Bump current_epoch_index past the retention window so close_epoch's
+    // gap check passes (offsets mirror test_close_epoch_blocks_unclosed_observations).
+    let es_account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut es_data = es_account.data.clone();
+    let cei_offset = 8 + 32 + 8 + 1 + 1 + 8 + 2 + 1;
+    es_data[cei_offset..cei_offset + 8].copy_from_slice(&8u64.to_le_bytes());
+    ctx.set_account(
+        &epoch_settings_key,
+        &solana_sdk::account::Account {
+            lamports: es_account.lamports,
+            data: es_data,
+            owner: es_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Force a fresh bank between close_observation and close_epoch (see the M8
+    // test's note on the non-deterministic writeback race).
+    let cur_slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(cur_slot + 1).unwrap();
+
+    // close_epoch must now proceed — the program-owned observer did NOT brick it.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                payer: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("close_epoch must succeed after the program-owned observation is closed");
+
+    assert!(
+        ctx.banks_client
+            .get_account(epoch_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "Epoch PDA closed — no brick"
+    );
+}
+
 // =========================================
 // SECURITY: Registry capacity limit
 // =========================================

@@ -1467,25 +1467,6 @@ pub struct WithdrawalPeriodUpdatedEvent {
     pub timestamp: i64,
 }
 
-/// Emitted by `admin_set_reward_ratios`. The epoch reward split
-/// (`EpochSettings.gateway_reward_ratio` / `observer_reward_ratio`) governs
-/// how each epoch's `total_eligible_rewards` is divided between gateway
-/// operators and prescribed observers. Indexers tracking reward economics
-/// need this to know the split changed. The new ratios take effect at the
-/// NEXT epoch prescription (`create_epoch` → `prescribe_epoch`), so
-/// already-computed epochs are unaffected. The two ratios always sum to
-/// `RATE_SCALE` (100%); `admin` is the authority signer that authorized the
-/// change.
-#[event]
-pub struct RewardRatiosUpdatedEvent {
-    pub admin: Pubkey,
-    pub old_gateway_ratio: u64,
-    pub old_observer_ratio: u64,
-    pub new_gateway_ratio: u64,
-    pub new_observer_ratio: u64,
-    pub timestamp: i64,
-}
-
 /// Emitted by `transfer_authority` (ADR-026) when the admin `authority` is
 /// rotated. `old_authority` is the signer that authorized the rotation.
 #[event]
@@ -1555,6 +1536,28 @@ pub struct GarMigrationFinalizedEvent {
     pub admin: Pubkey,
     pub gateway_count: u32,
     pub slot: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_reward_ratios`. The epoch reward split
+/// (`EpochSettings.gateway_reward_ratio` / `observer_reward_ratio`) governs
+/// how each epoch's `total_eligible_rewards` is divided between gateway
+/// operators and prescribed observers. Indexers tracking reward economics
+/// need this to know the split changed. The new ratios take effect at the
+/// NEXT epoch prescription (`create_epoch` → `prescribe_epoch`), so
+/// already-computed epochs are unaffected. The two ratios always sum to
+/// `RATE_SCALE` (100%); `admin` is the authority signer that authorized the
+/// change.
+///
+/// Declared last (after `GarMigrationFinalizedEvent`) to preserve append-only
+/// event ordering for a stable IDL (ADR-017); do not reorder.
+#[event]
+pub struct RewardRatiosUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_gateway_ratio: u64,
+    pub old_observer_ratio: u64,
+    pub new_gateway_ratio: u64,
+    pub new_observer_ratio: u64,
     pub timestamp: i64,
 }
 

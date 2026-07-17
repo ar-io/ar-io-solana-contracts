@@ -168,12 +168,22 @@ pub struct CloseObservation<'info> {
     )]
     pub observation: Account<'info, Observation>,
 
-    /// Rent recipient, bound to `observation.observer` via the address
-    /// constraint. The `close = observer` constraint above redirects the
-    /// reclaimed rent here, so a third-party `caller` cannot pocket it.
-    /// Does not sign — it only receives lamports.
+    /// CHECK: Rent recipient, bound to `observation.observer` via the
+    /// `address = observation.observer` constraint below — that constraint IS
+    /// the security check (the account must be exactly the recorded observer).
+    /// It is intentionally an `UncheckedAccount`, NOT a `SystemAccount`: a
+    /// gateway's `observer_address` may be a PDA / multisig (Squads) /
+    /// smart-contract wallet (program-owned) that still signs
+    /// `save_observations` via CPI. A `SystemAccount` would enforce
+    /// System-Program ownership and fail `close_observation` with
+    /// `AccountOwnedByWrongProgram` for such observers, leaving the
+    /// Observation PDA permanently unclosable — and since `close_epoch`
+    /// requires every observation closed, that epoch could never close
+    /// (stranded rent/state). The `close = observer` constraint redirects the
+    /// reclaimed rent here, so a third-party `caller` cannot pocket it. Does
+    /// not sign — it only receives lamports.
     #[account(mut, address = observation.observer @ GarError::WrongObserverAccount)]
-    pub observer: SystemAccount<'info>,
+    pub observer: UncheckedAccount<'info>,
 
     /// Permissionless caller — anyone willing to pay the tx fee can close a
     /// distributed epoch's observation. Rent always goes to `observer`
