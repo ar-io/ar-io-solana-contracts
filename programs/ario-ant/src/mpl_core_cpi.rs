@@ -32,7 +32,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
-    program::invoke,
+    program::{invoke, invoke_signed},
 };
 
 use crate::MPL_CORE_PROGRAM_ID;
@@ -60,8 +60,25 @@ pub const TRAIT_KEY_ANT_PROGRAM: &str = "ANT Program";
 /// MPL Core UpdatePluginV1 instruction discriminator (single byte, kinobi-generated).
 const UPDATE_PLUGIN_V1_DISCRIMINATOR: u8 = 6;
 
+/// MPL Core RevokePluginAuthorityV1 instruction discriminator. Resets a
+/// plugin's authority to its DEFAULT manager. The Attributes plugin is
+/// UpdateAuthority-managed, so revoking a legacy ANT's `Owner` delegation
+/// returns the plugin to `UpdateAuthority` — used by `adopt_authority`.
+/// (`ApprovePluginAuthorityV1` cannot be used to switch an already-delegated
+/// plugin between managed authorities — it errors `CannotRedelegate`.)
+const REVOKE_PLUGIN_AUTHORITY_V1_DISCRIMINATOR: u8 = 10;
+
+/// MPL Core UpdateV1 instruction discriminator. Rotates the asset-level
+/// UpdateAuthority (and optionally name/uri); used by `adopt_authority` to hand
+/// UA to the `ant_authority` PDA.
+const UPDATE_V1_DISCRIMINATOR: u8 = 15;
+
 /// MPL Core Plugin enum: Attributes variant index.
 const PLUGIN_VARIANT_ATTRIBUTES: u8 = 6;
+
+/// MPL Core *asset* UpdateAuthority enum, `Address` variant
+/// (None=0, Address=1, Collection=2). Carries a 32-byte pubkey body.
+const ASSET_UPDATE_AUTHORITY_ADDRESS: u8 = 1;
 
 /// One on-chain attribute entry. Owned Strings because the Borsh wire format
 /// prefixes each with a u32 length and we need to compute total size.
@@ -234,13 +251,73 @@ fn try_parse_attributes_at(data: &[u8], mut p: usize, want_key: &[u8]) -> Option
     Some(found)
 }
 
+/// Shared 6-account meta list used by every MPL Core CPI in this module
+/// (UpdatePluginV1, ApprovePluginAuthorityV1, UpdateV1). Optional accounts
+/// (collection, log_wrapper) are signaled to MPL Core by passing the MPL Core
+/// program id with isWritable=false / isSigner=false — the kinobi convention
+/// used by every official Core client.
+fn six_account_metas(
+    asset: Pubkey,
+    payer: Pubkey,
+    authority: Pubkey,
+    system_program: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(asset, false),
+        AccountMeta::new_readonly(MPL_CORE_PROGRAM_ID, false), // collection (None)
+        AccountMeta::new(payer, true),                         // payer (signer, writable)
+        AccountMeta::new_readonly(authority, true),            // authority (signer)
+        AccountMeta::new_readonly(system_program, false),
+        AccountMeta::new_readonly(MPL_CORE_PROGRAM_ID, false), // log_wrapper (None)
+    ]
+}
+
+/// Invoke an MPL Core instruction that follows the canonical 6-account shape,
+/// signing either with a plain wallet (`signer_seeds = None`) or with a program
+/// PDA (`signer_seeds = Some(...)`).
+fn invoke_six_account_ix<'info>(
+    data: Vec<u8>,
+    asset: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    mpl_core_program: &AccountInfo<'info>,
+    signer_seeds: Option<&[&[u8]]>,
+) -> Result<()> {
+    let ix = Instruction {
+        program_id: MPL_CORE_PROGRAM_ID,
+        accounts: six_account_metas(
+            asset.key(),
+            payer.key(),
+            authority.key(),
+            system_program.key(),
+        ),
+        data,
+    };
+    let infos = [
+        asset.clone(),
+        mpl_core_program.clone(), // collection placeholder
+        payer.clone(),
+        authority.clone(),
+        system_program.clone(),
+        mpl_core_program.clone(), // log_wrapper placeholder
+    ];
+    match signer_seeds {
+        Some(seeds) => invoke_signed(&ix, &infos, &[seeds])?,
+        None => invoke(&ix, &infos)?,
+    };
+    Ok(())
+}
+
 /// Invoke MPL Core's UpdatePluginV1 to overwrite the asset's Attributes plugin.
 ///
-/// `authority` must be the asset's current owner (we mint with plugin
-/// authority = `Owner`). Caller of `sync_attributes` is the verified asset
-/// holder (Anchor `authority` signer); pass it for both `payer` and
-/// `authority` and the CPI succeeds. `mpl_core_program` is pinned to
-/// `MPL_CORE_PROGRAM_ID` by an Anchor account constraint upstream.
+/// `authority` must be whoever the Attributes plugin resolves its authority to.
+/// For ADR-028 ANTs that is the `ant_authority` PDA (plugin authority =
+/// `UpdateAuthority` = the PDA); pass the PDA's `AccountInfo` as `authority` and
+/// its seeds as `signer_seeds` so the program signs via `invoke_signed`. For
+/// legacy ANTs (plugin authority = `Owner`), pass the owner's wallet signer and
+/// `signer_seeds = None`. `mpl_core_program` is pinned to `MPL_CORE_PROGRAM_ID`
+/// by an Anchor account constraint upstream.
 pub fn update_attributes_plugin<'info>(
     asset: &AccountInfo<'info>,
     payer: &AccountInfo<'info>,
@@ -248,40 +325,91 @@ pub fn update_attributes_plugin<'info>(
     system_program: &AccountInfo<'info>,
     mpl_core_program: &AccountInfo<'info>,
     attributes: &[AttributeKv],
+    signer_seeds: Option<&[&[u8]]>,
 ) -> Result<()> {
-    // Optional accounts (collection, log_wrapper) are signaled to MPL Core by
-    // passing the MPL Core program id with isWritable=false / isSigner=false —
-    // the kinobi convention used by every official Core client.
-    let collection_placeholder = mpl_core_program.clone();
-    let log_wrapper_placeholder = mpl_core_program.clone();
+    invoke_six_account_ix(
+        encode_update_attributes_ix_data(attributes),
+        asset,
+        payer,
+        authority,
+        system_program,
+        mpl_core_program,
+        signer_seeds,
+    )
+}
 
-    let metas = vec![
-        AccountMeta::new(asset.key(), false),
-        AccountMeta::new_readonly(MPL_CORE_PROGRAM_ID, false), // collection (None)
-        AccountMeta::new(payer.key(), true),                   // payer (signer, writable)
-        AccountMeta::new_readonly(authority.key(), true),      // authority (signer)
-        AccountMeta::new_readonly(system_program.key(), false),
-        AccountMeta::new_readonly(MPL_CORE_PROGRAM_ID, false), // log_wrapper (None)
-    ];
+/// Build the raw RevokePluginAuthorityV1 data that resets the Attributes plugin
+/// authority to its default manager (`UpdateAuthority`). Wire: `0A 06` (disc,
+/// PluginType Attributes = 6). Revoke takes no authority argument.
+fn encode_revoke_attributes_authority_ix_data() -> Vec<u8> {
+    vec![
+        REVOKE_PLUGIN_AUTHORITY_V1_DISCRIMINATOR,
+        PLUGIN_VARIANT_ATTRIBUTES,
+    ]
+}
 
-    let ix = Instruction {
-        program_id: MPL_CORE_PROGRAM_ID,
-        accounts: metas,
-        data: encode_update_attributes_ix_data(attributes),
-    };
+/// Reset the Attributes plugin's authority to its default manager
+/// (`UpdateAuthority`), so it resolves to whoever holds the asset UpdateAuthority.
+/// Signed by the *current* plugin authority — the `Owner` on legacy ANTs.
+/// Data = `0A 06`.
+///
+/// Used only by `adopt_authority` to migrate a legacy ANT (Attributes authority
+/// delegated to `Owner`) onto the program-controlled model. New ANTs mint with
+/// the Attributes authority already at the `UpdateAuthority` default
+/// (`01 02` in the CreateV1 plugin pair), so they never call this.
+pub fn revoke_attributes_authority_to_default<'info>(
+    asset: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    mpl_core_program: &AccountInfo<'info>,
+) -> Result<()> {
+    invoke_six_account_ix(
+        encode_revoke_attributes_authority_ix_data(),
+        asset,
+        payer,
+        authority,
+        system_program,
+        mpl_core_program,
+        None,
+    )
+}
 
-    invoke(
-        &ix,
-        &[
-            asset.clone(),
-            collection_placeholder,
-            payer.clone(),
-            authority.clone(),
-            system_program.clone(),
-            log_wrapper_placeholder,
-        ],
-    )?;
-    Ok(())
+/// Build the raw UpdateV1 data that ONLY rotates `new_update_authority` to
+/// `Some(Address(new_ua))`; name and uri are `None` so existing values persist.
+/// Wire: `0F 00 00 01 01 <32-byte new_ua>` (asset UpdateAuthority enum, Address
+/// variant = 1 — NOT the plugin authority enum).
+fn encode_update_v1_set_ua_ix_data(new_ua: &Pubkey) -> Vec<u8> {
+    let mut data = Vec::with_capacity(1 + 1 + 1 + 1 + 1 + 32);
+    data.push(UPDATE_V1_DISCRIMINATOR);
+    data.push(0u8); // new_name: Option = None
+    data.push(0u8); // new_uri: Option = None
+    data.push(1u8); // new_update_authority: Option = Some
+    data.push(ASSET_UPDATE_AUTHORITY_ADDRESS);
+    data.extend_from_slice(new_ua.as_ref());
+    data
+}
+
+/// Rotate the asset UpdateAuthority to `new_ua`, signed by the current UA — the
+/// `Owner` on legacy ANTs. Used only by `adopt_authority` to hand UA to the
+/// `ant_authority` PDA.
+pub fn set_update_authority<'info>(
+    asset: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    new_ua: &Pubkey,
+    system_program: &AccountInfo<'info>,
+    mpl_core_program: &AccountInfo<'info>,
+) -> Result<()> {
+    invoke_six_account_ix(
+        encode_update_v1_set_ua_ix_data(new_ua),
+        asset,
+        payer,
+        authority,
+        system_program,
+        mpl_core_program,
+        None,
+    )
 }
 
 // =========================================================================
@@ -301,6 +429,25 @@ mod tests {
         // disc(06) + plugin_variant(06) + vec_len(00 00 00 00)
         let data = encode_update_attributes_ix_data(&[]);
         assert_eq!(hex(&data), "060600000000");
+    }
+
+    #[test]
+    fn revoke_attributes_authority_encodes_to_two_bytes() {
+        // RevokePluginAuthorityV1 disc(0A) + PluginType Attributes(06). Resets
+        // the Attributes plugin to its default manager (UpdateAuthority).
+        let data = encode_revoke_attributes_authority_ix_data();
+        assert_eq!(hex(&data), "0a06");
+    }
+
+    #[test]
+    fn update_v1_set_ua_data_layout() {
+        // UpdateV1 disc(0f) + name None(00) + uri None(00)
+        // + new_update_authority Some(01) + Address variant(01) + 32-byte pubkey.
+        let ua = anchor_lang::prelude::Pubkey::new_from_array([7u8; 32]);
+        let data = encode_update_v1_set_ua_ix_data(&ua);
+        assert_eq!(data.len(), 1 + 1 + 1 + 1 + 1 + 32);
+        assert_eq!(hex(&data[..5]), "0f00000101");
+        assert_eq!(&data[5..], ua.as_ref());
     }
 
     #[test]

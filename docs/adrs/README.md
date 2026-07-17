@@ -98,6 +98,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-025 | Delegate Reward Share Is Keyed Off the Tally Snapshot, Not Live Delegated Stake | accepted | [`0025-delegate-share-keyed-off-tally-snapshot.md`](0025-delegate-share-keyed-off-tally-snapshot.md) |
 | ADR-026 | Single-Step `transfer_authority` for the Admin Authority Across All Programs | accepted | [`0026-admin-authority-transfer.md`](0026-admin-authority-transfer.md) |
 | ADR-027 | Restore the Escrow Active-Vault Re-lock via Direct CPI into ario-core's Existing ABI | accepted | [`0027-escrow-restore-active-vault-relock-direct-cpi.md`](0027-escrow-restore-active-vault-relock-direct-cpi.md) |
+| ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
 
 ### Numbering anomalies
 

@@ -184,7 +184,12 @@ async fn mint_test_ant(ctx: &mut ProgramTestContext, asset_keypair: &Keypair, ow
     data.push(6); // Plugin::Attributes
     data.extend_from_slice(&0u32.to_le_bytes()); // attribute_list len = 0
     data.push(1); // plugin authority Option = Some
-    data.push(1); // BasePluginAuthority::Owner
+    data.push(2); // plugin Authority::UpdateAuthority (ADR-028; was Owner=1)
+
+    // ADR-028: new ANTs mint with UpdateAuthority = the per-asset ario-ant
+    // `ant_authority` PDA (owner stays the user). Escrow only ever moves Owner,
+    // so UA parks here for the whole lifecycle.
+    let ant_authority = ant_authority_pda(&asset_keypair.pubkey());
 
     let placeholder = MPL_CORE_PROGRAM_ID;
     let metas = vec![
@@ -193,11 +198,8 @@ async fn mint_test_ant(ctx: &mut ProgramTestContext, asset_keypair: &Keypair, ow
         AccountMeta::new_readonly(owner.pubkey(), true), // 2 authority (signer)
         AccountMeta::new(ctx.payer.pubkey(), true),     // 3 payer (signer, writable)
         AccountMeta::new_readonly(owner.pubkey(), false), // 4 owner (explicit; None defaults to payer, not authority)
-        // 5 updateAuthority — explicit owner. ADR-013 mints AR.IO ANTs with
-        // `Owner == UpdateAuthority`, and PR-5's deposit handler relies on
-        // the depositor being the current UA so it can sign UpdateV1 to
-        // transfer UA into escrow custody alongside Owner.
-        AccountMeta::new_readonly(owner.pubkey(), false),
+        // 5 updateAuthority — the ant_authority PDA (ADR-028). Owner != UA now.
+        AccountMeta::new_readonly(ant_authority, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false), // 6 system_program
         AccountMeta::new_readonly(placeholder, false),                    // 7 logWrapper (None)
     ];
@@ -228,6 +230,17 @@ async fn mint_test_ant(ctx: &mut ProgramTestContext, asset_keypair: &Keypair, ow
 
 fn escrow_pda(ant_mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[ESCROW_ANT_SEED, ant_mint.as_ref()], &ario_ant_escrow::ID)
+}
+
+/// Per-asset ario-ant `ant_authority` PDA (ADR-028) — the address new ANTs park
+/// their Metaplex Core UpdateAuthority at. Escrow never CPIs ario-ant; this is
+/// only for minting realistic ANTs and asserting UA never moves off it.
+fn ant_authority_pda(asset: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[ario_ant::state::ANT_AUTHORITY_SEED, asset.as_ref()],
+        &ario_ant::ID,
+    )
+    .0
 }
 
 // =========================================
@@ -3274,15 +3287,15 @@ async fn test_claim_tokens_nonce_mismatch_fails() {
 }
 
 // =========================================
-// ANT Escrow — UpdateAuthority transfer
+// ANT Escrow — UpdateAuthority stays at the ario-ant program (ADR-028)
 // =========================================
 
 #[tokio::test]
-async fn test_claim_transfers_update_authority_to_claimant() {
-    // Audit L23: post-claim, the ANT's UpdateAuthority must belong to the
-    // claimant. Without the deposit-side UpdateV1 and the matching claim-side
-    // UpdateV1, UA would stay with the depositor — who could then UpdateV1
-    // the metadata URI on an asset they no longer own.
+async fn test_claim_leaves_update_authority_at_ant_program() {
+    // ADR-028: escrow only moves Owner. UpdateAuthority lives permanently at the
+    // per-asset ario-ant `ant_authority` PDA across deposit → claim, so the
+    // claimant receives Owner only and no party ever holds a stale UA. This is
+    // what structurally resolves the original audit-L23 concern.
     if skip_if_no_bpf_artifacts() {
         return;
     }
@@ -3292,13 +3305,14 @@ async fn test_claim_transfers_update_authority_to_claimant() {
     airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
     let asset_kp = Keypair::new();
     mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    let ant_authority = ant_authority_pda(&asset_kp.pubkey());
 
-    // Sanity: pre-deposit, UA belongs to the depositor.
+    // Sanity: at mint, UA is the ant_authority PDA (not the depositor).
     let pre_ua = read_asset_update_authority(&mut ctx, asset_kp.pubkey()).await;
     assert_eq!(
         pre_ua,
-        Some(depositor.pubkey()),
-        "depositor must hold UA before deposit"
+        Some(ant_authority),
+        "new ANTs mint with UA = ant_authority PDA"
     );
 
     // Use Ethereum claim path (simpler signature setup than RSA).
@@ -3316,13 +3330,13 @@ async fn test_claim_transfers_update_authority_to_claimant() {
     .await
     .expect("deposit");
 
-    // After deposit: UA belongs to the escrow PDA (custodied).
+    // After deposit: UA is untouched — still the ant_authority PDA. Escrow only
+    // takes Owner custody now.
     let post_deposit_ua = read_asset_update_authority(&mut ctx, asset_kp.pubkey()).await;
-    let (escrow_addr, _) = escrow_pda(&asset_kp.pubkey());
     assert_eq!(
         post_deposit_ua,
-        Some(escrow_addr),
-        "escrow PDA must hold UA between deposit and claim"
+        Some(ant_authority),
+        "UA must stay at the ant_authority PDA across deposit"
     );
 
     // Claim. After this, UA should be the claimant.
@@ -3359,23 +3373,16 @@ async fn test_claim_transfers_update_authority_to_claimant() {
     );
     assert_eq!(
         post_claim_ua,
-        Some(claimant.pubkey()),
-        "UpdateAuthority must be claimant — depositor must not retain UA \
-         (audit L23: enables post-claim metadata URI rewrite)"
-    );
-    assert_ne!(
-        post_claim_ua,
-        Some(depositor.pubkey()),
-        "regression: depositor still holds UA — would enable post-claim URI rewrite"
+        Some(ant_authority),
+        "UpdateAuthority must stay at the ant_authority PDA — escrow moves Owner only"
     );
 }
 
 #[tokio::test]
-async fn test_cancel_returns_update_authority_to_depositor() {
-    // Mirror of test_claim_transfers_update_authority_to_claimant for the
-    // cancel path: deposit → cancel must restore UA to the depositor.
-    // Otherwise the depositor would lose the ability to update their own
-    // asset's metadata URI after a cancelled deposit.
+async fn test_cancel_leaves_update_authority_at_ant_program() {
+    // Mirror of test_claim_leaves_update_authority_at_ant_program for the cancel
+    // path: escrow never touched UA, so deposit → cancel leaves UA at the
+    // ant_authority PDA throughout.
     if skip_if_no_bpf_artifacts() {
         return;
     }
@@ -3384,6 +3391,7 @@ async fn test_cancel_returns_update_authority_to_depositor() {
     airdrop(&mut ctx, &depositor.pubkey(), 5_000_000_000).await;
     let asset_kp = Keypair::new();
     mint_test_ant(&mut ctx, &asset_kp, &depositor).await;
+    let ant_authority = ant_authority_pda(&asset_kp.pubkey());
 
     deposit_tx(
         &mut ctx,
@@ -3408,8 +3416,8 @@ async fn test_cancel_returns_update_authority_to_depositor() {
     );
     assert_eq!(
         post_cancel_ua,
-        Some(depositor.pubkey()),
-        "UpdateAuthority returns to depositor — must not stay at the closed escrow PDA"
+        Some(ant_authority),
+        "UpdateAuthority stays at the ant_authority PDA — escrow never moved it"
     );
 }
 
@@ -3588,7 +3596,7 @@ async fn test_claim_ant_arweave_attested_happy_path() {
         .expect("claim_ant_arweave_attested should succeed");
 
     // Post-claim assertions: claimant owns the ANT, escrow PDA is closed,
-    // UpdateAuthority transferred.
+    // UpdateAuthority stays at the ant_authority PDA (ADR-028).
     let post_owner = read_asset_owner(&mut ctx, asset_kp.pubkey()).await;
     assert_eq!(
         post_owner,
@@ -3604,8 +3612,8 @@ async fn test_claim_ant_arweave_attested_happy_path() {
     let post_ua = read_asset_update_authority(&mut ctx, asset_kp.pubkey()).await;
     assert_eq!(
         post_ua,
-        Some(claimant.pubkey()),
-        "UpdateAuthority must transfer to claimant after attested claim"
+        Some(ant_authority_pda(&asset_kp.pubkey())),
+        "UpdateAuthority must stay at the ant_authority PDA after attested claim"
     );
 }
 

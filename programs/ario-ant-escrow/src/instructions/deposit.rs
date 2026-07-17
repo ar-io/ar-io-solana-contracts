@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 use crate::{
     error::EscrowError,
     events::{encode_recipient_pubkey_for_event, ASSET_TYPE_ANT},
-    mpl_core_cpi::{set_update_authority_signed_by_wallet, transfer_asset_signed_by_wallet},
+    mpl_core_cpi::transfer_asset_signed_by_wallet,
     state::{
         derive_initial_nonce, read_mpl_core_owner, validated_protocol_and_len, EscrowAnt,
         ESCROW_ANT_SEED, ESCROW_ANT_VERSION, MPL_CORE_PROGRAM_ID, RECIPIENT_PUBKEY_MAX_LEN,
@@ -72,20 +72,12 @@ pub fn handler(
         &ctx.accounts.mpl_core_program,
     )?;
 
-    // 4b. Audit L23: also move UpdateAuthority into escrow custody. AR.IO
-    //     ANTs are minted with `Owner == UpdateAuthority` (ADR-013); the
-    //     depositor is therefore the current UA at this point and can sign
-    //     the UpdateV1 alongside the TransferV1 above. Without this, the
-    //     depositor would retain UA after the recipient claimed the asset
-    //     and could rewrite the metadata URI on the claimed ANT.
-    set_update_authority_signed_by_wallet(
-        &ctx.accounts.ant_asset,
-        &ctx.accounts.depositor.to_account_info(),
-        &ctx.accounts.depositor.to_account_info(),
-        &ctx.accounts.escrow.key(),
-        &ctx.accounts.system_program.to_account_info(),
-        &ctx.accounts.mpl_core_program,
-    )?;
+    // 4b. UpdateAuthority is NOT touched (ADR-028). Program-controlled ANTs keep
+    //     UA permanently at the ario-ant `ant_authority` PDA, so escrow only ever
+    //     moves Owner. This structurally resolves the original audit-L23 concern
+    //     (a depositor retaining UA to rewrite metadata post-claim): the depositor
+    //     never holds UA at any point. TransferV1/BurnV1 are Owner-gated and are
+    //     unaffected by where UA lives.
 
     // 5. Populate the EscrowAnt record. Pubkey blob is left-aligned and
     //    zero-padded to RECIPIENT_PUBKEY_MAX_LEN; verifiers slice via

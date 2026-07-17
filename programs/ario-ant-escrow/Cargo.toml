@@ -104,3 +104,8 @@ ed25519-dalek = "=1.0.1"
 # Same version solana-program itself dev-deps so Cargo de-dupes.
 libsecp256k1 = "0.6.0"
 ario-test-utils = { path = "../../test-utils" }
+# ADR-028: tests derive the per-asset `ant_authority` PDA (the address new ANTs
+# park their UpdateAuthority at) via `ario_ant::ID` + `ANT_AUTHORITY_SEED`.
+# Escrow never CPIs ario-ant on-chain; `cpi` pulls in `no-entrypoint` so the
+# two `#[program]` entrypoints don't collide in the test binary.
+ario-ant = { path = "../ario-ant", features = ["cpi"] }

@@ -37,7 +37,7 @@ use anchor_lang::prelude::*;
 use crate::{
     canonical::build_ant_escrow_claim_message,
     error::EscrowError,
-    mpl_core_cpi::{set_update_authority_signed_by_pda, transfer_asset_signed_by_pda},
+    mpl_core_cpi::transfer_asset_signed_by_pda,
     state::{
         assert_mpl_core_asset_v1, EscrowAnt, ASSET_TYPE_ANT, ESCROW_ANT_SEED, MPL_CORE_PROGRAM_ID,
         PROTOCOL_ARWEAVE,
@@ -103,17 +103,10 @@ pub fn handler(ctx: Context<ClaimAntArweaveAttested>, message_nonce: [u8; 32]) -
         signer_seeds,
     )?;
 
-    // Audit L23: rotate UpdateAuthority to claimant atomically. See
-    // claim_arweave.rs for full rationale.
-    set_update_authority_signed_by_pda(
-        &ctx.accounts.ant_asset,
-        &ctx.accounts.payer.to_account_info(),
-        &ctx.accounts.escrow.to_account_info(),
-        &ctx.accounts.claimant.key(),
-        &ctx.accounts.system_program.to_account_info(),
-        &ctx.accounts.mpl_core_program,
-        signer_seeds,
-    )?;
+    // UpdateAuthority is NOT rotated (ADR-028): program-controlled ANTs keep UA
+    // permanently at the ario-ant `ant_authority` PDA, so the claimant receives
+    // Owner only. This is what structurally resolves the original audit-L23
+    // concern — no party ever holds a stale UA to grief the claimed asset.
 
     let clock = Clock::get()?;
     emit!(EscrowClaimedEvent {
