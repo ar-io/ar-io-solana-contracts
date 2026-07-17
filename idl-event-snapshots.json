@@ -2357,6 +2357,33 @@
       ]
     },
     {
+      "name": "AuthorityAdoptedEvent",
+      "discriminator": [
+        112,
+        34,
+        188,
+        25,
+        86,
+        153,
+        126,
+        0
+      ],
+      "fields": [
+        {
+          "name": "mint",
+          "type": "pubkey"
+        },
+        {
+          "name": "owner",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "AuthorityTransferredEvent",
       "discriminator": [
         54,

@@ -103,25 +103,45 @@ operator-discount verification and fund-from-stakes CPI.
 ### ANTs as Metaplex Core NFTs
 
 ANTs are Metaplex Core NFTs with an **Attributes plugin** (ArNS Name,
-Type, Undername Limit) for DAS / marketplace queryability. Plugin
-authority is `Owner` so the current holder can sign trait updates. The
-migration claim flow transfers Owner AND UpdateAuthority to the user
-atomically (ADR-013). AR.IO retains program-level upgrade authority via
-BPFLoaderUpgradeable — **production deploys must NOT use `--final`**.
+Type, Undername Limit) for DAS / marketplace queryability. **As of
+ADR-028** new ANTs mint with the Attributes-plugin authority =
+`UpdateAuthority` and the asset UpdateAuthority set to the program's
+per-asset `ant_authority` PDA, so trait updates are program-signed (see
+the ADR-028 note below); legacy ANTs kept plugin authority `Owner`. AR.IO
+retains program-level upgrade authority via BPFLoaderUpgradeable —
+**production deploys must NOT use `--final`**.
 
 **Every minted ANT carries the Attributes plugin** (populated at mint
 time for ANTs with an active ArNS record, empty otherwise). The
-empty-plugin form keeps every ANT `purchase`-ready: `ario_arns::buy_record`
-CPIs `UpdatePluginV1` to populate traits, which requires the plugin
-already exists. Every ARIO-ARNS handler that mutates trait-affecting
-state keeps the plugin coherent with `ArnsRecord` via this CPI;
-permissionless `sync_attributes` reconciles cases where the buyer
-wasn't the ANT owner.
+empty-plugin form keeps every ANT `purchase`-ready: the `UpdatePluginV1`
+CPI that populates traits requires the plugin to already exist.
 
-The CPI is hand-rolled in `programs/ario-arns/src/mpl_core_cpi.rs` and
+**Post-ADR-016, `ario-arns` is MPL-agnostic** — it no longer CPIs into
+Metaplex Core and has no `mpl_core_cpi.rs`. ArNS purchase handlers write
+only the `ArnsRecord`; the `UpdatePluginV1` CPI lives solely in
+**ario-ant** (`sync_attributes` / `clear_attributes`), which the SDK
+composes into the same tx as the arns purchase. The hand-rolled CPI is
+in `programs/ario-ant/src/mpl_core_cpi.rs` and
 `programs/ario-ant-escrow/src/mpl_core_cpi.rs` (the `mpl-core` crate
-doesn't compile on Cargo 1.79). Schema versioning via `migrate_ant`
-(`version: u8` + `realloc`). See ADR-012 / BD-096.
+doesn't compile on Cargo 1.79).
+
+**ADR-028 — program-controlled UpdateAuthority.** New ANTs mint with the
+Metaplex Core UpdateAuthority set to a per-asset **`ant_authority` PDA**
+(`["ant_authority", asset]`, ario-ant, signer-only) and the Attributes
+plugin authority = `Authority::UpdateAuthority` (→ that PDA). `Owner`
+stays the holder (custody). So `sync_attributes` is signed by the program
+via the PDA and is **permissionless** for program-controlled ANTs (guarded
+by the ArnsRecord owner/seeds/`record.ant == asset` checks);
+`clear_attributes` stays owner-gated but PDA-signed. Legacy ANTs (UA ≠
+PDA, plugin authority `Owner`) keep the owner-signed fallback and can opt
+in via the owner-signed `adopt_authority`. `TransferV1` / `BurnV1` are
+Owner-gated, so custody and marketplace transfers are unaffected by where
+UA lives. **`ario-ant-escrow` is NOT changed by ADR-028** and still rotates
+UpdateAuthority via the depositor's signature — so program-controlled ANTs
+can't be deposited into the current escrow (legacy ANTs still can); escrow
+compatibility is deferred. Schema versioning uses a trailing `SchemaVersion`
+field and grow-then-deserialize migrations (`migrate_ant`, ADR-020). See
+ADR-028 / ADR-012 / BD-096 / BD-114.
 
 ### Zero-copy registries
 

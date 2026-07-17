@@ -813,6 +813,18 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 
 ---
 
+### BD-114: ANT UpdateAuthority Held by the ario-ant Program (2026-07-16)
+
+| | |
+|---|---|
+| **Lua Behavior** | AO ANTs are processes, not NFTs; there is no Metaplex Core UpdateAuthority concept. |
+| **Solana Behavior (before, ADR-013)** | ANTs minted with `Owner == UpdateAuthority == holder wallet`; Attributes-plugin authority = `Owner`. `sync_attributes` / `clear_attributes` required the holder to sign (`invoke`). |
+| **Solana Behavior (now, ADR-028)** | New ANTs mint with `updateAuthority` = the per-asset `ant_authority` PDA (`["ant_authority", asset]`, ario-ant) and Attributes-plugin authority = `Authority::UpdateAuthority` (→ that PDA); `Owner` stays the holder. The program signs `UpdatePluginV1` with the PDA, so `sync_attributes` is **permissionless** (guarded by the existing ArnsRecord owner/seeds/`record.ant == asset` checks); `clear_attributes` stays owner-gated but is PDA-signed. Existing ANTs opt in via the new owner-signed `adopt_authority` (`RevokePluginAuthorityV1` `0A 06`, which resets the UpdateAuthority-managed Attributes plugin to its default, + `UpdateV1` set-UA), emitting `AuthorityAdoptedEvent`. `sync`/`clear` keep an owner-signed fallback for un-adopted legacy ANTs (UA ≠ PDA). |
+| **Why** | Attribute syncs (and future metadata control) should run through the protocol, and a name bought by a non-owner should reconcile immediately. Parking UA at a program PDA achieves this while the holder keeps custody (`TransferV1` / `BurnV1` are Owner-gated, so transfers/sells are unaffected). See ADR-028. |
+| **Deliberate consequence** | The `Owner == UpdateAuthority` invariant (ADR-013) is intentionally broken for program-controlled ANTs. **`ario-ant-escrow` is unchanged** and still rotates UA with the depositor's signature, so program-controlled ANTs cannot be deposited into the current escrow (legacy ANTs still can); escrow compatibility is deferred to a later change coordinated with the migration importer. The asset's on-chain `name`/`uri` become program-only-mutable (effectively immutable post-mint until/unless a PDA-signed `update_metadata` is added; ANT display metadata lives in the `AntConfig` PDA, so this is not a functional gap today). |
+
+---
+
 ## Summary Statistics
 
 | Category | Count |

@@ -9,6 +9,12 @@ pub const ANT_CONTROLLERS_SEED: &[u8] = b"ant_controllers";
 pub const ANT_RECORD_SEED: &[u8] = b"ant_record";
 pub const ANT_RECORD_META_SEED: &[u8] = b"ant_record_meta";
 pub const ANT_MIGRATION_CONFIG_SEED: &[u8] = b"ant_migration_config";
+/// Per-asset program-signer PDA that holds the Metaplex Core UpdateAuthority
+/// (and, via `Authority::UpdateAuthority`, the Attributes-plugin authority) for
+/// ANTs minted after ADR-028. Signer-only — no account is ever created at this
+/// address; the program signs MPL Core `UpdatePluginV1` / `UpdateV1` CPIs with
+/// it. PDA: ["ant_authority", asset.as_ref()]. Owner stays with the user.
+pub const ANT_AUTHORITY_SEED: &[u8] = b"ant_authority";
 /// Per-user ACL config head (ADR-012). PDA: ["acl_config", user.as_ref()]
 pub const ACL_CONFIG_SEED: &[u8] = b"acl_config";
 /// Per-user ACL page (ADR-012).
