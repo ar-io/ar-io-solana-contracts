@@ -755,6 +755,200 @@ async fn test_admin_set_withdrawal_period() {
     assert_anchor_error!(too_short_result, GarError::InvalidParameter);
 }
 
+/// Verify `admin_set_reward_ratios` (the governable epoch reward-split lever):
+///   1. Authority signer succeeds; `EpochSettings.gateway_reward_ratio` /
+///      `observer_reward_ratio` update to 800_000 / 200_000 (inside the band).
+///   2. Non-authority signer rejected with `Unauthorized`.
+///   3. A split that does NOT sum to `RATE_SCALE` rejected with
+///      `InvalidParameter`.
+///   4. A single ratio above `RATE_SCALE` rejected with `InvalidParameter`
+///      (the per-ratio sanity bound).
+///   5. Band floor/ceiling: `gateway=1_000_000 / observer=0` and
+///      `gateway=0 / observer=1_000_000` are REJECTED (`InvalidParameter`)
+///      even though they sum to `RATE_SCALE` — one side is out of the
+///      `[100_000, 900_000]` band. The stored fields are untouched by all the
+///      rejected updates.
+///   6. Band edge: `gateway=900_000 / observer=100_000` (both at a band
+///      boundary) is ACCEPTED and updates the stored split.
+#[tokio::test]
+async fn test_admin_set_reward_ratios() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    // Authority keypair we control so it can sign admin_set_reward_ratios.
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    // The reward-split fields live on `EpochSettings`; pre-create it with our
+    // authority. genesis/duration/enabled are irrelevant to this lever.
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    // Fund the authority so it can co-sign.
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+
+    let set_ix =
+        |gateway_reward_ratio: u64, observer_reward_ratio: u64, signer: Pubkey| Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: signer,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetRewardRatios {
+                gateway_reward_ratio,
+                observer_reward_ratio,
+            }
+            .data(),
+        };
+
+    // Step 1: authority sets 800_000 / 200_000 (sum == RATE_SCALE) — succeeds.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[set_ix(800_000, 200_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, 800_000);
+    assert_eq!(es.observer_reward_ratio, 200_000);
+
+    // Step 2: non-authority signer rejected.
+    let bad_signer = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &bad_signer.pubkey(),
+            10_000_000,
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_tx = Transaction::new_signed_with_payer(
+        &[set_ix(700_000, 300_000, bad_signer.pubkey())],
+        Some(&bad_signer.pubkey()),
+        &[&bad_signer],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(bad_tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 3: split that does not sum to RATE_SCALE rejected (sum = 900_000).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let bad_sum_tx = Transaction::new_signed_with_payer(
+        &[set_ix(800_000, 100_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(bad_sum_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 4: a single ratio above RATE_SCALE rejected (per-ratio sanity bound).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let over_tx = Transaction::new_signed_with_payer(
+        &[set_ix(2_000_000, 0, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(over_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 5a: gateway=1_000_000 / observer=0 rejected by the band floor even
+    // though it sums to RATE_SCALE and each ratio is <= RATE_SCALE (observer
+    // below MIN_REWARD_RATIO, gateway above MAX_REWARD_RATIO).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let zero_observer_tx = Transaction::new_signed_with_payer(
+        &[set_ix(1_000_000, 0, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(zero_observer_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 5b: gateway=0 / observer=1_000_000 rejected by the band (mirror).
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let zero_gateway_tx = Transaction::new_signed_with_payer(
+        &[set_ix(0, 1_000_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(zero_gateway_tx).await,
+        GarError::InvalidParameter
+    );
+
+    // The rejected updates left the stored split at Step 1's 800_000 / 200_000.
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, 800_000);
+    assert_eq!(es.observer_reward_ratio, 200_000);
+
+    // Step 6: gateway=900_000 / observer=100_000 sits exactly on the band
+    // boundary (MAX / MIN) — ACCEPTED, and updates the stored split.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let edge_tx = Transaction::new_signed_with_payer(
+        &[set_ix(900_000, 100_000, authority.pubkey())],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(edge_tx).await.unwrap();
+
+    let account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, 900_000);
+    assert_eq!(es.observer_reward_ratio, 100_000);
+}
+
 /// Verify `transfer_authority` (ADR-026):
 ///   1. Null pubkey rejected (`InvalidParameter`).
 ///   2. Non-authority signer rejected (`Unauthorized`).
@@ -5008,7 +5202,8 @@ async fn test_epoch_full_lifecycle() {
             accounts: ario_gar::accounts::CloseObservation {
                 epoch: epoch_key,
                 observation: observation_key,
-                payer: payer_pk,
+                observer: payer_pk,
+                caller: payer_pk,
             }
             .to_account_metas(None),
             data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
@@ -10515,22 +10710,33 @@ async fn test_close_observation() {
     );
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Verify observation account exists
-    let obs_account = ctx.banks_client.get_account(observation_key).await.unwrap();
+    // Verify observation account exists and capture its rent lamports.
+    // In this test the observer is `payer_pk` (gateway operator == observer).
+    let obs_account = ctx
+        .banks_client
+        .get_account(observation_key)
+        .await
+        .unwrap()
+        .expect("Observation should exist before closing");
+    let observation_rent = obs_account.lamports;
     assert!(
-        obs_account.is_some(),
-        "Observation should exist before closing"
+        observation_rent > 0,
+        "Observation should hold rent lamports"
     );
 
-    // Close observation
+    // --- Negative: a wrong `observer` account (!= observation.observer) is
+    // rejected, so a scavenger cannot redirect the rent to an account of
+    // their choosing.
+    let wrong_observer = Pubkey::new_unique();
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(
+    let bad_tx = Transaction::new_signed_with_payer(
         &[Instruction {
             program_id: ario_gar::ID,
             accounts: ario_gar::accounts::CloseObservation {
                 epoch: epoch_key,
                 observation: observation_key,
-                payer: payer_pk,
+                observer: wrong_observer,
+                caller: payer_pk,
             }
             .to_account_metas(None),
             data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
@@ -10539,13 +10745,125 @@ async fn test_close_observation() {
         &[&ctx.payer],
         blockhash,
     );
+    let bad_result = ctx.banks_client.process_transaction(bad_tx).await;
+    assert_anchor_error!(bad_result, GarError::WrongObserverAccount);
+
+    // The observation must survive the rejected close.
+    assert!(
+        ctx.banks_client
+            .get_account(observation_key)
+            .await
+            .unwrap()
+            .is_some(),
+        "Observation must survive a rejected close"
+    );
+
+    // --- Permissionless close signed by a DIFFERENT wallet than the observer.
+    // Fund a separate `caller` that signs + pays the tx fee but is NOT the
+    // observer; the reclaimed rent must flow back to the observer, and the
+    // caller must only be out the tx fee (never the rent it would have
+    // pocketed under the old `close = payer`).
+    let caller = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer_pk,
+            &caller.pubkey(),
+            100_000_000, // 0.1 SOL for fees
+        )],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
+    // Balances immediately before the close (observer == payer_pk is NOT the
+    // tx fee payer here, so its only delta will be the refunded rent).
+    let observer_before = ctx
+        .banks_client
+        .get_account(payer_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    let caller_before = ctx
+        .banks_client
+        .get_account(caller.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseObservation {
+                epoch: epoch_key,
+                observation: observation_key,
+                observer: payer_pk,
+                caller: caller.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
+        }],
+        Some(&caller.pubkey()),
+        &[&caller],
+        blockhash,
+    );
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Verify observation account is closed
+    // Verify observation account is closed.
     let obs_account = ctx.banks_client.get_account(observation_key).await.unwrap();
     assert!(
         obs_account.is_none(),
         "Observation should be closed after close_observation"
+    );
+
+    // Rent refunded to the OBSERVER, exactly.
+    let observer_after = ctx
+        .banks_client
+        .get_account(payer_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert_eq!(
+        observer_after,
+        observer_before + observation_rent,
+        "Observer should receive exactly the reclaimed observation rent"
+    );
+
+    // Caller only paid the tx fee — it did NOT receive the rent.
+    let caller_after = ctx
+        .banks_client
+        .get_account(caller.pubkey())
+        .await
+        .unwrap()
+        .unwrap()
+        .lamports;
+    assert!(
+        caller_after < caller_before,
+        "Caller should have paid the tx fee"
+    );
+    let caller_spent = caller_before - caller_after;
+    assert!(
+        caller_spent < observation_rent,
+        "Caller pays only the small tx fee, never the ~rent it would have \
+         pocketed under the old close = payer"
+    );
+
+    // epoch.observations_closed incremented.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.observations_closed, 1,
+        "observations_closed should increment on close"
     );
 }
 
@@ -17122,6 +17440,248 @@ async fn test_per_gateway_reward_excludes_leaving_from_divisor() {
     );
 }
 
+/// End-to-end proof that the `admin_set_reward_ratios` lever flows into epoch
+/// prescription: after the authority changes the split to 800_000 / 200_000,
+/// a subsequent `create_epoch` → `tally_weights` → `prescribe_epoch` computes
+/// `per_gateway_reward` / `per_observer_reward` with the NEW ratios, NOT the
+/// 900_000 / 100_000 genesis default. Reuses the 1-Joined / 1-Leaving fixture
+/// so the gateway divisor is a deterministic `joined_count == 1`.
+#[tokio::test]
+async fn test_reward_ratios_applied_in_prescription() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    // Authority keypair we control so it can sign admin_set_reward_ratios.
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 100, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    // Fund protocol with a known amount so the reward numbers are predictable.
+    let protocol_balance: u64 = 1_000_000_000_000; // 1M ARIO
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        protocol_balance,
+    )
+    .await;
+
+    let (gateway_key1, gateway_key2, _op2_pk) =
+        setup_two_gateways_with_leaver(&mut ctx, &setup).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // Change the reward split to 800_000 / 200_000 BEFORE prescription.
+    let new_gateway_ratio: u64 = 800_000;
+    let new_observer_ratio: u64 = 200_000;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let set_tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetRewardRatios {
+                gateway_reward_ratio: new_gateway_ratio,
+                observer_reward_ratio: new_observer_ratio,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, &authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(set_tx).await.unwrap();
+
+    // Warp past epoch start.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    // create_epoch
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally_weights — Leaving slot gets composite_weight=0 internally.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // prescribe_epoch — only the Joined gateway is reward-eligible + selected.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gateway_key1,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Read the prescribed epoch + the on-chain split that was live at prescription.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    let total = epoch.total_eligible_rewards as u128;
+    assert!(
+        total > 0,
+        "need non-zero eligible rewards to exercise the split"
+    );
+
+    let es_account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut es_account.data.as_slice()).unwrap();
+    assert_eq!(es.gateway_reward_ratio, new_gateway_ratio);
+    assert_eq!(es.observer_reward_ratio, new_observer_ratio);
+
+    // per_gateway_reward = total * NEW gateway ratio / RATE_SCALE / joined_count(=1).
+    let joined_count: u64 = 1;
+    let expected_gateway = total
+        .saturating_mul(new_gateway_ratio as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / joined_count;
+    assert_eq!(
+        epoch.per_gateway_reward, expected_gateway,
+        "per_gateway_reward must use the NEW gateway_reward_ratio (800_000)"
+    );
+    // Prove it is the NEW ratio, not the 900_000 genesis default.
+    let default_gateway = total
+        .saturating_mul(ario_gar::GATEWAY_OPERATOR_REWARD_RATE as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / joined_count;
+    assert_ne!(
+        epoch.per_gateway_reward, default_gateway,
+        "per_gateway_reward still reflects the 90% default — lever did not take effect"
+    );
+
+    // per_observer_reward = total * NEW observer ratio / RATE_SCALE / selected_count.
+    let selected_count = epoch.observer_count as u64;
+    assert!(
+        selected_count > 0,
+        "expected at least one selected observer"
+    );
+    let expected_observer = total
+        .saturating_mul(new_observer_ratio as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / selected_count;
+    assert_eq!(
+        epoch.per_observer_reward, expected_observer,
+        "per_observer_reward must use the NEW observer_reward_ratio (200_000)"
+    );
+    let default_observer = total
+        .saturating_mul(ario_gar::OBSERVER_REWARD_RATE as u128)
+        .checked_div(ario_gar::RATE_SCALE as u128)
+        .unwrap_or(0) as u64
+        / selected_count;
+    assert_ne!(
+        epoch.per_observer_reward, default_observer,
+        "per_observer_reward still reflects the 10% default — lever did not take effect"
+    );
+}
+
 #[tokio::test]
 async fn test_claim_delegate_from_leaving_gateway_is_permissionless() {
     // The delegator does NOT need to sign — anyone (the cranker, a stranger,
@@ -17994,7 +18554,8 @@ async fn test_close_epoch_blocks_unclosed_observations() {
             accounts: ario_gar::accounts::CloseObservation {
                 epoch: epoch_key,
                 observation: observation_key,
-                payer: payer_pk,
+                observer: payer_pk,
+                caller: payer_pk,
             }
             .to_account_metas(None),
             data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
@@ -18043,6 +18604,431 @@ async fn test_close_epoch_blocks_unclosed_observations() {
             .unwrap()
             .is_none(),
         "Epoch PDA closed"
+    );
+}
+
+// =====================================================================
+// close_observation — program-owned (non-System) observer
+// =====================================================================
+
+#[tokio::test]
+async fn test_close_observation_program_owned_observer() {
+    // Regression for the CodeRabbit-flagged epoch-close brick: a gateway's
+    // `observer_address` may be a PDA / multisig (Squads) / smart-contract
+    // wallet — i.e. an account OWNED BY A PROGRAM, not the System Program —
+    // that still signs `save_observations` via CPI. When `CloseObservation`
+    // typed the rent recipient as `SystemAccount`, closing such an
+    // observer's Observation PDA failed `AccountOwnedByWrongProgram`; the PDA
+    // could never close, and since `close_epoch` requires every observation
+    // closed, that epoch would be PERMANENTLY unclosable (stranded rent).
+    //
+    // With the rent recipient typed as `UncheckedAccount` (validated only by
+    // `address = observation.observer`), a program-owned observer closes
+    // cleanly, the rent lands on that observer, `observations_closed`
+    // increments, and `close_epoch` can then proceed.
+    //
+    // `save_observations` requires the observer to SIGN, so a program-owned
+    // observer can't submit one directly in a test. We drive the real flow to
+    // a distributed epoch (observer == payer), then relocate that Observation
+    // PDA to one whose recorded `observer` is a program-owned pubkey and close
+    // THAT — exercising exactly the account shape the old `SystemAccount`
+    // rejected.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    // Baseline clock + slot.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let stake_amount = 20_000_000_000u64;
+    let gateway_key = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    ctx.set_sysvar(&clock);
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // create_epoch
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // tally
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // prescribe — pass the Joined gateway as the prescribed observer
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // submit one observation (observer == payer, which signs)
+    let (real_observation_key, _) = observation_pda(0, &payer_pk);
+    let mut gateway_results = [0u8; 375];
+    gateway_results[0] = 0b00000001;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::SaveObservations {
+                epoch: epoch_key,
+                observation: real_observation_key,
+                observer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::SaveObservations {
+                _epoch_index: 0,
+                gateway_results,
+                gateway_count: 1,
+                report_tx_id: [1u8; 32],
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // warp past epoch end + distribute
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200 + 86_400;
+    ctx.set_sysvar(&clock);
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut dist_accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    dist_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: dist_accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // --- Relocate the just-created Observation PDA onto a PROGRAM-OWNED
+    // observer. `save_observations` won't let a program-owned account sign,
+    // so we take the real Observation's bytes and rewrite its `observer`
+    // (and canonical `bump`) to a program-owned pubkey, then re-seat it at
+    // the PDA that pubkey derives. epoch.observations_submitted stays 1.
+    let real_obs = ctx
+        .banks_client
+        .get_account(real_observation_key)
+        .await
+        .unwrap()
+        .expect("real observation should exist after distribute");
+    let observation_rent = real_obs.lamports;
+    assert!(
+        observation_rent > 0,
+        "observation should hold rent lamports"
+    );
+
+    // A program-owned rent recipient: owned by ario_gar (NOT the System
+    // Program) — the exact account shape a `SystemAccount` bound would reject.
+    let prog_observer = Pubkey::new_unique();
+    let (relocated_observation_key, relocated_bump) = observation_pda(0, &prog_observer);
+
+    // Rewrite the borsh Observation: observer @ [16..48], bump @ [465].
+    let mut relocated_data = real_obs.data.clone();
+    relocated_data[16..48].copy_from_slice(prog_observer.as_ref());
+    relocated_data[465] = relocated_bump;
+    ctx.set_account(
+        &relocated_observation_key,
+        &solana_sdk::account::Account {
+            lamports: observation_rent,
+            data: relocated_data,
+            owner: real_obs.owner, // ario_gar::ID
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Drop the original (payer-derived) Observation so exactly one observation
+    // exists for the epoch, keeping observations_submitted (1) coherent.
+    ctx.set_account(
+        &real_observation_key,
+        &solana_sdk::account::Account {
+            lamports: 0,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Seed the program-owned observer account (owner = ario_gar, NOT System).
+    let prog_observer_start_lamports = 1_000_000_000u64;
+    ctx.set_account(
+        &prog_observer,
+        &solana_sdk::account::Account {
+            lamports: prog_observer_start_lamports,
+            data: vec![],
+            owner: ario_gar::ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Sanity: the rent recipient really is program-owned (would trip the old
+    // SystemAccount ownership check).
+    let prog_observer_acct = ctx
+        .banks_client
+        .get_account(prog_observer)
+        .await
+        .unwrap()
+        .expect("program-owned observer should exist");
+    assert_ne!(
+        prog_observer_acct.owner,
+        system_program::id(),
+        "observer must be program-owned for this regression"
+    );
+
+    // close_observation with a PROGRAM-OWNED observer must succeed.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseObservation {
+                epoch: epoch_key,
+                observation: relocated_observation_key,
+                observer: prog_observer,
+                caller: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseObservation { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("close_observation must succeed for a program-owned observer");
+
+    // Observation PDA closed.
+    assert!(
+        ctx.banks_client
+            .get_account(relocated_observation_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "Observation should be closed"
+    );
+
+    // Reclaimed rent landed on the program-owned observer.
+    let prog_observer_after = ctx
+        .banks_client
+        .get_account(prog_observer)
+        .await
+        .unwrap()
+        .expect("program-owned observer should still exist")
+        .lamports;
+    assert_eq!(
+        prog_observer_after,
+        prog_observer_start_lamports + observation_rent,
+        "rent must be refunded to the program-owned observer"
+    );
+
+    // observations_closed incremented → equals observations_submitted.
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch.observations_closed, 1,
+        "observations_closed should increment on close"
+    );
+    assert_eq!(
+        epoch.observations_closed, epoch.observations_submitted,
+        "all observations must be accounted closed"
+    );
+
+    // Bump current_epoch_index past the retention window so close_epoch's
+    // gap check passes (offsets mirror test_close_epoch_blocks_unclosed_observations).
+    let es_account = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut es_data = es_account.data.clone();
+    let cei_offset = 8 + 32 + 8 + 1 + 1 + 8 + 2 + 1;
+    es_data[cei_offset..cei_offset + 8].copy_from_slice(&8u64.to_le_bytes());
+    ctx.set_account(
+        &epoch_settings_key,
+        &solana_sdk::account::Account {
+            lamports: es_account.lamports,
+            data: es_data,
+            owner: es_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    // Force a fresh bank between close_observation and close_epoch (see the M8
+    // test's note on the non-deterministic writeback race).
+    let cur_slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(cur_slot + 1).unwrap();
+
+    // close_epoch must now proceed — the program-owned observer did NOT brick it.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CloseEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                payer: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CloseEpoch { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("close_epoch must succeed after the program-owned observation is closed");
+
+    assert!(
+        ctx.banks_client
+            .get_account(epoch_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "Epoch PDA closed — no brick"
     );
 }
 

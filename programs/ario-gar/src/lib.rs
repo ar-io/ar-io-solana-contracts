@@ -315,6 +315,29 @@ pub mod ario_gar {
         instructions::epoch::admin_set_epoch_duration(ctx, new_duration)
     }
 
+    /// Override the epoch reward split — `EpochSettings.gateway_reward_ratio`
+    /// / `observer_reward_ratio` (each scaled by `RATE_SCALE`; genesis default
+    /// 900_000 / 100_000 = 90% / 10%). The two ratios must sum to `RATE_SCALE`
+    /// (100%). Authority-only; NOT migration-gated (survives
+    /// `finalize_migration`), making the split a governable parameter.
+    ///
+    /// Takes effect at the NEXT epoch prescription (`create_epoch` →
+    /// `prescribe_epoch`); already-computed epochs keep their stamped
+    /// per-gateway / per-observer rewards. See
+    /// `instructions::epoch::admin_set_reward_ratios` for the full motivation
+    /// + the sum-must-equal-`RATE_SCALE` invariant.
+    pub fn admin_set_reward_ratios(
+        ctx: Context<UpdateEpochSettings>,
+        gateway_reward_ratio: u64,
+        observer_reward_ratio: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_reward_ratios(
+            ctx,
+            gateway_reward_ratio,
+            observer_reward_ratio,
+        )
+    }
+
     /// Authority-gated one-shot to set `current_epoch_index` to a non-zero
     /// starting value (and re-anchor `genesis_timestamp` so the first
     /// `create_epoch` fires immediately for that index). Use case:
@@ -1052,6 +1075,19 @@ pub const REWARD_DECAY_START_EPOCH: u64 = 365;
 pub const REWARD_DECAY_LAST_EPOCH: u64 = 547;
 pub const MISSED_OBSERVATION_PENALTY: u64 = 250_000; // 25% (scaled by RATE_SCALE)
 
+/// Floor/ceiling band for each side of the governable epoch reward split
+/// (`admin_set_reward_ratios`). Each of `gateway_reward_ratio` /
+/// `observer_reward_ratio` must land within `[MIN_REWARD_RATIO,
+/// MAX_REWARD_RATIO]` — i.e. neither side below 10% nor above 90% (scaled by
+/// `RATE_SCALE`). This prevents the authority from zeroing out one side's
+/// incentive (e.g. gateway=1_000_000 / observer=0, which would strip all
+/// observer rewards). The `sum == RATE_SCALE` invariant makes the two bounds
+/// symmetric: 90% on one side forces 10% on the other, so both the genesis
+/// 90/10 (900_000 / 100_000) and the intended 80/20 (800_000 / 200_000)
+/// splits fall INSIDE the band.
+pub const MIN_REWARD_RATIO: u64 = 100_000; // 10% (scaled by RATE_SCALE)
+pub const MAX_REWARD_RATIO: u64 = 900_000; // 90% (scaled by RATE_SCALE)
+
 // =========================================
 // GATEWAY SETTINGS FIELD BITMASK
 // =========================================
@@ -1500,6 +1536,28 @@ pub struct GarMigrationFinalizedEvent {
     pub admin: Pubkey,
     pub gateway_count: u32,
     pub slot: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_reward_ratios`. The epoch reward split
+/// (`EpochSettings.gateway_reward_ratio` / `observer_reward_ratio`) governs
+/// how each epoch's `total_eligible_rewards` is divided between gateway
+/// operators and prescribed observers. Indexers tracking reward economics
+/// need this to know the split changed. The new ratios take effect at the
+/// NEXT epoch prescription (`create_epoch` → `prescribe_epoch`), so
+/// already-computed epochs are unaffected. The two ratios always sum to
+/// `RATE_SCALE` (100%); `admin` is the authority signer that authorized the
+/// change.
+///
+/// Declared last (after `GarMigrationFinalizedEvent`) to preserve append-only
+/// event ordering for a stable IDL (ADR-017); do not reorder.
+#[event]
+pub struct RewardRatiosUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_gateway_ratio: u64,
+    pub old_observer_ratio: u64,
+    pub new_gateway_ratio: u64,
+    pub new_observer_ratio: u64,
     pub timestamp: i64,
 }
 

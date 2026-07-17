@@ -335,4 +335,12 @@ pub enum GarError {
 
     #[msg("Delegation must be disabled on this gateway for this operation")]
     DelegationNotDisabled,
+
+    // =========================================
+    // CLOSE_OBSERVATION RENT-REFUND ERROR
+    // Appended at the end to keep existing error codes stable for
+    // downstream decoders (cranker/observer).
+    // =========================================
+    #[msg("Supplied observer account does not match the observation's recorded observer")]
+    WrongObserverAccount,
 }
