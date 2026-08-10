@@ -56,6 +56,6 @@ Archive a doc once **all four** are true:
 
 | Archived | File | Successor / reason |
 |----------|------|--------------------|
-| _empty_  |      |                    |
+| 2026-07-01 | [`RESTORE_ACTIVE_VAULT_RELOCK.md`](RESTORE_ACTIVE_VAULT_RELOCK.md) | Restoration shipped as [ADR-027](../adrs/0027-escrow-restore-active-vault-relock-direct-cpi.md) (deviating: existing ario-core ABI + payer pass-through, not a new instruction); see `ANT_ESCROW_PROTOCOL_SPEC.md` §11.5 |
 
 (Once entries exist, sort newest-first.)

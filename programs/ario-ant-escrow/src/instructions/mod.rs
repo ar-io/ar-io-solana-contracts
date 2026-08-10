@@ -17,6 +17,9 @@ pub mod claim_ethereum;
 pub mod claim_tokens_arweave_attested;
 pub mod claim_tokens_ethereum;
 pub mod claim_vault_arweave_attested;
+// Shared post-verification settlement for the two vault-claim handlers.
+// No Accounts struct inside, so it is deliberately NOT glob re-exported.
+pub(crate) mod claim_vault_common;
 pub mod claim_vault_ethereum;
 pub mod deposit;
 pub mod deposit_tokens;

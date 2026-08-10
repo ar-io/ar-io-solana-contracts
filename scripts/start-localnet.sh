@@ -56,20 +56,23 @@ MPL_CORE_ID="CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
 
 # 3. Resolve our five program IDs from the deploy keypairs (build-sbf.sh
 #    --sync just rewrote the source declare_id!() to match).
-declare -A PROGRAMS=(
-  [ario_core]="$REPO_ROOT/target/deploy/ario_core-keypair.json"
-  [ario_gar]="$REPO_ROOT/target/deploy/ario_gar-keypair.json"
-  [ario_arns]="$REPO_ROOT/target/deploy/ario_arns-keypair.json"
-  [ario_ant]="$REPO_ROOT/target/deploy/ario_ant-keypair.json"
-  [ario_ant_escrow]="$REPO_ROOT/target/deploy/ario_ant_escrow-keypair.json"
-)
+#    NOTE: no associative arrays / `${var^^}` here — macOS ships bash 3.2,
+#    which supports neither (same constraint noted in build-sbf.sh).
+keypair_for() { echo "$REPO_ROOT/target/deploy/${1}-keypair.json"; }
 
 # 4. Surfpool flags assembled per https://github.com/solana-foundation/surfpool.
 #    `surfpool start` defaults to mainnet-fork — we want a clean local cluster.
-ARGS=(start --no-tui --rpc-port "$SURFPOOL_PORT")
+#    Surfpool 1.3.x renamed `--rpc-port` to `--port`; probe the installed
+#    binary's help so both 1.2.x and 1.3.x work.
+if surfpool start --help 2>&1 | grep -q -- '--rpc-port'; then
+  PORT_FLAG="--rpc-port"
+else
+  PORT_FLAG="--port"
+fi
+ARGS=(start --no-tui "$PORT_FLAG" "$SURFPOOL_PORT")
 
 for prog in ario_core ario_gar ario_arns ario_ant ario_ant_escrow; do
-  kp="${PROGRAMS[$prog]}"
+  kp="$(keypair_for "$prog")"
   so="$REPO_ROOT/target/deploy/${prog}.so"
   if [[ ! -f "$kp" || ! -f "$so" ]]; then
     echo "[start-localnet] missing artifact for $prog: kp=$kp so=$so" >&2
@@ -77,7 +80,8 @@ for prog in ario_core ario_gar ario_arns ario_ant ario_ant_escrow; do
   fi
   pid="$(solana-keygen pubkey "$kp")"
   ARGS+=(--bpf-program "$pid" "$so")
-  declare "${prog^^}_ID=$pid"
+  prog_uc="$(echo "$prog" | tr '[:lower:]' '[:upper:]')"
+  eval "${prog_uc}_ID=\"\$pid\""
 done
 
 if [[ -f "$REPO_ROOT/target/deploy/mpl_core.so" ]]; then

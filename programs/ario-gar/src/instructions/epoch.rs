@@ -5,7 +5,8 @@ use crate::error::GarError;
 use crate::state::*;
 use crate::{
     EpochClosedEvent, EpochCreatedEvent, EpochDurationUpdatedEvent, EpochPrescribedEvent,
-    EpochWeightsTalliedEvent, EpochsToggledEvent, RATE_SCALE,
+    EpochWeightsTalliedEvent, EpochsToggledEvent, RewardRatiosUpdatedEvent, MAX_REWARD_RATIO,
+    MIN_REWARD_RATIO, RATE_SCALE,
 };
 
 /// Enable/disable epoch processing.
@@ -100,6 +101,102 @@ pub fn admin_set_epoch_duration(
         old_genesis,
         new_genesis,
         settings.current_epoch_index
+    );
+
+    Ok(())
+}
+
+/// Authority-gated override of the epoch **reward split** —
+/// `EpochSettings.gateway_reward_ratio` and
+/// `EpochSettings.observer_reward_ratio`. Each ratio is scaled by
+/// `RATE_SCALE` (default 900_000 / 100_000 = 90% / 10%, written once at
+/// genesis by `initialize_epochs`). Together they govern how each epoch's
+/// `total_eligible_rewards` is divided between gateway operators and
+/// prescribed observers — see the per-unit reward math in `prescribe_epoch`
+/// (`per_gateway_reward` / `per_observer_reward`). This is the ONLY lever
+/// that changes the split without a code upgrade, making it a governable
+/// parameter (e.g. handed to the Squads multisig at cutover).
+///
+/// **Invariant:** `gateway_reward_ratio + observer_reward_ratio ==
+/// RATE_SCALE` — the split must account for exactly 100% of the epoch
+/// reward pool. Each ratio is additionally sanity-bounded `<= RATE_SCALE`.
+/// A split that does not sum to `RATE_SCALE` is rejected with
+/// `InvalidParameter`.
+///
+/// **Band:** each ratio must also fall within `[MIN_REWARD_RATIO,
+/// MAX_REWARD_RATIO]` = `[100_000, 900_000]` — neither side below 10% nor
+/// above 90% — so the authority cannot zero out one side's incentive
+/// (e.g. gateway=1_000_000 / observer=0). Both the genesis 90/10 and the
+/// intended 80/20 splits land inside the band. Out-of-band values are
+/// rejected with `InvalidParameter`.
+///
+/// **Timing:** takes effect at the NEXT epoch prescription. The ratios are
+/// read when `create_epoch` → `prescribe_epoch` computes
+/// `per_gateway_reward` / `per_observer_reward`; any epoch already
+/// prescribed keeps the reward numbers stamped at prescription time and is
+/// unaffected.
+///
+/// Authority-only. NOT migration-gated (unlike `admin_repair_settings`), so
+/// the reward split remains adjustable after `finalize_migration`. Mirrors
+/// `admin_set_epoch_duration`'s pattern (shared `UpdateEpochSettings`
+/// context on `EpochSettings`, `has_one = authority`).
+pub fn admin_set_reward_ratios(
+    ctx: Context<UpdateEpochSettings>,
+    gateway_reward_ratio: u64,
+    observer_reward_ratio: u64,
+) -> Result<()> {
+    // Sanity-bound each ratio individually first — a single value above
+    // RATE_SCALE is nonsensical regardless of the sum.
+    require!(
+        gateway_reward_ratio <= RATE_SCALE,
+        GarError::InvalidParameter
+    );
+    require!(
+        observer_reward_ratio <= RATE_SCALE,
+        GarError::InvalidParameter
+    );
+    // Floor/ceiling band: neither side may fall below MIN_REWARD_RATIO (10%)
+    // nor above MAX_REWARD_RATIO (90%), so the authority cannot zero out one
+    // side's incentive (e.g. gateway=1_000_000 / observer=0). Genesis 90/10
+    // and the intended 80/20 both land inside the band.
+    require!(
+        gateway_reward_ratio >= MIN_REWARD_RATIO && gateway_reward_ratio <= MAX_REWARD_RATIO,
+        GarError::InvalidParameter
+    );
+    require!(
+        observer_reward_ratio >= MIN_REWARD_RATIO && observer_reward_ratio <= MAX_REWARD_RATIO,
+        GarError::InvalidParameter
+    );
+    // The split must account for exactly 100% of the epoch reward pool.
+    // checked_add guards against overflow on adversarial inputs (both are
+    // bounded above, so this cannot actually overflow — keep the pattern).
+    let sum = gateway_reward_ratio
+        .checked_add(observer_reward_ratio)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    require!(sum == RATE_SCALE, GarError::InvalidParameter);
+
+    let clock = Clock::get()?;
+    let settings = &mut ctx.accounts.epoch_settings;
+    let old_gateway_ratio = settings.gateway_reward_ratio;
+    let old_observer_ratio = settings.observer_reward_ratio;
+    settings.gateway_reward_ratio = gateway_reward_ratio;
+    settings.observer_reward_ratio = observer_reward_ratio;
+
+    emit!(RewardRatiosUpdatedEvent {
+        admin: ctx.accounts.authority.key(),
+        old_gateway_ratio,
+        old_observer_ratio,
+        new_gateway_ratio: gateway_reward_ratio,
+        new_observer_ratio: observer_reward_ratio,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "EpochSettings reward split {}/{} → {}/{} (gateway/observer, scaled by RATE_SCALE)",
+        old_gateway_ratio,
+        old_observer_ratio,
+        gateway_reward_ratio,
+        observer_reward_ratio
     );
 
     Ok(())

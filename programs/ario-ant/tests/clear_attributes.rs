@@ -61,15 +61,25 @@ fn program_test() -> ProgramTest {
     pt
 }
 
-/// Mint a real Metaplex Core asset with an empty Attributes plugin
-/// (authority = Owner). Lifted verbatim from sync_attributes test.
+/// Per-asset ario-ant `ant_authority` PDA (ADR-028).
+fn ant_authority_pda(asset: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[ario_ant::state::ANT_AUTHORITY_SEED, asset.as_ref()],
+        &ario_ant::ID,
+    )
+    .0
+}
+
+/// Mint a real Metaplex Core asset with an empty Attributes plugin, minted the
+/// ADR-028 way (UA = ant_authority PDA, plugin authority = UpdateAuthority).
 async fn mint_test_ant(ctx: &mut ProgramTestContext, asset: &Keypair) {
     mint_test_ant_with_attributes(ctx, asset, &[]).await;
 }
 
 /// Mint a real Metaplex Core asset with pre-populated Attributes plugin
-/// entries (authority = Owner). Used to plant `ANT Program` at mint time
-/// so we can verify clear preserves it through a real UpdatePluginV1 CPI.
+/// entries, minted the ADR-028 way (UA = ant_authority PDA, plugin authority =
+/// UpdateAuthority). Used to plant `ANT Program` at mint time so we can verify
+/// clear preserves it through a real PDA-signed UpdatePluginV1 CPI.
 async fn mint_test_ant_with_attributes(
     ctx: &mut ProgramTestContext,
     asset: &Keypair,
@@ -95,7 +105,7 @@ async fn mint_test_ant_with_attributes(
         data.extend_from_slice(v.as_bytes());
     }
     data.push(1); // authority Option = Some
-    data.push(1); // BasePluginAuthority::Owner
+    data.push(2); // plugin Authority::UpdateAuthority (ADR-028; was Owner=1)
 
     let placeholder = MPL_CORE_PROGRAM_ID;
     let metas = vec![
@@ -103,8 +113,12 @@ async fn mint_test_ant_with_attributes(
         AccountMeta::new_readonly(placeholder, false), // collection (None)
         AccountMeta::new_readonly(ctx.payer.pubkey(), true), // authority
         AccountMeta::new(ctx.payer.pubkey(), true),    // payer
-        AccountMeta::new_readonly(placeholder, false), // owner (None → authority)
-        AccountMeta::new_readonly(placeholder, false), // updateAuthority (None)
+        // owner MUST be explicit: MPL Core defaults owner to updateAuthority
+        // when None, so with UA = the ant_authority PDA an omitted owner would
+        // make the PDA the owner. Pin it to the user.
+        AccountMeta::new_readonly(ctx.payer.pubkey(), false), // owner
+        // updateAuthority = ant_authority PDA (ADR-028)
+        AccountMeta::new_readonly(ant_authority_pda(&asset.pubkey()), false),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(placeholder, false), // logWrapper (None)
     ];
@@ -158,6 +172,9 @@ async fn inject_arns_record(
     data.push(0);
     data.extend_from_slice(&(name.len() as u32).to_le_bytes());
     data.extend_from_slice(name.as_bytes());
+    // version: SchemaVersion (3 bytes), byte-end field after the variable-length
+    // `name` (ADR-020). Required or `try_deserialize` hits Borsh EOF.
+    data.extend_from_slice(&[1, 0, 0]);
 
     let rent = ctx.banks_client.get_rent().await.unwrap();
     let account = solana_sdk::account::Account {
@@ -172,17 +189,11 @@ async fn inject_arns_record(
 }
 
 /// Build a `sync_attributes` instruction (used in setup-then-clear tests).
-fn build_sync_ix(
-    asset: &Pubkey,
-    payer: &Pubkey,
-    authority: &Pubkey,
-    arns_record: &Pubkey,
-    name: &str,
-) -> Instruction {
+fn build_sync_ix(asset: &Pubkey, payer: &Pubkey, arns_record: &Pubkey, name: &str) -> Instruction {
     let metas = ario_ant::accounts::SyncAttributes {
         asset: *asset,
         payer: *payer,
-        authority: *authority,
+        ant_authority: ant_authority_pda(asset),
         arns_record: *arns_record,
         mpl_core_program: MPL_CORE_PROGRAM_ID,
         system_program: system_program::ID,
@@ -198,12 +209,14 @@ fn build_sync_ix(
     }
 }
 
-/// Build a `clear_attributes` instruction.
+/// Build a `clear_attributes` instruction. Clear is owner-gated, so `authority`
+/// must be the owner; the program signs the CPI with `ant_authority`.
 fn build_clear_ix(asset: &Pubkey, payer: &Pubkey, authority: &Pubkey) -> Instruction {
     let metas = ario_ant::accounts::ClearAttributes {
         asset: *asset,
         payer: *payer,
         authority: *authority,
+        ant_authority: ant_authority_pda(asset),
         mpl_core_program: MPL_CORE_PROGRAM_ID,
         system_program: system_program::ID,
     }
@@ -351,7 +364,7 @@ async fn clear_attributes_removes_arns_traits_after_release_scenario() {
     let name = "released";
     let arns_record = inject_arns_record(&mut ctx, name, &asset.pubkey(), 1, 25).await;
     let payer_pk = ctx.payer.pubkey();
-    let sync_ix = build_sync_ix(&asset.pubkey(), &payer_pk, &payer_pk, &arns_record, name);
+    let sync_ix = build_sync_ix(&asset.pubkey(), &payer_pk, &arns_record, name);
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx =
         Transaction::new_signed_with_payer(&[sync_ix], Some(&payer_pk), &[&ctx.payer], blockhash);
@@ -436,7 +449,7 @@ async fn clear_attributes_preserves_ant_program_trait_when_present() {
     let name = "preservetest";
     let arns_record = inject_arns_record(&mut ctx, name, &asset.pubkey(), 0, 5).await;
     let payer_pk = ctx.payer.pubkey();
-    let sync_ix = build_sync_ix(&asset.pubkey(), &payer_pk, &payer_pk, &arns_record, name);
+    let sync_ix = build_sync_ix(&asset.pubkey(), &payer_pk, &arns_record, name);
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx =
         Transaction::new_signed_with_payer(&[sync_ix], Some(&payer_pk), &[&ctx.payer], blockhash);
@@ -538,7 +551,7 @@ async fn sync_attributes_fails_after_release_then_clear_recovers() {
     let name = "releasedname";
     let arns_record = inject_arns_record(&mut ctx, name, &asset.pubkey(), 1, 10).await;
     let payer_pk = ctx.payer.pubkey();
-    let sync_ix = build_sync_ix(&asset.pubkey(), &payer_pk, &payer_pk, &arns_record, name);
+    let sync_ix = build_sync_ix(&asset.pubkey(), &payer_pk, &arns_record, name);
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx =
         Transaction::new_signed_with_payer(&[sync_ix], Some(&payer_pk), &[&ctx.payer], blockhash);
@@ -558,7 +571,7 @@ async fn sync_attributes_fails_after_release_then_clear_recovers() {
     ctx.set_account(&arns_record, &empty.into());
 
     // sync_attributes must fail — record owner is system program.
-    let sync_ix2 = build_sync_ix(&asset.pubkey(), &payer_pk, &payer_pk, &arns_record, name);
+    let sync_ix2 = build_sync_ix(&asset.pubkey(), &payer_pk, &arns_record, name);
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx =
         Transaction::new_signed_with_payer(&[sync_ix2], Some(&payer_pk), &[&ctx.payer], blockhash);
@@ -616,13 +629,7 @@ async fn sync_attributes_fails_after_reassign_clear_recovers_old_asset() {
     let name = "reassigned";
     let arns_record = inject_arns_record(&mut ctx, name, &old_asset.pubkey(), 1, 20).await;
     let payer_pk = ctx.payer.pubkey();
-    let sync_ix = build_sync_ix(
-        &old_asset.pubkey(),
-        &payer_pk,
-        &payer_pk,
-        &arns_record,
-        name,
-    );
+    let sync_ix = build_sync_ix(&old_asset.pubkey(), &payer_pk, &arns_record, name);
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx =
         Transaction::new_signed_with_payer(&[sync_ix], Some(&payer_pk), &[&ctx.payer], blockhash);
@@ -638,13 +645,7 @@ async fn sync_attributes_fails_after_reassign_clear_recovers_old_asset() {
     inject_arns_record(&mut ctx, name, &new_asset.pubkey(), 1, 20).await;
 
     // sync_attributes against old_asset must fail — record.ant is now new_asset.
-    let sync_ix2 = build_sync_ix(
-        &old_asset.pubkey(),
-        &payer_pk,
-        &payer_pk,
-        &arns_record,
-        name,
-    );
+    let sync_ix2 = build_sync_ix(&old_asset.pubkey(), &payer_pk, &arns_record, name);
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx =
         Transaction::new_signed_with_payer(&[sync_ix2], Some(&payer_pk), &[&ctx.payer], blockhash);

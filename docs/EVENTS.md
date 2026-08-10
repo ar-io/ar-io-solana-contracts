@@ -39,7 +39,7 @@ Full API in `sdk/src/solana/events.ts`.
 | `ario-core` | 14 | Token transfer, vault CRUD, primary-name lifecycle, supply/migration finalized, config updates, admin-authority transfer (ADR-026) |
 | `ario-gar` | 34 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), multi-source funding plan, admin-authority transfer (ADR-026) |
 | `ario-arns` | 13 | Name purchases (5 base events × `funding_source: u8` covering 25 emit variants), reassign/release, reservation lifecycle, prune, demand-factor updates, admin-authority transfer (ADR-026) |
-| `ario-ant` | 21 | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`), admin record/ACL/orphan closes, admin-authority transfer (ADR-026) |
+| `ario-ant` | 22 | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`), admin record/ACL/orphan closes, admin-authority transfer (ADR-026), `adopt_authority` (ADR-028) |
 | `ario-ant-escrow` | 5 | Unified shapes for 15 instructions via `asset_type: u8` (ANT/Tokens/Vault) + `claim_protocol: u8` (Arweave/Ethereum), admin purge |
 
 Full per-event field shapes: `BD-103` in
@@ -150,7 +150,7 @@ ConfigUpdated/AntMetadataUpdated, add `expires_at` to NameReserved.
 minor SDK release. The IDL snapshot at
 `contracts/idl-event-snapshots.json` becomes a CI freeze gate.
 
-Full rationale: `ADR-017` in [`DECISIONS.md`](./DECISIONS.md).
+Full rationale: `ADR-018` in [`DECISIONS.md`](./DECISIONS.md).
 
 ## Subscribing live (consumer patterns)
 
@@ -353,7 +353,7 @@ Yes. Add it to:
 ## Cross-references
 
 - **Catalog:** [`BEHAVIORAL_DIFFERENCES.md` § BD-103](./BEHAVIORAL_DIFFERENCES.md)
-- **ABI policy:** [`DECISIONS.md` § ADR-017](./DECISIONS.md)
+- **ABI policy:** [`DECISIONS.md` § ADR-018](./DECISIONS.md)
 - **Gap analysis (rollout history):** [`EVENT_EMISSION_AUDIT.md`](./EVENT_EMISSION_AUDIT.md)
 - **Build plan (rollout history):** [`EVENT_EMISSION_IMPLEMENTATION_PLAN.md`](./EVENT_EMISSION_IMPLEMENTATION_PLAN.md)
 - **Superseded original draft:** [`EVENT_EMISSION_PLAN.md`](./EVENT_EMISSION_PLAN.md) (kept for context)

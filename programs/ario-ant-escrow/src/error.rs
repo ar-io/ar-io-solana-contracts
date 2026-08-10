@@ -160,12 +160,27 @@ pub enum EscrowError {
     #[msg("Revocable vaults are not supported by the escrow (see ADR-021)")]
     RevocableVaultUnsupported,
 
-    /// Active (still-locked) vault claims are disabled: a locked vault can only
-    /// be claimed after its `vault_end_timestamp`, at which point it is
-    /// delivered liquid to the claimant. The former active re-lock path was
-    /// removed because its sibling-`vaulted_transfer` introspection had no 1:1
-    /// claim↔re-lock binding (reuse / redirection). See the active-vault
-    /// re-lock removal ADR.
+    /// Historical (ADR-022 era): active (still-locked) vault claims were
+    /// disabled between ADR-022 and ADR-027. Unused since ADR-027 restored
+    /// the active path via direct CPI re-lock; retained because the error
+    /// ABI is append-only (codes are stable once committed).
     #[msg("Vault is still locked; claim is only available after the vault end timestamp")]
     VaultStillLocked,
+
+    /// Active vault re-lock (remaining lock >= ario-core's
+    /// `min_vault_duration`) was requested but the claim was submitted
+    /// without the trailing re-lock account set (`payer_token_account`,
+    /// `ario_core_config`, `recipient_vault_counter`, `vault`,
+    /// `vault_token_account`, `ario_core_program`). Pass all six when
+    /// claiming a still-locked vault. See ADR-027.
+    #[msg("Still-locked vault claim requires the re-lock accounts (see ADR-027)")]
+    RelockAccountsMissing,
+
+    /// The escrow's token account is in an impossible state (shorter than
+    /// the SPL layout, or live balance below the escrowed principal).
+    /// Defensive: Anchor's typed constraints and the deposit invariant make
+    /// this unreachable in practice; the check guards the C1 dust sweep's
+    /// balance arithmetic (see `claim_vault_common::settle_vault_claim`).
+    #[msg("Escrow token account state is invalid")]
+    InvalidEscrowTokenAccountState,
 }

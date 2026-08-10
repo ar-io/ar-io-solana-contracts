@@ -1557,11 +1557,14 @@ pub mod ario_ant {
     /// plugin payload with `[ArNS Name, Type, Undername Limit (+ ANT
     /// Program)]`.
     ///
-    /// Authority: ANTs mint with the Attributes plugin authority set to
-    /// `Owner` — only the current MPL Core asset holder can sign the
-    /// inner CPI. `authority` MUST equal the on-chain owner (Anchor
-    /// handler check) and is forwarded as both `payer` and `authority`
-    /// to the CPI.
+    /// Authority (ADR-028): program-controlled ANTs mint with UpdateAuthority =
+    /// the per-asset `ant_authority` PDA and the Attributes plugin authority =
+    /// `UpdateAuthority`, so the program signs UpdatePluginV1 with the PDA and
+    /// this instruction is PERMISSIONLESS — any `payer` may trigger it; the
+    /// ArnsRecord checks guarantee only the canonical traits for this asset get
+    /// written. Legacy ANTs (plugin authority = `Owner`) fall back to the
+    /// pre-ADR-028 rule: `payer` must equal the current MPL Core owner and signs
+    /// the CPI directly.
     ///
     /// Reshape rationale: pre-Sprint-3, ario-arns `buy_name` /
     /// `upgrade_name` / etc. CPI'd into MPL Core themselves (and skipped
@@ -1585,25 +1588,125 @@ pub mod ario_ant {
     /// owner otherwise has no AR.IO-program path to remove (sync would
     /// fail the post-state `record.ant == asset.key()` check).
     ///
-    /// Authority must currently hold the asset (matching sync's authority
-    /// rule — Owner-authority Attributes plugin). Strictly additive: no
-    /// existing flow breaks. See ADR-016 / BD-100 for the architectural
-    /// context this closes.
+    /// Owner-gated in both models (it removes live traits): `authority` must
+    /// equal the current MPL Core owner. For ADR-028 program-controlled ANTs the
+    /// program signs the CPI with the `ant_authority` PDA; legacy ANTs are
+    /// owner-signed. See ADR-016 / BD-100 for the architectural context this
+    /// closes.
     pub fn clear_attributes(ctx: Context<ClearAttributes>) -> Result<()> {
         clear_attributes_handler(ctx)
     }
+
+    /// Opt-in migration of an EXISTING (legacy) ANT onto the program-controlled
+    /// authority model (ADR-028). Signed by the current owner, it hands the
+    /// per-asset `ant_authority` PDA both the asset UpdateAuthority and the
+    /// Attributes-plugin authority, so future attribute syncs are permissionless
+    /// and program-signed. Owner (custody) is unchanged — the user keeps the NFT.
+    ///
+    /// Legacy ANTs mint with `Owner == UpdateAuthority` and Attributes plugin
+    /// authority = `Owner`, so a single owner signature authorizes both inner
+    /// CPIs. New ANTs mint already-adopted (via CreateV1) and never call this.
+    pub fn adopt_authority(ctx: Context<AdoptAuthority>) -> Result<()> {
+        adopt_authority_handler(ctx)
+    }
+}
+
+fn adopt_authority_handler(ctx: Context<AdoptAuthority>) -> Result<()> {
+    let asset_key = ctx.accounts.asset.key();
+    let ant_authority_key = ctx.accounts.ant_authority.key();
+
+    // The owner signer must be the asset's current MPL Core owner. On legacy
+    // ANTs Owner == UpdateAuthority, so this same signature also authorizes both
+    // the RevokePluginAuthorityV1 (current plugin authority = Owner) and the
+    // UpdateV1 UA rotation (current UA = Owner).
+    {
+        let asset_data = ctx.accounts.asset.try_borrow_data()?;
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        require!(
+            ctx.accounts.owner.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+
+        // Idempotency: refuse if UA is already the `ant_authority` PDA — the
+        // asset is already program-controlled and the UpdateV1 would be a no-op
+        // (and the ApprovePluginAuthorityV1 would fail — the owner is no longer
+        // the plugin authority).
+        let current_ua = read_mpl_core_update_authority(&asset_data)?;
+        require!(
+            current_ua != Some(ant_authority_key),
+            AntError::AlreadyProgramControlled
+        );
+    }
+
+    // (a) Reset the Attributes plugin authority to its default manager
+    // (`UpdateAuthority`) so it resolves to whoever holds the asset
+    // UpdateAuthority. The Attributes plugin is UpdateAuthority-managed, so a
+    // legacy ANT's `Owner` setting is a delegation; RevokePluginAuthorityV1
+    // (not Approve, which errors CannotRedelegate) clears it. Signed by the
+    // owner (current plugin authority).
+    mpl_core_cpi::revoke_attributes_authority_to_default(
+        &ctx.accounts.asset,
+        &ctx.accounts.payer.to_account_info(),
+        &ctx.accounts.owner.to_account_info(),
+        &ctx.accounts.system_program.to_account_info(),
+        &ctx.accounts.mpl_core_program,
+    )?;
+
+    // (b) Rotate the asset UpdateAuthority to the `ant_authority` PDA. Signed by
+    // the owner (current UA). After this the plugin authority (UpdateAuthority)
+    // resolves to the PDA — the same on-chain state a new ANT mints with.
+    mpl_core_cpi::set_update_authority(
+        &ctx.accounts.asset,
+        &ctx.accounts.payer.to_account_info(),
+        &ctx.accounts.owner.to_account_info(),
+        &ant_authority_key,
+        &ctx.accounts.system_program.to_account_info(),
+        &ctx.accounts.mpl_core_program,
+    )?;
+
+    emit!(AuthorityAdoptedEvent {
+        mint: asset_key,
+        owner: ctx.accounts.owner.key(),
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    msg!(
+        "ANT {} adopted program authority (UA -> ant_authority PDA {})",
+        asset_key,
+        ant_authority_key
+    );
+    Ok(())
 }
 
 fn sync_attributes_handler(ctx: Context<SyncAttributes>, name: String) -> Result<()> {
     use anchor_lang::AccountDeserialize;
 
-    // Authority must currently hold the asset (Owner-authority plugin).
+    let asset_key = ctx.accounts.asset.key();
+
+    // Pick the signing model from the asset's current UpdateAuthority (ADR-028).
+    //
+    // Program-controlled (new/adopted) ANTs: UA = the `ant_authority` PDA and
+    // the Attributes plugin authority = `UpdateAuthority`, so the program signs
+    // the CPI with the PDA and sync is PERMISSIONLESS — anyone may pay/trigger
+    // it. Safety comes from the ArnsRecord checks below (owner + seeds +
+    // `record.ant == asset`): a caller can only ever write the canonical traits
+    // for THIS asset.
+    //
+    // Legacy ANTs (UA != PDA, plugin authority still `Owner`): fall back to the
+    // pre-ADR-028 rule — `payer` must be the current MPL Core owner and signs
+    // the CPI directly.
     let asset_data = ctx.accounts.asset.try_borrow_data()?;
-    let nft_owner = read_mpl_core_owner(&asset_data)?;
-    require!(
-        ctx.accounts.authority.key() == nft_owner,
-        AntError::NotNftHolder
-    );
+    let current_ua = read_mpl_core_update_authority(&asset_data)?;
+    let program_controlled = current_ua == Some(ctx.accounts.ant_authority.key());
+
+    if !program_controlled {
+        let nft_owner = read_mpl_core_owner(&asset_data)?;
+        require!(
+            ctx.accounts.payer.key() == nft_owner,
+            AntError::NotNftHolder
+        );
+    }
+
     // Preserve `ANT Program` across the whole-list replace UpdatePluginV1
     // performs. Read it before we drop the asset borrow.
     let existing_program =
@@ -1643,14 +1746,31 @@ fn sync_attributes_handler(ctx: Context<SyncAttributes>, name: String) -> Result
     );
 
     let attributes = mpl_core_cpi::build_attribute_list(&record, existing_program);
-    mpl_core_cpi::update_attributes_plugin(
-        &ctx.accounts.asset,
-        &ctx.accounts.payer.to_account_info(),
-        &ctx.accounts.authority.to_account_info(),
-        &ctx.accounts.system_program.to_account_info(),
-        &ctx.accounts.mpl_core_program,
-        &attributes,
-    )?;
+    if program_controlled {
+        // Program signs UpdatePluginV1 with the per-asset `ant_authority` PDA.
+        let bump = ctx.bumps.ant_authority;
+        let seeds: &[&[u8]] = &[ANT_AUTHORITY_SEED, asset_key.as_ref(), &[bump]];
+        mpl_core_cpi::update_attributes_plugin(
+            &ctx.accounts.asset,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.ant_authority.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.mpl_core_program,
+            &attributes,
+            Some(seeds),
+        )?;
+    } else {
+        // Legacy Owner-authority plugin: `payer` (== owner, checked above) signs.
+        mpl_core_cpi::update_attributes_plugin(
+            &ctx.accounts.asset,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.mpl_core_program,
+            &attributes,
+            None,
+        )?;
+    }
 
     emit!(AttributesSyncedEvent {
         mint: ctx.accounts.asset.key(),
@@ -1668,15 +1788,23 @@ fn sync_attributes_handler(ctx: Context<SyncAttributes>, name: String) -> Result
 }
 
 fn clear_attributes_handler(ctx: Context<ClearAttributes>) -> Result<()> {
-    // Authority must currently hold the asset (Owner-authority plugin).
-    // Same rule sync_attributes enforces — only the NFT holder can sign
-    // UpdatePluginV1.
+    let asset_key = ctx.accounts.asset.key();
+
+    // Clear stays OWNER-GATED in both models — it removes live traits, so only
+    // the current holder should trigger it (sync is the permissionless
+    // direction). The `authority` signer must equal the MPL Core owner.
     let asset_data = ctx.accounts.asset.try_borrow_data()?;
     let nft_owner = read_mpl_core_owner(&asset_data)?;
     require!(
         ctx.accounts.authority.key() == nft_owner,
         AntError::NotNftHolder
     );
+
+    // The signing model still depends on where the plugin authority lives:
+    // ADR-028 ANTs (UA = `ant_authority` PDA) are PDA-signed; legacy ANTs
+    // (plugin authority = `Owner`) are owner-signed.
+    let current_ua = read_mpl_core_update_authority(&asset_data)?;
+    let program_controlled = current_ua == Some(ctx.accounts.ant_authority.key());
 
     // Preserve `ANT Program` across the whole-list replace. This trait is
     // asset-bound (ADR-016 / BD-100) — clearing the ArNS-related traits
@@ -1700,14 +1828,29 @@ fn clear_attributes_handler(ctx: Context<ClearAttributes>) -> Result<()> {
 
     let kept_program = !attributes.is_empty();
 
-    mpl_core_cpi::update_attributes_plugin(
-        &ctx.accounts.asset,
-        &ctx.accounts.payer.to_account_info(),
-        &ctx.accounts.authority.to_account_info(),
-        &ctx.accounts.system_program.to_account_info(),
-        &ctx.accounts.mpl_core_program,
-        &attributes,
-    )?;
+    if program_controlled {
+        let bump = ctx.bumps.ant_authority;
+        let seeds: &[&[u8]] = &[ANT_AUTHORITY_SEED, asset_key.as_ref(), &[bump]];
+        mpl_core_cpi::update_attributes_plugin(
+            &ctx.accounts.asset,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.ant_authority.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.mpl_core_program,
+            &attributes,
+            Some(seeds),
+        )?;
+    } else {
+        mpl_core_cpi::update_attributes_plugin(
+            &ctx.accounts.asset,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.authority.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.mpl_core_program,
+            &attributes,
+            None,
+        )?;
+    }
 
     let clock = Clock::get()?;
     emit!(AttributesClearedEvent {
@@ -1751,6 +1894,35 @@ pub(crate) fn read_mpl_core_owner(data: &[u8]) -> Result<Pubkey> {
     Ok(Pubkey::from(owner_bytes))
 }
 
+/// Read the asset-level UpdateAuthority from a Metaplex Core AssetV1 account's
+/// raw data. Returns `Some(pubkey)` for the `Address` variant, `None` for the
+/// `None` or `Collection` variants (neither is a plain pubkey we compare
+/// against the `ant_authority` PDA).
+///
+/// AssetV1 layout (see `mpl_core_cpi::read_existing_attribute` for the full
+/// reference): byte 0 = key (1), bytes 1..33 = owner, byte 33 = UpdateAuthority
+/// enum variant (asset enum: 0=None, 1=Address(Pubkey), 2=Collection(Pubkey)).
+///
+/// WARNING: hardcodes the MPL Core AssetV1 byte layout — mpl-core is not a Cargo
+/// dependency. Must be updated manually if Metaplex Core changes the layout.
+pub(crate) fn read_mpl_core_update_authority(data: &[u8]) -> Result<Option<Pubkey>> {
+    require!(data.len() >= 34, AntError::InvalidAsset);
+    require!(data[0] == 1, AntError::InvalidAsset);
+
+    match data[33] {
+        // Address variant: 32-byte pubkey body follows the variant tag.
+        1 => {
+            require!(data.len() >= 66, AntError::InvalidAsset);
+            let ua_bytes: [u8; 32] = data[34..66]
+                .try_into()
+                .map_err(|_| AntError::InvalidAsset)?;
+            Ok(Some(Pubkey::from(ua_bytes)))
+        }
+        // None (0) or Collection (2) — not a comparable UA pubkey.
+        _ => Ok(None),
+    }
+}
+
 // =========================================
 // PARAMETER TYPES
 // =========================================
@@ -1767,9 +1939,9 @@ pub struct InitializeAntParams {
     pub target_protocol: Option<u8>,
     /// Logo (Arweave TX ID, 43 chars) — empty for default
     pub logo: String,
-    /// Description (max 256 chars)
+    /// Description (max 128 chars)
     pub description: String,
-    /// Keywords (max 8)
+    /// Keywords (max 3)
     pub keywords: Vec<String>,
 }
 
@@ -1797,9 +1969,9 @@ pub struct SetRecordMetadataParams {
     pub display_name: Option<String>,
     /// Optional logo (Arweave TX ID, 43 chars)
     pub record_logo: Option<String>,
-    /// Optional description (max 256 chars)
+    /// Optional description (max 128 chars)
     pub record_description: Option<String>,
-    /// Optional keywords (max 8)
+    /// Optional keywords (max 3)
     pub record_keywords: Option<Vec<String>>,
 }
 
@@ -2502,15 +2674,21 @@ pub struct SyncAttributes<'info> {
     )]
     pub asset: AccountInfo<'info>,
 
-    /// Pays for any rent the inner CPI may charge. Often the same key as
-    /// `authority` (ANT owner) but kept separate so a sponsor can pay.
+    /// Pays for any rent the inner CPI may charge and triggers the sync.
+    /// PERMISSIONLESS for ADR-028 (program-controlled) ANTs — any caller may
+    /// sponsor. For legacy ANTs (plugin authority = `Owner`) it MUST equal the
+    /// current MPL Core owner (checked in the handler), and signs UpdatePluginV1
+    /// directly.
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// Must equal the asset's current MPL Core owner — the Attributes
-    /// plugin uses `Owner` as its `BasePluginAuthority`, so only the
-    /// holder can sign UpdatePluginV1.
-    pub authority: Signer<'info>,
+    /// CHECK: per-asset program-signer PDA (ADR-028). For program-controlled
+    /// ANTs this is the asset's UpdateAuthority (and, via the
+    /// `Authority::UpdateAuthority` plugin binding, the Attributes-plugin
+    /// authority); the program signs UpdatePluginV1 with it. Address is pinned
+    /// by the seeds — never read or written.
+    #[account(seeds = [ANT_AUTHORITY_SEED, asset.key().as_ref()], bump)]
+    pub ant_authority: UncheckedAccount<'info>,
 
     /// CHECK: ArnsRecord PDA in the canonical ario-arns program. Owner +
     /// PDA seeds + `ant == asset.key()` are all validated in the handler.
@@ -2550,12 +2728,59 @@ pub struct ClearAttributes<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    /// Must equal the asset's current MPL Core owner — Owner-authority
-    /// plugin requires the holder to sign UpdatePluginV1.
+    /// Must equal the asset's current MPL Core owner. Clear is owner-gated in
+    /// both models (it removes live traits); the signer here authorizes the
+    /// operation, while for program-controlled ANTs the program signs the CPI
+    /// with `ant_authority`.
     pub authority: Signer<'info>,
+
+    /// CHECK: per-asset program-signer PDA (ADR-028). For program-controlled
+    /// ANTs the program signs UpdatePluginV1 with it. Address pinned by seeds.
+    #[account(seeds = [ANT_AUTHORITY_SEED, asset.key().as_ref()], bump)]
+    pub ant_authority: UncheckedAccount<'info>,
 
     /// Metaplex Core program — pinned to the canonical ID; required for
     /// the inner CPI.
+    /// CHECK: validated via key constraint.
+    #[account(
+        constraint = mpl_core_program.key() == MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub mpl_core_program: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// `adopt_authority` (ADR-028): hand an existing ANT's UpdateAuthority +
+/// Attributes-plugin authority to the per-asset `ant_authority` PDA. Owner
+/// (custody) is unchanged.
+#[derive(Accounts)]
+pub struct AdoptAuthority<'info> {
+    /// The Metaplex Core asset being adopted.
+    /// CHECK: validated as MPL-Core-owned via the constraint; owner + UA read
+    /// from raw data in the handler.
+    #[account(
+        mut,
+        constraint = asset.owner == &MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
+    )]
+    pub asset: AccountInfo<'info>,
+
+    /// Pays for any rent the inner CPIs may charge. Often the same key as
+    /// `owner` but kept separate so a sponsor can pay.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Must equal the asset's current MPL Core owner. On legacy ANTs Owner ==
+    /// UpdateAuthority == plugin authority, so this one signature authorizes both
+    /// the RevokePluginAuthorityV1 and the UpdateV1 UA rotation.
+    pub owner: Signer<'info>,
+
+    /// CHECK: per-asset program-signer PDA (ADR-028) — the target of the UA
+    /// rotation. Address pinned by seeds; never read or written directly.
+    #[account(seeds = [ANT_AUTHORITY_SEED, asset.key().as_ref()], bump)]
+    pub ant_authority: UncheckedAccount<'info>,
+
+    /// Metaplex Core program — pinned to the canonical ID; required for the
+    /// inner CPIs.
     /// CHECK: validated via key constraint.
     #[account(
         constraint = mpl_core_program.key() == MPL_CORE_PROGRAM_ID @ AntError::InvalidAsset,
@@ -2910,6 +3135,18 @@ pub struct AttributesClearedEvent {
 pub struct AttributesSyncedEvent {
     pub mint: Pubkey,
     pub name: String,
+    pub timestamp: i64,
+}
+
+/// Emitted by `adopt_authority` (ADR-028) after a legacy ANT's
+/// UpdateAuthority + Attributes-plugin authority are handed to the
+/// per-asset `ant_authority` PDA. `owner` is the wallet that authorized
+/// the handover. Indexers use this to flip an ANT from owner-signed to
+/// program-controlled attribute management.
+#[event]
+pub struct AuthorityAdoptedEvent {
+    pub mint: Pubkey,
+    pub owner: Pubkey,
     pub timestamp: i64,
 }
 

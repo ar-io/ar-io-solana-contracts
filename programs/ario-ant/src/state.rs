@@ -9,6 +9,12 @@ pub const ANT_CONTROLLERS_SEED: &[u8] = b"ant_controllers";
 pub const ANT_RECORD_SEED: &[u8] = b"ant_record";
 pub const ANT_RECORD_META_SEED: &[u8] = b"ant_record_meta";
 pub const ANT_MIGRATION_CONFIG_SEED: &[u8] = b"ant_migration_config";
+/// Per-asset program-signer PDA that holds the Metaplex Core UpdateAuthority
+/// (and, via `Authority::UpdateAuthority`, the Attributes-plugin authority) for
+/// ANTs minted after ADR-028. Signer-only — no account is ever created at this
+/// address; the program signs MPL Core `UpdatePluginV1` / `UpdateV1` CPIs with
+/// it. PDA: ["ant_authority", asset.as_ref()]. Owner stays with the user.
+pub const ANT_AUTHORITY_SEED: &[u8] = b"ant_authority";
 /// Per-user ACL config head (ADR-012). PDA: ["acl_config", user.as_ref()]
 pub const ACL_CONFIG_SEED: &[u8] = b"acl_config";
 /// Per-user ACL page (ADR-012).
@@ -216,9 +222,9 @@ pub struct AntConfig {
     pub ticker: String,
     /// Logo - Arweave transaction ID (43 chars)
     pub logo: String,
-    /// Description (max 256 chars)
+    /// Description (max 128 chars)
     pub description: String,
-    /// Keywords (max 8, each max 32 chars)
+    /// Keywords (max 3, each max 32 chars)
     pub keywords: Vec<String>,
     /// Last known NFT owner - for lazy controller cleanup on transfer
     pub last_known_owner: Pubkey,
@@ -279,7 +285,7 @@ impl AntConfig {
 pub struct AntControllers {
     /// The Metaplex Core asset this controller list belongs to
     pub mint: Pubkey,
-    /// Controller addresses (max 10)
+    /// Controller addresses (max 4)
     pub controllers: Vec<Pubkey>,
     /// PDA bump
     pub bump: u8,
@@ -494,9 +500,9 @@ pub struct AntRecordMetadata {
     pub display_name: Option<String>,
     /// Optional logo (Arweave TX ID, 43 chars — Arweave-only for permanence)
     pub record_logo: Option<String>,
-    /// Optional description (max 256 chars)
+    /// Optional description (max 128 chars)
     pub record_description: Option<String>,
-    /// Optional keywords (max 8, each max 32 chars)
+    /// Optional keywords (max 3, each max 32 chars)
     pub record_keywords: Option<Vec<String>>,
     /// PDA bump
     pub bump: u8,

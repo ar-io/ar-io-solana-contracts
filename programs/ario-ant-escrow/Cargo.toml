@@ -14,7 +14,11 @@ name = "ario_ant_escrow"
 workspace = true
 
 [features]
-idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+# `ario-core/idl-build` must ride along because this crate references
+# `ario_core::cpi::accounts::*` (vault re-lock CPI, ADR-0027) — Cargo's
+# feature unifier doesn't propagate idl-build through the cpi dep edge.
+# See CLAUDE.md "idl-build feature must propagate through cpi deps".
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "ario-core/idl-build"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []

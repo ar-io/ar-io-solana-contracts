@@ -196,4 +196,9 @@ pub enum AntError {
     /// an unspendable address.
     #[msg("New authority cannot be the null pubkey")]
     InvalidAuthority,
+
+    /// `adopt_authority` (ADR-028): the asset's UpdateAuthority is already the
+    /// `ant_authority` PDA — it is already program-controlled, nothing to do.
+    #[msg("ANT is already program-controlled (UpdateAuthority is the ant_authority PDA)")]
+    AlreadyProgramControlled,
 }

@@ -1,14 +1,27 @@
 # Restoring the escrow active-vault re-lock path
 
-> **Status:** Playbook only. The active re-lock path is currently **disabled**
+> [!WARNING]
+> **Archived 2026-07-01.** This playbook is preserved for historical
+> reference only — the restoration it describes **shipped** as
+> [ADR-027](../adrs/0027-escrow-restore-active-vault-relock-direct-cpi.md)
+> / BD-113. Note the shipped design **deviates** from this playbook: a hard
+> constraint that ario-core must not be modified ruled out the new
+> `vaulted_transfer_for_escrow` instruction proposed below, so the escrow
+> instead CPIs the **existing** `vaulted_transfer` / `create_vault` ABI via
+> an atomic payer pass-through inside the claim handler, with a liquid
+> fallback when the remaining lock is under `min_vault_duration`. The
+> current source of truth is ADR-027, `ANT_ESCROW_PROTOCOL_SPEC.md` §11.5,
+> and `programs/ario-ant-escrow/src/instructions/claim_vault_common.rs`.
+>
+> **Status (historical):** Playbook only. The active re-lock path is currently **disabled**
 > (ADR-022). This document captures the design + concrete steps needed if the
 > "claim a still-locked vault and keep it locked for the remaining duration on
 > Solana" capability is ever revived.
 
 Pairs with:
-- [`adrs/0022-escrow-disable-active-vault-relock.md`](adrs/0022-escrow-disable-active-vault-relock.md) — why the path was disabled, alternatives considered.
-- [`adrs/0021-escrow-vault-relocks-non-revocable.md`](adrs/0021-escrow-vault-relocks-non-revocable.md) — the non-revocable invariant; restoration must preserve it.
-- [`ACTIVE_VAULT_DISABLE_ROLLOUT.md`](ACTIVE_VAULT_DISABLE_ROLLOUT.md) — the rollout this would reverse.
+- [`adrs/0022-escrow-disable-active-vault-relock.md`](../adrs/0022-escrow-disable-active-vault-relock.md) — why the path was disabled, alternatives considered.
+- [`adrs/0021-escrow-vault-relocks-non-revocable.md`](../adrs/0021-escrow-vault-relocks-non-revocable.md) — the non-revocable invariant; restoration must preserve it.
+- [`ACTIVE_VAULT_DISABLE_ROLLOUT.md`](../ACTIVE_VAULT_DISABLE_ROLLOUT.md) — the rollout this would reverse.
 
 ## Step 0 — decide if you actually need it
 
