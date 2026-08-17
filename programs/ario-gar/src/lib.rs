@@ -380,7 +380,13 @@ pub mod ario_gar {
 
     /// Create a new epoch (F23)
     /// This is permissionless - anyone can call when the previous epoch has ended
-    pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
+    ///
+    /// ADR-0029: optionally pass the `["epoch_rent_receipt", epoch_index]`
+    /// PDA as a single writable `remaining_accounts` entry to record yourself
+    /// as the creator, so `close_epoch` refunds this epoch's rent to you
+    /// rather than to whoever closes it. Omitting it preserves the old
+    /// behavior exactly.
+    pub fn create_epoch<'info>(ctx: Context<'_, '_, '_, 'info, CreateEpoch<'info>>) -> Result<()> {
         instructions::epoch::create_epoch(ctx)
     }
 
@@ -401,7 +407,15 @@ pub mod ario_gar {
     /// Close a fully distributed epoch account, reclaiming rent.
     /// Permissionless — anyone can call once the epoch is distributed and
     /// at least `epoch_retention` epochs have passed.
-    pub fn close_epoch(ctx: Context<CloseEpoch>, _epoch_index: u64) -> Result<()> {
+    ///
+    /// ADR-0029: when the epoch carries a rent receipt, pass the receipt PDA
+    /// and its recorded creator as the first two writable
+    /// `remaining_accounts`; the rent is refunded to that creator, not to the
+    /// signer. Epochs created without a receipt still refund `payer`.
+    pub fn close_epoch<'info>(
+        ctx: Context<'_, '_, '_, 'info, CloseEpoch<'info>>,
+        _epoch_index: u64,
+    ) -> Result<()> {
         instructions::epoch::close_epoch(ctx, _epoch_index)
     }
 
@@ -1488,8 +1502,14 @@ pub struct EpochWeightsTalliedEvent {
 }
 
 /// Emitted by `close_epoch` when the epoch PDA is closed. `rent_recovered`
-/// is the lamport delta refunded to the caller (captured pre/post account
-/// close). Marker for retention-window pruning in indexers.
+/// is the Epoch account's lamport balance immediately before the close, i.e.
+/// the rent refunded — to the epoch's recorded creator when it has a rent
+/// receipt (ADR-0029), otherwise to the caller. Marker for retention-window
+/// pruning in indexers.
+///
+/// The recipient is deliberately NOT a field: field shapes are frozen
+/// post-mainnet (ADR-018), and indexers can already read it from the
+/// transaction's account list.
 #[event]
 pub struct EpochClosedEvent {
     pub epoch_index: u64,

@@ -27091,3 +27091,554 @@ async fn test_delegate_reward_share_ratio_applied_at_tally() {
     assert_eq!(gw.settings.delegate_reward_share_ratio, 5000);
     assert_eq!(gw.settings.pending_delegate_reward_share_ratio, None);
 }
+
+// =========================================
+// ADR-0029: EPOCH RENT REFUNDS THE CREATOR
+// =========================================
+//
+// `create_epoch` funds the Epoch PDA (~0.0664 SOL); `close_epoch` used to
+// hand that rent to whoever signed the close, so a close-only bot could
+// harvest rent funded by the operators running the mandatory pipeline. The
+// creator is now recorded in an auxiliary `EpochRentReceipt` PDA and the
+// refund follows `epoch.has_rent_receipt`, a program-written flag — never
+// the caller's choice of accounts.
+
+fn epoch_rent_receipt_pda(epoch_index: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[EPOCH_RENT_RECEIPT_SEED, &epoch_index.to_le_bytes()],
+        &ario_gar::ID,
+    )
+}
+
+/// Lamport balance, or 0 for an account that doesn't exist (i.e. was closed).
+async fn lamports_of(ctx: &mut ProgramTestContext, key: &Pubkey) -> u64 {
+    ctx.banks_client
+        .get_account(*key)
+        .await
+        .unwrap()
+        .map(|a| a.lamports)
+        .unwrap_or(0)
+}
+
+async fn read_epoch_flags(ctx: &mut ProgramTestContext, epoch_key: &Pubkey) -> (u8, u64) {
+    let acc = ctx
+        .banks_client
+        .get_account(*epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&acc.data[8..8 + std::mem::size_of::<Epoch>()]);
+    (epoch.has_rent_receipt, epoch.epoch_index)
+}
+
+/// Boot the standard GAR scaffold with epochs enabled (genesis 100) and the
+/// clock at epoch 0's start — the minimum state `create_epoch` needs. No
+/// gateway joins: ADR-0029 is about which account receives lamports, and
+/// `create_epoch` only reads `registry.count` on that path.
+async fn setup_rent_receipt_ctx() -> (ProgramTestContext, GarSetup) {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+
+    (ctx, setup)
+}
+
+/// Fund a fresh keypair from the test payer so it can pay account rent.
+async fn fund_keypair(ctx: &mut ProgramTestContext, who: &Pubkey, lamports: u64) {
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            who,
+            lamports,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+}
+
+/// `create_epoch` signed by `creator` (the ix's `payer`, so the account that
+/// funds the Epoch's rent), with the ADR-0029 receipt appended as a
+/// `remaining_account` when `with_receipt`.
+///
+/// The transaction fee is paid by `ctx.payer`, never by `creator`, so every
+/// lamport assertion below is pure rent — no fee arithmetic to reason about.
+async fn create_epoch_as(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    epoch_index: u64,
+    creator: &Keypair,
+    with_receipt: bool,
+) -> std::result::Result<(), BanksClientError> {
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(epoch_index);
+    let mut accounts = ario_gar::accounts::CreateEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        payer: creator.pubkey(),
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    if with_receipt {
+        accounts.push(solana_sdk::instruction::AccountMeta::new(
+            epoch_rent_receipt_pda(epoch_index).0,
+            false,
+        ));
+    }
+
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts,
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, creator],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// `close_epoch` signed by `closer` (the ix's `payer`), with an arbitrary
+/// list of extra accounts so tests can supply the right receipt, the wrong
+/// one, or none at all. Fee paid by `ctx.payer` for the same reason as above.
+async fn close_epoch_as(
+    ctx: &mut ProgramTestContext,
+    epoch_index: u64,
+    closer: &Keypair,
+    extra: &[Pubkey],
+) -> std::result::Result<(), BanksClientError> {
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(epoch_index);
+    let mut accounts = ario_gar::accounts::CloseEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        payer: closer.pubkey(),
+    }
+    .to_account_metas(None);
+    for key in extra {
+        accounts.push(solana_sdk::instruction::AccountMeta::new(*key, false));
+    }
+
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts,
+            data: ario_gar::instruction::CloseEpoch {
+                _epoch_index: epoch_index,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, closer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// Put epoch `epoch_index` into `close_epoch`'s accept state without running
+/// tally → prescribe → observe → distribute: mark rewards distributed and
+/// push `current_epoch_index` past the 7-epoch retention window. Patches only
+/// those bytes, so `has_rent_receipt` survives untouched — the flag under
+/// test is never the thing the harness wrote.
+async fn make_epoch_closeable(
+    ctx: &mut ProgramTestContext,
+    epoch_index: u64,
+    observations_submitted: u8,
+) {
+    let (epoch_key, _) = epoch_pda(epoch_index);
+    let epoch_acc = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut data = epoch_acc.data.clone();
+    {
+        let epoch: &mut Epoch =
+            bytemuck::from_bytes_mut(&mut data[8..8 + std::mem::size_of::<Epoch>()]);
+        epoch.rewards_distributed = 1;
+        epoch.observations_submitted = observations_submitted;
+    }
+    ctx.set_account(
+        &epoch_key,
+        &solana_sdk::account::Account {
+            lamports: epoch_acc.lamports,
+            data,
+            owner: epoch_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let es_acc = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut es_data = es_acc.data.clone();
+    // current_epoch_index: 8 (disc) + 32 (authority) + 8 (epoch_duration)
+    // + 1 + 1 + 8 (min_observer_stake) + 2 (slash_rate) + 1 (enabled) = 61
+    let cei_offset = 8 + 32 + 8 + 1 + 1 + 8 + 2 + 1;
+    es_data[cei_offset..cei_offset + 8].copy_from_slice(&(epoch_index + 8).to_le_bytes());
+    ctx.set_account(
+        &epoch_settings_key,
+        &solana_sdk::account::Account {
+            lamports: es_acc.lamports,
+            data: es_data,
+            owner: es_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+}
+
+/// Case 1: creating with the receipt records the payer as creator and sets
+/// the program-controlled flag that `close_epoch` later branches on.
+#[tokio::test]
+async fn test_create_epoch_with_rent_receipt_records_creator() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+
+    let creator_before = lamports_of(&mut ctx, &creator.pubkey()).await;
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+
+    let (receipt_key, receipt_bump) = epoch_rent_receipt_pda(0);
+    let receipt_acc = ctx
+        .banks_client
+        .get_account(receipt_key)
+        .await
+        .unwrap()
+        .expect("receipt PDA should exist");
+    assert_eq!(receipt_acc.owner, ario_gar::ID);
+    assert_eq!(receipt_acc.data.len(), EpochRentReceipt::SIZE);
+    let receipt = EpochRentReceipt::try_deserialize(&mut receipt_acc.data.as_slice()).unwrap();
+    assert_eq!(receipt.creator, creator.pubkey());
+    assert_eq!(receipt.bump, receipt_bump);
+
+    let (flag, index) = read_epoch_flags(&mut ctx, &epoch_pda(0).0).await;
+    assert_eq!(flag, 1, "create_epoch must record that a receipt exists");
+    assert_eq!(index, 0);
+
+    // The creator, not the fee payer, funded both accounts.
+    let epoch_lamports = lamports_of(&mut ctx, &epoch_pda(0).0).await;
+    let creator_after = lamports_of(&mut ctx, &creator.pubkey()).await;
+    assert_eq!(
+        creator_before - creator_after,
+        epoch_lamports + receipt_acc.lamports
+    );
+}
+
+/// Case 2: an un-upgraded cranker sends the pre-ADR-0029 account list. Epoch
+/// creation must not stall — it degrades to the old behaviour with the flag
+/// left at 0.
+#[tokio::test]
+async fn test_create_epoch_without_rent_receipt_stays_legacy() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, false)
+        .await
+        .unwrap();
+
+    assert!(
+        ctx.banks_client
+            .get_account(epoch_rent_receipt_pda(0).0)
+            .await
+            .unwrap()
+            .is_none(),
+        "no receipt should be created when the caller omits it"
+    );
+    let (flag, _) = read_epoch_flags(&mut ctx, &epoch_pda(0).0).await;
+    assert_eq!(flag, 0);
+}
+
+/// Case 3 (the arbitrage this ADR closes): a third party closes an epoch
+/// they did not fund. Every lamport of rent goes to the creator; the closer
+/// gets nothing.
+#[tokio::test]
+async fn test_close_epoch_refunds_creator_not_closer() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    let closer = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+    fund_keypair(&mut ctx, &closer.pubkey(), 10_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+    make_epoch_closeable(&mut ctx, 0, 0).await;
+
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+    let epoch_key = epoch_pda(0).0;
+    let epoch_rent = lamports_of(&mut ctx, &epoch_key).await;
+    let receipt_rent = lamports_of(&mut ctx, &receipt_key).await;
+    let creator_before = lamports_of(&mut ctx, &creator.pubkey()).await;
+    let closer_before = lamports_of(&mut ctx, &closer.pubkey()).await;
+
+    close_epoch_as(&mut ctx, 0, &closer, &[receipt_key, creator.pubkey()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lamports_of(&mut ctx, &creator.pubkey()).await - creator_before,
+        epoch_rent + receipt_rent,
+        "creator must receive the Epoch rent AND the receipt's own rent"
+    );
+    assert_eq!(
+        lamports_of(&mut ctx, &closer.pubkey()).await,
+        closer_before,
+        "closer must gain nothing — it only authorises the permissionless close"
+    );
+    // Both accounts gone: no orphaned rent left behind.
+    assert!(ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ctx
+        .banks_client
+        .get_account(receipt_key)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Case 4: the creator closes its own epoch. It is simultaneously the
+/// receipt's `creator` and the fallback `payer`, so this pins that the refund
+/// is applied through exactly one branch.
+#[tokio::test]
+async fn test_close_epoch_by_creator_credits_once() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+    make_epoch_closeable(&mut ctx, 0, 0).await;
+
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+    let epoch_key = epoch_pda(0).0;
+    let epoch_rent = lamports_of(&mut ctx, &epoch_key).await;
+    let receipt_rent = lamports_of(&mut ctx, &receipt_key).await;
+    let creator_before = lamports_of(&mut ctx, &creator.pubkey()).await;
+
+    close_epoch_as(&mut ctx, 0, &creator, &[receipt_key, creator.pubkey()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lamports_of(&mut ctx, &creator.pubkey()).await - creator_before,
+        epoch_rent + receipt_rent,
+        "creator-closes-own-epoch must credit the rent once, not twice"
+    );
+    assert!(ctx
+        .banks_client
+        .get_account(receipt_key)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Case 5: an epoch with no receipt (every epoch created before this program
+/// version) still refunds the closer, closed with the pre-ADR-0029 account
+/// list — the compatibility promise that keeps un-upgraded crankers working.
+#[tokio::test]
+async fn test_close_epoch_without_receipt_refunds_payer() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    let closer = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+    fund_keypair(&mut ctx, &closer.pubkey(), 10_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, false)
+        .await
+        .unwrap();
+    make_epoch_closeable(&mut ctx, 0, 0).await;
+
+    let epoch_key = epoch_pda(0).0;
+    let epoch_rent = lamports_of(&mut ctx, &epoch_key).await;
+    let closer_before = lamports_of(&mut ctx, &closer.pubkey()).await;
+
+    close_epoch_as(&mut ctx, 0, &closer, &[]).await.unwrap();
+
+    assert_eq!(
+        lamports_of(&mut ctx, &closer.pubkey()).await - closer_before,
+        epoch_rent
+    );
+    assert!(ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Case 6 — THE EXPLOIT. Account optionality is caller-controlled, so a
+/// scavenger's move is to omit the receipt and force the `close = payer`
+/// fallback. The branch reads program state instead, so this is rejected —
+/// and the epoch stays closeable by the honest path afterwards.
+#[tokio::test]
+async fn test_close_epoch_omitting_receipt_is_rejected() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    let scavenger = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+    fund_keypair(&mut ctx, &scavenger.pubkey(), 10_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+    make_epoch_closeable(&mut ctx, 0, 0).await;
+
+    let epoch_key = epoch_pda(0).0;
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+
+    // No remaining accounts at all — the pre-ADR-0029 account list.
+    let result = close_epoch_as(&mut ctx, 0, &scavenger, &[]).await;
+    assert_anchor_error!(result, GarError::MissingEpochRentReceipt);
+
+    // Receipt supplied but the creator slot omitted — same rejection.
+    let result = close_epoch_as(&mut ctx, 0, &scavenger, &[receipt_key]).await;
+    assert_anchor_error!(result, GarError::MissingEpochRentReceipt);
+
+    // The epoch is refused, not bricked: the honest close still works.
+    assert!(ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .is_some());
+    let creator_before = lamports_of(&mut ctx, &creator.pubkey()).await;
+    let epoch_rent = lamports_of(&mut ctx, &epoch_key).await;
+    let receipt_rent = lamports_of(&mut ctx, &receipt_key).await;
+    close_epoch_as(&mut ctx, 0, &scavenger, &[receipt_key, creator.pubkey()])
+        .await
+        .unwrap();
+    assert_eq!(
+        lamports_of(&mut ctx, &creator.pubkey()).await - creator_before,
+        epoch_rent + receipt_rent
+    );
+}
+
+/// Case 7: the refund target is bound to the receipt's recorded creator, and
+/// the receipt is bound to its own epoch index. Substituting either is
+/// rejected.
+#[tokio::test]
+async fn test_close_epoch_rejects_mismatched_receipt_and_creator() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    let scavenger = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 2_000_000_000).await;
+    fund_keypair(&mut ctx, &scavenger.pubkey(), 10_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+
+    // A second receipted epoch, to borrow its receipt as a "valid-looking"
+    // substitute for epoch 0's.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100 + 86_400;
+    ctx.set_sysvar(&clock);
+    create_epoch_as(&mut ctx, &setup, 1, &creator, true)
+        .await
+        .unwrap();
+
+    make_epoch_closeable(&mut ctx, 0, 0).await;
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+    let (other_receipt_key, _) = epoch_rent_receipt_pda(1);
+
+    // Right receipt, attacker-supplied creator.
+    let result = close_epoch_as(&mut ctx, 0, &scavenger, &[receipt_key, scavenger.pubkey()]).await;
+    assert_anchor_error!(result, GarError::WrongEpochCreator);
+
+    // Another epoch's receipt — same owner, same layout, wrong index.
+    let result = close_epoch_as(
+        &mut ctx,
+        0,
+        &scavenger,
+        &[other_receipt_key, creator.pubkey()],
+    )
+    .await;
+    assert_anchor_error!(result, GarError::InvalidEpochRentReceipt);
+
+    // A system-owned account forged at neither address: rejected before any
+    // byte of it is read as a `creator`.
+    let forged = Keypair::new();
+    fund_keypair(&mut ctx, &forged.pubkey(), 5_000_000).await;
+    let result = close_epoch_as(
+        &mut ctx,
+        0,
+        &scavenger,
+        &[forged.pubkey(), scavenger.pubkey()],
+    )
+    .await;
+    assert_anchor_error!(result, GarError::InvalidEpochRentReceipt);
+}
+
+/// Case 8: the receipt path does not weaken the audit-M8 gate — an epoch
+/// with unclosed observations still refuses to close.
+#[tokio::test]
+async fn test_close_epoch_with_receipt_still_enforces_m8() {
+    let (mut ctx, setup) = setup_rent_receipt_ctx().await;
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+    // One observation submitted, none closed.
+    make_epoch_closeable(&mut ctx, 0, 1).await;
+
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+    let result = close_epoch_as(&mut ctx, 0, &creator, &[receipt_key, creator.pubkey()]).await;
+    assert_anchor_error!(result, GarError::EpochObservationsNotClosed);
+}

@@ -60,6 +60,8 @@ an observer's ~0.004 SOL rent." `close_epoch` was left on the old pattern with
 2. Add a `creator: Pubkey` field to `Epoch`.
 3. Receipt PDA, with `close_epoch` branching on whether the caller passed it.
 4. Require the receipt unconditionally on both instructions.
+4b. Carry the receipt as Anchor `Option<Account<…>>` rather than
+    `remaining_accounts`.
 5. Restrict `close_epoch` to the creator.
 6. Do nothing — treat close as a cleanup bounty like `finalize_gone`.
 
@@ -90,16 +92,62 @@ pub _padding2: [u8; 1],
 which "replaces a former `_padding1` byte." Pre-upgrade accounts have zeroed
 padding, which correctly reads as "no receipt."
 
-- `create_epoch` takes the receipt as an **optional** account. When supplied it
-  is initialised with `creator = payer` and `epoch.has_rent_receipt = 1`. When
-  omitted the epoch is created exactly as today.
+- `create_epoch` takes the receipt as a **trailing `remaining_accounts` slot**
+  (see "Why not `Option<Account>`" below). When supplied it is initialised with
+  `creator = payer` and `epoch.has_rent_receipt = 1`. When omitted the epoch is
+  created exactly as today.
 - `close_epoch` branches on the **flag**, never on what the caller passed:
   - `has_rent_receipt == 1` → the receipt is **required**; the Epoch's rent goes
-    to `receipt.creator` (bound by `address = receipt.creator`), and the receipt
-    is closed to the same target.
+    to `receipt.creator`, and the receipt is closed to the same target.
   - `has_rent_receipt == 0` → fall back to today's `close = payer`.
 
 Closing remains permissionless; the signer pays only the tx fee.
+
+### Why not `Option<Account<…>>`
+
+The obvious encoding of "optional account" is Anchor's own. It does not work
+here, and using it would cause the exact failure this ADR exists to prevent.
+
+**Anchor optional accounts are positional.** A caller that does not want the
+account must still pass a placeholder (the program ID) in that slot. Without the
+`allow-missing-optionals` feature, `Option::try_accounts` returns
+`AccountNotEnoughKeys` on a short account list
+(`anchor-lang-0.31.1/src/accounts/option.rs`). So any cranker built against the
+pre-upgrade IDL — which sends the old, shorter account list — would fail
+`create_epoch` the instant the program is upgraded. Since creation is
+permissionless and nobody is obligated to perform it, that is a network-wide
+stall.
+
+Enabling `allow-missing-optionals` is not an escape hatch either: it is a
+feature on the shared `anchor-lang` crate, so Cargo's feature unification would
+turn it on for ario-core, ario-arns, ario-ant and ario-ant-escrow as well —
+silently changing how *their* existing optional accounts behave.
+
+`remaining_accounts` is genuinely absent when unused. The decisive evidence:
+with this design the `create_epoch` and `close_epoch` account lists are
+**byte-identical in the IDL before and after**, and all 191 pre-existing
+integration tests pass unmodified.
+
+The cost is that constraints cannot be expressed declaratively on a
+`remaining_accounts` slot. The equivalent checks are performed in the handler —
+owner check, `create_program_address` against the stored bump to bind the
+receipt to its epoch, and `require_keys_eq!` against `receipt.creator` — and
+each is covered by a dedicated rejection test.
+
+### IDL visibility
+
+Anchor only emits `#[account]` types that are referenced by some `Accounts`
+struct, so a type reached solely through `remaining_accounts` does not appear in
+the IDL. `EpochRentReceipt` is consequently the only gar account type absent
+from it, which costs downstream a generated decoder and PDA helper, costs
+explorers the ability to decode it, and removes compile-time drift protection
+for hand-rolled offsets.
+
+This is recoverable without touching `create_epoch`/`close_epoch`: any *other*
+instruction referencing the type pulls it into the IDL. `admin_close_stale_epoch`
+already orphans receipts, so an `admin_close_orphaned_epoch_rent_receipt`
+cleanup instruction serves a real purpose and restores IDL visibility as a side
+effect.
 
 ## Consequences
 
@@ -123,7 +171,12 @@ Closing remains permissionless; the signer pays only the tx fee.
   capital, it blocks nothing (new epochs create/tally/prescribe/distribute
   independently), and anyone may still close for cleanup. Strictly better than
   today, where an *active* operator loses capital to a bot.
-- `create_epoch` now initialises two accounts; CU headroom must be confirmed.
+- `create_epoch` now initialises two accounts. Measured on BPF: create
+  17,891 -> 28,564 CU (+10,673, 14% of the 200k default budget), close
+  6,023 -> 8,416 CU. Comfortable headroom.
+- `EpochRentReceipt` is absent from the IDL (see "IDL visibility"), so
+  clients hand-derive the PDA and parse it by offset until a referencing
+  instruction is added.
 
 ### Neutral
 
@@ -162,6 +215,10 @@ Closing remains permissionless; the signer pays only the tx fee.
 - **Rejected — require the receipt unconditionally:** un-upgraded third-party
   crankers would fail, and because creation is permissionless and nobody is
   obligated to perform it, epoch creation could stall network-wide.
+- **Rejected — Anchor `Option<Account<…>>`:** optional accounts are
+  positional, so a short account list from an un-upgraded cranker throws
+  `AccountNotEnoughKeys` and `create_epoch` fails network-wide. See "Why
+  not `Option<Account<…>>`" above.
 - **Rejected — restrict `close_epoch` to the creator:** removes permissionless
   liveness; a vanished creator could never be cleaned up.
 - **Rejected — do nothing:** cleanup bounties apply to forfeited assets. Epoch
