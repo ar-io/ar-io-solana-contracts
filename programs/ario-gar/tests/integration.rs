@@ -27642,3 +27642,299 @@ async fn test_close_epoch_with_receipt_still_enforces_m8() {
     let result = close_epoch_as(&mut ctx, 0, &creator, &[receipt_key, creator.pubkey()]).await;
     assert_anchor_error!(result, GarError::EpochObservationsNotClosed);
 }
+
+// =========================================
+// ADR-0029: ORPHANED RENT-RECEIPT CLEANUP
+// =========================================
+//
+// `close_epoch` closes an epoch's receipt alongside the epoch, so the only way
+// to strand one is `admin_close_stale_epoch`: it closes the Epoch under its own
+// authority + migration gates and leaves the 41-byte receipt behind with no
+// parent. `admin_close_orphaned_epoch_rent_receipt` reclaims that rent — for
+// the creator who paid it, never for the admin — and refuses to touch a receipt
+// whose epoch is still alive, since that case belongs to permissionless
+// `close_epoch` (which refunds ~57x more).
+
+/// Variant of `setup_rent_receipt_ctx` with a *signable* admin on
+/// `EpochSettings` and `GatewaySettings.migration_active` flipped on — the two
+/// gates `admin_close_stale_epoch` needs before it can orphan anything.
+async fn setup_orphan_cleanup_ctx() -> (ProgramTestContext, GarSetup, Keypair) {
+    let admin = Keypair::new();
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let mut pt = program_test_with_gar(
+        &admin.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &admin.pubkey(), 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+
+    // The scaffold writes `migration_active = false`; `admin_close_stale_epoch`
+    // is gated on it. Deserialize + mutate + reserialize (not byte offsets) so
+    // a GatewaySettings layout change can't silently defeat this.
+    let (settings_key, _) = settings_pda();
+    let settings_acc = ctx
+        .banks_client
+        .get_account(settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings = GatewaySettings::try_deserialize(&mut settings_acc.data.as_slice()).unwrap();
+    settings.migration_active = true;
+    let mut new_data = Vec::with_capacity(settings_acc.data.len());
+    settings.try_serialize(&mut new_data).unwrap();
+    new_data.resize(settings_acc.data.len(), 0);
+    ctx.set_account(
+        &settings_key,
+        &solana_sdk::account::Account {
+            lamports: settings_acc.lamports,
+            data: new_data,
+            owner: settings_acc.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+
+    fund_keypair(&mut ctx, &admin.pubkey(), 1_000_000_000).await;
+    (ctx, setup, admin)
+}
+
+/// `admin_close_stale_epoch` — the recovery ix that closes an Epoch outside the
+/// normal lifecycle and therefore manufactures the orphan under test.
+async fn admin_close_stale_epoch_as(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    epoch_index: u64,
+    admin: &Keypair,
+) -> std::result::Result<(), BanksClientError> {
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminCloseStaleEpoch {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_pda(epoch_index).0,
+                authority: admin.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminCloseStaleEpoch { epoch_index }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, admin],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// `admin_close_orphaned_epoch_rent_receipt`, with `authority` and `creator`
+/// caller-chosen so the rejection cases can substitute either. Fee paid by
+/// `ctx.payer`, so every lamport assertion is pure rent.
+async fn close_orphaned_receipt_as(
+    ctx: &mut ProgramTestContext,
+    epoch_index: u64,
+    authority: &Keypair,
+    creator: &Pubkey,
+) -> std::result::Result<(), BanksClientError> {
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminCloseOrphanedEpochRentReceipt {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_pda(epoch_index).0,
+                receipt: epoch_rent_receipt_pda(epoch_index).0,
+                creator: *creator,
+                authority: authority.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminCloseOrphanedEpochRentReceipt { epoch_index }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer, authority],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// Create epoch 0 with a receipt, then close the Epoch via
+/// `admin_close_stale_epoch` — leaving a genuinely orphaned receipt whose
+/// recorded creator is the returned keypair.
+async fn orphan_epoch_rent_receipt() -> (ProgramTestContext, GarSetup, Keypair, Keypair) {
+    let (mut ctx, setup, admin) = setup_orphan_cleanup_ctx().await;
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+    admin_close_stale_epoch_as(&mut ctx, &setup, 0, &admin)
+        .await
+        .unwrap();
+
+    assert!(
+        ctx.banks_client
+            .get_account(epoch_pda(0).0)
+            .await
+            .unwrap()
+            .is_none(),
+        "admin_close_stale_epoch must close the Epoch"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(epoch_rent_receipt_pda(0).0)
+            .await
+            .unwrap()
+            .is_some(),
+        "…and leave the receipt orphaned — the case this cleanup ix exists for"
+    );
+
+    (ctx, setup, admin, creator)
+}
+
+/// Case 1: the orphan is collectable, and the rent goes to the creator who
+/// funded it. The admin signs and gains nothing.
+#[tokio::test]
+async fn test_close_orphaned_receipt_refunds_creator() {
+    let (mut ctx, _setup, admin, creator) = orphan_epoch_rent_receipt().await;
+
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+    let receipt_rent = lamports_of(&mut ctx, &receipt_key).await;
+    let creator_before = lamports_of(&mut ctx, &creator.pubkey()).await;
+    let admin_before = lamports_of(&mut ctx, &admin.pubkey()).await;
+
+    close_orphaned_receipt_as(&mut ctx, 0, &admin, &creator.pubkey())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lamports_of(&mut ctx, &creator.pubkey()).await - creator_before,
+        receipt_rent,
+        "the receipt's rent belongs to the account that paid it"
+    );
+    assert_eq!(
+        lamports_of(&mut ctx, &admin.pubkey()).await,
+        admin_before,
+        "the admin only pays the tx fee — cleanup is not a way to collect rent"
+    );
+}
+
+/// Case 2: while the Epoch still exists there is nothing orphaned. The receipt
+/// stays put so `close_epoch` — permissionless, and refunding the epoch's own
+/// ~0.0664 SOL to the same creator — remains the path that closes it.
+#[tokio::test]
+async fn test_close_orphaned_receipt_rejects_live_epoch() {
+    let (mut ctx, setup, admin) = setup_orphan_cleanup_ctx().await;
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 1_000_000_000).await;
+
+    create_epoch_as(&mut ctx, &setup, 0, &creator, true)
+        .await
+        .unwrap();
+
+    let result = close_orphaned_receipt_as(&mut ctx, 0, &admin, &creator.pubkey()).await;
+    assert_anchor_error!(result, GarError::EpochStillExists);
+
+    assert!(
+        ctx.banks_client
+            .get_account(epoch_rent_receipt_pda(0).0)
+            .await
+            .unwrap()
+            .is_some(),
+        "a refused cleanup must leave the receipt intact"
+    );
+}
+
+/// Case 3: authority-only. A stranger cannot close a receipt even though the
+/// rent would go to the creator either way.
+#[tokio::test]
+async fn test_close_orphaned_receipt_rejects_non_admin() {
+    let (mut ctx, _setup, _admin, creator) = orphan_epoch_rent_receipt().await;
+    let impostor = Keypair::new();
+    fund_keypair(&mut ctx, &impostor.pubkey(), 10_000_000).await;
+
+    let result = close_orphaned_receipt_as(&mut ctx, 0, &impostor, &creator.pubkey()).await;
+    assert_anchor_error!(result, GarError::Unauthorized);
+}
+
+/// Case 4: the refund target is bound to `receipt.creator`. The admin cannot
+/// redirect the rent — not to a third party, and not to itself.
+#[tokio::test]
+async fn test_close_orphaned_receipt_rejects_wrong_creator() {
+    let (mut ctx, _setup, admin, _creator) = orphan_epoch_rent_receipt().await;
+
+    let stranger = Pubkey::new_unique();
+    let result = close_orphaned_receipt_as(&mut ctx, 0, &admin, &stranger).await;
+    assert_anchor_error!(result, GarError::WrongEpochCreator);
+
+    let admin_pk = admin.pubkey();
+    let result = close_orphaned_receipt_as(&mut ctx, 0, &admin, &admin_pk).await;
+    assert_anchor_error!(result, GarError::WrongEpochCreator);
+}
+
+/// Case 5: the receipt is genuinely gone afterwards — off the ledger, and
+/// unreachable by a second call — so no rent is left stranded at that index.
+#[tokio::test]
+async fn test_close_orphaned_receipt_leaves_nothing_behind() {
+    let (mut ctx, _setup, admin, creator) = orphan_epoch_rent_receipt().await;
+    let (receipt_key, _) = epoch_rent_receipt_pda(0);
+
+    close_orphaned_receipt_as(&mut ctx, 0, &admin, &creator.pubkey())
+        .await
+        .unwrap();
+
+    assert!(
+        ctx.banks_client
+            .get_account(receipt_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "receipt account must be closed, not merely drained"
+    );
+
+    // Replay the identical call against the now-empty address. Warping is what
+    // produces a fresh blockhash — program-test never advances slots on its own,
+    // so without it the retry carries the same signature and BanksClient serves
+    // the first call's cached `Ok` instead of executing anything.
+    let slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(slot + 100).unwrap();
+    let replay = close_orphaned_receipt_as(&mut ctx, 0, &admin, &creator.pubkey()).await;
+    match replay {
+        Err(BanksClientError::TransactionError(
+            solana_sdk::transaction::TransactionError::InstructionError(
+                _,
+                solana_sdk::instruction::InstructionError::Custom(code),
+            ),
+        )) => assert_eq!(
+            code,
+            anchor_lang::error::ErrorCode::AccountNotInitialized as u32,
+            "expected Anchor's AccountNotInitialized — the receipt no longer \
+             deserializes. (Not assert_anchor_error!: that macro offsets by \
+             ERROR_CODE_OFFSET, which applies to GarError variants only.)"
+        ),
+        other => panic!("expected AccountNotInitialized, got: {:?}", other),
+    }
+}

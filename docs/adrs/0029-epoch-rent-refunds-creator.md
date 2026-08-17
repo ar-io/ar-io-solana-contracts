@@ -149,6 +149,14 @@ already orphans receipts, so an `admin_close_orphaned_epoch_rent_receipt`
 cleanup instruction serves a real purpose and restores IDL visibility as a side
 effect.
 
+That instruction now exists. It is authority-gated, takes the receipt as a
+declared `Account<'info, EpochRentReceipt>`, refunds to `receipt.creator` (not
+to the authority), and requires the parent `Epoch` to be gone — System-Program-
+owned with zero data, the same post-close test `ario-ant`'s
+`close_orphaned_record_metadata` uses. While the epoch lives, `close_epoch`
+remains the path that closes the pair, and it is permissionless. The
+`create_epoch` / `close_epoch` account lists are unchanged.
+
 ## Consequences
 
 ### Positive
@@ -174,9 +182,10 @@ effect.
 - `create_epoch` now initialises two accounts. Measured on BPF: create
   17,891 -> 28,564 CU (+10,673, 14% of the 200k default budget), close
   6,023 -> 8,416 CU. Comfortable headroom.
-- `EpochRentReceipt` is absent from the IDL (see "IDL visibility"), so
-  clients hand-derive the PDA and parse it by offset until a referencing
-  instruction is added.
+- `EpochRentReceipt` reaches the IDL only because
+  `admin_close_orphaned_epoch_rent_receipt` declares it (see "IDL visibility").
+  Any future refactor that drops that instruction silently removes the type,
+  its PDA seeds and its decoder from every generated client.
 
 ### Neutral
 

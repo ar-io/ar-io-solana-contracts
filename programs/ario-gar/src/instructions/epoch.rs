@@ -344,6 +344,57 @@ pub fn admin_close_stale_epoch(
     Ok(())
 }
 
+/// Close an `EpochRentReceipt` whose parent `Epoch` no longer exists,
+/// returning its 0.00117624 SOL to the creator that funded it.
+///
+/// `close_epoch` always closes an epoch's receipt alongside the epoch, so the
+/// only way to strand one is `admin_close_stale_epoch`, which closes the
+/// `Epoch` outside that path and leaves the receipt with no parent and no
+/// instruction able to reach it. Re-creating the epoch does not free it
+/// either: `create_epoch` refuses to overwrite an existing receipt rather than
+/// re-point someone else's rent.
+///
+/// The refund goes to `receipt.creator`, never to the authority. ADR-0029's
+/// principle is that epoch rent returns to whoever paid it, and an admin
+/// cleaning up after its own recovery instruction is not a reason for it to
+/// change hands — the authority pays the tx fee and nothing else.
+///
+/// Requiring the Epoch to be GONE is what keeps this from becoming an
+/// authority-only shortcut around `close_epoch`. While the epoch lives,
+/// `close_epoch` is the path that returns the full ~0.0664 SOL *and* the
+/// receipt's rent to the creator, and it stays permissionless; this
+/// instruction only reaches receipts that path can no longer see.
+///
+/// Naming `EpochRentReceipt` in a declared `Accounts` struct also restores the
+/// type to the IDL — Anchor only emits `#[account]` types some context
+/// references, and the receipt is otherwise reached solely through
+/// `remaining_accounts`.
+pub fn admin_close_orphaned_epoch_rent_receipt(
+    ctx: Context<AdminCloseOrphanedEpochRentReceipt>,
+    epoch_index: u64,
+) -> Result<()> {
+    // Post-close state: closing reassigns the account to the System Program
+    // and truncates its data (see `close_account_to`), and an index that never
+    // had an epoch reads identically. Both halves are required — a live Epoch
+    // is program-owned with `Epoch::SIZE` bytes, so either alone would reject
+    // it, but together they also reject a program-owned account that was
+    // merely emptied.
+    let epoch = &ctx.accounts.epoch;
+    require!(
+        epoch.data_is_empty() && epoch.owner == &system_program::ID,
+        GarError::EpochStillExists
+    );
+
+    msg!(
+        "Closed orphaned rent receipt for epoch {}; rent refunded to creator {}",
+        epoch_index,
+        ctx.accounts.receipt.creator
+    );
+
+    // Anchor's `close = creator` constraint drains the receipt.
+    Ok(())
+}
+
 /// Create a new epoch (F23)
 /// This is permissionless - anyone can call when the previous epoch has ended
 ///
@@ -1307,6 +1358,66 @@ pub struct AdminCloseStaleEpoch<'info> {
     pub epoch: AccountLoader<'info, Epoch>,
 
     #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+/// Close an `EpochRentReceipt` orphaned by `admin_close_stale_epoch`.
+///
+/// Everything is declared here rather than carried in `remaining_accounts`:
+/// the backward-compatibility reasoning that shapes `create_epoch` /
+/// `close_epoch` (un-upgraded crankers must keep working) does not apply to a
+/// brand-new authority-only instruction, so the checks live where Anchor can
+/// enforce them declaratively — and the declared `EpochRentReceipt` is what
+/// puts the type back in the IDL.
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct AdminCloseOrphanedEpochRentReceipt<'info> {
+    /// Authority gate via `has_one` (matches `EpochSettings.authority`).
+    /// Deliberately NOT `migration_active`-gated like `AdminCloseStaleEpoch`:
+    /// a receipt orphaned during the migration window must still be
+    /// collectable after `finalize_migration`, or its rent is stranded
+    /// forever.
+    #[account(
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    /// CHECK: The receipt's parent Epoch, which must be GONE — proven in the
+    /// handler (System-Program-owned + zero data). Unchecked precisely because
+    /// the account legitimately does not exist; a typed `AccountLoader` would
+    /// fail before the handler could observe it. The `seeds` constraint still
+    /// pins the address to this program's Epoch PDA for `epoch_index`, so
+    /// "gone" is asserted about the right account.
+    #[account(
+        seeds = [EPOCH_SEED, &epoch_index.to_le_bytes()],
+        bump,
+    )]
+    pub epoch: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [EPOCH_RENT_RECEIPT_SEED, &epoch_index.to_le_bytes()],
+        bump = receipt.bump,
+        close = creator,
+    )]
+    pub receipt: Account<'info, EpochRentReceipt>,
+
+    /// CHECK: Rent recipient, bound to `receipt.creator` by the `address`
+    /// constraint below — that constraint IS the security check. An
+    /// `UncheckedAccount` rather than a `SystemAccount` for the same reason as
+    /// `close_observation`'s `observer`: a creator may be a PDA / multisig
+    /// (Squads) / smart-contract wallet that signed `create_epoch` via CPI,
+    /// and enforcing System-Program ownership would make that creator's
+    /// receipt permanently unclosable. Does not sign — it only receives
+    /// lamports.
+    #[account(mut, address = receipt.creator @ GarError::WrongEpochCreator)]
+    pub creator: UncheckedAccount<'info>,
+
+    /// Admin signer. Pays the tx fee and nothing else — the reclaimed rent
+    /// goes to `creator` (ADR-0029), so cleanup is never a way to collect
+    /// someone else's capital.
     pub authority: Signer<'info>,
 }
 

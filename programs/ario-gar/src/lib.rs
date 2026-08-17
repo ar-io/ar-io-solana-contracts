@@ -378,6 +378,22 @@ pub mod ario_gar {
         instructions::epoch::admin_close_stale_epoch(ctx, epoch_index)
     }
 
+    /// Close an `EpochRentReceipt` (ADR-0029) whose `Epoch` was closed out
+    /// from under it by `admin_close_stale_epoch` — the only path that
+    /// closes an epoch without closing its receipt, and therefore the only
+    /// way one is ever orphaned. The reclaimed rent goes to the recorded
+    /// creator, not to the authority, which pays only the tx fee.
+    ///
+    /// Rejects with `EpochStillExists` while the epoch is alive: that case
+    /// belongs to permissionless `close_epoch`, which returns the epoch's
+    /// rent to the creator too.
+    pub fn admin_close_orphaned_epoch_rent_receipt(
+        ctx: Context<AdminCloseOrphanedEpochRentReceipt>,
+        epoch_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_close_orphaned_epoch_rent_receipt(ctx, epoch_index)
+    }
+
     /// Create a new epoch (F23)
     /// This is permissionless - anyone can call when the previous epoch has ended
     ///
