@@ -64,7 +64,7 @@ runs ~80K CU on surfpool, well below the budget. See `programs/ario-arns/src/mpl
 | `RedelegationRecord`| 61          | `["redelegation", delegator_pubkey]` | Redelegation fee tracking |
 | `EpochSettings`     | 159         | `["epoch_settings"]` | Singleton epoch config; includes `disable_at` timelock (GAR-007) and `failed_gateway_slash_rate` |
 | `Epoch`             | 9,400       | `["epoch", epoch_index.to_le_bytes()]` | Zero-copy; embeds prescriptions, failure tallies |
-| `EpochRentReceipt`  | 44          | `["epoch_rent_receipt", epoch_index.to_le_bytes()]` | Records the `create_epoch` payer; closed with the epoch (ADR-0029) |
+| `EpochRentReceipt`  | 44          | `["epoch_rent_receipt", epoch_index.to_le_bytes()]` | Records the `create_epoch` payer. `close_epoch` closes it alongside the epoch; `admin_close_stale_epoch` leaves it for `admin_close_orphaned_epoch_rent_receipt` (ADR-0029) |
 | `Observation`       | 466         | `["observation", epoch_index.to_le_bytes(), observer_pubkey]` | Per-observer observation report |
 
 **Gateway SIZE breakdown (942 bytes):**
