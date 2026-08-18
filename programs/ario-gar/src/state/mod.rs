@@ -126,6 +126,7 @@ pub const OBSERVER_LOOKUP_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const REDELEGATION_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const EPOCH_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const EPOCH_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const EPOCH_RENT_RECEIPT_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const OBSERVATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 // =========================================
@@ -973,13 +974,8 @@ impl Epoch {
 /// zero-copy, so growing it would break `AccountLoader` for every epoch
 /// already on chain and pull in ADR-020's grow-then-deserialize migration
 /// constraints. This account is purely additive — `create_epoch` funds it,
-/// `close_epoch` refunds its ~0.00118 SOL to the same creator alongside the
+/// `close_epoch` refunds its ~0.0012 SOL to the same creator alongside the
 /// epoch's own rent.
-///
-/// Carries no `SchemaVersion` (unlike the long-lived PDAs above): it is
-/// created and destroyed inside a single epoch's lifecycle and is never
-/// present across a program upgrade window long enough to migrate — a
-/// version field would be 3 bytes of rent per epoch that nothing reads.
 #[account]
 pub struct EpochRentReceipt {
     /// The `create_epoch` payer, and therefore the only valid recipient of
@@ -990,11 +986,13 @@ pub struct EpochRentReceipt {
     /// instead of re-running the `find_program_address` search, saving
     /// ~1.5k CU on the close path.
     pub bump: u8,
+    pub version: SchemaVersion,
 }
 
 impl EpochRentReceipt {
-    /// 8 (discriminator) + 32 (creator) + 1 (bump) = 41 bytes.
-    pub const SIZE: usize = ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + BUMP_SIZE;
+    /// 8 (discriminator) + 32 (creator) + 1 (bump) + 3 (version) = 44 bytes.
+    pub const SIZE: usize =
+        ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + BUMP_SIZE + SCHEMA_VERSION_SIZE;
 }
 
 /// Compute reward rate for a given epoch index
@@ -2063,6 +2061,7 @@ mod tests {
         let r = EpochRentReceipt {
             creator: Pubkey::default(),
             bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
         };
         let mut buf = Vec::new();
         r.try_serialize(&mut buf).unwrap();
@@ -2071,9 +2070,9 @@ mod tests {
             EpochRentReceipt::SIZE,
             "EpochRentReceipt::SIZE drift"
         );
-        // ADR-0029 quotes 41 bytes / 0.00117624 SOL; a silent grow would
+        // ADR-0029 quotes 44 bytes / 0.00119712 SOL; a silent grow would
         // change the transient rent every epoch creation carries.
-        assert_eq!(EpochRentReceipt::SIZE, 41);
+        assert_eq!(EpochRentReceipt::SIZE, 44);
     }
 
     /// ADR-0029 repurposed one `_padding2` byte as `has_rent_receipt`. The

@@ -345,7 +345,7 @@ pub fn admin_close_stale_epoch(
 }
 
 /// Close an `EpochRentReceipt` whose parent `Epoch` no longer exists,
-/// returning its 0.00117624 SOL to the creator that funded it.
+/// returning its 0.00119712 SOL to the creator that funded it.
 ///
 /// `close_epoch` always closes an epoch's receipt alongside the epoch, so the
 /// only way to strand one is `admin_close_stale_epoch`, which closes the
@@ -623,6 +623,7 @@ fn init_epoch_rent_receipt<'info>(
     let state = EpochRentReceipt {
         creator: payer.key(),
         bump: receipt_bump,
+        version: EPOCH_RENT_RECEIPT_VERSION,
     };
     let mut data = receipt.try_borrow_mut_data()?;
     let mut cursor = std::io::Cursor::new(&mut data[..]);

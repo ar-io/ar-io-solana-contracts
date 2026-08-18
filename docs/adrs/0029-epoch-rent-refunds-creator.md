@@ -76,8 +76,9 @@ Add an auxiliary PDA recording the creator:
 pub struct EpochRentReceipt {
     pub creator: Pubkey,
     pub bump: u8,
+    pub version: SchemaVersion,
 }
-// space 8 + 32 + 1 = 41 bytes -> 0.00117624 SOL, refunded on close
+// space 8 + 32 + 1 + 3 = 44 bytes -> 0.00119712 SOL, refunded on close
 // seeds = [EPOCH_RENT_RECEIPT_SEED, &epoch_index.to_le_bytes()]
 ```
 
@@ -180,8 +181,8 @@ remains the path that closes the pair, and it is permissionless. The
   independently), and anyone may still close for cleanup. Strictly better than
   today, where an *active* operator loses capital to a bot.
 - `create_epoch` now initialises two accounts. Measured on BPF: create
-  17,891 -> 28,564 CU (+10,673, 14% of the 200k default budget), close
-  6,023 -> 8,416 CU. Comfortable headroom.
+  17,894 -> 28,707 CU (+10,813, 14% of the 200k default budget), close
+  6,026 -> 8,432 CU. Comfortable headroom.
 - `EpochRentReceipt` reaches the IDL only because
   `admin_close_orphaned_epoch_rent_receipt` declares it (see "IDL visibility").
   Any future refactor that drops that instruction silently removes the type,
@@ -189,7 +190,7 @@ remains the path that closes the pair, and it is permissionless. The
 
 ### Neutral
 
-- +0.00117624 SOL transient rent per epoch (1.8% of the epoch rent), refunded
+- +0.00119712 SOL transient rent per epoch (1.8% of the epoch rent), refunded
   on close.
 - A ~8-day transition window (epochs close at `current − 7`) during which both
   the receipt and fallback paths are live.
