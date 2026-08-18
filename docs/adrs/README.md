@@ -99,6 +99,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-026 | Single-Step `transfer_authority` for the Admin Authority Across All Programs | accepted | [`0026-admin-authority-transfer.md`](0026-admin-authority-transfer.md) |
 | ADR-027 | Restore the Escrow Active-Vault Re-lock via Direct CPI into ario-core's Existing ABI | accepted | [`0027-escrow-restore-active-vault-relock-direct-cpi.md`](0027-escrow-restore-active-vault-relock-direct-cpi.md) |
 | ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
+| ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
 
 ### Numbering anomalies
 

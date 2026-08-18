@@ -343,4 +343,29 @@ pub enum GarError {
     // =========================================
     #[msg("Supplied observer account does not match the observation's recorded observer")]
     WrongObserverAccount,
+
+    // =========================================
+    // EPOCH RENT-RECEIPT ERRORS (ADR-0029)
+    // Appended at the end to keep existing error codes stable for
+    // downstream decoders (cranker/observer).
+    // =========================================
+    // NB: keep #[msg] on ONE line. Anchor copies the literal into the IDL
+    // verbatim, so a `\`-continued string leaks its escape and indentation
+    // into the rendered message every downstream decoder and explorer shows.
+    #[msg("This epoch has a rent receipt: close_epoch requires the receipt PDA and its recorded creator as writable remaining_accounts")]
+    MissingEpochRentReceipt,
+
+    #[msg(
+        "Supplied epoch rent receipt is not this program's ['epoch_rent_receipt', epoch_index] PDA"
+    )]
+    InvalidEpochRentReceipt,
+
+    #[msg("Supplied creator account does not match the rent receipt's recorded creator")]
+    WrongEpochCreator,
+
+    // One line, unwrapped: Anchor copies the literal into the IDL verbatim, so
+    // a `\`-continued message reaches downstream decoders with the escape and
+    // indentation still in it.
+    #[msg("Epoch still exists — close_epoch is the path that refunds its rent to the creator")]
+    EpochStillExists,
 }

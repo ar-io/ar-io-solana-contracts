@@ -43,6 +43,7 @@ pub const OBSERVER_LOOKUP_SEED: &[u8] = b"observer_lookup";
 // Epoch seeds
 pub const EPOCH_SEED: &[u8] = b"epoch";
 pub const EPOCH_SETTINGS_SEED: &[u8] = b"epoch_settings";
+pub const EPOCH_RENT_RECEIPT_SEED: &[u8] = b"epoch_rent_receipt";
 pub const OBSERVATION_SEED: &[u8] = b"observation";
 
 // =========================================
@@ -125,6 +126,7 @@ pub const OBSERVER_LOOKUP_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const REDELEGATION_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const EPOCH_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const EPOCH_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const EPOCH_RENT_RECEIPT_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const OBSERVATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 // =========================================
@@ -913,11 +915,17 @@ pub struct Epoch {
     /// Bitmap tracking which prescribed observers have submitted (50 bits = 7 bytes)
     pub has_observed: [u8; 7],
     pub version_bytes: [u8; 3],
-    pub _padding2: [u8; 2],
+    /// 1 once `create_epoch` wrote an `EpochRentReceipt` for this epoch, so
+    /// `close_epoch` knows the rent belongs to a recorded creator. Program-
+    /// controlled: the refund branch must NOT depend on which accounts the
+    /// caller chose to pass. Replaces one `_padding2` byte — no layout change.
+    pub has_rent_receipt: u8,
+    pub _padding2: [u8; 1],
 }
 
 impl Epoch {
     // 9*8 + 32 + 3*4 + 8*1 + MAX_GATEWAYS*2 + 50*32*2 + 2*32 + 7 + 5.
+    // The trailing 5 is version_bytes(3) + has_rent_receipt(1) + _padding2(1).
     // Production (3000 slots): 9400. Devnet-shrunk (30 slots): 3460 +
     // 4 bytes trailing repr(C) alignment pad = 3464; use mem::size_of
     // to capture either layout exactly without manual arithmetic.
@@ -952,6 +960,39 @@ impl Epoch {
             false
         }
     }
+}
+
+// =========================================
+// EPOCH RENT RECEIPT (ADR-0029)
+// =========================================
+
+/// Records which account funded an `Epoch`'s rent so `close_epoch` refunds
+/// the creator rather than whoever wins the race to close (ADR-0029).
+/// PDA: ["epoch_rent_receipt", epoch_index.to_le_bytes()]
+///
+/// Auxiliary PDA instead of a `creator` field on `Epoch`: `Epoch` is
+/// zero-copy, so growing it would break `AccountLoader` for every epoch
+/// already on chain and pull in ADR-020's grow-then-deserialize migration
+/// constraints. This account is purely additive — `create_epoch` funds it,
+/// `close_epoch` refunds its ~0.0012 SOL to the same creator alongside the
+/// epoch's own rent.
+#[account]
+pub struct EpochRentReceipt {
+    /// The `create_epoch` payer, and therefore the only valid recipient of
+    /// this epoch's reclaimed rent.
+    pub creator: Pubkey,
+    /// Canonical bump for `["epoch_rent_receipt", epoch_index]`. Stored so
+    /// `close_epoch` can re-derive the address with `create_program_address`
+    /// instead of re-running the `find_program_address` search, saving
+    /// ~1.5k CU on the close path.
+    pub bump: u8,
+    pub version: SchemaVersion,
+}
+
+impl EpochRentReceipt {
+    /// 8 (discriminator) + 32 (creator) + 1 (bump) + 3 (version) = 44 bytes.
+    pub const SIZE: usize =
+        ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + BUMP_SIZE + SCHEMA_VERSION_SIZE;
 }
 
 /// Compute reward rate for a given epoch index
@@ -2013,5 +2054,43 @@ mod tests {
             AllowlistEntry::SIZE,
             "AllowlistEntry::SIZE drift"
         );
+    }
+
+    #[test]
+    fn epoch_rent_receipt_size_matches_serialized() {
+        let r = EpochRentReceipt {
+            creator: Pubkey::default(),
+            bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
+        };
+        let mut buf = Vec::new();
+        r.try_serialize(&mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            EpochRentReceipt::SIZE,
+            "EpochRentReceipt::SIZE drift"
+        );
+        // ADR-0029 quotes 44 bytes / 0.00119712 SOL; a silent grow would
+        // change the transient rent every epoch creation carries.
+        assert_eq!(EpochRentReceipt::SIZE, 44);
+    }
+
+    /// ADR-0029 repurposed one `_padding2` byte as `has_rent_receipt`. The
+    /// whole point of that choice is that live `Epoch` accounts keep
+    /// decoding, so pin both the total size and the offset of the byte that
+    /// moved into the tail immediately before it.
+    #[test]
+    fn epoch_rent_receipt_flag_is_layout_neutral() {
+        assert_eq!(Epoch::SIZE, 9400);
+        let version_off = std::mem::offset_of!(Epoch, version_bytes);
+        let flag_off = std::mem::offset_of!(Epoch, has_rent_receipt);
+        // version_bytes(3) then has_rent_receipt(1) then _padding2(1),
+        // ending exactly at SIZE — no field shifted, no byte added.
+        assert_eq!(flag_off, version_off + 3);
+        assert_eq!(flag_off + 1 + 1, Epoch::SIZE);
+        // Pinned absolutely: the flag occupies a byte the pre-ADR-0029
+        // program only ever wrote as zero, so every live Epoch reads back
+        // as "no receipt" and takes the `close = payer` fallback.
+        assert_eq!(flag_off, 9398);
     }
 }
