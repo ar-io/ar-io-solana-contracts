@@ -15,39 +15,48 @@
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
-      "import": "./lib/index.js"
+      "import": "./lib/index.js",
+      "default": "./lib/index.js"
     },
     "./core": {
       "types": "./lib/core/index.d.ts",
-      "import": "./lib/core/index.js"
+      "import": "./lib/core/index.js",
+      "default": "./lib/core/index.js"
     },
     "./gar": {
       "types": "./lib/gar/index.d.ts",
-      "import": "./lib/gar/index.js"
+      "import": "./lib/gar/index.js",
+      "default": "./lib/gar/index.js"
     },
     "./arns": {
       "types": "./lib/arns/index.d.ts",
-      "import": "./lib/arns/index.js"
+      "import": "./lib/arns/index.js",
+      "default": "./lib/arns/index.js"
     },
     "./ant": {
       "types": "./lib/ant/index.d.ts",
-      "import": "./lib/ant/index.js"
+      "import": "./lib/ant/index.js",
+      "default": "./lib/ant/index.js"
     },
     "./ant-escrow": {
       "types": "./lib/ant-escrow/index.d.ts",
-      "import": "./lib/ant-escrow/index.js"
+      "import": "./lib/ant-escrow/index.js",
+      "default": "./lib/ant-escrow/index.js"
     },
     "./mpl-core": {
       "types": "./lib/mpl-core/index.d.ts",
-      "import": "./lib/mpl-core/index.js"
+      "import": "./lib/mpl-core/index.js",
+      "default": "./lib/mpl-core/index.js"
     },
     "./canonical": {
       "types": "./lib/canonical/index.d.ts",
-      "import": "./lib/canonical/index.js"
+      "import": "./lib/canonical/index.js",
+      "default": "./lib/canonical/index.js"
     },
     "./canonical/ant-escrow": {
       "types": "./lib/canonical/ant-escrow.d.ts",
-      "import": "./lib/canonical/ant-escrow.js"
+      "import": "./lib/canonical/ant-escrow.js",
+      "default": "./lib/canonical/ant-escrow.js"
     }
   },
   "files": [
