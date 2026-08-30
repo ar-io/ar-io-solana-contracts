@@ -209,6 +209,99 @@ remains the path that closes the pair, and it is permissionless. The
   the M8 gate unchanged.
 - Leave `BPF_OUT_DIR` unset when testing `ario-gar`.
 
+## Amendment 2026-08-19: options 5 and 6, and measured mainnet behaviour
+
+The original "Considered options" list named six candidates but only argued
+against 2, 3 and 4b. Options **5 (restrict `close_epoch` to the creator)** and
+**6 (do nothing — treat close as a cleanup bounty)** were listed and never
+rebutted. Since 5 and 6 are the two that amount to *don't ship this*, that gap
+is filled here, together with a fresh measurement.
+
+### Measured, post-#116, on mainnet
+
+The evidence table in "Context" was sampled 2026-08-17 and mixes pre- and
+post-#116 behaviour (#116 deployed 2026-08-10 changed `close_observation` to
+refund the observer). Re-measured 2026-08-19 over a **clean post-#116 window**
+by walking each Epoch PDA's own signature history — first tx = `create_epoch`,
+last tx = `close_epoch` — for epochs 505–518:
+
+| epoch | created by | closed by | creator Δ | closer Δ |
+|---|---|---|---|---|
+| 505 | `ErEgD7dq…` | `4mVbPuLw…` | −0.06637584 | +0.06635556 |
+| 506 | `ErEgD7dq…` | `4mVbPuLw…` | −0.06637582 | +0.06635556 |
+| 507 | `ErEgD7dq…` | `4mVbPuLw…` | −0.06637582 | +0.06635556 |
+| 508 | `ErEgD7dq…` | `4mVbPuLw…` | −0.06637586 | +0.06635556 |
+| 509 | `ErEgD7dq…` | `4mVbPuLw…` | −0.06637584 | +0.06635556 |
+| 510 | `ErEgD7dq…` | `4mVbPuLw…` | −0.06637586 | +0.06636056 |
+| 511 | `34LYvMpt…` | `4mVbPuLw…` | −0.06637584 | +0.06635556 |
+| 512 | `79mpc44F…` | `4mVbPuLw…` | −0.06637582 | +0.06635556 |
+| 513–518 | `3D8n4cFe…`, `ErEgD7dq…`, `9MJFMSad…` | *not yet mature* | −0.0664 each | — |
+
+**Eight of eight matured closes in the window were taken by `4mVbPuLw…`, which
+created zero epochs.** That is a complete sweep, not a sampling artifact, and it
+holds entirely after #116. Five distinct addresses created epochs; exactly one
+closed them. The transfer is **0.0664 SOL per epoch ⇒ 24.2 SOL/year** at the
+current daily cadence. The problem statement is confirmed.
+
+### Option 6 — do nothing, treat close as a cleanup bounty
+
+The strongest argument against this ADR, and it deserves to be stated properly:
+a paid close is a **bounty that guarantees cleanup happens**. Someone always
+shows up, because it pays. After this change closing earns nothing, so the only
+party with a reason to close an epoch is the creator recovering their own
+deposit — seven epochs later.
+
+Two findings bound that risk:
+
+1. **It is not a liveness risk.** `create_epoch` requires only
+   `epoch_settings.enabled` and the start-time check — verified 2026-08-19; it
+   has **no dependency on prior epochs being closed**. An unclosed epoch strands
+   rent; it cannot stall epoch creation. So the failure mode is a slow leak, not
+   an outage.
+2. **The incentive to self-serve does exist.** Creators recover their own rent,
+   and since #116 observers recover their own observation rent. Every party can
+   clean up after itself.
+
+**⚠️ But the measurement surfaced a risk this ADR did not previously consider.**
+`4mVbPuLw…` is not a pure parasite. In the same window it also performs
+`close_observation` — at a **net loss** (epochs 514/515/516, ≈ −0.00001 SOL
+each), because #116 sends that rent to the observer, and `4mVbPuLw…` is not an
+observer. Its `close_epoch` income appears to be what funds that cleanup work.
+
+That reframes it as a **specialised cleanup operator funded by an epoch-rent
+bounty**, not a scavenger. If this ADR removes the funding, the rational
+response is to exit — and observation cleanup is not optional: the M8 gate makes
+`close_epoch` require `observations_closed == observations_submitted`, so
+un-closed observations block epoch closing outright. Mainnet has already seen
+that failure once (the 08-11 → 08-16 `close_observation` stall, root cause never
+established, resolved only by an authority-run backfill of 65 stale
+observations).
+
+The interpretation is an inference from behaviour, not a proven motive. But the
+dependency is real and should be watched.
+
+**Decision unchanged, with an explicit follow-up:** the arbitrage is real,
+total, and structural — mandatory work must not be a pure cost, and creators
+should not have to win a race against a bot to recover their own capital. But
+Option 6's insight is retained as an operational obligation:
+
+- Monitor close latency and un-closed observation counts after the mainnet
+  deploy. If `4mVbPuLw…` exits and observers do not self-close, the M8 gate will
+  bite before the rent leak does.
+- The remedy, if that happens, is a **protocol-funded** closing fee — never a
+  reinstated creator-funded one. (Already risk #4 in the plan; this amendment
+  supplies the evidence for why it may actually be needed.)
+
+### Option 5 — restrict `close_epoch` to the creator
+
+Rejected. It solves the extraction (nobody else can take the rent) but violates
+a stated decision driver: *"closing must stay permissionless so a vanished
+creator cannot strand cleanup."* Under Option 5 an abandoned epoch is
+permanently unclosable by anyone, which converts a rent leak into stranded state
+plus, via the M8 gate, an ordering hazard for observation cleanup. The chosen
+design keeps the close permissionless and only redirects **where the lamports
+land** — strictly weaker, and strictly safer, than a signer restriction.
+
 ## Related
 
 - gar #116 — `close_observation` refunds the observer.
