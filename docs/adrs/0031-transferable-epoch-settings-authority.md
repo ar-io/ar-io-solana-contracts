@@ -41,10 +41,14 @@ settings.authority = params.authority;
 and no instruction writes it again. It is immutable for the life of a
 deployment.
 
-Seven instructions gate on it: `set_epochs_enabled`,
-`admin_set_epoch_duration`, `admin_set_reward_ratios`,
-`admin_set_current_epoch_index`, `close_epoch_settings`,
-`admin_close_stale_epoch`, `admin_close_orphaned_epoch_rent_receipt`.
+Seven instructions gate on it, across four account contexts (`epoch.rs`):
+
+| context | instructions |
+|---|---|
+| `UpdateEpochSettings` | `set_epochs_enabled`, `admin_set_epoch_duration`, `admin_set_reward_ratios`, `admin_set_current_epoch_index` |
+| `CloseEpochSettings` | `close_epoch_settings` |
+| `AdminCloseStaleEpoch` | `admin_close_stale_epoch` |
+| `AdminCloseOrphanedEpochRentReceipt` | `admin_close_orphaned_epoch_rent_receipt` |
 
 Running the ADR-026 handoff today therefore moves `GatewaySettings` to the
 multisig and leaves all seven **permanently on the deploy key** — including the
