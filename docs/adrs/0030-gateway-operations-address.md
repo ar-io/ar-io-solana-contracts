@@ -17,9 +17,10 @@ change any gateway setting. That single key is currently required for two things
 that have nothing to do with custody:
 
 **1. Spending the ArNS discount.** A gateway `Joined` for 180 days with a ≥90%
-pass rate earns 20% off every ArNS purchase (`GATEWAY_OPERATOR_DISCOUNT_PCT =
-200_000`, `GATEWAY_DISCOUNT_MIN_TENURE = 15_552_000`). The gate derives the
-Gateway PDA **from the signer**:
+pass rate earns 20% off every ArNS purchase (`GATEWAY_OPERATOR_DISCOUNT_PCT = 200_000`,
+`GATEWAY_DISCOUNT_MIN_TENURE = 15_552_000` — `ario-arns/src/pricing.rs:36,39`;
+the 90% gate is SHOULD-11 at `pricing.rs:327`). The gate derives the Gateway PDA
+**from the signer** (`pricing.rs:308`):
 
 ```rust
 let (expected_pda, _) = Pubkey::find_program_address(
@@ -45,8 +46,9 @@ them never to do.
 
 The protocol already solved this shape once. `Gateway.observer_address` (M3) is a
 second `Pubkey` authorising a different wallet for one specific action, so the
-staking key need not live on the observing box: *"Defaults to operator address if
-not set. Allows a different wallet to submit observations."*
+staking key need not live on the observing box (`state/mod.rs:340-342`):
+*"Defaults to operator address if not set. Allows a different wallet to submit
+observations."*
 
 **Assumption worth flagging.** The framing below treats "who may spend the
 discount" as a key-management problem. It is worth being explicit that the
@@ -112,7 +114,7 @@ becomes irrevocable by the only party entitled to revoke it. The same applies to
 **Option 2 was rejected — delegation economics stay operator-only.** They affect
 people who never agreed to the delegation. Delegators staked against a reward
 share they chose, and disabling delegated staking does not merely stop new
-stake: per `gateway.rs`, *"Existing delegates are NOT auto-withdrawn… the cranker
+stake: per `gateway.rs:454`, *"Existing delegates are NOT auto-withdrawn… the cranker
 moves them to withdrawal vaults via `claim_delegate_from_disabled_gateway`"* —
 so a stolen ops key can force-eject every delegator. There is a
 `pending_delegate_reward_share_ratio` ratchet applied at epoch boundaries
@@ -301,7 +303,9 @@ adding the next one.
 * Code: `programs/ario-gar/src/state/mod.rs` (`Gateway`, `GATEWAY_VERSION`),
   `programs/ario-gar/src/instructions/gateway.rs`,
   `programs/ario-gar/src/schema_migration.rs`,
-  `programs/ario-arns/src/instructions/purchase.rs`
+  `programs/ario-arns/src/instructions/purchase.rs`,
+  `programs/ario-arns/src/pricing.rs` (discount constants + the signer-derived
+  gate this ADR inverts)
 * Precedent: `Gateway.observer_address` (M3) — the delegation pattern generalised
   here
 * Requirement: SHOULD-11 — the ArNS discount's tenure + performance gates
