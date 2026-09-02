@@ -1,190 +1,154 @@
-# ADR-0030: A Gateway May Delegate Its ArNS Discount to an Operations Address
+# ADR-0030: A Gateway May Delegate Operations to a Second Address
 
 - Status: proposed
 - Date: 2026-09-02
 - Deciders: protocol engineering
-- Related: M3 `observer_address` (the precedent this copies), SHOULD-11 (the
-  discount's tenure + performance gates), ADR-012 (`version: SchemaVersion` +
-  `realloc` schema migration)
+- Related: M3 `observer_address` (the precedent this generalises), SHOULD-11
+  (the ArNS discount's tenure + performance gates), ADR-012 (`version:
+  SchemaVersion` + `realloc` migration), ADR-0031 (ships first, separately)
 
 ## Context and problem statement
 
-A gateway that has been `Joined` for 180 days with a ≥90% epoch pass rate earns a
-**20% discount on every ArNS purchase** (`GATEWAY_OPERATOR_DISCOUNT_PCT =
-200_000`, `GATEWAY_DISCOUNT_MIN_TENURE = 15_552_000` seconds).
+A gateway's **operator address is its staking wallet**. It holds the stake, and
+it is the only signer that can `leave_network`, `decrease_operator_stake`, or
+change any gateway setting. That single key is currently required for two things
+that have nothing to do with custody:
 
-**Today only the staking wallet can spend it.** The gate in
-`ario-arns::pricing::try_apply_gateway_discount` derives the Gateway PDA **from
-the signer**:
+**1. Spending the ArNS discount.** A gateway `Joined` for 180 days with a ≥90%
+pass rate earns 20% off every ArNS purchase (`GATEWAY_OPERATOR_DISCOUNT_PCT =
+200_000`, `GATEWAY_DISCOUNT_MIN_TENURE = 15_552_000`). The gate derives the
+Gateway PDA **from the signer**:
 
 ```rust
 let (expected_pda, _) = Pubkey::find_program_address(
-    &[ario_gar::state::GATEWAY_SEED, signer.as_ref()],   // <-- seeded by the SIGNER
+    &[GATEWAY_SEED, signer.as_ref()],      // <-- seeded by the SIGNER
     &ario_gar::ID,
 );
 require!(gateway_info.key() == expected_pda, ArnsError::NotGatewayOperator);
 require!(gateway.operator == *signer,         ArnsError::NotGatewayOperator);
 ```
 
-No wallet other than the operator can produce a matching address, so the discount
-is unreachable from a bundler, a downstream client, or any automated purchasing
-flow. The only workaround available today is to **put the staked operator key
-into that system** — the wallet holding the gateway's stake, able to
-`leave_network`, withdraw, and rotate the gateway's own settings. That is a
-strictly worse security posture than the problem it solves, and it is what
-operators are currently pushed toward.
+No other wallet can produce a matching address, so the discount is unreachable
+from a bundler, a downstream client, or any automated purchasing flow.
 
-The protocol already solved this exact shape once. `Gateway.observer_address`
-(M3) is a second `Pubkey` that authorises a *different* wallet for one specific
-action — submitting observations — precisely so the staking key does not have to
-live on the observing box. Its doc comment states the intent plainly: *"Defaults
-to operator address if not set. Allows a different wallet to submit
-observations."*
+**2. Routine gateway maintenance.** Changing an FQDN, port, or note means
+`update_gateway_settings`, which is operator-gated — so an operator must load
+their **staked wallet into a browser** and drive the network portal. That is
+the single most routine gateway task, and it currently demands the highest-value
+key the operator holds.
+
+Both push operators toward the same bad habit: putting a staking key somewhere
+it should never be. The only workaround available today *is* the thing we would
+tell them never to do.
+
+The protocol already solved this shape once. `Gateway.observer_address` (M3) is a
+second `Pubkey` authorising a different wallet for one specific action, so the
+staking key need not live on the observing box: *"Defaults to operator address if
+not set. Allows a different wallet to submit observations."*
 
 ## Decision drivers
 
-- The staked operator key should not need to be present wherever ArNS names are
-  purchased.
-- The discount's *earning* conditions (tenure, pass rate, `Joined`) must be
-  untouched — this is about who may **spend** an earned discount, never about who
-  earns one.
+- The staked operator key should not be required for routine, non-custodial work.
+- A compromised delegate must not be able to move funds, end the gateway, or
+  make itself permanent.
+- Third parties (delegators) must not be exposed to a delegation they never
+  consented to.
+- The discount's *earning* conditions must be untouched — this is about who may
+  **spend** an earned discount, never who earns one.
 - Prefer an existing, reviewed pattern over a new mechanism.
-- Existing gateways must keep working with no action required.
-
-## Considered options
-
-1. **Second authorised address on `Gateway`** (chosen) — mirrors `observer_address`.
-2. **Derive the Gateway PDA from a passed operator argument** rather than the
-   signer, and let anyone claim any gateway's discount. Rejected outright: it
-   hands every gateway's discount to the whole network.
-3. **Off-chain attestation** — operator signs a delegation the buyer presents.
-   Rejected: needs signature verification plumbing in `ario-arns`, a revocation
-   story, and replay protection, to reach the same place as one stored `Pubkey`.
-4. **A list of authorised addresses.** Deferred, not rejected — see
-   "Consequences".
-5. **Do nothing.** Rejected: the status quo actively encourages operators to
-   deploy staked keys into bundlers.
 
 ## Decision
 
-**Add `operations_address: Pubkey` to `Gateway`, and let the ArNS discount be
-claimed by either the operator or that address.**
+**Add `operations_address: Pubkey` to `Gateway`** — a second authorised signer,
+defaulting to the operator, rotatable **only** by the operator — and let it sign
+two things: the ArNS discount, and gateway *metadata* updates.
 
-```rust
-/// Separate address authorised to spend this gateway's ArNS discount.
-/// Defaults to the operator address. Lets a bundler or downstream client use
-/// the discount without holding the staked operator key.
-pub operations_address: Pubkey,
-```
+### The security boundary
 
-Three changes:
+Every operator-gated instruction falls into one of two classes. The split is the
+core of this ADR:
 
-**1. `ario-gar`** — new field, defaulted to `operator` on join and on migration,
-plus `update_operations_address` gated on the operator, mirroring
-`update_observer_address` (`gateway.rs:534`) including its `Joined` requirement
-and no-op rejection.
+| class | instructions | signer |
+|---|---|---|
+| **Custodial** — moves funds or ends the gateway | `join_network`, `leave_network`, `increase_operator_stake`, `decrease_operator_stake`, `deduct_operator_stake_for_payment` | **operator only** |
+| **Delegation economics** — affects third parties | `update_gateway_settings` (`allow_delegated_staking`, `delegate_reward_share_ratio`, `min_delegation_amount`), `set_allowlist_enabled`, `allow_delegate`, `disallow_delegate` | **operator only** |
+| **Rotation** — defines the delegation itself | `update_observer_address`, `update_operations_address` | **operator only** |
+| **Operational metadata** — routing and presentation | `label`, `fqdn`, `port`, `protocol`, `properties`, `note` | operator **or** `operations_address` |
+| **ArNS discount** — spends an earned benefit | `buy_*` / `extend_lease` / `increase_undername_limit` discount path | operator **or** `operations_address` |
 
-**2. `ario-arns`** — invert the PDA derivation so it comes from the account's
-**stored** operator rather than from the signer:
+**The rotation row is the load-bearing rule.** `operations_address` must never be
+able to change `operations_address`. If it could, a compromised delegate rotates
+to an attacker key and locks the operator out permanently — the delegation
+becomes irrevocable by the only party entitled to revoke it. The same applies to
+`observer_address`: one delegated key must not be able to grant another.
+
+**Delegation economics stay operator-only** because they affect people who never
+agreed to the delegation. Delegators staked against a reward share they chose; a
+compromised delegate dropping it to zero harms them, not just the operator.
+There is a `pending_delegate_reward_share_ratio` ratchet applied at epoch
+boundaries (`epoch.rs:781`) that would give notice — but "harms third parties
+with notice" is still a materially worse blast radius than "operator misroutes
+their own gateway", and it buys no operational convenience worth that.
+
+### Blast radius of a compromised operations wallet
+
+It can point the gateway at a bad FQDN or port, so the gateway fails observations
+and loses rewards until the operator notices and rotates. It can spend the
+gateway's ArNS discount. That is the whole list: **bounded, self-inflicted, and
+recoverable by the operator at any time.** It cannot touch stake, cannot leave
+the network, cannot harm delegators, and cannot make itself permanent.
+
+### Changes
+
+**1. `ario-gar`**
+
+- `operations_address: Pubkey` on `Gateway`, **appended after `version`** — the
+  migration path grows the account and zero-extends the tail, so a new field must
+  be last or old data misaligns. Defaults to `operator` at `join_network`.
+- `update_operations_address` — operator-gated, mirroring
+  `update_observer_address` including its `Joined` guard and no-op rejection.
+- `update_gateway_metadata` — a **new** instruction covering only the six
+  routing/presentation fields, accepting operator **or** `operations_address`.
+  Deliberately separate from `update_gateway_settings`, which stays operator-only
+  and unchanged: splitting by signer rather than adding a mode keeps both
+  instructions' account lists byte-stable and makes the boundary legible at the
+  call site.
+
+**2. `ario-arns`** — derive the Gateway PDA from the account's **stored**
+operator instead of the signer:
 
 ```rust
 let gateway: Gateway = Gateway::try_deserialize(&mut &gateway_data[..])?;
-
-// Canonical Gateway PDA for the operator recorded IN the account.
 let (expected_pda, _) = Pubkey::find_program_address(
     &[GATEWAY_SEED, gateway.operator.as_ref()],
     &ario_gar::ID,
 );
 require!(gateway_info.key() == expected_pda, ArnsError::NotGatewayOperator);
-
 require!(
     *signer == gateway.operator || *signer == gateway.operations_address,
     ArnsError::NotGatewayOperator
 );
 ```
 
-The tenure, pass-rate and `Joined` checks are unchanged.
+Tenure, pass-rate and `Joined` checks are unchanged.
 
-**3. Schema migration** — bump `Gateway.version` and default
-`operations_address = operator` for every existing gateway, so behaviour is
-identical until an operator opts in.
+**3. Schema migration** — bump `GATEWAY_VERSION`, default
+`operations_address = operator` for every existing gateway.
 
-## Why this is safe
+## Why the inverted derivation is still sound
 
-The inverted derivation looks like it weakens the check. It does not:
+It looks like a weakening. It is not:
 
-- `gateway_info.owner == ario_gar::ID` still holds, so the account cannot be
-  fabricated — only `ario-gar` can create one.
-- Deriving from `gateway.operator` and comparing to `gateway_info.key()` proves
-  the passed account is *the* canonical Gateway PDA for the operator it claims.
-  A forged account with an attacker-chosen `operator` field would derive to a
-  different address and fail.
-- The signer must then equal one of two values **stored inside that verified
+- `gateway_info.owner == ario_gar::ID` still holds — only `ario-gar` can create
+  the account, so it cannot be fabricated.
+- Deriving from `gateway.operator` and comparing against `gateway_info.key()`
+  proves the account is *the* canonical Gateway PDA for the operator it claims.
+  A forged account carrying an attacker-chosen `operator` derives to a different
+  address and fails.
+- The signer must then match one of two values stored **inside that verified
   account**, both writable only by the operator.
 
-Gaming vectors considered:
-
-| vector | outcome |
-|---|---|
-| Point `operations_address` at a wallet that has not earned a discount | No gain — tenure/pass-rate/`Joined` are read from the Gateway account, never from the signer. |
-| Share one operations wallet across many buyers | The discount reaches whoever that wallet buys for. **Already possible today by sharing the operator key**; this makes it safe rather than reckless. A policy limit, if wanted, is a separate decision. |
-| Use one wallet as `operations_address` for many gateways | No gain. The discount is a flat 20%, not cumulative. |
-| Set `operations_address` to a wallet you do not control | You give away your own discount. Self-limiting, no effect on anyone else. |
-| Rotate rapidly to dodge something | Nothing is time-bound to the address; the tenure clock lives on `start_timestamp`. |
-
-Net effect on risk is **negative**: the change removes the only current reason to
-deploy a staked operator key into third-party infrastructure.
-
-## Consequences
-
-### Positive
-
-- The discount becomes usable from bundlers and downstream clients with a
-  low-value, rotatable key.
-- Compromise of an operations wallet costs at most the discount. It cannot
-  `leave_network`, withdraw stake, or alter gateway settings.
-- One reviewed pattern (`observer_address`) now covers both delegated actions.
-
-### Negative / risks
-
-- `Gateway` grows by 32 bytes and needs a `realloc` migration. `migrate_gateway`
-  already exists for this, but it is a per-account pass across the registry
-  (currently 646 gateways on mainnet).
-- **Un-migrated gateways read `operations_address` as zeroes.** The migration
-  must default it to `operator`; a zeroed field must never be treated as
-  "matches anything". Worth an explicit test.
-- Two ways to authorise one action is marginally more surface to reason about.
-
-### Neutral
-
-- Purely additive to the ABI: a new instruction and a new trailing field. No
-  existing instruction's account list changes, so un-upgraded clients keep
-  working — buyers signing as the operator are unaffected.
-- Nothing about how the discount is *earned* changes.
-
-## Deferred
-
-**Multiple operations addresses.** A `Vec<Pubkey>` would serve operators running
-several independent purchasing systems, but costs a variable-length field, a cap,
-and add/remove instructions. Start with one — `Gateway.version` exists precisely
-so a list can replace it later without a redesign.
-
-## Implementation notes
-
-- Mirror `update_observer_address` exactly, including its `GatewayLeaving` guard
-  and its rejection of a no-op update.
-- Emit an event alongside `ObserverAddressUpdated` for parity (ADR-018).
-- Test matrix: operator still gets the discount; `operations_address` gets it;
-  an unrelated signer does not; a zeroed/un-migrated field does not authorise
-  anyone; a forged Gateway account with a spoofed `operator` fails the PDA check;
-  tenure and pass-rate failures still deny both signers.
-- **Ship separately from ADR-0031, deployed after it.** They are independent
-  changes with different risk profiles: ADR-0031 is additive with no layout
-  change and no migration, while this one grows `Gateway` by 32 bytes and must
-  migrate 646 live mainnet accounts. Bundling would gate a zero-migration fix
-  behind a migration.
-
-### ⚠️ The schema-migration ladder is currently broken — fix it first
+## ⚠️ The schema-migration ladder is broken — fix it first
 
 `migrate_gateway` **cannot migrate any live mainnet gateway today.** All 646 are
 stamped `version = 0.0.0`, `GATEWAY_VERSION` is `1.1.0`, and
@@ -200,11 +164,70 @@ while account.version < GATEWAY_VERSION {   // 0.0.0 < 1.1.0 -> enter
                                              // 1.0.0 matches `_` -> ERROR
 ```
 
-The `1.1.0` bump landed without its migration arm. It is latent today only
-because `Gateway::SIZE` is still exactly 964 bytes — matching every live account
-— so nothing has ever needed migrating and nobody has run it.
+The `1.1.0` bump landed without its migration arm. It is latent only because
+`Gateway::SIZE` is still exactly **964 bytes**, matching every live account — so
+nothing has ever needed migrating and nobody has run it.
 
 **This ADR is the first change that actually requires the ladder**, so it must
-also supply the missing `1.0.0 → 1.1.0` arm before adding `1.1.0 → 1.2.0` for
-`operations_address`. Treat the migration as the risky half of this work, not a
-formality: it rewrites 646 live accounts on mainnet.
+supply the missing `1.0.0 → 1.1.0` arm before adding the next. Treat the
+migration as the risky half of this work: it rewrites 646 live mainnet accounts.
+
+## Consequences
+
+### Positive
+
+- Routine gateway maintenance and ArNS purchasing no longer require the staked
+  key. The portal can be driven by a low-value, rotatable wallet.
+- Compromise of an operations wallet costs misrouting and a discount — never
+  stake, never the gateway itself, never delegator returns.
+- One reviewed pattern (`observer_address`) now covers three delegated actions.
+
+### Negative / risks
+
+- `Gateway` grows 32 bytes and needs a `realloc` migration across 646 live
+  accounts, over a ladder that is currently broken.
+- **An un-migrated `operations_address` reads as zeroes.** It must default to
+  `operator`; a zeroed field must never be treated as "matches anything". This is
+  an authorisation bypass if got wrong, and needs an explicit test.
+- Two ways to authorise some actions is more surface to reason about. The
+  boundary table above is the mitigation and should be kept current.
+- Splitting metadata out of `update_gateway_settings` means two instructions
+  where operators previously knew one. Clients must be updated to route
+  correctly, though the old path keeps working for operators.
+
+### Neutral
+
+- Additive to the ABI: new instructions and a new trailing field. No existing
+  instruction's account list changes, so un-upgraded clients keep working and
+  operator-signed flows are entirely unaffected.
+- Nothing about how the discount is *earned* changes.
+
+## Deferred
+
+**Multiple operations addresses.** A `Vec<Pubkey>` would serve operators running
+several independent systems, but costs a variable-length field, a cap, and
+add/remove instructions. Start with one — `Gateway.version` exists precisely so a
+list can replace it later without a redesign.
+
+## Implementation notes
+
+- Mirror `update_observer_address` for the rotation instruction, including its
+  `GatewayLeaving` guard and no-op rejection.
+- Emit events for both new instructions (ADR-018).
+- Test matrix: operator retains every capability; `operations_address` gets the
+  discount and metadata updates; `operations_address` is **rejected** for every
+  custodial, delegation-economics and rotation instruction; **a zeroed /
+  un-migrated field authorises nobody**; a forged Gateway account with a spoofed
+  `operator` fails the PDA check; tenure and pass-rate failures still deny both
+  signers.
+- **Ship separately from ADR-0031, deployed after it.** Independent changes with
+  very different risk: ADR-0031 is additive with no migration, this rewrites 646
+  live accounts. Bundling would gate a zero-migration fix behind a migration.
+
+## Downstream
+
+- **SDK** — `updateOperationsAddress`, `updateGatewayMetadata`, and the discount
+  path must pass the Gateway PDA rather than deriving it from the signer.
+- **network-portal** — surface the operations address in gateway settings, and
+  route metadata edits through the new instruction so the portal can be driven
+  by a non-staking wallet. This is the change operators will actually feel.
