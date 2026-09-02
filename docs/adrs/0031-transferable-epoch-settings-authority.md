@@ -156,9 +156,12 @@ instructions' account lists byte-stable, so existing clients are unaffected.
 - **Fix staging too** once deployed — it is the reference environment for the
   mainnet ceremony, and leaving it split means the rehearsal does not match the
   real thing.
-- Bundle with ADR-0030 (`operations_address`). Both are `ario-gar`, and the
-  ADR-0029 rollout showed a mainnet gar upgrade costs a full cycle: `extend`,
-  buffer, byte-verify, deploy, verify. One cycle is enough for both.
+- **Ship separately from ADR-0030, deployed one after the other.** They are
+  independent changes with very different risk profiles: this one is additive
+  with no layout change and no migration, while ADR-0030 grows `Gateway` by 32
+  bytes and must migrate 646 live mainnet accounts. Bundling would gate a
+  zero-migration fix behind a migration. This ADR ships first because it is what
+  unblocks ADR-026.
 
 ## Audit note
 
