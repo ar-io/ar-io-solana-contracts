@@ -178,5 +178,33 @@ so a list can replace it later without a redesign.
   an unrelated signer does not; a zeroed/un-migrated field does not authorise
   anyone; a forged Gateway account with a spoofed `operator` fails the PDA check;
   tenure and pass-rate failures still deny both signers.
-- Bundle with the `EpochSettings.authority` transfer gap — both are `ario-gar`
-  and would otherwise cost two separate mainnet upgrade cycles.
+- **Ship separately from ADR-0031, deployed after it.** They are independent
+  changes with different risk profiles: ADR-0031 is additive with no layout
+  change and no migration, while this one grows `Gateway` by 32 bytes and must
+  migrate 646 live mainnet accounts. Bundling would gate a zero-migration fix
+  behind a migration.
+
+### ⚠️ The schema-migration ladder is currently broken — fix it first
+
+`migrate_gateway` **cannot migrate any live mainnet gateway today.** All 646 are
+stamped `version = 0.0.0`, `GATEWAY_VERSION` is `1.1.0`, and
+`migrate_gateway_version` only has a `0.0.0 → 1.0.0` arm:
+
+```rust
+while account.version < GATEWAY_VERSION {   // 0.0.0 < 1.1.0 -> enter
+    match account.version {
+        0.0.0 => version = 1.0.0            // now 1.0.0
+        _ => return err!(UnknownSchemaVersion)
+    }
+}                                            // 1.0.0 < 1.1.0 -> enter again
+                                             // 1.0.0 matches `_` -> ERROR
+```
+
+The `1.1.0` bump landed without its migration arm. It is latent today only
+because `Gateway::SIZE` is still exactly 964 bytes — matching every live account
+— so nothing has ever needed migrating and nobody has run it.
+
+**This ADR is the first change that actually requires the ladder**, so it must
+also supply the missing `1.0.0 → 1.1.0` arm before adding `1.1.0 → 1.2.0` for
+`operations_address`. Treat the migration as the risky half of this work, not a
+formality: it rewrites 646 live accounts on mainnet.
