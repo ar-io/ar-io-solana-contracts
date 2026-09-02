@@ -949,6 +949,209 @@ async fn test_admin_set_reward_ratios() {
     assert_eq!(es.observer_reward_ratio, 100_000);
 }
 
+/// Verify `transfer_epoch_settings_authority` (ADR-0031).
+///
+/// `ario-gar` is the only program with two authority-bearing accounts, and
+/// `transfer_authority` moves only `GatewaySettings`. Without this instruction
+/// `EpochSettings.authority` is immutable after `initialize_epochs`, which would
+/// strand all seven epoch admin instructions on the deploy key after an ADR-026
+/// handoff — the split currently visible on staging.
+///
+/// Mirrors `test_transfer_authority` step for step, and additionally asserts
+/// that rotating `EpochSettings` does NOT disturb `GatewaySettings.authority`,
+/// since the whole point is that the two move independently.
+#[tokio::test]
+async fn test_transfer_epoch_settings_authority() {
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &Pubkey::new_unique(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (gar_settings_key, _) = settings_pda();
+
+    // Make ctx.payer the EpochSettings authority (authority = bytes 8..40).
+    let mut es = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    es.data[8..40].copy_from_slice(ctx.payer.pubkey().as_ref());
+    // Capture `epoch_duration` (bytes 40..48) to prove the sibling is untouched.
+    let duration_before = es.data[40..48].to_vec();
+    ctx.set_account(
+        &epoch_settings_key,
+        &solana_sdk::account::AccountSharedData::from(es),
+    );
+
+    // Capture GatewaySettings.authority — it must NOT move.
+    let gar_auth_before = ctx
+        .banks_client
+        .get_account(gar_settings_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[8..40]
+        .to_vec();
+
+    let ix = |new_authority: Pubkey, signer: Pubkey| Instruction {
+        program_id: ario_gar::ID,
+        accounts: ario_gar::accounts::TransferEpochSettingsAuthority {
+            epoch_settings: epoch_settings_key,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_gar::instruction::TransferEpochSettingsAuthority { new_authority }.data(),
+    };
+
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(Pubkey::default(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 2: non-authority signer rejected.
+    let bad = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_bad = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund_bad).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(Pubkey::new_unique(), bad.pubkey())],
+        Some(&bad.pubkey()),
+        &[&bad],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 3: current authority rotates successfully.
+    let new_auth = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(new_auth.pubkey(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(es.authority, new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..48],
+        &duration_before[..],
+        "sibling field (epoch_duration) must be byte-identical after rotation"
+    );
+
+    // The OTHER authority-bearing account must be untouched — the two are
+    // independent, which is the reason this is a separate instruction.
+    let gar_auth_after = ctx
+        .banks_client
+        .get_account(gar_settings_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[8..40]
+        .to_vec();
+    assert_eq!(
+        gar_auth_before, gar_auth_after,
+        "GatewaySettings.authority must not move when EpochSettings rotates"
+    );
+
+    // Step 4: old authority is now dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(Pubkey::new_unique(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 5: the NEW authority can now drive a gated epoch instruction.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_auth.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: new_auth.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetEpochDuration {
+                new_duration: 3_600,
+            }
+            .data(),
+        }],
+        Some(&new_auth.pubkey()),
+        &[&new_auth],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let es = EpochSettings::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(epoch_settings_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        es.epoch_duration, 3_600,
+        "rotated authority must be able to drive a gated epoch instruction"
+    );
+}
+
 /// Verify `transfer_authority` (ADR-026):
 ///   1. Null pubkey rejected (`InvalidParameter`).
 ///   2. Non-authority signer rejected (`Unauthorized`).

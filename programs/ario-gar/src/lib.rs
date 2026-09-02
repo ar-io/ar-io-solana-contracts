@@ -139,6 +139,17 @@ pub mod ario_gar {
         instructions::initialize::transfer_authority(ctx, new_authority)
     }
 
+    /// Rotate `EpochSettings.authority` (ADR-0031). Gated on the current
+    /// `EpochSettings` authority; rejects the null pubkey. Separate from
+    /// `transfer_authority`, which moves only `GatewaySettings` — see the
+    /// handler doc comment for why both exist.
+    pub fn transfer_epoch_settings_authority(
+        ctx: Context<TransferEpochSettingsAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::transfer_epoch_settings_authority(ctx, new_authority)
+    }
+
     // =========================================
     // GATEWAY LIFECYCLE (F10-F12)
     // =========================================
@@ -1501,6 +1512,18 @@ pub struct WithdrawalPeriodUpdatedEvent {
 /// rotated. `old_authority` is the signer that authorized the rotation.
 #[event]
 pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted by `transfer_epoch_settings_authority` (ADR-0031) when
+/// `EpochSettings.authority` is rotated. Kept distinct from
+/// `AuthorityTransferredEvent` so subscribers can tell which of gar's two
+/// authority-bearing accounts moved. `old_authority` is the signer that
+/// authorized the rotation.
+#[event]
+pub struct EpochSettingsAuthorityTransferredEvent {
     pub old_authority: Pubkey,
     pub new_authority: Pubkey,
     pub timestamp: i64,
