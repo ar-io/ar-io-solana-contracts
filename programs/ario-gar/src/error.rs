@@ -384,4 +384,13 @@ pub enum GarError {
     // requirement.
     #[msg("Only the live epoch may be tallied; tallying an older epoch would destroy the live epoch's weights")]
     EpochNoLongerLive,
+
+    // ADR-035: appended at the END of the enum, deliberately. Anchor derives
+    // codes positionally (6000 + index), so placing this next to the other
+    // schema-migration errors -- where it belongs topically -- would renumber
+    // every variant after it, including EpochWeightsClobbered (6097) and
+    // EpochNoLongerLive (6098), both already live on mainnet. Topical grouping
+    // is not worth an ABI break; `scripts/error-code-snapshot.mjs` enforces this.
+    #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
+    PreV110GatewayLayout,
 }

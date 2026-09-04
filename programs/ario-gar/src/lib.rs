@@ -643,6 +643,13 @@ pub mod ario_gar {
 
     pub fn migrate_gateway(ctx: Context<MigrateGateway>) -> Result<()> {
         let info = ctx.accounts.gateway.to_account_info();
+        // Read the size BEFORE growing: afterwards every account looks canonical
+        // and the pre-1.1.0 ones are indistinguishable. See
+        // `GATEWAY_SIZE_AT_V1_1_0` for why growing one of those corrupts it.
+        require!(
+            info.data_len() >= state::GATEWAY_SIZE_AT_V1_1_0,
+            error::GarError::PreV110GatewayLayout
+        );
         schema_migration::grow_account(
             &info,
             &ctx.accounts.payer.to_account_info(),
