@@ -217,9 +217,10 @@ delegation.
 
 ### Negative / risks
 
-* `Gateway` grows 32 bytes and needs a `realloc` migration across 646 live
-  accounts, over a ladder that is **currently broken** (see Implementation
-  notes). This migration is the risky half of the work, not the field.
+* `Gateway` grows 32 bytes and needs a `realloc` migration across 648 live
+  accounts. The ladder that migration depends on was broken and is repaired in
+  PR #128 (see Implementation notes). This migration is the risky half of the
+  work, not the field.
 * **An un-migrated `operations_address` reads as zeroes.** It must default to
   `operator`; a zeroed field must never be treated as "matches anything". This is
   an authorisation bypass if got wrong, and needs an explicit test.
@@ -240,12 +241,11 @@ delegation.
 
 ## Implementation notes
 
-### Prerequisite: the schema-migration ladder is broken
+### Prerequisite: the schema-migration ladder (fixed in PR #128)
 
-`migrate_gateway` **cannot migrate any live mainnet gateway today.** All 646 are
-stamped `version = 0.0.0`, `GATEWAY_VERSION` is `1.1.0` (`state/mod.rs:120`), and
-`migrate_gateway_version` (`schema_migration.rs:147`) only has a `0.0.0 → 1.0.0`
-arm:
+`migrate_gateway` **could not migrate any live gateway.** All 648 live accounts
+are stamped `version = 0.0.0`, `GATEWAY_VERSION` is `1.1.0` (`state/mod.rs`), and
+`migrate_gateway_version` (`schema_migration.rs`) only had a `0.0.0 → 1.0.0` arm:
 
 ```rust
 while account.version < GATEWAY_VERSION {   // 0.0.0 < 1.1.0 -> enter
@@ -257,11 +257,32 @@ while account.version < GATEWAY_VERSION {   // 0.0.0 < 1.1.0 -> enter
                                              // 1.0.0 matches `_` -> ERROR
 ```
 
-The `1.1.0` bump landed without its migration arm. It is latent only because
-`Gateway::SIZE` still matches every live account, so nothing has ever needed
-migrating and nobody has run it. **This ADR is the first change that actually
-requires the ladder**, so it must supply the missing `1.0.0 → 1.1.0` arm before
-adding the next one.
+**Correction to an earlier draft of this ADR:** that missing arm was *not* an
+oversight, and "supply the missing arm" would have been the unsafe fix. The
+1.1.0 change grew `GatewaySettings2` by 12 bytes
+(`pending_delegate_reward_share_ratio` `Option<u16>` = 3,
+`delegation_disabled_at` `Option<i64>` = 9), and **`GatewaySettings2` sits
+mid-struct** — position 25 of 34, ahead of `registry_index`,
+`observer_address`, `cumulative_reward_per_token`, `bump` and `version`. That is
+not expressible as a grow-then-deserialize migration, because `grow_account`
+zero-fills the *tail* while every field after `settings` stays shifted. The
+comment above `GATEWAY_VERSION` says exactly this and concludes that pre-1.1.0
+accounts are recreated, not migrated.
+
+PR #128 resolves it with a size fence rather than an assumption, having first
+verified against mainnet that all 648 live accounts are exactly 964 bytes — the
+current `Gateway::SIZE` — so they already carry the 1.1.0 layout physically and
+are merely mis-stamped. A genuinely pre-1.1.0 account would be 952 bytes.
+`migrate_gateway` now reads `data_len()` *before* growing and rejects anything
+smaller with `PreV110GatewayLayout`; the `1.0.0 → 1.1.0` arm is then a pure
+version stamp.
+
+**What this means for this ADR.** The prerequisite is satisfied, and the
+constraint it leaves behind is the important part: `operations_address` must be
+**appended at the very end, after `version`**, so that `grow_account`'s tail
+zero-fill lands exactly on the new field and nothing already in the account
+shifts. Appending anywhere else reintroduces the 1.1.0 problem — which is
+precisely the failure this ADR would otherwise have caused.
 
 ### Build notes
 
@@ -310,9 +331,9 @@ adding the next one.
   here
 * Requirement: SHOULD-11 — the ArNS discount's tenure + performance gates
 * ADR: [ADR-020](0020-schema-migration-grow-then-deserialize.md) —
-  grow-then-deserialize, append-only versioning, and the `{0,0,0} → 1.0.0`
-  bootstrap arms; the ladder this ADR must repair, and the rule that puts
-  `operations_address` at the byte-end
+  grow-then-deserialize and append-only versioning; the rule that requires
+  `operations_address` to sit at the byte-end
+* PR: #128 — repairs the Gateway migration ladder this ADR depends on
 * ADR: ADR-018 (in [`docs/DECISIONS.md`](../DECISIONS.md)) — Anchor `#[event]`
   ABI policy for the two new instructions. Note the numbering split: ADR-001–019
   live in `DECISIONS.md`, `docs/adrs/` restarts at 0020.
