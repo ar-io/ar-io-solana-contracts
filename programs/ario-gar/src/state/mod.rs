@@ -117,7 +117,7 @@ pub const GATEWAY_REGISTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 // inside Gateway, this is NOT an in-place grow-then-deserialize migration — see
 // `schema_migration::migrate_gateway_version`. Existing pre-1.1.0 accounts are
 // recreated (devnet/staging full redeploy), not migrated.
-pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
+pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 2, 0);
 /// Byte size of a `Gateway` account whose layout is 1.1.0 or later.
 ///
 /// **This is a frozen historical constant. Never change it, and never redefine
@@ -362,6 +362,22 @@ pub struct Gateway {
     pub cumulative_reward_per_token: u128,
     pub bump: u8,
     pub version: SchemaVersion,
+    /// ADR-0030: a second signer the operator may authorise for non-custodial
+    /// work — gateway metadata updates and spending the ArNS discount.
+    ///
+    /// Defaults to `operator` at `join_network`, and is rotatable **only** by
+    /// the operator: if this address could change itself, a compromised
+    /// delegate would rotate to an attacker key and lock the operator out
+    /// permanently.
+    ///
+    /// **Appended after `version` deliberately.** `grow_account` zero-fills the
+    /// tail, so a field at the very end is the only placement where migrating a
+    /// live account cannot shift anything already stored. See
+    /// `GATEWAY_SIZE_AT_V1_1_0` for what happens when a field grows mid-struct.
+    ///
+    /// A zeroed value means "not yet migrated" and must authorise **nobody** —
+    /// never treat `Pubkey::default()` as a wildcard.
+    pub operations_address: Pubkey,
 }
 
 impl Gateway {
@@ -386,7 +402,8 @@ impl Gateway {
         + 32  // observer_address
         + 16  // cumulative_reward_per_token
         + 1   // bump
-        + SCHEMA_VERSION_SIZE; // version
+        + SCHEMA_VERSION_SIZE // version
+        + 32; // operations_address (ADR-0030, appended after version)
 
     /// Minimum operator stake required to join (in base units)
     pub const MIN_OPERATOR_STAKE: u64 = 20_000_000_000; // 20,000 ARIO
@@ -1710,6 +1727,7 @@ mod tests {
             cumulative_reward_per_token: 1_000_000_000_000_000_000, // 1e18
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1757,6 +1775,7 @@ mod tests {
             cumulative_reward_per_token: 2_000_000_000_000_000_000, // 2e18
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1988,6 +2007,7 @@ mod tests {
             cumulative_reward_per_token: 0,
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         }
     }
 

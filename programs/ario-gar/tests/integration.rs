@@ -28077,7 +28077,9 @@ async fn test_migrate_gateway_stamps_legacy_version_to_latest() {
     let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
     let operator = ctx.payer.pubkey();
 
-    // Sanity: a freshly joined gateway is already canonical.
+    // Sanity: a freshly joined gateway is already canonical for the CURRENT
+    // schema, whatever that is — asserting a literal here just breaks on the
+    // next appended field.
     let fresh = ctx
         .banks_client
         .get_account(gateway_key)
@@ -28086,8 +28088,8 @@ async fn test_migrate_gateway_stamps_legacy_version_to_latest() {
         .unwrap();
     assert_eq!(
         fresh.data.len(),
-        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
-        "a newly joined Gateway should be exactly the 1.1.0 canonical size"
+        ario_gar::state::Gateway::SIZE,
+        "a newly joined Gateway should be the current canonical size"
     );
 
     // Reproduce the live mainnet shape: correct bytes, stale version stamp.
@@ -28114,9 +28116,31 @@ async fn test_migrate_gateway_stamps_legacy_version_to_latest() {
     assert_eq!(
         after.version,
         ario_gar::state::GATEWAY_VERSION,
-        "ladder must reach GATEWAY_VERSION, not stall at 1.0.0"
+        "ladder must reach GATEWAY_VERSION, not stall part-way"
     );
-    assert_eq!(after.version, SchemaVersion::new(1, 1, 0));
+
+    // The account was grown from the 1.1.0 size to the current canonical size,
+    // and the appended tail is where operations_address landed.
+    let grown = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grown.data.len(), ario_gar::state::Gateway::SIZE);
+
+    // ADR-0030's 1.1.0 -> 1.2.0 arm: a migrated gateway delegates to nobody but
+    // its own operator. A zeroed value here would be an authorisation bypass,
+    // because the discount and metadata paths accept operations_address.
+    assert_eq!(
+        after.operations_address, after.operator,
+        "migration must default operations_address to the operator"
+    );
+    assert_ne!(
+        after.operations_address,
+        Pubkey::default(),
+        "operations_address must never survive migration as the zero pubkey"
+    );
 
     // The 1.0.0 -> 1.1.0 arm is a stamp: it must not clobber settings that are
     // already populated, nor disturb anything after `settings` in the struct.
@@ -28209,5 +28233,194 @@ fn test_gateway_size_fence_is_frozen() {
     assert!(
         ario_gar::state::Gateway::SIZE >= ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
         "Gateway::SIZE may only grow; a shrink below the fence makes it unsatisfiable"
+    );
+}
+
+// =========================================
+// ADR-0030 — update_operations_address
+// =========================================
+
+async fn send_update_operations_address(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+    new_ops: Pubkey,
+    signer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateOperationsAddress {
+                gateway: *gateway_key,
+                operator: *operator,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateOperationsAddress {
+                new_operations_address: new_ops,
+            }
+            .data(),
+        }],
+        Some(&signer.pubkey()),
+        &[signer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn gar_ctx_with_gateway() -> (ProgramTestContext, Pubkey, Pubkey) {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator = ctx.payer.pubkey();
+    (ctx, operator, gateway_key)
+}
+
+#[tokio::test]
+async fn test_join_network_defaults_operations_address_to_operator() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        gw.operations_address, operator,
+        "a new gateway must delegate to nobody but its own operator"
+    );
+    assert_ne!(gw.operations_address, Pubkey::default());
+}
+
+#[tokio::test]
+async fn test_update_operations_address_by_operator() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = Pubkey::new_unique();
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops, &payer_kp)
+        .await
+        .expect("operator may rotate the operations address");
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.operations_address, ops);
+    // Rotation must not disturb the other delegated address or the operator.
+    assert_eq!(gw.operator, operator);
+    assert_eq!(gw.observer_address, operator);
+
+    // Revocation is setting it back to the operator.
+    let payer_kp2 = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, operator, &payer_kp2)
+        .await
+        .expect("revoking by pointing back at the operator must work");
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.operations_address, operator);
+}
+
+/// **The load-bearing rule of ADR-0030.** If the operations address could
+/// rotate itself, a compromised delegate would point it at an attacker key and
+/// the operator could never revoke it.
+#[tokio::test]
+async fn test_operations_address_cannot_rotate_itself() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = Keypair::new();
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .unwrap();
+
+    // The delegate now tries to rotate the delegation to a key it controls.
+    fund_lamports(&mut ctx, &ops.pubkey(), 10_000_000_000);
+    let attacker = Pubkey::new_unique();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateOperationsAddress {
+                gateway: gateway_key,
+                // It can only present ITSELF as the operator, which fails the
+                // seeds check before the constraint even runs.
+                operator: ops.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateOperationsAddress {
+                new_operations_address: attacker,
+            }
+            .data(),
+        }],
+        Some(&ops.pubkey()),
+        &[&ops],
+        bh,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "the operations address must NOT be able to rotate the delegation"
+    );
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        gw.operations_address,
+        ops.pubkey(),
+        "delegation must be unchanged after the attempt"
+    );
+    assert_ne!(gw.operations_address, attacker);
+}
+
+#[tokio::test]
+async fn test_update_operations_address_rejects_zero_and_noop() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Zero would authorise nobody; accepting it turns "revoke" into "brick".
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let zero = send_update_operations_address(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        Pubkey::default(),
+        &payer_kp,
+    )
+    .await;
+    assert_anchor_error!(zero, GarError::InvalidParameter);
+
+    // Setting the value it already holds is a no-op and rejected, matching
+    // update_observer_address.
+    let payer_kp2 = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let noop =
+        send_update_operations_address(&mut ctx, &operator, &gateway_key, operator, &payer_kp2)
+            .await;
+    assert_anchor_error!(noop, GarError::InvalidParameter);
+}
+
+#[tokio::test]
+async fn test_update_operations_address_rejects_non_operator() {
+    let (mut ctx, _operator, gateway_key) = gar_ctx_with_gateway().await;
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+
+    let result = send_update_operations_address(
+        &mut ctx,
+        &stranger.pubkey(),
+        &gateway_key,
+        Pubkey::new_unique(),
+        &stranger,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a stranger must not be able to set a gateway's operations address"
     );
 }

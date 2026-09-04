@@ -181,6 +181,15 @@ pub mod ario_gar {
         instructions::gateway::update_observer_address(ctx, new_observer)
     }
 
+    /// ADR-0030: rotate the delegated operations address. Operator-only — the
+    /// operations address must never be able to change itself.
+    pub fn update_operations_address(
+        ctx: Context<UpdateOperationsAddress>,
+        new_operations_address: Pubkey,
+    ) -> Result<()> {
+        instructions::gateway::update_operations_address(ctx, new_operations_address)
+    }
+
     // =========================================
     // OPERATOR STAKE (F13-F14)
     // =========================================
@@ -1380,6 +1389,17 @@ pub struct GatewaySettingsUpdatedEvent {
 pub struct ObserverAddressUpdatedEvent {
     pub operator: Pubkey,
     pub new_observer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// ADR-0030. Emitted when the operator rotates the delegated operations
+/// address. Carries the old value too, so a subscriber can tell a first-time
+/// delegation from a revocation (`new == operator`) without prior state.
+#[event]
+pub struct OperationsAddressUpdatedEvent {
+    pub operator: Pubkey,
+    pub old_operations_address: Pubkey,
+    pub new_operations_address: Pubkey,
     pub timestamp: i64,
 }
 

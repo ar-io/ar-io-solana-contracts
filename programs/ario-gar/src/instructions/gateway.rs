@@ -97,6 +97,8 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
     };
     // M3: Observer address (client passes operator key for default)
     gateway.observer_address = params.observer_address;
+    // ADR-0030: a new gateway delegates nothing until the operator says so.
+    gateway.operations_address = gateway.operator;
 
     // SHOULD-9: Initialize observer lookup for uniqueness enforcement
     let observer_lookup = &mut ctx.accounts.observer_lookup;
@@ -508,6 +510,50 @@ pub fn update_gateway_settings(
         operator: gateway.operator,
         fields_changed,
         timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+
+/// ADR-0030: rotate the address authorised for non-custodial gateway work.
+///
+/// **Operator-gated, and that is the load-bearing rule of ADR-0030.** If
+/// `operations_address` could rotate itself, a compromised delegate would point
+/// it at an attacker key and the operator could never revoke it — the delegation
+/// would become irrevocable by the only party entitled to revoke it.
+///
+/// Setting it back to `operator` is how a delegation is revoked.
+pub fn update_operations_address(
+    ctx: Context<UpdateOperationsAddress>,
+    new_operations_address: Pubkey,
+) -> Result<()> {
+    let gateway = &mut ctx.accounts.gateway;
+
+    require!(
+        gateway.status == GatewayStatus::Joined,
+        GarError::GatewayLeaving
+    );
+    // A zeroed operations address would authorise nobody, but accepting it
+    // silently turns "revoke" into "brick the delegation" — revocation is
+    // setting it back to the operator, which is explicit and reversible.
+    require!(
+        new_operations_address != Pubkey::default(),
+        GarError::InvalidParameter
+    );
+    require!(
+        new_operations_address != gateway.operations_address,
+        GarError::InvalidParameter
+    );
+
+    let old_operations_address = gateway.operations_address;
+    gateway.operations_address = new_operations_address;
+
+    let clock = Clock::get()?;
+    emit!(crate::OperationsAddressUpdatedEvent {
+        operator: gateway.operator,
+        old_operations_address,
+        new_operations_address,
+        timestamp: clock.unix_timestamp,
     });
 
     Ok(())
@@ -964,6 +1010,21 @@ pub struct UpdateGatewaySettings<'info> {
     )]
     pub gateway: Account<'info, Gateway>,
 
+    pub operator: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateOperationsAddress<'info> {
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, operator.key().as_ref()],
+        bump = gateway.bump,
+        constraint = gateway.operator == operator.key() @ GarError::NotOperator,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    /// The staking wallet. Deliberately the only signer accepted here: see
+    /// `update_operations_address`.
     pub operator: Signer<'info>,
 }
 
