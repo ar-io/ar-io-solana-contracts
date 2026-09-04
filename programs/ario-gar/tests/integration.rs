@@ -1037,7 +1037,10 @@ async fn test_transfer_epoch_settings_authority() {
         &[&ctx.payer],
         bh,
     );
-    ctx.banks_client.process_transaction(fund_bad).await.unwrap();
+    ctx.banks_client
+        .process_transaction(fund_bad)
+        .await
+        .unwrap();
     let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
         &[ix(Pubkey::new_unique(), bad.pubkey())],
