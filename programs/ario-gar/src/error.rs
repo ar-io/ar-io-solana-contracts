@@ -321,6 +321,9 @@ pub enum GarError {
     #[msg("Unknown schema version — no migration path exists from this version")]
     UnknownSchemaVersion,
 
+    #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
+    PreV110GatewayLayout,
+
     // =========================================
     // DELEGATION LIFECYCLE ERRORS (Fix #6)
     // Appended at the end to keep existing error codes stable.
