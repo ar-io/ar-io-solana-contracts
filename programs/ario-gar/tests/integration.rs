@@ -27938,3 +27938,276 @@ async fn test_close_orphaned_receipt_leaves_nothing_behind() {
         other => panic!("expected AccountNotInitialized, got: {:?}", other),
     }
 }
+
+// =========================================
+// GATEWAY SCHEMA-MIGRATION LADDER
+//
+// Every live mainnet Gateway is stamped 0.0.0 while GATEWAY_VERSION is 1.1.0,
+// and before this suite the ladder had no 1.0.0 -> 1.1.0 arm: the loop stamped
+// 1.0.0, re-entered, fell through to `_` and returned UnknownSchemaVersion. So
+// `migrate_gateway` could not migrate any real account.
+//
+// The 1.1.0 change grew GatewaySettings2 *mid-struct*, which is not a
+// grow-then-deserialize migration, so the arm is a version stamp and
+// `migrate_gateway` fences out physically-pre-1.1.0 accounts by size.
+// =========================================
+
+/// Rewrite the Gateway PDA in place, padded to `len` bytes, so a test can
+/// present an account at an arbitrary schema version or historical size.
+async fn overwrite_gateway_raw(
+    ctx: &mut ProgramTestContext,
+    gateway_key: &Pubkey,
+    gateway: &ario_gar::state::Gateway,
+    len: usize,
+) {
+    let existing = ctx
+        .banks_client
+        .get_account(*gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut data = Vec::new();
+    gateway.try_serialize(&mut data).unwrap();
+    assert!(
+        data.len() <= len,
+        "serialized Gateway ({}) exceeds requested account length ({len})",
+        data.len()
+    );
+    data.resize(len, 0);
+
+    let mut account = solana_sdk::account::Account {
+        lamports: existing.lamports,
+        data,
+        owner: existing.owner,
+        executable: false,
+        rent_epoch: existing.rent_epoch,
+    };
+    // Keep it rent-exempt at the new length so realloc's top-up is not the
+    // thing under test.
+    account.lamports = account.lamports.max(10_000_000);
+    ctx.set_account(
+        gateway_key,
+        &solana_sdk::account::AccountSharedData::from(account),
+    );
+}
+
+async fn read_gateway(
+    ctx: &mut ProgramTestContext,
+    gateway_key: &Pubkey,
+) -> ario_gar::state::Gateway {
+    let acct = ctx
+        .banks_client
+        .get_account(*gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    ario_gar::state::Gateway::try_deserialize(&mut &acct.data[..]).unwrap()
+}
+
+/// Takes the payer explicitly: re-sending the same instruction from the same
+/// payer on the same blockhash produces an identical signature, which
+/// `solana-program-test` treats as an already-processed duplicate and reports
+/// as success. An "is it idempotent?" assertion needs a distinct signer.
+async fn send_migrate_gateway(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+    payer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let payer_pk = payer.pubkey();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateGateway {
+                operator: *operator,
+                gateway: *gateway_key,
+                payer: payer_pk,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateGateway {}.data(),
+        }],
+        Some(&payer_pk),
+        &[payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// Fund a fresh keypair so it can pay for a transaction.
+fn fund_lamports(ctx: &mut ProgramTestContext, key: &Pubkey, lamports: u64) {
+    ctx.set_account(
+        key,
+        &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+            lamports,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+}
+
+/// A live-mainnet-shaped account: canonical 1.1.0 size, stamped 0.0.0.
+/// It must walk 0.0.0 -> 1.0.0 -> 1.1.0 without touching any other field.
+#[tokio::test]
+async fn test_migrate_gateway_stamps_legacy_version_to_latest() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator = ctx.payer.pubkey();
+
+    // Sanity: a freshly joined gateway is already canonical.
+    let fresh = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fresh.data.len(),
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+        "a newly joined Gateway should be exactly the 1.1.0 canonical size"
+    );
+
+    // Reproduce the live mainnet shape: correct bytes, stale version stamp.
+    let mut legacy = read_gateway(&mut ctx, &gateway_key).await;
+    let expected_fqdn = legacy.fqdn.clone();
+    let expected_observer = legacy.observer_address;
+    let expected_ratio = legacy.settings.delegate_reward_share_ratio;
+    let expected_stake = legacy.operator_stake;
+    legacy.version = SchemaVersion::new(0, 0, 0);
+    overwrite_gateway_raw(
+        &mut ctx,
+        &gateway_key,
+        &legacy,
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+    )
+    .await;
+
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer_kp)
+        .await
+        .expect("0.0.0 must walk all the way to GATEWAY_VERSION");
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        after.version,
+        ario_gar::state::GATEWAY_VERSION,
+        "ladder must reach GATEWAY_VERSION, not stall at 1.0.0"
+    );
+    assert_eq!(after.version, SchemaVersion::new(1, 1, 0));
+
+    // The 1.0.0 -> 1.1.0 arm is a stamp: it must not clobber settings that are
+    // already populated, nor disturb anything after `settings` in the struct.
+    assert_eq!(after.fqdn, expected_fqdn, "fqdn must survive the stamp");
+    assert_eq!(
+        after.observer_address, expected_observer,
+        "observer_address sits after settings and must not shift"
+    );
+    assert_eq!(
+        after.settings.delegate_reward_share_ratio, expected_ratio,
+        "populated settings must not be overwritten with defaults"
+    );
+    assert_eq!(after.operator_stake, expected_stake);
+
+    // Second call is now a no-op error rather than a re-stamp. A different
+    // payer keeps the signature distinct so this is a real re-execution.
+    let payer2 = Keypair::new();
+    fund_lamports(&mut ctx, &payer2.pubkey(), 10_000_000_000);
+    let again = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer2).await;
+    assert_anchor_error!(again, GarError::AlreadyLatestVersion);
+}
+
+/// A physically pre-1.1.0 account (952 bytes: GatewaySettings2 is 12 bytes
+/// smaller) must be refused. Growing it would zero-fill the tail while every
+/// field after `settings` stayed shifted, silently corrupting the account.
+#[tokio::test]
+async fn test_migrate_gateway_rejects_pre_v110_layout() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator = ctx.payer.pubkey();
+
+    let mut legacy = read_gateway(&mut ctx, &gateway_key).await;
+    legacy.version = SchemaVersion::new(0, 0, 0);
+    // 12 bytes smaller: pending_delegate_reward_share_ratio (Option<u16>, 3)
+    // + delegation_disabled_at (Option<i64>, 9) did not exist pre-1.1.0.
+    overwrite_gateway_raw(
+        &mut ctx,
+        &gateway_key,
+        &legacy,
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0 - 12,
+    )
+    .await;
+
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let result = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer_kp).await;
+    assert_anchor_error!(result, GarError::PreV110GatewayLayout);
+
+    // And it must be refused *before* any realloc — the account is untouched.
+    let acct = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        acct.data.len(),
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0 - 12,
+        "a rejected migration must not have grown the account"
+    );
+}
+
+/// The frozen layout fence must never be redefined in terms of the live
+/// `Gateway::SIZE`, which grows every time a field is appended.
+#[test]
+fn test_gateway_size_fence_is_frozen() {
+    assert_eq!(
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+        964,
+        "GATEWAY_SIZE_AT_V1_1_0 is a historical constant and must never change"
+    );
+    assert!(
+        ario_gar::state::Gateway::SIZE >= ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+        "Gateway::SIZE may only grow; a shrink below the fence makes it unsatisfiable"
+    );
+}
