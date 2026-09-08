@@ -321,12 +321,6 @@ pub enum GarError {
     #[msg("Unknown schema version — no migration path exists from this version")]
     UnknownSchemaVersion,
 
-    #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
-    PreV110GatewayLayout,
-
-    #[msg("Signer is neither the gateway operator nor its operations address")]
-    NotGatewayAuthority,
-
     // =========================================
     // DELEGATION LIFECYCLE ERRORS (Fix #6)
     // Appended at the end to keep existing error codes stable.
@@ -374,4 +368,15 @@ pub enum GarError {
     // indentation still in it.
     #[msg("Epoch still exists — close_epoch is the path that refunds its rent to the creator")]
     EpochStillExists,
+
+    // ── APPEND-ONLY BELOW ──────────────────────────────────────────────────
+    // Anchor assigns error codes by POSITION in this enum, so a variant
+    // inserted anywhere above renumbers every variant after it and breaks
+    // every client matching on the numeric code. New variants go here, at the
+    // end, always.
+    #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
+    PreV110GatewayLayout,
+
+    #[msg("Signer is neither the gateway operator nor its operations address")]
+    NotGatewayAuthority,
 }
