@@ -28691,3 +28691,86 @@ async fn test_update_gateway_metadata_validation_is_signer_independent() {
     let r = send_update_metadata(&mut ctx, &operator, &gateway_key, long, &ops).await;
     assert_anchor_error!(r, GarError::InvalidFqdn);
 }
+
+/// **Deployment-safety regression.** After ADR-0030, `Gateway::SIZE` is 996 but
+/// every live account is still 964 until `migrate_gateway` runs on it. If
+/// Anchor could not deserialize those, the program upgrade would break every
+/// gateway instruction network-wide until the migration finished.
+///
+/// It works because accounts are allocated at SIZE with a zero-padded tail and
+/// the borsh content is much shorter than SIZE (the String fields reserve their
+/// maximum but rarely use it), so the appended field reads out of the padding as
+/// `Pubkey::default()` rather than hitting EOF. This test pins that, because the
+/// margin is a property of the layout and not something to assume.
+#[tokio::test]
+async fn test_unmigrated_964_byte_gateway_still_loads() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Build a genuinely pre-ADR-0030 account: serialize, then DROP the trailing
+    // 32 bytes of borsh content (operations_address is the last field), then pad
+    // to the old 964-byte size. Merely shrinking the account is not the same
+    // thing -- the field would still be present in the content.
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    {
+        let existing = ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32); // remove operations_address entirely
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &gateway_key,
+            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+                lamports: existing.lamports.max(10_000_000),
+                data,
+                owner: existing.owner,
+                executable: false,
+                rent_epoch: existing.rent_epoch,
+            }),
+        );
+    }
+
+    let shrunk = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        shrunk.data.len(),
+        964,
+        "simulating a live, un-migrated account"
+    );
+
+    // It must still deserialize, with the appended field reading as zero.
+    let reread = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        reread.operations_address,
+        Pubkey::default(),
+        "the appended field must read out of the zero padding, not fail"
+    );
+    assert_eq!(reread.operator, gw.operator, "prior fields must be intact");
+    assert_eq!(reread.fqdn, gw.fqdn);
+    assert_eq!(reread.observer_address, gw.observer_address);
+
+    // And a real instruction against it must still work for the operator.
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("unmigrated.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("an un-migrated gateway must remain fully operable by its operator");
+
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key).await.fqdn,
+        "unmigrated.example.com"
+    );
+}

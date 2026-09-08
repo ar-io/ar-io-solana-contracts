@@ -2153,6 +2153,52 @@ mod tests {
     // ADR-0030 authorisation predicate
     // =========================================
 
+    /// **Deployment-safety invariant for ADR-0030.**
+    ///
+    /// After the upgrade, `Gateway::SIZE` is 996 but every live account is still
+    /// 964 until `migrate_gateway` runs. Those accounts stay readable only
+    /// because the appended `operations_address` is read out of the zero padding
+    /// — which requires a real gateway's borsh content to leave 32 bytes of slack
+    /// inside the OLD 964-byte size.
+    ///
+    /// The slack comes entirely from `properties`: `SIZE` reserves 4 + 256 for
+    /// it, but `join_network`, `update_gateway_settings` and
+    /// `update_gateway_metadata` all enforce `is_valid_arweave_id`, capping it at
+    /// 43 characters and saving 213 bytes.
+    ///
+    /// So this is not a comfortable margin, it is a consequence of a validation
+    /// rule. **If `properties` is ever allowed to hold an arbitrary 256-byte
+    /// string, un-migrated accounts will fail to deserialize and every gateway
+    /// instruction will break until the migration completes.** This test is what
+    /// catches that.
+    #[test]
+    fn validated_max_gateway_fits_in_the_pre_migration_size() {
+        let mut gw = gateway_at_max_size();
+        // The real validated maximum: an Arweave ID, not 256 arbitrary bytes.
+        gw.properties = "x".repeat(43);
+
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+
+        assert!(
+            data.len() <= GATEWAY_SIZE_AT_V1_1_0,
+            "a validated-maximum Gateway serializes to {} bytes, which does not \
+             fit the pre-migration size of {}; un-migrated accounts would EOF",
+            data.len(),
+            GATEWAY_SIZE_AT_V1_1_0
+        );
+
+        // And the theoretical SIZE-formula maximum genuinely does NOT fit, which
+        // is why the validation rule above is load-bearing rather than incidental.
+        let mut wide = Vec::new();
+        gateway_at_max_size().try_serialize(&mut wide).unwrap();
+        assert!(
+            wide.len() > GATEWAY_SIZE_AT_V1_1_0,
+            "if this ever fits, the margin no longer depends on properties \
+             validation and this test's premise needs revisiting"
+        );
+    }
+
     #[test]
     fn zeroed_operations_address_authorises_nobody() {
         let operator = Pubkey::new_unique();
