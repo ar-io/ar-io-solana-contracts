@@ -4,7 +4,7 @@ Single-page entry point for everything event-related. Every other
 event doc references this; if you're new to the surface, start here.
 
 > **TL;DR:** All five AR.IO Solana programs emit Anchor `#[event]` on
-> every state-changing instruction (74 events, 127+ emit sites). Consume
+> every state-changing instruction (91 events, 127+ emit sites). Consume
 > via `parseTransactionEvents(rpc, signature)` from
 > `@ar.io/sdk/solana`. Events follow the Anchor 0.31 wire format (sha256
 > discriminator + borsh body in `Program data:` log lines), so any
@@ -37,7 +37,7 @@ Full API in `sdk/src/solana/events.ts`.
 | Program | Events | Highlights |
 |---|---|---|
 | `ario-core` | 14 | Token transfer, vault CRUD, primary-name lifecycle, supply/migration finalized, config updates, admin-authority transfer (ADR-026) |
-| `ario-gar` | 34 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), multi-source funding plan, admin-authority transfer (ADR-026) |
+| `ario-gar` | 37 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), multi-source funding plan, admin-authority transfer (ADR-026), delegated operations address + metadata updates (ADR-0030) |
 | `ario-arns` | 13 | Name purchases (5 base events × `funding_source: u8` covering 25 emit variants), reassign/release, reservation lifecycle, prune, demand-factor updates, admin-authority transfer (ADR-026) |
 | `ario-ant` | 22 | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`), admin record/ACL/orphan closes, admin-authority transfer (ADR-026), `adopt_authority` (ADR-028) |
 | `ario-ant-escrow` | 5 | Unified shapes for 15 instructions via `asset_type: u8` (ANT/Tokens/Vault) + `claim_protocol: u8` (Arweave/Ethereum), admin purge |
