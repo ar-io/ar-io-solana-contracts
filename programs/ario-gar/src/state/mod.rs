@@ -135,6 +135,24 @@ pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 2, 0);
 /// `cumulative_reward_per_token`, `bump` and `version`. Such accounts cannot be
 /// migrated in place and are rejected outright.
 pub const GATEWAY_SIZE_AT_V1_1_0: usize = 964;
+
+/// ADR-0030: may `signer` act for a gateway with these two addresses?
+///
+/// Extracted as a pure function for one reason: the `Pubkey::default()` case is
+/// **unreachable from an integration test**, because the zero pubkey is the
+/// System Program and nobody can sign as it. A test that drives the instruction
+/// with an ordinary stranger passes whether or not the zero guard is present,
+/// so it proves nothing. This function makes the guard directly testable.
+///
+/// A zeroed `operations_address` means "not yet migrated" and must authorise
+/// nobody. Never treat it as a wildcard.
+pub fn is_gateway_authority(
+    signer: &Pubkey,
+    operator: &Pubkey,
+    operations_address: &Pubkey,
+) -> bool {
+    signer == operator || (*operations_address != Pubkey::default() && signer == operations_address)
+}
 pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
@@ -2129,5 +2147,39 @@ mod tests {
         // program only ever wrote as zero, so every live Epoch reads back
         // as "no receipt" and takes the `close = payer` fallback.
         assert_eq!(flag_off, 9398);
+    }
+
+    // =========================================
+    // ADR-0030 authorisation predicate
+    // =========================================
+
+    #[test]
+    fn zeroed_operations_address_authorises_nobody() {
+        let operator = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+        let zero = Pubkey::default();
+
+        // The case an integration test cannot reach: the zero pubkey is the
+        // System Program, so no keypair can present it as a signer. If this
+        // guard regressed, an un-migrated gateway would authorise it.
+        assert!(
+            !is_gateway_authority(&zero, &operator, &zero),
+            "a zeroed operations_address must never authorise the zero pubkey"
+        );
+        assert!(!is_gateway_authority(&stranger, &operator, &zero));
+
+        // The operator still works on an un-migrated gateway.
+        assert!(is_gateway_authority(&operator, &operator, &zero));
+    }
+
+    #[test]
+    fn operations_address_authorises_only_itself_and_the_operator() {
+        let operator = Pubkey::new_unique();
+        let ops = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+
+        assert!(is_gateway_authority(&operator, &operator, &ops));
+        assert!(is_gateway_authority(&ops, &operator, &ops));
+        assert!(!is_gateway_authority(&stranger, &operator, &ops));
     }
 }

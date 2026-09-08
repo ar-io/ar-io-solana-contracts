@@ -28424,3 +28424,270 @@ async fn test_update_operations_address_rejects_non_operator() {
         "a stranger must not be able to set a gateway's operations address"
     );
 }
+
+// =========================================
+// ADR-0030 — update_gateway_metadata
+// =========================================
+
+async fn send_update_metadata(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+    params: ario_gar::UpdateGatewayMetadataParams,
+    signer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewayMetadata {
+                operator: *operator,
+                gateway: *gateway_key,
+                signer: signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewayMetadata { params }.data(),
+        }],
+        Some(&signer.pubkey()),
+        &[signer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+fn fqdn_params(fqdn: &str) -> ario_gar::UpdateGatewayMetadataParams {
+    ario_gar::UpdateGatewayMetadataParams {
+        fqdn: Some(fqdn.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Delegate to a fresh key and return it.
+async fn delegate_operations_to(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+) -> Keypair {
+    let ops = Keypair::new();
+    fund_lamports(ctx, &ops.pubkey(), 10_000_000_000);
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_operations_address(ctx, operator, gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .unwrap();
+    ops
+}
+
+#[tokio::test]
+async fn test_update_gateway_metadata_by_operator() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("operator.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("the operator must retain every capability it had");
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.fqdn, "operator.example.com");
+}
+
+/// The point of ADR-0030: routine maintenance without the staking wallet.
+#[tokio::test]
+async fn test_update_gateway_metadata_by_operations_address() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        ario_gar::UpdateGatewayMetadataParams {
+            label: Some("delegated".to_string()),
+            fqdn: Some("ops.example.com".to_string()),
+            port: Some(8443),
+            ..Default::default()
+        },
+        &ops,
+    )
+    .await
+    .expect("the operations address must be able to update metadata");
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.label, "delegated");
+    assert_eq!(gw.fqdn, "ops.example.com");
+    assert_eq!(gw.port, 8443);
+    // Custody is untouched.
+    assert_eq!(gw.operator, operator);
+    assert_eq!(gw.operations_address, ops.pubkey());
+}
+
+#[tokio::test]
+async fn test_update_gateway_metadata_rejects_stranger() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let _ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    let result = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("evil.example.com"),
+        &stranger,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::NotGatewayAuthority);
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_ne!(gw.fqdn, "evil.example.com");
+}
+
+/// An un-migrated gateway (zeroed `operations_address`) is still operable by
+/// its operator and grants nothing to anyone else.
+///
+/// Note what this does NOT prove: the zero pubkey is the System Program, so no
+/// keypair can sign as it, and this test passes with or without the
+/// `!= Pubkey::default()` guard. That guard is verified by the unit test
+/// `zeroed_operations_address_authorises_nobody` against `is_gateway_authority`,
+/// which is the only place the case is reachable.
+#[tokio::test]
+async fn test_zeroed_operations_address_authorises_nobody() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Force the un-migrated shape: zeroed operations_address, canonical size.
+    let mut gw = read_gateway(&mut ctx, &gateway_key).await;
+    gw.operations_address = Pubkey::default();
+    overwrite_gateway_raw(&mut ctx, &gateway_key, &gw, ario_gar::state::Gateway::SIZE).await;
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key)
+            .await
+            .operations_address,
+        Pubkey::default()
+    );
+
+    // Nobody may ride the zero value in.
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    let result = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("bypass.example.com"),
+        &stranger,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::NotGatewayAuthority);
+
+    // The operator still can, so the gateway is not bricked by the zero value.
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("operator-still-works.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("an un-migrated gateway must still be operable by its operator");
+}
+
+/// The security boundary of ADR-0030: metadata widens, delegation economics
+/// do not. A delegated key must not be able to eject delegators or change
+/// their reward share.
+#[tokio::test]
+async fn test_operations_address_cannot_reach_delegation_economics() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    let before = read_gateway(&mut ctx, &gateway_key).await;
+
+    // update_gateway_settings is operator-only and must reject the delegate.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewaySettings {
+                settings: settings_pda().0,
+                gateway: gateway_key,
+                operator: ops.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewaySettings {
+                params: ario_gar::UpdateGatewayParams {
+                    allow_delegated_staking: Some(false),
+                    delegate_reward_share_ratio: Some(0),
+                    ..Default::default()
+                },
+            }
+            .data(),
+        }],
+        Some(&ops.pubkey()),
+        &[&ops],
+        bh,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "the operations address must NOT reach delegation economics"
+    );
+
+    // A successful metadata update by the same key leaves economics untouched.
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("ops2.example.com"),
+        &ops,
+    )
+    .await
+    .unwrap();
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.fqdn, "ops2.example.com");
+    assert_eq!(
+        after.settings.allow_delegated_staking, before.settings.allow_delegated_staking,
+        "allow_delegated_staking must be unreachable from update_gateway_metadata"
+    );
+    assert_eq!(
+        after.settings.delegate_reward_share_ratio,
+        before.settings.delegate_reward_share_ratio
+    );
+    assert_eq!(
+        after.settings.pending_delegate_reward_share_ratio,
+        before.settings.pending_delegate_reward_share_ratio
+    );
+    assert_eq!(
+        after.settings.min_delegation_amount,
+        before.settings.min_delegation_amount
+    );
+    assert_eq!(after.operator_stake, before.operator_stake);
+}
+
+/// A delegated signer must not be able to write values the operator could not.
+#[tokio::test]
+async fn test_update_gateway_metadata_validation_is_signer_independent() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    let empty = ario_gar::UpdateGatewayMetadataParams {
+        label: Some(String::new()),
+        ..Default::default()
+    };
+    let by_ops = send_update_metadata(&mut ctx, &operator, &gateway_key, empty.clone(), &ops).await;
+    assert_anchor_error!(by_ops, GarError::InvalidLabel);
+
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let by_operator =
+        send_update_metadata(&mut ctx, &operator, &gateway_key, empty, &payer_kp).await;
+    assert_anchor_error!(by_operator, GarError::InvalidLabel);
+
+    // And an over-long fqdn is refused for the delegate too.
+    let long = fqdn_params(&"a".repeat(129));
+    let r = send_update_metadata(&mut ctx, &operator, &gateway_key, long, &ops).await;
+    assert_anchor_error!(r, GarError::InvalidFqdn);
+}

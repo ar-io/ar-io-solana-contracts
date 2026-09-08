@@ -324,6 +324,9 @@ pub enum GarError {
     #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
     PreV110GatewayLayout,
 
+    #[msg("Signer is neither the gateway operator nor its operations address")]
+    NotGatewayAuthority,
+
     // =========================================
     // DELEGATION LIFECYCLE ERRORS (Fix #6)
     // Appended at the end to keep existing error codes stable.
