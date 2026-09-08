@@ -28774,3 +28774,57 @@ async fn test_unmigrated_964_byte_gateway_still_loads() {
         "unmigrated.example.com"
     );
 }
+
+/// Both ADR-0030 instructions carry a `Joined` guard mirroring
+/// `update_gateway_settings` / `update_observer_address`. A gateway on its way
+/// out must not be re-pointed or have its delegation changed.
+#[tokio::test]
+async fn test_adr0030_instructions_reject_leaving_gateway() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    // Put the gateway into Leaving directly — leave_network's other effects are
+    // not what is under test here.
+    let mut gw = read_gateway(&mut ctx, &gateway_key).await;
+    gw.status = ario_gar::state::GatewayStatus::Leaving;
+    overwrite_gateway_raw(&mut ctx, &gateway_key, &gw, ario_gar::state::Gateway::SIZE).await;
+
+    // Metadata: refused for the operator AND for the delegate.
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let by_operator = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("leaving.example.com"),
+        &payer_kp,
+    )
+    .await;
+    assert_anchor_error!(by_operator, GarError::GatewayLeaving);
+
+    let by_ops = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("leaving2.example.com"),
+        &ops,
+    )
+    .await;
+    assert_anchor_error!(by_ops, GarError::GatewayLeaving);
+
+    // Rotation is refused too.
+    let payer_kp2 = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let rotate = send_update_operations_address(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        Pubkey::new_unique(),
+        &payer_kp2,
+    )
+    .await;
+    assert_anchor_error!(rotate, GarError::GatewayLeaving);
+
+    // Nothing moved.
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.fqdn, gw.fqdn);
+    assert_eq!(after.operations_address, ops.pubkey());
+}
