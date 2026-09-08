@@ -7112,6 +7112,142 @@ mod fund_from_stake {
     /// 6-char name, 1-year lease: base 1.5B * 1.2 = 1.8B undiscounted.
     const UNDISCOUNTED_1Y_6CHAR: u64 = 1_500_000_000u64 * 12 / 10;
 
+    /// **Deployment-safety.** Immediately after the upgrade, every live gateway
+    /// is still 964 bytes with no `operations_address` in its content, and stays
+    /// that way until `migrate_gateway` runs on it. The operator MUST keep its
+    /// discount through that window — otherwise the deploy silently removes the
+    /// benefit from all 648 gateways until the migration completes.
+    ///
+    /// The un-migrated field reads out of the zero padding as `Pubkey::default()`,
+    /// which `is_gateway_authority` treats as "delegates to nobody" while still
+    /// honouring the operator.
+    #[tokio::test]
+    async fn test_unmigrated_gateway_operator_keeps_discount() {
+        let operator_kp = Keypair::new();
+        let mint_kp = Keypair::new();
+        let stake_kp = Keypair::new();
+        let treasury_kp = Keypair::new();
+        let pt = program_test_with_arns_and_gar(
+            treasury_kp.pubkey(),
+            stake_kp.pubkey(),
+            mint_kp.pubkey(),
+        );
+        let mut ctx = pt.start_with_context().await;
+        let setup = setup_full_environment_with_keys(
+            &mut ctx,
+            &operator_kp,
+            mint_kp,
+            stake_kp,
+            treasury_kp,
+        )
+        .await;
+
+        // Rebuild the gateway in its pre-ADR-0030 on-chain shape: qualifying
+        // tenure, and the trailing operations_address dropped from the content.
+        let acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        gw.start_timestamp = -(200 * 86_400i64);
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32); // no operations_address, as on chain today
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: acct.lamports,
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
+        // Confirm we really are in the un-migrated state.
+        let reread = Gateway::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(setup.gateway_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(reread.operations_address, Pubkey::default());
+
+        // The OPERATOR must still get the discount. buy_name_from_operator_stake
+        // is signed by the operator, which is the path a real gateway owner uses.
+        let name = "unmigr".to_string();
+        let (record_key, _) = arns_record_pda(&name);
+        let (gar_settings_key, _) = gar_settings_pda();
+        let mut accounts = ario_arns::accounts::BuyNameFromOperatorStake {
+            config: setup.config_key,
+            demand_factor: setup.demand_factor_key,
+            arns_record: record_key,
+            name_registry: name_registry_key(),
+            reserved_name_check: reserved_name_pda(&name).0,
+            returned_name_check: returned_name_pda(&name).0,
+            gar_settings: gar_settings_key,
+            gateway: setup.gateway_key,
+            stake_token_account: setup.stake_token.pubkey(),
+            protocol_token_account: setup.treasury.pubkey(),
+            buyer: setup.operator,
+            gar_program: ario_gar::ID,
+            token_program: spl_token::id(),
+            system_program: system_program::id(),
+        }
+        .to_account_metas(None);
+        accounts.push(AccountMeta::new_readonly(setup.gateway_key, false));
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts,
+                data: ario_arns::instruction::BuyNameFromOperatorStake {
+                    params: ario_arns::BuyNameParams {
+                        name: name.clone(),
+                        purchase_type: PurchaseType::Lease,
+                        years: 1,
+                        ant: Pubkey::new_unique(),
+                    },
+                }
+                .data(),
+            }],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer, &operator_kp],
+            blockhash,
+        );
+        ctx.banks_client
+            .process_transaction(tx)
+            .await
+            .expect("an un-migrated gateway's operator must keep its discount");
+
+        let record = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(record_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.purchase_price,
+            UNDISCOUNTED_1Y_6CHAR * 8 / 10,
+            "the discount must survive the pre-migration window"
+        );
+    }
+
     /// ADR-0030's headline capability: a wallet that is NOT the operator buys at
     /// the gateway's discount because the operator delegated to it.
     #[tokio::test]
