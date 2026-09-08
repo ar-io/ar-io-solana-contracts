@@ -142,11 +142,34 @@ browser, which is the problem.
 
 ### Blast radius of a compromised operations wallet
 
-It can point the gateway at a bad FQDN or port, so the gateway fails observations
-and loses rewards until the operator notices and rotates. It can spend the
-gateway's ArNS discount. That is the whole list: **bounded, self-inflicted, and
+It can point the gateway at a bad FQDN or port, so the gateway fails
+observations and loses rewards until the operator notices and rotates. It can
+spend the gateway's ArNS discount. That is the whole list: **bounded and
 recoverable by the operator at any time.** It cannot touch stake, cannot leave
-the network, cannot harm delegators, and cannot make itself permanent.
+the network, and cannot make itself permanent.
+
+**It is not purely self-inflicted, and this ADR should not claim otherwise.**
+Epoch rewards are split with delegators via `delegate_reward_share_ratio`, so a
+gateway failing observations earns less for its delegators too — people who
+never agreed to the delegation. That is the same objection this ADR raises
+against delegating delegation economics, so it deserves an honest answer rather
+than a silent exception.
+
+The difference is one of kind, not politeness:
+
+* Metadata damage is **indirect, rate-limited and self-correcting**. It costs a
+  share of one epoch's rewards at a time, it stops the moment the operator
+  rotates the key, and delegators keep their principal and their exit rights
+  throughout.
+* Disabling delegated staking is **immediate and irreversible by the delegator**.
+  Per `gateway.rs`, existing delegates are moved to withdrawal vaults by
+  `claim_delegate_from_disabled_gateway` — they are ejected from a position they
+  chose, and re-entry is gated on a cooldown they do not control.
+
+Delegators already carry operator-performance risk; that is inherent in
+delegating to a gateway at all. What they have not accepted is being removed
+from their position by a key the operator handed to someone else. The boundary
+is drawn on that line.
 
 ### Changes
 
@@ -296,7 +319,7 @@ precisely the failure this ADR would otherwise have caused.
   `operator` fails the PDA check; tenure and pass-rate failures still deny both
   signers.
 * **Ship separately from ADR-0031, deployed after it.** Independent changes with
-  very different risk: ADR-0031 is additive with no migration, this rewrites 646
+  very different risk: ADR-0031 is additive with no migration, this rewrites 648
   live accounts. Bundling would gate a zero-migration fix behind a migration.
 
 ### Deferred
