@@ -6974,6 +6974,209 @@ mod fund_from_stake {
         );
     }
 
+    /// Shared scaffold for the ADR-0030 discount tests: a gateway old enough to
+    /// qualify, optionally delegating to `ops`, and optionally with a forged
+    /// stored operator.
+    async fn discount_scenario(
+        ops: Option<Pubkey>,
+        forge_operator: bool,
+    ) -> (ProgramTestContext, FundFromStakeSetup) {
+        let operator_kp = Keypair::new();
+        let mint_kp = Keypair::new();
+        let stake_kp = Keypair::new();
+        let treasury_kp = Keypair::new();
+        let pt = program_test_with_arns_and_gar(
+            treasury_kp.pubkey(),
+            stake_kp.pubkey(),
+            mint_kp.pubkey(),
+        );
+        let mut ctx = pt.start_with_context().await;
+        let setup = setup_full_environment_with_keys(
+            &mut ctx,
+            &operator_kp,
+            mint_kp,
+            stake_kp,
+            treasury_kp,
+        )
+        .await;
+
+        let gw_acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut gw_acct.data.as_slice()).unwrap();
+        gw.start_timestamp = -(200 * 86_400i64); // clears the 180-day tenure gate
+        if let Some(ops) = ops {
+            gw.operations_address = ops;
+        }
+        if forge_operator {
+            // Claim a different operator while staying at this address. The PDA
+            // re-derivation must catch it.
+            gw.operator = Pubkey::new_unique();
+        }
+        let mut new_data = Vec::new();
+        gw.try_serialize(&mut new_data).unwrap();
+        new_data.resize(gw_acct.data.len(), 0);
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: gw_acct.lamports,
+                data: new_data,
+                owner: gw_acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+        (ctx, setup)
+    }
+
+    /// Patch the gateway's delegated operations address after setup, so the test
+    /// can use the SAME context's payer (each ProgramTestContext has its own).
+    async fn set_gateway_operations_address(
+        ctx: &mut ProgramTestContext,
+        setup: &FundFromStakeSetup,
+        ops: Pubkey,
+    ) {
+        let acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        gw.operations_address = ops;
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.resize(acct.data.len(), 0);
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: acct.lamports,
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    async fn buy_name_claiming_discount(
+        ctx: &mut ProgramTestContext,
+        setup: &FundFromStakeSetup,
+        name: &str,
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let (record_key, _) = arns_record_pda(name);
+        let mut accounts = ario_arns::accounts::BuyName {
+            config: setup.config_key,
+            demand_factor: setup.demand_factor_key,
+            arns_record: record_key,
+            name_registry: name_registry_key(),
+            buyer_token_account: setup.buyer_token.pubkey(),
+            protocol_token_account: setup.treasury.pubkey(),
+            reserved_name_check: reserved_name_pda(name).0,
+            returned_name_check: returned_name_pda(name).0,
+            buyer: ctx.payer.pubkey(),
+            token_program: spl_token::id(),
+            system_program: system_program::id(),
+        }
+        .to_account_metas(None);
+        // remaining_accounts[0] is the opt-in discount claim.
+        accounts.push(AccountMeta::new_readonly(setup.gateway_key, false));
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts,
+                data: ario_arns::instruction::BuyName {
+                    params: ario_arns::BuyNameParams {
+                        name: name.to_string(),
+                        purchase_type: PurchaseType::Lease,
+                        years: 1,
+                        ant: Pubkey::new_unique(),
+                    },
+                }
+                .data(),
+            }],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await
+    }
+
+    /// 6-char name, 1-year lease: base 1.5B * 1.2 = 1.8B undiscounted.
+    const UNDISCOUNTED_1Y_6CHAR: u64 = 1_500_000_000u64 * 12 / 10;
+
+    /// ADR-0030's headline capability: a wallet that is NOT the operator buys at
+    /// the gateway's discount because the operator delegated to it.
+    #[tokio::test]
+    async fn test_gateway_discount_via_operations_address() {
+        let (mut ctx, setup) = discount_scenario(None, false).await;
+        let buyer = ctx.payer.pubkey();
+        assert_ne!(buyer, setup.operator, "the buyer must not be the operator");
+
+        // Delegate to THIS context's payer. Building a second scenario here
+        // would hand back a different payer keypair and silently test nothing.
+        set_gateway_operations_address(&mut ctx, &setup, buyer).await;
+
+        buy_name_claiming_discount(&mut ctx, &setup, "opsdsc")
+            .await
+            .expect("the operations address must be able to spend the discount");
+
+        let record = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(arns_record_pda("opsdsc").0)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.purchase_price,
+            UNDISCOUNTED_1Y_6CHAR * 8 / 10,
+            "the delegated buyer must receive the 20% gateway discount"
+        );
+    }
+
+    /// The protection my change moved: the old code derived the PDA from the
+    /// SIGNER, so presenting someone else's gateway was structurally impossible.
+    /// Now any real gateway passes the PDA check and the signer test is the only
+    /// thing standing between a stranger and a free 20%.
+    #[tokio::test]
+    async fn test_gateway_discount_denied_to_unrelated_signer() {
+        let (mut ctx, setup) = discount_scenario(None, false).await;
+        assert_ne!(ctx.payer.pubkey(), setup.operator);
+
+        let result = buy_name_claiming_discount(&mut ctx, &setup, "strngr").await;
+        assert!(
+            result.is_err(),
+            "a signer who is neither operator nor operations address must NOT \
+             receive the discount by presenting the gateway"
+        );
+    }
+
+    /// A Gateway account claiming an operator it does not belong to must fail the
+    /// re-derivation, which is what makes seeding the PDA from stored state sound.
+    #[tokio::test]
+    async fn test_gateway_discount_rejects_forged_operator() {
+        let (mut ctx, setup) = discount_scenario(Some(Pubkey::new_unique()), true).await;
+
+        let result = buy_name_claiming_discount(&mut ctx, &setup, "forged").await;
+        assert!(
+            result.is_err(),
+            "a Gateway whose stored operator does not derive to its own address \
+             must be rejected"
+        );
+    }
+
     // -----------------------------------------
     // buy_returned_name from delegation (split payment)
     // -----------------------------------------
