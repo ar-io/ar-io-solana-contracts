@@ -300,6 +300,26 @@ are merely mis-stamped. A genuinely pre-1.1.0 account would be 952 bytes.
 smaller with `PreV110GatewayLayout`; the `1.0.0 → 1.1.0` arm is then a pure
 version stamp.
 
+**The pre-migration window is safe, and was verified rather than assumed.**
+Between the program upgrade and the last `migrate_gateway`, every live account
+is still 964 bytes with no `operations_address` in its content. Both programs
+read `Gateway` with `try_deserialize`, so the obvious worry is an EOF that would
+break every gateway instruction — and, in `ario-arns`, silently remove the ArNS
+discount from all 648 gateways at once.
+
+It does not happen: accounts are allocated at `SIZE` with a zero-padded tail and
+a real gateway's borsh content is far shorter, so the appended field reads out of
+the padding as `Pubkey::default()`. That value authorises nobody, which is the
+correct pre-migration behaviour, while the operator keeps every capability
+including the discount. Both halves are covered by tests that construct the
+genuine pre-ADR-0030 shape rather than a merely-shrunk account.
+
+The margin is a consequence of one validation rule, not spare room: `SIZE`
+reserves 4 + 256 for `properties`, but every write path enforces
+`is_valid_arweave_id`, capping it at 43 characters. **If `properties` is ever
+allowed to hold an arbitrary 256-byte string, un-migrated accounts will EOF.** A
+unit test pins that invariant.
+
 **What this means for this ADR.** The prerequisite is satisfied, and the
 constraint it leaves behind is the important part: `operations_address` must be
 **appended at the very end, after `version`**, so that `grow_account`'s tail
