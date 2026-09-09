@@ -288,9 +288,27 @@ pub fn try_apply_gateway_discount(
         ArnsError::InvalidGatewayProgram
     );
 
-    // Validate PDA: seeds = ["gateway", signer_pubkey], program = ario-gar
+    // Deserialize the Gateway account. This now happens BEFORE the PDA check
+    // because the seed comes from the account's own stored `operator` (ADR-0030),
+    // not from the signer.
+    let gateway_data = gateway_info.try_borrow_data()?;
+    let gateway: ario_gar::state::Gateway =
+        ario_gar::state::Gateway::try_deserialize(&mut &gateway_data[..])
+            .map_err(|_| error!(ArnsError::InvalidParameter))?;
+
+    // Validate PDA: seeds = ["gateway", gateway.operator], program = ario-gar.
+    //
+    // Seeding from stored state rather than from the signer looks like a
+    // weakening; it is not, and it is the pattern ADR-020 §4 already establishes
+    // for exactly this case. The account is owner-checked above, so only ario-gar
+    // can have created it, and `try_deserialize` has checked the discriminator.
+    // Re-deriving from the operator it claims and comparing against its own key
+    // proves it is THE canonical Gateway PDA for that operator — a forged account
+    // carrying an attacker-chosen operator derives to a different address and
+    // fails here. The signer is then matched against two values stored INSIDE
+    // that verified account, both writable only by the operator.
     let (expected_pda, _bump) = Pubkey::find_program_address(
-        &[ario_gar::state::GATEWAY_SEED, signer.as_ref()],
+        &[ario_gar::state::GATEWAY_SEED, gateway.operator.as_ref()],
         &ario_gar::ID,
     );
     require!(
@@ -298,14 +316,17 @@ pub fn try_apply_gateway_discount(
         ArnsError::NotGatewayOperator
     );
 
-    // Deserialize the Gateway account
-    let gateway_data = gateway_info.try_borrow_data()?;
-    let gateway: ario_gar::state::Gateway =
-        ario_gar::state::Gateway::try_deserialize(&mut &gateway_data[..])
-            .map_err(|_| error!(ArnsError::InvalidParameter))?;
-
-    // Verify operator matches signer
-    require!(gateway.operator == *signer, ArnsError::NotGatewayOperator);
+    // ADR-0030: the operator, or the gateway's operations_address. Shares the
+    // predicate with ario-gar so the zero-pubkey rule cannot drift between the
+    // two programs.
+    require!(
+        ario_gar::state::is_gateway_authority(
+            signer,
+            &gateway.operator,
+            &gateway.operations_address
+        ),
+        ArnsError::NotGatewayOperator
+    );
 
     // Verify gateway is active (Joined status)
     require!(

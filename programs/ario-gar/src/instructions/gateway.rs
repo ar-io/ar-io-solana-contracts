@@ -97,6 +97,8 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
     };
     // M3: Observer address (client passes operator key for default)
     gateway.observer_address = params.observer_address;
+    // ADR-0030: a new gateway delegates nothing until the operator says so.
+    gateway.operations_address = gateway.operator;
 
     // SHOULD-9: Initialize observer lookup for uniqueness enforcement
     let observer_lookup = &mut ctx.accounts.observer_lookup;
@@ -508,6 +510,131 @@ pub fn update_gateway_settings(
         operator: gateway.operator,
         fields_changed,
         timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+
+/// ADR-0030: update the routing/presentation metadata of a gateway.
+///
+/// Accepts the operator **or** the gateway's `operations_address`, so routine
+/// maintenance no longer requires loading the staking wallet into a browser.
+///
+/// Deliberately separate from `update_gateway_settings`, which stays
+/// operator-only and byte-identical. The split is by signer rather than by a
+/// mode flag, so the delegation-economics fields are not merely rejected for a
+/// delegated signer — they are absent from this instruction's params entirely
+/// and cannot be reached by malformed input.
+///
+/// Blast radius of a compromised operations key is bounded to exactly this:
+/// misroute the gateway (costing its own rewards until the operator rotates)
+/// and spend the ArNS discount. It cannot touch stake, leave the network, harm
+/// delegators, or make itself permanent.
+pub fn update_gateway_metadata(
+    ctx: Context<UpdateGatewayMetadata>,
+    params: crate::UpdateGatewayMetadataParams,
+) -> Result<()> {
+    let signer = ctx.accounts.signer.key();
+    let gateway = &mut ctx.accounts.gateway;
+
+    require!(
+        gateway.status == GatewayStatus::Joined,
+        GarError::GatewayLeaving
+    );
+
+    // Authorisation. See `is_gateway_authority` for why the zero-pubkey case is
+    // handled there rather than inline: it is unreachable from an integration
+    // test, so it needs a unit test of its own to be verified at all.
+    require!(
+        is_gateway_authority(&signer, &gateway.operator, &gateway.operations_address),
+        GarError::NotGatewayAuthority
+    );
+
+    // Same validation as update_gateway_settings — a delegated signer must not
+    // be able to write values the operator could not.
+    let mut fields_changed: u32 = 0;
+
+    if let Some(label) = params.label {
+        require!(
+            !label.is_empty() && label.len() <= 64,
+            GarError::InvalidLabel
+        );
+        gateway.label = label;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_LABEL;
+    }
+    if let Some(fqdn) = params.fqdn {
+        require!(!fqdn.is_empty() && fqdn.len() <= 128, GarError::InvalidFqdn);
+        gateway.fqdn = fqdn;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_FQDN;
+    }
+    if let Some(port) = params.port {
+        gateway.port = port;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_PORT;
+    }
+    if let Some(protocol) = params.protocol {
+        gateway.protocol = protocol;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_PROTOCOL;
+    }
+    if let Some(properties) = params.properties {
+        require!(is_valid_arweave_id(&properties), GarError::InvalidParameter);
+        gateway.properties = properties;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_PROPERTIES;
+    }
+    if let Some(note) = params.note {
+        require!(note.len() <= 256, GarError::InvalidParameter);
+        gateway.note = note;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_NOTE;
+    }
+
+    emit!(crate::GatewayMetadataUpdatedEvent {
+        operator: gateway.operator,
+        signer,
+        fields_changed,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+
+/// ADR-0030: rotate the address authorised for non-custodial gateway work.
+///
+/// **Operator-gated, and that is the load-bearing rule of ADR-0030.** If
+/// `operations_address` could rotate itself, a compromised delegate would point
+/// it at an attacker key and the operator could never revoke it — the delegation
+/// would become irrevocable by the only party entitled to revoke it.
+///
+/// Setting it back to `operator` is how a delegation is revoked.
+pub fn update_operations_address(
+    ctx: Context<UpdateOperationsAddress>,
+    new_operations_address: Pubkey,
+) -> Result<()> {
+    let gateway = &mut ctx.accounts.gateway;
+
+    require!(
+        gateway.status == GatewayStatus::Joined,
+        GarError::GatewayLeaving
+    );
+    // A zeroed operations address would authorise nobody, but accepting it
+    // silently turns "revoke" into "brick the delegation" — revocation is
+    // setting it back to the operator, which is explicit and reversible.
+    require!(
+        new_operations_address != Pubkey::default(),
+        GarError::InvalidParameter
+    );
+    require!(
+        new_operations_address != gateway.operations_address,
+        GarError::InvalidParameter
+    );
+
+    let old_operations_address = gateway.operations_address;
+    gateway.operations_address = new_operations_address;
+
+    let clock = Clock::get()?;
+    emit!(crate::OperationsAddressUpdatedEvent {
+        operator: gateway.operator,
+        old_operations_address,
+        new_operations_address,
+        timestamp: clock.unix_timestamp,
     });
 
     Ok(())
@@ -964,6 +1091,43 @@ pub struct UpdateGatewaySettings<'info> {
     )]
     pub gateway: Account<'info, Gateway>,
 
+    pub operator: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateGatewayMetadata<'info> {
+    /// CHECK: identifies WHICH gateway, by seeding the PDA. Not a signer — that
+    /// is the whole point of this instruction. The `seeds` + `bump` check below
+    /// proves `gateway` is the canonical PDA for this operator, so a caller
+    /// cannot pair an arbitrary operator with someone else's gateway account.
+    pub operator: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, operator.key().as_ref()],
+        bump = gateway.bump,
+        constraint = gateway.operator == operator.key() @ GarError::NotOperator,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    /// Either the operator or the gateway's `operations_address`; checked in the
+    /// handler against the deserialized account, not by an Anchor constraint,
+    /// because the zero-pubkey case has to be excluded explicitly.
+    pub signer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateOperationsAddress<'info> {
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, operator.key().as_ref()],
+        bump = gateway.bump,
+        constraint = gateway.operator == operator.key() @ GarError::NotOperator,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    /// The staking wallet. Deliberately the only signer accepted here: see
+    /// `update_operations_address`.
     pub operator: Signer<'info>,
 }
 

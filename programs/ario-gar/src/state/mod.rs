@@ -117,7 +117,7 @@ pub const GATEWAY_REGISTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 // inside Gateway, this is NOT an in-place grow-then-deserialize migration — see
 // `schema_migration::migrate_gateway_version`. Existing pre-1.1.0 accounts are
 // recreated (devnet/staging full redeploy), not migrated.
-pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
+pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 2, 0);
 /// Byte size of a `Gateway` account whose layout is 1.1.0 or later.
 ///
 /// **This is a frozen historical constant. Never change it, and never redefine
@@ -135,6 +135,24 @@ pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
 /// `cumulative_reward_per_token`, `bump` and `version`. Such accounts cannot be
 /// migrated in place and are rejected outright.
 pub const GATEWAY_SIZE_AT_V1_1_0: usize = 964;
+
+/// ADR-0030: may `signer` act for a gateway with these two addresses?
+///
+/// Extracted as a pure function for one reason: the `Pubkey::default()` case is
+/// **unreachable from an integration test**, because the zero pubkey is the
+/// System Program and nobody can sign as it. A test that drives the instruction
+/// with an ordinary stranger passes whether or not the zero guard is present,
+/// so it proves nothing. This function makes the guard directly testable.
+///
+/// A zeroed `operations_address` means "not yet migrated" and must authorise
+/// nobody. Never treat it as a wildcard.
+pub fn is_gateway_authority(
+    signer: &Pubkey,
+    operator: &Pubkey,
+    operations_address: &Pubkey,
+) -> bool {
+    signer == operator || (*operations_address != Pubkey::default() && signer == operations_address)
+}
 pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
@@ -362,6 +380,22 @@ pub struct Gateway {
     pub cumulative_reward_per_token: u128,
     pub bump: u8,
     pub version: SchemaVersion,
+    /// ADR-0030: a second signer the operator may authorise for non-custodial
+    /// work — gateway metadata updates and spending the ArNS discount.
+    ///
+    /// Defaults to `operator` at `join_network`, and is rotatable **only** by
+    /// the operator: if this address could change itself, a compromised
+    /// delegate would rotate to an attacker key and lock the operator out
+    /// permanently.
+    ///
+    /// **Appended after `version` deliberately.** `grow_account` zero-fills the
+    /// tail, so a field at the very end is the only placement where migrating a
+    /// live account cannot shift anything already stored. See
+    /// `GATEWAY_SIZE_AT_V1_1_0` for what happens when a field grows mid-struct.
+    ///
+    /// A zeroed value means "not yet migrated" and must authorise **nobody** —
+    /// never treat `Pubkey::default()` as a wildcard.
+    pub operations_address: Pubkey,
 }
 
 impl Gateway {
@@ -386,7 +420,8 @@ impl Gateway {
         + 32  // observer_address
         + 16  // cumulative_reward_per_token
         + 1   // bump
-        + SCHEMA_VERSION_SIZE; // version
+        + SCHEMA_VERSION_SIZE // version
+        + 32; // operations_address (ADR-0030, appended after version)
 
     /// Minimum operator stake required to join (in base units)
     pub const MIN_OPERATOR_STAKE: u64 = 20_000_000_000; // 20,000 ARIO
@@ -1710,6 +1745,7 @@ mod tests {
             cumulative_reward_per_token: 1_000_000_000_000_000_000, // 1e18
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1757,6 +1793,7 @@ mod tests {
             cumulative_reward_per_token: 2_000_000_000_000_000_000, // 2e18
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1988,6 +2025,7 @@ mod tests {
             cumulative_reward_per_token: 0,
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         }
     }
 
@@ -2109,5 +2147,85 @@ mod tests {
         // program only ever wrote as zero, so every live Epoch reads back
         // as "no receipt" and takes the `close = payer` fallback.
         assert_eq!(flag_off, 9398);
+    }
+
+    // =========================================
+    // ADR-0030 authorisation predicate
+    // =========================================
+
+    /// **Deployment-safety invariant for ADR-0030.**
+    ///
+    /// After the upgrade, `Gateway::SIZE` is 996 but every live account is still
+    /// 964 until `migrate_gateway` runs. Those accounts stay readable only
+    /// because the appended `operations_address` is read out of the zero padding
+    /// — which requires a real gateway's borsh content to leave 32 bytes of slack
+    /// inside the OLD 964-byte size.
+    ///
+    /// The slack comes entirely from `properties`: `SIZE` reserves 4 + 256 for
+    /// it, but `join_network`, `update_gateway_settings` and
+    /// `update_gateway_metadata` all enforce `is_valid_arweave_id`, capping it at
+    /// 43 characters and saving 213 bytes.
+    ///
+    /// So this is not a comfortable margin, it is a consequence of a validation
+    /// rule. **If `properties` is ever allowed to hold an arbitrary 256-byte
+    /// string, un-migrated accounts will fail to deserialize and every gateway
+    /// instruction will break until the migration completes.** This test is what
+    /// catches that.
+    #[test]
+    fn validated_max_gateway_fits_in_the_pre_migration_size() {
+        let mut gw = gateway_at_max_size();
+        // The real validated maximum: an Arweave ID, not 256 arbitrary bytes.
+        gw.properties = "x".repeat(43);
+
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+
+        assert!(
+            data.len() <= GATEWAY_SIZE_AT_V1_1_0,
+            "a validated-maximum Gateway serializes to {} bytes, which does not \
+             fit the pre-migration size of {}; un-migrated accounts would EOF",
+            data.len(),
+            GATEWAY_SIZE_AT_V1_1_0
+        );
+
+        // And the theoretical SIZE-formula maximum genuinely does NOT fit, which
+        // is why the validation rule above is load-bearing rather than incidental.
+        let mut wide = Vec::new();
+        gateway_at_max_size().try_serialize(&mut wide).unwrap();
+        assert!(
+            wide.len() > GATEWAY_SIZE_AT_V1_1_0,
+            "if this ever fits, the margin no longer depends on properties \
+             validation and this test's premise needs revisiting"
+        );
+    }
+
+    #[test]
+    fn zeroed_operations_address_authorises_nobody() {
+        let operator = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+        let zero = Pubkey::default();
+
+        // The case an integration test cannot reach: the zero pubkey is the
+        // System Program, so no keypair can present it as a signer. If this
+        // guard regressed, an un-migrated gateway would authorise it.
+        assert!(
+            !is_gateway_authority(&zero, &operator, &zero),
+            "a zeroed operations_address must never authorise the zero pubkey"
+        );
+        assert!(!is_gateway_authority(&stranger, &operator, &zero));
+
+        // The operator still works on an un-migrated gateway.
+        assert!(is_gateway_authority(&operator, &operator, &zero));
+    }
+
+    #[test]
+    fn operations_address_authorises_only_itself_and_the_operator() {
+        let operator = Pubkey::new_unique();
+        let ops = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+
+        assert!(is_gateway_authority(&operator, &operator, &ops));
+        assert!(is_gateway_authority(&ops, &operator, &ops));
+        assert!(!is_gateway_authority(&stranger, &operator, &ops));
     }
 }

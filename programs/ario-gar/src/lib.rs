@@ -181,6 +181,24 @@ pub mod ario_gar {
         instructions::gateway::update_observer_address(ctx, new_observer)
     }
 
+    /// ADR-0030: update routing/presentation metadata. Accepts the operator
+    /// **or** the gateway's `operations_address`.
+    pub fn update_gateway_metadata(
+        ctx: Context<UpdateGatewayMetadata>,
+        params: UpdateGatewayMetadataParams,
+    ) -> Result<()> {
+        instructions::gateway::update_gateway_metadata(ctx, params)
+    }
+
+    /// ADR-0030: rotate the delegated operations address. Operator-only — the
+    /// operations address must never be able to change itself.
+    pub fn update_operations_address(
+        ctx: Context<UpdateOperationsAddress>,
+        new_operations_address: Pubkey,
+    ) -> Result<()> {
+        instructions::gateway::update_operations_address(ctx, new_operations_address)
+    }
+
     // =========================================
     // OPERATOR STAKE (F13-F14)
     // =========================================
@@ -1205,6 +1223,21 @@ pub struct JoinNetworkParams {
     pub observer_address: Pubkey,
 }
 
+/// ADR-0030: the routing/presentation subset of `UpdateGatewayParams`.
+///
+/// Deliberately a separate params type rather than a mode flag on the existing
+/// one: the delegation-economics fields are simply absent, so an
+/// `operations_address` signer cannot reach them even by malformed input.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct UpdateGatewayMetadataParams {
+    pub label: Option<String>,
+    pub fqdn: Option<String>,
+    pub port: Option<u16>,
+    pub protocol: Option<state::Protocol>,
+    pub properties: Option<String>,
+    pub note: Option<String>,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct UpdateGatewayParams {
     pub label: Option<String>,
@@ -1380,6 +1413,30 @@ pub struct GatewaySettingsUpdatedEvent {
 pub struct ObserverAddressUpdatedEvent {
     pub operator: Pubkey,
     pub new_observer: Pubkey,
+    pub timestamp: i64,
+}
+
+/// ADR-0030. Emitted on a metadata update.
+///
+/// Carries `signer` as well as `operator` precisely because this instruction
+/// accepts two different signers: if a delegated key is later found to be
+/// compromised, this is what lets you tell which changes it made.
+#[event]
+pub struct GatewayMetadataUpdatedEvent {
+    pub operator: Pubkey,
+    pub signer: Pubkey,
+    pub fields_changed: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0030. Emitted when the operator rotates the delegated operations
+/// address. Carries the old value too, so a subscriber can tell a first-time
+/// delegation from a revocation (`new == operator`) without prior state.
+#[event]
+pub struct OperationsAddressUpdatedEvent {
+    pub operator: Pubkey,
+    pub old_operations_address: Pubkey,
+    pub new_operations_address: Pubkey,
     pub timestamp: i64,
 }
 
