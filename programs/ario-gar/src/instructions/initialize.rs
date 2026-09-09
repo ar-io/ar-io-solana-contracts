@@ -445,3 +445,64 @@ pub struct TransferAuthority<'info> {
 
     pub authority: Signer<'info>,
 }
+
+/// Rotate `EpochSettings.authority` (ADR-0031).
+///
+/// `ario-gar` is the only program with two authority-bearing accounts, and
+/// `transfer_authority` above moves only `GatewaySettings`. Without this,
+/// `EpochSettings.authority` is written once by `initialize_epochs` and is
+/// immutable thereafter — which would strand every epoch admin instruction
+/// (`set_epochs_enabled`, `admin_set_epoch_duration`, `admin_set_reward_ratios`,
+/// `admin_set_current_epoch_index`, `close_epoch_settings`,
+/// `admin_close_stale_epoch`, `admin_close_orphaned_epoch_rent_receipt`) on the
+/// deploy key after an ADR-026 handoff. Staging demonstrates exactly that split.
+///
+/// Deliberately a SEPARATE instruction rather than extending `transfer_authority`
+/// to move both: that would change an existing instruction's account list and
+/// break every client already calling it. Keeping them separate also lets the
+/// two authorities legitimately differ — e.g. an operations multisig for epoch
+/// tuning, a colder one for staking parameters.
+pub fn transfer_epoch_settings_authority(
+    ctx: Context<TransferEpochSettingsAuthority>,
+    new_authority: Pubkey,
+) -> Result<()> {
+    require!(
+        new_authority != Pubkey::default(),
+        crate::error::GarError::InvalidParameter
+    );
+
+    let settings = &mut ctx.accounts.epoch_settings;
+    let old_authority = settings.authority;
+    settings.authority = new_authority;
+
+    let clock = Clock::get()?;
+    emit!(crate::EpochSettingsAuthorityTransferredEvent {
+        old_authority,
+        new_authority,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "EpochSettings.authority {} → {} (admin rotation)",
+        old_authority,
+        new_authority
+    );
+
+    Ok(())
+}
+
+/// Context for `transfer_epoch_settings_authority`. `has_one = authority` binds
+/// the signer to the CURRENT `EpochSettings` authority — the only load-bearing
+/// check, mirroring `TransferAuthority` above.
+#[derive(Accounts)]
+pub struct TransferEpochSettingsAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ crate::error::GarError::Unauthorized,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    pub authority: Signer<'info>,
+}
