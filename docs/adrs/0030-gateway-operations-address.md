@@ -338,6 +338,23 @@ precisely the failure this ADR would otherwise have caused.
   un-migrated field authorises nobody**; a forged Gateway account with a spoofed
   `operator` fails the PDA check; tenure and pass-rate failures still deny both
   signers.
+* **gar and arns do not have to deploy in the same transaction, or even the
+  same day.** An earlier draft of this ADR said they must ship together. That is
+  more cautious than the code requires, and the distinction matters because
+  lockstep deploys are the risky kind. `ario-arns` only ever *reads* `Gateway`
+  (`pricing.rs`, the single cross-program reader), so there is no write skew:
+  - **New arns, old gar** — accounts are still 964 bytes, the appended field
+    reads from the zero-padded tail as `Pubkey::default()`, and the discount
+    works for the operator.
+  - **Old arns, new gar** — accounts may be 996 bytes, and a struct that ends at
+    `version` simply ignores the trailing 32 bytes. This is not a new behaviour:
+    every live gateway already carries ~181 bytes of ignored padding, which is
+    the same mechanism.
+
+  Both directions degrade to "operator-only discount", never to a failure and
+  never to a wider grant. Deploying together is still tidier; it is a preference,
+  not a correctness requirement.
+
 * **Ship separately from ADR-0031, deployed after it.** Independent changes with
   very different risk: ADR-0031 is additive with no migration, this rewrites 648
   live accounts. Bundling would gate a zero-migration fix behind a migration.
