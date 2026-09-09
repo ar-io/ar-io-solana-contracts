@@ -28828,3 +28828,74 @@ async fn test_adr0030_instructions_reject_leaving_gateway() {
     assert_eq!(after.fqdn, gw.fqdn);
     assert_eq!(after.operations_address, ops.pubkey());
 }
+
+/// **Adversarial: does a permissionless migration clobber a delegation the
+/// operator deliberately set?**
+///
+/// `update_operations_address` works on an un-migrated 964-byte account (the
+/// content has room to grow by 32 bytes). If an operator delegates BEFORE
+/// `migrate_gateway` runs, the 1.1.0 -> 1.2.0 arm then unconditionally writes
+/// `operations_address = operator` — and `migrate_gateway` is permissionless,
+/// so anyone can trigger that.
+#[tokio::test]
+async fn test_migration_must_not_clobber_a_deliberate_delegation() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Put the gateway in the real pre-ADR-0030 shape: stamped 0.0.0, 964 bytes,
+    // operations_address absent from the content entirely.
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    {
+        let acct = ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut legacy = gw.clone();
+        legacy.version = SchemaVersion::new(0, 0, 0);
+        let mut data = Vec::new();
+        legacy.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32);
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &gateway_key,
+            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+                lamports: acct.lamports.max(10_000_000),
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: acct.rent_epoch,
+            }),
+        );
+    }
+
+    // The operator delegates while still un-migrated.
+    let ops = Keypair::new();
+    fund_lamports(&mut ctx, &ops.pubkey(), 10_000_000_000);
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .expect("delegating before migration should work");
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key)
+            .await
+            .operations_address,
+        ops.pubkey(),
+        "delegation must have been recorded"
+    );
+
+    // Now ANYONE runs the permissionless migration.
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &stranger)
+        .await
+        .expect("migrate_gateway is permissionless");
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.version, ario_gar::state::GATEWAY_VERSION);
+    assert_eq!(
+        after.operations_address,
+        ops.pubkey(),
+        "a third party's migration must NOT reset a delegation the operator set"
+    );
+}
