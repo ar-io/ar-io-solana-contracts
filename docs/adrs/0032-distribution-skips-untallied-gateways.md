@@ -1,6 +1,6 @@
 # ADR-0032: A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-11, contracts #130)
 * **Date:** 2026-09-11
 * **Deciders:** @vilenarios
 * **Consulted:** vilenarios.com gateway operator (incident report), permagate.io (corroborating cranker)

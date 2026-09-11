@@ -108,7 +108,8 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-027 | Restore the Escrow Active-Vault Re-lock via Direct CPI into ario-core's Existing ABI | accepted | [`0027-escrow-restore-active-vault-relock-direct-cpi.md`](0027-escrow-restore-active-vault-relock-direct-cpi.md) |
 | ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
 | ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
-| ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | proposed | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
+| ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
+| ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
 
 ### Reserved by open PRs
 
@@ -118,6 +119,7 @@ Numbers claimed by unmerged PRs, so they do not look free to the next author:
 |---|---|---|
 | ADR-030 | [#125](https://github.com/ar-io/ar-io-solana-contracts/pull/125) (impl [#129](https://github.com/ar-io/ar-io-solana-contracts/pull/129)) | `0030-gateway-operations-address.md` |
 | ADR-031 | [#126](https://github.com/ar-io/ar-io-solana-contracts/pull/126) (impl [#127](https://github.com/ar-io/ar-io-solana-contracts/pull/127)) | `0031-transferable-epoch-settings-authority.md` |
+
 
 Delete a row once its PR merges and the ADR appears in the Index above.
 
