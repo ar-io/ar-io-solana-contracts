@@ -15630,6 +15630,65 @@ async fn test_distribute_epoch_untallied_joiner_does_not_block() {
 }
 
 #[tokio::test]
+async fn test_distribute_epoch_refuses_weights_from_a_later_epoch() {
+    // ADR-0032's safety half. `weights_epoch` is one shared field per Gateway,
+    // re-stamped by whichever epoch was tallied most recently, so a LATER
+    // epoch's tally destroys the pending epoch's weights for every gateway it
+    // touched. Skipping those the way we skip an untallied late joiner would
+    // pay ZERO to all of them and set rewards_distributed = 1 -- irreversible,
+    // while emitting EpochDistributedEvent and looking like success.
+    //
+    // This is not hypothetical: staging epochs 790/791 reached it in Aug 2026,
+    // and mainnet 540 is in it now (every gateway in its undistributed range
+    // reads weights_epoch = 541). It must fail loudly instead.
+    let (mut ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key) =
+        setup_untallied_joiner_scenario().await;
+
+    // Simulate epoch 2's tally having re-stamped the tallied gateway, while
+    // epoch 1 is still undistributed.
+    let mut acct = ctx
+        .banks_client
+        .get_account(keep_gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(gw.weights.weights_epoch, 1, "sanity: tallied for epoch 1");
+    gw.weights.weights_epoch = 2;
+    {
+        let dst = &mut acct.data[8..];
+        let mut cursor = std::io::Cursor::new(dst);
+        gw.serialize(&mut cursor).unwrap();
+    }
+    ctx.set_account(&keep_gateway, &acct.into());
+
+    let result = distribute_two_slots(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        keep_gateway,
+        new_gateway,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::WeightsFromLaterEpoch);
+
+    // And the epoch must remain undistributed, so the decision stays open.
+    let epoch_after = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch_after: &Epoch =
+        bytemuck::from_bytes(&epoch_after.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch_after.rewards_distributed, 0,
+        "a clobbered epoch must NOT be marked distributed"
+    );
+}
+
+#[tokio::test]
 async fn test_distribute_epoch_stale_weights_with_nonzero_composite_earns_zero() {
     // The case the removed `require!` actually protected against, and the
     // reason staleness moved into `is_eligible` rather than simply being

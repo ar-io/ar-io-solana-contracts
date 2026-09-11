@@ -368,4 +368,10 @@ pub enum GarError {
     // indentation still in it.
     #[msg("Epoch still exists — close_epoch is the path that refunds its rent to the creator")]
     EpochStillExists,
+
+    // ADR-0032. Distinct from WeightsNotTallied on purpose: this one means the
+    // epoch's weights are GONE, not merely missing for one gateway, and it
+    // needs a human decision rather than a retry.
+    #[msg("Gateway weights were overwritten by a later epoch's tally; this epoch can no longer be distributed")]
+    WeightsFromLaterEpoch,
 }

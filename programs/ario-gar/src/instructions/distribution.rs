@@ -191,13 +191,47 @@ pub fn distribute_epoch<'info>(
         // a gateway is traversed and earns 0, the same outcome a leaver already
         // gets. See `is_eligible` below for why this is strictly stronger than
         // the guard it replaces.
-        let weights_stale = gateway.weights.weights_epoch != epoch.epoch_index;
+        let weights_epoch = gateway.weights.weights_epoch;
+        let weights_stale = weights_epoch != epoch.epoch_index;
+
+        // ADR-0032, and the reason staleness is not simply "skip and pay 0".
+        //
+        // `weights_epoch` is a SINGLE shared field per Gateway, re-stamped by
+        // whichever epoch was tallied most recently. So there are two very
+        // different ways to be stale, and they must not be treated alike:
+        //
+        //   weights_epoch < epoch_index (0 included)
+        //     This gateway was never tallied for this epoch -- it entered the
+        //     registry after `weights_tallied` was set. A per-gateway
+        //     condition: it has no weights here, earns 0, and must not block
+        //     everyone else. This is the mainnet epoch 540 case.
+        //
+        //   weights_epoch > epoch_index
+        //     A LATER epoch's tally has already overwritten this epoch's
+        //     weights. That is SYSTEMIC, not per-gateway: every gateway that
+        //     later tally touched is in the same state, so proceeding would
+        //     pay ZERO to all of them and set `rewards_distributed = 1`,
+        //     making it irreversible -- while emitting EpochDistributedEvent
+        //     and looking like success. The epoch's weights cannot be
+        //     reconstructed, so there is no correct payout to compute. Fail
+        //     loudly and let an operator decide (`admin_close_stale_epoch` is
+        //     the deliberate write-off). Staging epochs 790/791 reached this
+        //     state in Aug 2026; mainnet 540 is in it now, after epoch 541's
+        //     tally re-stamped every gateway in its undistributed range.
+        //
+        // Leavers are exempt: tally zeroes their composite and skips the
+        // stamp, so their weights_epoch is arbitrarily old and they earn 0
+        // regardless.
+        require!(
+            is_leaving || weights_epoch <= epoch.epoch_index,
+            GarError::WeightsFromLaterEpoch
+        );
         if weights_stale && !is_leaving {
             msg!(
                 "slot {} untallied for epoch {} (weights_epoch={}); reward 0",
                 dist_idx,
                 epoch.epoch_index,
-                gateway.weights.weights_epoch
+                weights_epoch
             );
         }
 
