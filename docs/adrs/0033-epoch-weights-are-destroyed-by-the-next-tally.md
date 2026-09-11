@@ -159,11 +159,35 @@ duration was already unclosable, so the gate removes a capability without
 removing a recovery path. One additive error variant; no layout change, no ABI
 change — the same rollout class as ADR-0032, and it can ship alongside it.
 
-**Option 1 carries the operational half.** The N+1-overtakes-N race is a
-sequencing problem in clients we control. Cranker discipline is: distribute N to
-`rewards_distributed = 1` before tallying N+1, and treat a pending undistributed
-epoch as a reason to defer tallying rather than a reason to proceed. Paired with
-ADR-0032 shrinking the window, this is adequate without touching the contract.
+**Option 1 carries the operational half — and reading the client changed what
+it is.** `crankEpochStep` is **already correctly ordered**: it works the live
+epoch (`currentIndex - 1`) through tally → prescribe → distribute, and reaches
+`createEpoch` only after `rewardsDistributed === 1`. Its own comment says so:
+*"Lazy-state maintenance … reached only once the live epoch is fully distributed
+(rewardsDistributed === 1 here) … run BEFORE creating the next epoch."* A
+conforming crank therefore **cannot** create N+1 while N is undistributed, and
+cannot cause this race at all.
+
+So option 1 is not a cranker-ordering change. It is two different things:
+
+* **Gate out-of-band epoch creation.** The race requires someone to create N+1
+  outside the crank while N is undistributed. That is exactly how mainnet 540
+  was lost: epoch 541 was created by hand to unfreeze a wedged network, and
+  541's tally then clobbered 540's weights. Any tool or runbook that creates an
+  epoch manually must first establish that the previous epoch is distributed, or
+  record the loss as an accepted trade. `check-epoch-distributable.mjs` computes
+  exactly that.
+
+* **Do NOT "fix" the missing try/catch on the distribute branch naively.** When
+  `distribute_epoch` throws, the exception escapes `crankEpochStep` and the tick
+  stops *before* `createEpoch`. That freeze is **load-bearing protection**: it is
+  what preserves the pending epoch's weights. Wrapping the branch in a plain
+  try/catch — previously proposed as the highest-leverage fix for the mainnet
+  freeze — would let every operator's crank fall through to create-next, and the
+  following tally would then destroy the stuck epoch's rewards automatically. If
+  that branch is ever wrapped, it must **catch and stop**, surfacing the failure,
+  never catch and continue. Only an epoch established as unrecoverable should be
+  allowed to fall through.
 
 **Option 3 is rejected on cost.** `DistributeEpoch.epoch_settings` is **not**
 `mut` ([`distribution.rs`](../../programs/ario-gar/src/instructions/distribution.rs)),
@@ -197,10 +221,16 @@ than re-litigated.
 
 ### Negative / risks
 
-* **The N+1 race remains possible in principle.** It is mitigated
-  procedurally, not prevented. An operator running a non-conforming cranker can
-  still destroy a pending epoch's weights — without profit, but with loss to
-  others.
+* **The N+1 race remains possible in principle**, but only through out-of-band
+  epoch creation, since `crankEpochStep` cannot produce it. Mitigated
+  procedurally, not prevented: anyone who creates an epoch by hand while the
+  previous one is undistributed still destroys that epoch's weights — without
+  profit, but with loss to others.
+* **The protective freeze is preserved by doing nothing**, which is an uneasy
+  place to leave it: the network stalling on an undistributed epoch is what
+  currently keeps that epoch's rewards alive, and someone reading the missing
+  try/catch as a plain bug will remove that protection in good faith. This is
+  why it is written down here rather than left to code review.
 * **`EpochTallyWindowClosed` is a new way for a tally to fail.** A cranker fleet
   offline for more than one full epoch duration will find the missed epoch
   permanently untallied — hence never prescribed, distributed or closed by any
@@ -232,8 +262,10 @@ than re-litigated.
   `end_timestamp + epoch_duration` fails; a partially-tallied epoch cannot be
   resumed after the window; and a regression test that the normal
   create → tally → prescribe → distribute → close cycle is unaffected.
-* Cranker/observer change (`ar-io-cranker`, `ar-io-observer`): refuse to tally
-  epoch N+1 while N is undistributed, and surface it rather than proceeding.
+* **No cranker/observer ordering change is needed** — `crankEpochStep` already
+  enforces it. What is needed is a guard on any out-of-band epoch creation, and
+  a comment on the distribute branch recording that its un-caught throw is
+  deliberate protection rather than an oversight.
 * Operator advisory must cover both new failure modes —
   `EpochWeightsClobbered` (ADR-0032) and `EpochTallyWindowClosed` (here).
 * Pre-flight before any distribution:
