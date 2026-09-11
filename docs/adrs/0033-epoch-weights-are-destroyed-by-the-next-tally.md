@@ -128,36 +128,40 @@ lowers the likelihood while leaving the mechanism intact.
 
 > **Options 1 + 2 now; option 4 deferred; option 3 rejected.**
 
-**Option 2 is the cheap, correct half.** `tally_weights` already has `epoch`
-and the clock in scope, so the gate is a `require!` with no new accounts:
+**Option 2 is the cheap, correct half — gated on the live epoch, not on time.**
+`create_epoch` always creates `epoch[current_epoch_index]` and then increments,
+so the live epoch is exactly `current_epoch_index - 1`. `tally_weights` already
+has `epoch_settings` in its context, so the gate is a `require!` with no new
+accounts:
 
 ```rust
-let epoch_span = epoch.end_timestamp.checked_sub(epoch.start_timestamp)?;
-let tally_deadline = epoch.end_timestamp.checked_add(epoch_span)?;
-require!(
-    clock.unix_timestamp <= tally_deadline,
-    GarError::EpochTallyWindowClosed
-);
+let live_epoch_index = epoch_settings.current_epoch_index.checked_sub(1)?;
+require!(epoch.epoch_index == live_epoch_index, GarError::EpochNoLongerLive);
 ```
 
-**The span comes from the epoch's own timestamps, not from
-`epoch_settings.epoch_duration`.** An earlier revision of this ADR specified the
-setting, which is wrong: `admin_set_epoch_duration` can change it afterwards and
-would retroactively move the window for every epoch created under the old
-cadence. Staging compressed the duration to 60 s in Aug 2026 — under a
-settings-derived deadline that would have locked in-flight 24 h epochs out of
-tally almost immediately. Deriving the span from `end - start` makes the deadline
-a property of the epoch itself and immune to later governance changes.
-`test_tally_window_uses_the_epochs_own_span_not_current_settings` was verified to
-fail against the settings-derived variant, so the distinction is held by a test
-rather than by this paragraph.
+This is the precise harm condition — tallying anything older overwrites the live
+epoch's weights — rather than a proxy for it.
 
-This makes a stranded partially-tallied epoch **inert** rather than a permanent
-weapon, which retires the adversarial route entirely. It cannot strand anything
-that was not already stranded: an epoch nobody tallied within a full extra
-duration was already unclosable, so the gate removes a capability without
-removing a recovery path. One additive error variant; no layout change, no ABI
-change — the same rollout class as ADR-0032, and it can ship alongside it.
+**A time window was implemented first and rejected.** The obvious formulation,
+"refuse once the clock passes the epoch's end plus one epoch span", fails on two
+edges:
+
+* **Retroactive lockout.** The gate applies to epochs that already exist, so
+  deploying it while one sat mid-tally past its deadline would strand that epoch
+  permanently and re-freeze the cluster on the spot — the exact failure this
+  workstream exists to remove. Staging epoch 818 happened to complete its tally
+  shortly before this was checked, so it was safe by luck rather than design.
+* **Mid-tally guillotine.** A batched tally is ~36 transactions for 647
+  gateways. It can cross the deadline mid-run and leave the epoch permanently
+  partial — very reachable on a compressed cadence, which staging ran in
+  Aug 2026.
+
+A first revision also specified `epoch_settings.epoch_duration` as the span,
+which `admin_set_epoch_duration` can move retroactively; switching to the
+epoch's own `end - start` fixed that but left both edges above. The live-epoch
+test has none of the three problems: the live epoch stays tallyable however long
+it takes, it stops being live only when the next epoch is created, and it does
+not consult the duration at all.
 
 **Option 1 carries the operational half — and reading the client changed what
 it is.** `crankEpochStep` is **already correctly ordered**: it works the live
@@ -231,19 +235,18 @@ than re-litigated.
   currently keeps that epoch's rewards alive, and someone reading the missing
   try/catch as a plain bug will remove that protection in good faith. This is
   why it is written down here rather than left to code review.
-* **`EpochTallyWindowClosed` is a new way for a tally to fail.** A cranker fleet
-  offline for more than one full epoch duration will find the missed epoch
-  permanently untallied — hence never prescribed, distributed or closed by any
-  permissionless path. That epoch was already effectively lost, but the failure
-  mode becomes explicit and needs to be in the operator advisory.
-* **A new permanent-loss case, which should be a conscious acceptance.** The
-  stranded epoch's rent stays reclaimable through `admin_close_stale_epoch` —
-  verified to carry no tally or distribution requirement, only authority plus
-  `migration_active`. But that instruction goes inert at `finalize_migration`,
-  after which such an epoch's ~0.0664 SOL is stranded for good. The window is
-  two full epoch spans, so reaching it requires a total cranker outage longer
-  than a day at mainnet cadence; the trade is accepted because the capability
-  removed was net-harmful either way.
+* **`EpochNoLongerLive` is a new way for a tally to fail.** An epoch that stops
+  being live while still untallied can never be tallied, hence never prescribed,
+  distributed or closed by any permissionless path. Its rent stays reclaimable
+  through `admin_close_stale_epoch` — verified to carry no tally or distribution
+  requirement, only authority plus `migration_active` — which goes inert at
+  `finalize_migration`.
+* **But that state is unreachable by a conforming cranker**, which is what makes
+  this version cheap: `crankEpochStep` creates the next epoch only once the live
+  one has `rewardsDistributed == 1`, so an epoch only stops being live after it
+  has been distributed. Reaching the stranded state requires out-of-band epoch
+  creation. The rejected time-window version could be triggered by a cranker
+  outage alone, which is a materially worse behavioural cost.
 * Accepting option 1 means the guarantee depends on client behaviour, which is
   exactly the kind of dependency ADR-0032's own decision drivers argue against.
   It is accepted here only because the alternative costs a cutover and the
@@ -257,17 +260,17 @@ than re-litigated.
 ## Implementation notes
 
 * Gate in `tally_weights` (`programs/ario-gar/src/instructions/epoch.rs`), plus
-  an additive `EpochTallyWindowClosed` variant in `error.rs`.
-* Tests: tally inside the window succeeds; tally one second past
-  `end_timestamp + epoch_duration` fails; a partially-tallied epoch cannot be
-  resumed after the window; and a regression test that the normal
-  create → tally → prescribe → distribute → close cycle is unaffected.
+  an additive `EpochNoLongerLive` variant in `error.rs`.
+* Tests: the live epoch stays tallyable ~115 days past its end (the property a
+  time window would not have); tallying an epoch after `current_epoch_index`
+  advances past it fails with `EpochNoLongerLive` and stamps no gateway; both
+  verified to fail with the gate removed.
 * **No cranker/observer ordering change is needed** — `crankEpochStep` already
   enforces it. What is needed is a guard on any out-of-band epoch creation, and
   a comment on the distribute branch recording that its un-caught throw is
   deliberate protection rather than an oversight.
 * Operator advisory must cover both new failure modes —
-  `EpochWeightsClobbered` (ADR-0032) and `EpochTallyWindowClosed` (here).
+  `EpochWeightsClobbered` (ADR-0032) and `EpochNoLongerLive` (here).
 * Pre-flight before any distribution:
   `node check-epoch-distributable.mjs --cluster <c> --epoch <n>`.
 
