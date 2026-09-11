@@ -20,7 +20,15 @@ decision**, monotonic four-digit numbering, append-only once merged to
 
 1. **Pick the next free number.** Look at the table below and the
    filenames in this directory; pick `max + 1`, zero-padded to four
-   digits.
+   digits. **Also check open PRs** — an unmerged PR reserves its number,
+   and the merged tree will not show it. `gh pr list --state open` plus
+   `gh pr view <n> --json files` is enough. Taking a number that an open
+   PR already claims forces one of the two to be renumbered after
+   review, which the append-only rule makes expensive.
+
+   A number reserved by an open PR leaves an apparent gap in the Index
+   table until that PR merges. That is expected; do not "close" the gap
+   by reusing the number.
 2. **Copy the template.**
    ```bash
    cp docs/adrs/0000-template.md docs/adrs/NNNN-kebab-case-title.md
@@ -101,6 +109,17 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
 | ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
 | ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | proposed | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
+
+### Reserved by open PRs
+
+Numbers claimed by unmerged PRs, so they do not look free to the next author:
+
+| # | claimed by | file |
+|---|---|---|
+| ADR-030 | [#125](https://github.com/ar-io/ar-io-solana-contracts/pull/125) (impl [#129](https://github.com/ar-io/ar-io-solana-contracts/pull/129)) | `0030-gateway-operations-address.md` |
+| ADR-031 | [#126](https://github.com/ar-io/ar-io-solana-contracts/pull/126) (impl [#127](https://github.com/ar-io/ar-io-solana-contracts/pull/127)) | `0031-transferable-epoch-settings-authority.md` |
+
+Delete a row once its PR merges and the ADR appears in the Index above.
 
 ### Numbering anomalies
 
