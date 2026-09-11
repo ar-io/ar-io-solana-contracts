@@ -94,6 +94,17 @@ The comment above `is_eligible` states the assumption that made this invisible:
 That holds for a gateway that joins *before* tally. It is false for one that
 joins *after* tally, which is the case nobody modelled.
 
+### The guard is vacuous at epoch index 0
+
+Surfaced while writing the regression tests, and worth recording because it
+shapes how this must be tested: `weights_epoch` is initialised to 0, so for
+**epoch index 0** an untallied gateway satisfies `weights_epoch == epoch_index`
+trivially and the guard never fires. A test written against epoch 0 therefore
+passes identically before and after this change — the first draft of the
+regression test did exactly that, and had to be retargeted to epoch index 1 to
+reproduce the failure at all. No mainnet consequence (the incident was epoch
+540), but any future test of this path must run at a non-zero epoch index.
+
 ### This was observed once already
 
 [`solana-ar-io/docs/EPOCH_RENT_TO_CREATOR_PLAN.md` §6.3](https://github.com/ar-io/solana-ar-io)
@@ -225,11 +236,13 @@ revisited rather than carried forward by inertia.
 
 ### Negative / risks
 
-* **`WeightsNotTallied (6048)` becomes unreachable from this path.** It remains
-  a declared error variant; any operator tooling or dashboard that treats 6048
-  as a known/expected condition will simply stop observing it. No client parses
-  it for control flow today as far as we know, but this should be called out in
-  the operator advisory.
+* **`WeightsNotTallied (6048)` stops being raised by `distribute_epoch`.** The
+  variant is *not* retired — `prescribe_epoch` still raises it
+  ([`epoch.rs:916`](../../programs/ario-gar/src/instructions/epoch.rs),
+  `require!(epoch.weights_tallied != 0)`), which is a different and legitimate
+  condition (prescribing before tally). Tooling that keys off 6048 should be
+  checked for an assumption that it came from distribution; the operator
+  advisory should say so.
 * **A gateway in this state silently earns 0 for one epoch** instead of loudly
   failing. That is the intended trade, but it is a silent economic outcome, so
   it must be surfaced via `msg!` and should be documented for operators: *join
@@ -252,12 +265,23 @@ revisited rather than carried forward by inertia.
   `programs/ario-gar/src/instructions/distribution.rs`; update the stale comment
   above `is_eligible` (the "its weights ARE fresh" assumption) in the same diff.
 * Tests to add in `programs/ario-gar/tests/integration.rs`:
-  1. join after `weights_tallied == 1` → `distribute_epoch` completes; the late
-     joiner's `operator_stake` is unchanged; every other gateway is paid.
-  2. `joined` + stale `weights_epoch` + **nonzero** `composite_weight` → earns 0
+  1. `test_distribute_epoch_untallied_joiner_does_not_block` — join after
+     `weights_tallied == 1` → `distribute_epoch` completes; the joiner's
+     `operator_stake` is unchanged and its stats do not tick; the tallied
+     gateway is still paid; the cursor reaches `active_gateway_count` and
+     `rewards_distributed` flips.
+  2. `test_distribute_epoch_stale_weights_with_nonzero_composite_earns_zero` —
+     `joined` + stale `weights_epoch` + **nonzero** `composite_weight` → earns 0
      (the case the old `require!` existed for).
-  3. `leaving` + stale weights → unchanged behaviour (regression guard).
-  4. cursor reaches `active_gateway_count` and `rewards_distributed` flips.
+  3. `leaving` + stale weights → already covered by the existing
+     `test_distribute_epoch_leaving_gateway_zero_rewards`.
+
+  Both new tests must be verified to **fail on the pre-fix program** with
+  `Custom(6048)`, not merely to pass on the fixed one. Placing a
+  joined-but-untallied gateway *inside* `[0, active_gateway_count)` requires a
+  slot below the count to be freed after tally — the tests use
+  `leave_network` + `finalize_gone`, mirroring the three removals that relocated
+  `lazygiraffe.io` to index 622 on mainnet.
 * Assert **zero IDL drift**: `node scripts/idl-event-snapshot.mjs` must pass
   without `--update`.
 * Staging must **reproduce the failure on the pre-fix program first**, then

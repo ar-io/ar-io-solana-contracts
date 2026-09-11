@@ -15155,6 +15155,547 @@ async fn test_distribute_epoch_late_joiner_excluded_from_reward() {
 }
 
 // -----------------------------------------
+// ADR-0032 — a `joined` gateway that never reached `tally_weights` for the
+// epoch being distributed must not abort the batch.
+//
+// Reproduces the mainnet epoch 540 deadlock (2026-09-11): `lazygiraffe.io`
+// joined 16.6h into the epoch, after `weights_tallied` had already been set,
+// and ended up at a registry index below `active_gateway_count`. Every
+// distribution transaction network-wide then reverted with
+// `WeightsNotTallied (6048)` and the cursor was pinned at 615 for ~15h.
+//
+// Getting a joined-but-untallied gateway INSIDE [0, active_gateway_count)
+// requires a slot below that count to be freed after tally — on mainnet that
+// was three `finalize_gone` removals. Here: gw_keep takes slot 0, the payer's
+// gateway takes slot 1 and is GC'd after tally, then gw_new joins into the
+// freed slot 1 — still inside `active_gateway_count == 2`, never tallied.
+// -----------------------------------------
+
+/// Builds the epoch-540 shape: slot 0 tallied and eligible, slot 1 holding a
+/// gateway that joined after `weights_tallied` was set.
+///
+/// Returns `(ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key)`.
+async fn setup_untallied_joiner_scenario(
+) -> (ProgramTestContext, GarSetup, Pubkey, Pubkey, Pubkey, Pubkey) {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+
+    let op_keep = Keypair::new();
+    let op_new = Keypair::new();
+    let stranger = Keypair::new();
+
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    for kp in [&op_keep, &op_new, &stranger] {
+        pt.add_account(
+            kp.pubkey(),
+            solana_sdk::account::Account {
+                lamports: 50_000_000_000,
+                data: vec![],
+                owner: solana_sdk::system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+    }
+    let mut ctx = pt.start_with_context().await;
+
+    // The guard under test compares `weights_epoch` against the epoch index, and
+    // a never-tallied gateway reads 0. At epoch index 0 that is indistinguishable
+    // from "tallied for epoch 0", so the guard is vacuous there and the scenario
+    // would prove nothing. Mainnet hit this at epoch 540. Run at index 1:
+    // epoch 1's window is [86_500, 172_900] for genesis 100 / duration 86_400.
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let mut es_acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(es_acct.data[60], 1, "EpochSettings layout drift: `enabled`");
+    es_acct.data[61..69].copy_from_slice(&1u64.to_le_bytes());
+    ctx.set_account(&epoch_settings_key, &es_acct.into());
+
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_key, _) = epoch_pda(1);
+    let stake_amount = 20_000_000_000u64;
+
+    // t=0 — gw_keep joins BEFORE epoch 1's start (86_500), so tally gives it a
+    // composite > 0 and it is the epoch's only eligible earner.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    let keep_token = Keypair::new();
+    create_token_account(
+        &mut ctx,
+        &keep_token,
+        &setup.mint.pubkey(),
+        &op_keep.pubkey(),
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &keep_token.pubkey(),
+        &setup.mint_authority,
+        100_000_000_000,
+    )
+    .await;
+    let keep_gateway = join_gateway_with_operator(
+        &mut ctx,
+        &setup,
+        &op_keep,
+        &keep_token.pubkey(),
+        stake_amount,
+    )
+    .await;
+
+    // t=86_600 — the payer's gateway takes slot 1. It joins after epoch 1's
+    // start (86_500), so tally forces its composite to 0; that keeps gw_keep the
+    // only selectable observer and avoids a prescribe permutation retry. It is
+    // GC'd below.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 86_600;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+    let payer_gateway = join_gateway(&mut ctx, &setup, stake_amount).await;
+
+    // create_epoch snapshots active_gateway_count = registry.count = 2.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Tally BOTH slots, so `weights_tallied` flips to 1 and can never re-run.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        keep_gateway,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        payer_gateway,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: tally_accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 1 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Prescribe — only gw_keep carries a non-zero weight.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut prescribe_accounts = ario_gar::accounts::PrescribeEpoch {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    prescribe_accounts.push(solana_sdk::instruction::AccountMeta::new_readonly(
+        keep_gateway,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: prescribe_accounts,
+            data: ario_gar::instruction::PrescribeEpoch { _epoch_index: 1 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // The payer's gateway leaves, then is GC'd — freeing slot 1 (it is the
+    // last index, so `finalize_gone` needs no swap account).
+    let (op_wd_counter, _) = withdrawal_counter_pda(&payer_pk);
+    let (op_wd, _) = withdrawal_pda(&payer_pk, 0);
+    let mut leave_accounts = ario_gar::accounts::LeaveNetwork {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        registry: setup.registry_key,
+        gateway: payer_gateway,
+        withdrawal_counter: op_wd_counter,
+        withdrawal: op_wd,
+        excess_withdrawal: None,
+        operator: payer_pk,
+        system_program: system_program::id(),
+    }
+    .to_account_metas(None);
+    let (payer_observer_lookup, _) = observer_lookup_pda(&payer_pk);
+    leave_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        payer_observer_lookup,
+        false,
+    ));
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: leave_accounts,
+            data: ario_gar::instruction::LeaveNetwork {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    // Warp past the GC window (leave_timestamp 86_600 + 90d + 7 * 86_400) —
+    // which also puts the clock past epoch 1's end (172_900), so distribute is
+    // allowed.
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 9_000_000;
+    ctx.set_sysvar(&clock);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::FinalizeGone {
+                gateway: payer_gateway,
+                registry: setup.registry_key,
+                epoch_settings: epoch_settings_key,
+                caller: stranger.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::FinalizeGone {}.data(),
+        }],
+        Some(&stranger.pubkey()),
+        &[&stranger],
+        blockhash,
+    );
+    ctx.banks_client
+        .process_transaction(tx)
+        .await
+        .expect("finalize_gone must free slot 1");
+
+    // gw_new joins into the freed slot 1 — inside active_gateway_count (2),
+    // `joined`, and with weights_epoch still 0 because tally is finished.
+    let new_token = Keypair::new();
+    create_token_account(&mut ctx, &new_token, &setup.mint.pubkey(), &op_new.pubkey()).await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &new_token.pubkey(),
+        &setup.mint_authority,
+        100_000_000_000,
+    )
+    .await;
+    let new_gateway =
+        join_gateway_with_operator(&mut ctx, &setup, &op_new, &new_token.pubkey(), stake_amount)
+            .await;
+
+    // Preconditions the whole test rests on.
+    let registry_data = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&registry_data.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    assert_eq!(registry.count, 2, "slot 1 was freed then refilled");
+    assert_eq!(
+        registry.gateways[1].address,
+        op_new.pubkey(),
+        "the untallied joiner occupies slot 1"
+    );
+
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(epoch.active_gateway_count, 2, "count frozen at epoch start");
+    assert_eq!(epoch.weights_tallied, 1, "tally is closed for this epoch");
+
+    let new_gw = ctx
+        .banks_client
+        .get_account(new_gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_gw = Gateway::try_deserialize(&mut new_gw.data.as_slice()).unwrap();
+    assert_eq!(
+        new_gw.weights.weights_epoch, 0,
+        "joiner never reached tally_weights (0 != epoch index 1 -> stale)"
+    );
+    assert_eq!(
+        new_gw.status,
+        GatewayStatus::Joined,
+        "and it is Joined, so the old guard applied to it"
+    );
+
+    (
+        ctx,
+        setup,
+        keep_gateway,
+        new_gateway,
+        epoch_key,
+        epoch_settings_key,
+    )
+}
+
+/// Builds and sends `distribute_epoch` over slots 0 and 1.
+async fn distribute_two_slots(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    epoch_settings_key: Pubkey,
+    epoch_key: Pubkey,
+    slot0: Pubkey,
+    slot1: Pubkey,
+) -> std::result::Result<(), BanksClientError> {
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    accounts.push(solana_sdk::instruction::AccountMeta::new(slot0, false));
+    accounts.push(solana_sdk::instruction::AccountMeta::new(slot1, false));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 1 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_distribute_epoch_untallied_joiner_does_not_block() {
+    let (mut ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key) =
+        setup_untallied_joiner_scenario().await;
+
+    let new_stake_before = {
+        let acct = ctx
+            .banks_client
+            .get_account(new_gateway)
+            .await
+            .unwrap()
+            .unwrap();
+        Gateway::try_deserialize(&mut acct.data.as_slice())
+            .unwrap()
+            .operator_stake
+    };
+
+    // Pre-ADR-0032 this reverted with WeightsNotTallied (6048) and the cursor
+    // could never advance past slot 1 — at any batch size or offset, because
+    // accounts are validated positionally against `distribution_index`.
+    distribute_two_slots(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        keep_gateway,
+        new_gateway,
+    )
+    .await
+    .expect("an untallied joiner must not abort the batch");
+
+    // The untallied joiner earns nothing and its stats do not tick.
+    let new_after = ctx
+        .banks_client
+        .get_account(new_gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_after = Gateway::try_deserialize(&mut new_after.data.as_slice()).unwrap();
+    assert_eq!(
+        new_after.operator_stake, new_stake_before,
+        "untallied gateway must receive zero reward"
+    );
+    assert_eq!(
+        new_after.stats.total_epochs, 0,
+        "and must not be recorded as having participated"
+    );
+
+    // The tallied gateway WAS paid — proves the pool was non-zero, so the
+    // joiner's zero is a real exclusion rather than a vacuous all-zero epoch.
+    let keep_after = ctx
+        .banks_client
+        .get_account(keep_gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let keep_after = Gateway::try_deserialize(&mut keep_after.data.as_slice()).unwrap();
+    assert!(
+        keep_after.operator_stake > 20_000_000_000,
+        "the tallied gateway must still be paid"
+    );
+
+    // And the epoch completes, which is the whole point: the cursor reaches
+    // active_gateway_count instead of parking forever.
+    let epoch_after = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch_after: &Epoch =
+        bytemuck::from_bytes(&epoch_after.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch_after.distribution_index, 2,
+        "cursor cleared both slots"
+    );
+    assert_eq!(
+        epoch_after.rewards_distributed, 1,
+        "epoch 540's deadlock does not reproduce"
+    );
+}
+
+#[tokio::test]
+async fn test_distribute_epoch_stale_weights_with_nonzero_composite_earns_zero() {
+    // The case the removed `require!` actually protected against, and the
+    // reason staleness moved into `is_eligible` rather than simply being
+    // deleted: a gateway that missed tally while its registry slot still
+    // carries a NONZERO composite_weight. `composite_weight > 0` alone would
+    // pay it on weights that were never computed for this epoch.
+    let (mut ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key) =
+        setup_untallied_joiner_scenario().await;
+
+    // Force slot 1's composite_weight non-zero without tallying it.
+    let mut registry_acct = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let registry: &mut GatewayRegistry = bytemuck::from_bytes_mut(
+            &mut registry_acct.data[8..8 + std::mem::size_of::<GatewayRegistry>()],
+        );
+        assert_eq!(
+            registry.gateways[1].composite_weight, 0,
+            "sanity: join_network writes composite 0"
+        );
+        registry.gateways[1].composite_weight = 1_000_000;
+    }
+    ctx.set_account(&setup.registry_key, &registry_acct.into());
+
+    let new_stake_before = {
+        let acct = ctx
+            .banks_client
+            .get_account(new_gateway)
+            .await
+            .unwrap()
+            .unwrap();
+        Gateway::try_deserialize(&mut acct.data.as_slice())
+            .unwrap()
+            .operator_stake
+    };
+
+    distribute_two_slots(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        keep_gateway,
+        new_gateway,
+    )
+    .await
+    .expect("stale weights must not abort the batch");
+
+    let new_after = ctx
+        .banks_client
+        .get_account(new_gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_after = Gateway::try_deserialize(&mut new_after.data.as_slice()).unwrap();
+    assert_eq!(
+        new_after.operator_stake, new_stake_before,
+        "a gateway with stale weights must earn zero even when its registry \
+         slot carries a non-zero composite_weight"
+    );
+}
+
+// -----------------------------------------
 // G5. update_observer_address on leaving gateway (line 397)
 // -----------------------------------------
 
