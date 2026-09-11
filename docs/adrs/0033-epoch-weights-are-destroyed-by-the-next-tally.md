@@ -1,6 +1,6 @@
 # ADR-0033: An Epoch's Weights Survive Only Until the Next Tally
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-11; option 2 implemented in contracts #132)
 * **Date:** 2026-09-11
 * **Deciders:** @vilenarios
 * **Consulted:** security review of [ADR-0032](0032-distribution-skips-untallied-gateways.md)
