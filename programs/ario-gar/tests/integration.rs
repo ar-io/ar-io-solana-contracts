@@ -28731,10 +28731,19 @@ async fn try_tally_at(
 }
 
 #[tokio::test]
-async fn test_tally_weights_allowed_at_the_window_boundary() {
-    // Epoch 0 = [100, 86_500]; deadline = end + span = 172_900. Exactly on the
-    // boundary must still be allowed, so an operator one second inside a
-    // generous window is never punished for it.
+async fn test_tally_weights_allowed_on_the_live_epoch_after_a_long_delay() {
+    // The live epoch stays tallyable however late it is. This is the property a
+    // time-window gate (end + one epoch span) would NOT have had, and it is why
+    // the gate keys off "is this the live epoch" instead:
+    //
+    //   * a time window applies retroactively to epochs that already exist, so
+    //     deploying it while one sat mid-tally past its deadline would strand
+    //     that epoch permanently and re-freeze the cluster on the spot;
+    //   * and a batched tally (~36 txs for 647 gateways) could cross the
+    //     deadline mid-run and leave the epoch permanently partial -- very
+    //     reachable on a compressed cadence, which staging ran in Aug 2026.
+    //
+    // Epoch 0 is [100, 86_500]; tally here at ~115 days past its end.
     let (mut ctx, setup, gateway, epoch_key, epoch_settings_key) =
         setup_epoch0_ready_for_tally().await;
     try_tally_at(
@@ -28743,30 +28752,11 @@ async fn test_tally_weights_allowed_at_the_window_boundary() {
         epoch_settings_key,
         epoch_key,
         gateway,
-        172_900,
+        10_000_000,
     )
     .await
-    .expect("tally exactly at the deadline must be allowed");
-}
+    .expect("the live epoch must stay tallyable regardless of elapsed time");
 
-#[tokio::test]
-async fn test_tally_weights_refused_past_the_window() {
-    // One second past the deadline. Tallying here would re-stamp this gateway's
-    // weights_epoch to 0 while a later epoch owns them.
-    let (mut ctx, setup, gateway, epoch_key, epoch_settings_key) =
-        setup_epoch0_ready_for_tally().await;
-    let result = try_tally_at(
-        &mut ctx,
-        &setup,
-        epoch_settings_key,
-        epoch_key,
-        gateway,
-        172_901,
-    )
-    .await;
-    assert_anchor_error!(result, GarError::EpochTallyWindowClosed);
-
-    // Still untallied, so nothing was half-applied.
     let ep = ctx
         .banks_client
         .get_account(epoch_key)
@@ -28774,22 +28764,19 @@ async fn test_tally_weights_refused_past_the_window() {
         .unwrap()
         .unwrap();
     let ep: &Epoch = bytemuck::from_bytes(&ep.data[8..8 + std::mem::size_of::<Epoch>()]);
-    assert_eq!(ep.weights_tallied, 0);
-    assert_eq!(ep.tally_index, 0);
+    assert_eq!(ep.weights_tallied, 1, "tally completed");
 }
 
 #[tokio::test]
-async fn test_tally_window_uses_the_epochs_own_span_not_current_settings() {
-    // The whole reason the deadline is derived from the epoch's own timestamps
-    // rather than `epoch_settings.epoch_duration`: `admin_set_epoch_duration`
-    // can change the setting afterwards, which would retroactively move the
-    // window for epochs created under the old cadence. Staging did exactly that
-    // in Aug 2026 when it compressed the duration to 60s.
+async fn test_tally_weights_refused_on_a_non_live_epoch() {
+    // The attack this closes: tally an older, partially-tallied epoch and the
+    // stamp lands on gateways whose weights belong to the LIVE epoch, destroying
+    // its payout. Permissionless, one tx fee.
     //
-    // Epoch 0 was created with a 86_400s span, so its deadline is 172_900. Crush
-    // the *setting* to 60s and tally at 172_900 anyway: it must still succeed.
-    // Against a settings-derived deadline (86_500 + 60 = 86_560) this would
-    // fail, so this test is what distinguishes the two implementations.
+    // `create_epoch` makes epoch[current_epoch_index] then increments, so the
+    // live epoch is current_epoch_index - 1. Epoch 0 was created, leaving
+    // current = 1 and epoch 0 live. Advance current to 2 so epoch 1 is live and
+    // epoch 0 is not, then try to tally epoch 0.
     let (mut ctx, setup, gateway, epoch_key, epoch_settings_key) =
         setup_epoch0_ready_for_tally().await;
 
@@ -28800,21 +28787,45 @@ async fn test_tally_window_uses_the_epochs_own_span_not_current_settings() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        i64::from_le_bytes(es.data[40..48].try_into().unwrap()),
-        86_400,
-        "EpochSettings layout drift: epoch_duration"
+        u64::from_le_bytes(es.data[61..69].try_into().unwrap()),
+        1,
+        "EpochSettings layout drift: current_epoch_index"
     );
-    es.data[40..48].copy_from_slice(&60i64.to_le_bytes());
+    es.data[61..69].copy_from_slice(&2u64.to_le_bytes());
     ctx.set_account(&epoch_settings_key, &es.into());
 
-    try_tally_at(
+    let result = try_tally_at(
         &mut ctx,
         &setup,
         epoch_settings_key,
         epoch_key,
         gateway,
-        172_900,
+        90_000,
     )
-    .await
-    .expect("the deadline must follow the epoch's own span, not the live setting");
+    .await;
+    assert_anchor_error!(result, GarError::EpochNoLongerLive);
+
+    // Nothing half-applied: the stale epoch is untouched, and crucially no
+    // gateway's weights_epoch was re-stamped.
+    let ep = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let ep: &Epoch = bytemuck::from_bytes(&ep.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(ep.weights_tallied, 0);
+    assert_eq!(ep.tally_index, 0);
+
+    let gw = ctx
+        .banks_client
+        .get_account(gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw = Gateway::try_deserialize(&mut gw.data.as_slice()).unwrap();
+    assert_eq!(
+        gw.weights.weights_epoch, 0,
+        "the refused tally must not have stamped the gateway"
+    );
 }
