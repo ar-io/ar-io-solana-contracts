@@ -194,37 +194,55 @@ pub fn distribute_epoch<'info>(
         let weights_epoch = gateway.weights.weights_epoch;
         let weights_stale = weights_epoch != epoch.epoch_index;
 
+        // Was this gateway outside the epoch's earning set to begin with? Same
+        // test `tally_weights` uses to force `effective_composite = 0`
+        // (SHOULD-13, epoch.rs) and therefore the same population
+        // `prescribe_epoch` excluded from the `joined_count` divisor. Read off
+        // the Gateway account, not the registry slot, so it cannot drift from
+        // the copy tally consulted.
+        let outside_earning_set = gateway.start_timestamp > epoch.start_timestamp;
+
         // ADR-0032, and the reason staleness is not simply "skip and pay 0".
         //
         // `weights_epoch` is a SINGLE shared field per Gateway, re-stamped by
-        // whichever epoch was tallied most recently. So there are two very
-        // different ways to be stale, and they must not be treated alike:
+        // whichever epoch was tallied most recently, in EITHER direction --
+        // `tally_weights`' only epoch precondition is `weights_tallied == 0`
+        // (epoch.rs), with no time gate and no ordering gate, so a later tally
+        // of a *newer* epoch or a belated tally of an older, partially-tallied
+        // one both overwrite this epoch's stamp. Staleness therefore covers two
+        // populations the shared field cannot distinguish:
         //
-        //   weights_epoch < epoch_index (0 included)
-        //     This gateway was never tallied for this epoch -- it entered the
-        //     registry after `weights_tallied` was set. A per-gateway
-        //     condition: it has no weights here, earns 0, and must not block
-        //     everyone else. This is the mainnet epoch 540 case.
+        //   Outside the earning set (joined after this epoch started)
+        //     `prescribe_epoch` already excluded it from the `joined_count`
+        //     divisor, so it is owed nothing. Per-gateway: skip it, pay 0, and
+        //     do NOT let it block everyone else. This is the mainnet epoch 540
+        //     / lazygiraffe case this change exists to fix.
         //
-        //   weights_epoch > epoch_index
-        //     A LATER epoch's tally has already overwritten this epoch's
-        //     weights. That is SYSTEMIC, not per-gateway: every gateway that
-        //     later tally touched is in the same state, so proceeding would
-        //     pay ZERO to all of them and set `rewards_distributed = 1`,
-        //     making it irreversible -- while emitting EpochDistributedEvent
-        //     and looking like success. The epoch's weights cannot be
-        //     reconstructed, so there is no correct payout to compute. Fail
-        //     loudly and let an operator decide (`admin_close_stale_epoch` is
-        //     the deliberate write-off). Staging epochs 790/791 reached this
-        //     state in Aug 2026; mainnet 540 is in it now, after epoch 541's
+        //   Inside the earning set, but its stamp was overwritten
+        //     It WAS tallied for this epoch and IS baked into
+        //     `per_gateway_reward` via the divisor -- yet its weights are gone
+        //     and cannot be reconstructed. Paying 0 here would under-allocate
+        //     the pool, permanently forfeit that gateway's and its DELEGATES'
+        //     rewards, and still set `rewards_distributed = 1` while emitting
+        //     EpochDistributedEvent -- indistinguishable from success, and
+        //     unrecoverable (`RewardsAlreadyDistributed` blocks any retry).
+        //     There is no correct payout to compute, so fail loudly and let an
+        //     operator decide; `admin_close_stale_epoch` is the deliberate
+        //     write-off. Staging 790/791 reached this state in Aug 2026 via
+        //     racing crankers, and mainnet 540 is in it now after epoch 541's
         //     tally re-stamped every gateway in its undistributed range.
         //
-        // Leavers are exempt: tally zeroes their composite and skips the
-        // stamp, so their weights_epoch is arbitrarily old and they earn 0
+        // Keying off `outside_earning_set` rather than the direction of the
+        // stamp is deliberate: it tests entitlement directly, using state a
+        // belated `tally_weights` cannot forge, instead of inferring it from
+        // which way the shared field happened to move.
+        //
+        // Leavers are exempt: tally zeroes their composite and skips the stamp
+        // entirely, so their weights_epoch is arbitrarily old and they earn 0
         // regardless.
         require!(
-            is_leaving || weights_epoch <= epoch.epoch_index,
-            GarError::WeightsFromLaterEpoch
+            is_leaving || !weights_stale || outside_earning_set,
+            GarError::EpochWeightsClobbered
         );
         if weights_stale && !is_leaving {
             msg!(

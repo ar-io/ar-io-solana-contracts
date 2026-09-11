@@ -15630,7 +15630,7 @@ async fn test_distribute_epoch_untallied_joiner_does_not_block() {
 }
 
 #[tokio::test]
-async fn test_distribute_epoch_refuses_weights_from_a_later_epoch() {
+async fn test_distribute_epoch_refuses_when_earning_gateway_weights_clobbered() {
     // ADR-0032's safety half. `weights_epoch` is one shared field per Gateway,
     // re-stamped by whichever epoch was tallied most recently, so a LATER
     // epoch's tally destroys the pending epoch's weights for every gateway it
@@ -15671,9 +15671,69 @@ async fn test_distribute_epoch_refuses_weights_from_a_later_epoch() {
         new_gateway,
     )
     .await;
-    assert_anchor_error!(result, GarError::WeightsFromLaterEpoch);
+    assert_anchor_error!(result, GarError::EpochWeightsClobbered);
 
     // And the epoch must remain undistributed, so the decision stays open.
+    let epoch_after = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch_after: &Epoch =
+        bytemuck::from_bytes(&epoch_after.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(
+        epoch_after.rewards_distributed, 0,
+        "a clobbered epoch must NOT be marked distributed"
+    );
+}
+
+/// Population (b) reached by a *downward* re-stamp — the case a direction-based
+/// check would miss. `tally_weights`' only epoch precondition is
+/// `weights_tallied == 0`, with no time gate and no ordering gate, so a
+/// partially-tallied OLDER epoch can be tallied at any later time and stamps
+/// `weights_epoch` to a value BELOW the epoch being distributed. Such an epoch
+/// account is permanent: `close_epoch` needs `rewards_distributed != 0`, which
+/// an untallied epoch can never reach.
+///
+/// The victim is in the earning set and baked into `per_gateway_reward` via the
+/// divisor, so paying it 0 would under-allocate the pool and permanently forfeit
+/// its and its delegates' rewards while the epoch finalized as a success.
+#[tokio::test]
+async fn test_distribute_epoch_refuses_downward_restamp_of_earning_gateway() {
+    let (mut ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key) =
+        setup_untallied_joiner_scenario().await;
+
+    let mut acct = ctx
+        .banks_client
+        .get_account(keep_gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(gw.weights.weights_epoch, 1, "sanity: tallied for epoch 1");
+    // A belated tally of epoch 0 would stamp this. Note 0 is also the value a
+    // never-tallied gateway carries, which is precisely why direction cannot be
+    // the discriminator — entitlement has to be.
+    gw.weights.weights_epoch = 0;
+    {
+        let dst = &mut acct.data[8..];
+        let mut cursor = std::io::Cursor::new(dst);
+        gw.serialize(&mut cursor).unwrap();
+    }
+    ctx.set_account(&keep_gateway, &acct.into());
+
+    let result = distribute_two_slots(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        keep_gateway,
+        new_gateway,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::EpochWeightsClobbered);
+
     let epoch_after = ctx
         .banks_client
         .get_account(epoch_key)

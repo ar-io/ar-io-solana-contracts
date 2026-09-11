@@ -168,18 +168,51 @@ options, option 4*.
 
 ## Decision
 
-> **Option 2.** Replace the `require!` with a staleness term in the existing
-> eligibility expression, so a `joined` gateway whose `weights_epoch` does not
-> match the epoch is traversed and earns 0, exactly as a `leaving` gateway
-> already is.
+> **Option 2, with staleness split by entitlement.** A gateway that was
+> outside this epoch's earning set is traversed and earns 0, exactly as a
+> `leaving` gateway already is. A gateway that was *inside* it and had its
+> weights destroyed still fails loudly — under a new, distinct error.
 
 ```rust
-// replaces the require! at distribution.rs:176-180
 let weights_stale = gateway.weights.weights_epoch != epoch.epoch_index;
 
-// at distribution.rs:209
+// Same test tally_weights uses to force effective_composite = 0 (SHOULD-13),
+// hence the same population prescribe_epoch excluded from the joined_count
+// divisor. Read off the Gateway account, not the registry slot, so it cannot
+// drift from the copy tally consulted.
+let outside_earning_set = gateway.start_timestamp > epoch.start_timestamp;
+
+require!(
+    is_leaving || !weights_stale || outside_earning_set,
+    GarError::EpochWeightsClobbered
+);
+
 let is_eligible = registry.gateways[dist_idx].composite_weight > 0 && !weights_stale;
 ```
+
+**Why staleness must be split, and why not by the direction of the stamp.**
+`weights_epoch` is a single shared field and `tally_weights`' only epoch
+precondition is `weights_tallied == 0` — no time gate, no ordering gate. So the
+stamp can be overwritten in *either* direction: by a later epoch's tally, or by
+a belated tally of an older, partially-tallied epoch (an epoch left that way is
+permanent — `close_epoch` requires `rewards_distributed != 0`, which an
+untallied epoch can never reach). Staleness therefore conflates two
+populations:
+
+* **Outside the earning set** — joined after this epoch started, already
+  excluded from the `joined_count` divisor by `prescribe_epoch`, owed nothing.
+  Skip and pay 0. This is the mainnet 540 case.
+* **Inside the earning set, stamp overwritten** — tallied for this epoch and
+  baked into `per_gateway_reward`, but its weights are gone. Paying 0 would
+  under-allocate the pool, permanently forfeit that gateway's *and its
+  delegates'* rewards, and still set `rewards_distributed = 1` while emitting
+  `EpochDistributedEvent` — indistinguishable from success and unrecoverable,
+  since `RewardsAlreadyDistributed` blocks any retry.
+
+An earlier revision of this ADR discriminated on `weights_epoch > epoch_index`.
+That is wrong: it misses the downward re-stamp, which reaches the second
+population just as effectively. Testing entitlement directly, via state a
+belated tally cannot forge, covers both directions.
 
 This satisfies the drivers better than the alternatives:
 
@@ -191,11 +224,16 @@ This satisfies the drivers better than the alternatives:
   really written for — a gateway that missed tally while carrying a **nonzero**
   `composite_weight` from a previous epoch, which today reverts the batch and
   afterwards would simply earn 0.
-* **Rollout cost.** Body-only change to one instruction. No account layout
-  change, no instruction ABI change, no new accounts, no new events — the IDL is
-  byte-identical, so `scripts/idl-event-snapshot.mjs` must report zero drift and
-  no client, SDK or downstream republish is required. Diagnostics go to `msg!`
-  precisely to preserve this.
+* **Rollout cost.** Body-only change to one instruction. No account-layout
+  change, no instruction-ABI change, no new accounts, no new events. Measured by
+  rebuilding and diffing the IDL: instructions, accounts, events and types
+  identical; `distribute_epoch`'s account list and args identical; **one
+  additive error variant** (`EpochWeightsClobbered`, code 6097); no errors
+  removed; all pre-existing error codes unchanged; `idl-event-snapshot.mjs`
+  stable. Diagnostics otherwise go to `msg!` to keep the surface this small.
+  _(An earlier revision of this ADR claimed the IDL was "byte-identical". That
+  was true of the first draft and became false when the guard below was added;
+  corrected here rather than left to be discovered during Phase 2.)_
 * **Single-writer contract.** `weights_epoch` keeps one writer and one reader.
 
 **Option 1** is rejected: it makes protocol liveness contingent on an
