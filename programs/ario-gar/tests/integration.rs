@@ -28598,3 +28598,234 @@ async fn test_close_orphaned_receipt_leaves_nothing_behind() {
         other => panic!("expected AccountNotInitialized, got: {:?}", other),
     }
 }
+
+// -----------------------------------------
+// ADR-0033: the tally window gate.
+//
+// `weights_epoch` and the registry's `composite_weight` are per-TALLY, not
+// per-epoch, and `weights_tallied == 0` used to be tally's ONLY epoch
+// precondition. So an epoch left partially tallied stayed tallyable forever,
+// and tallying it later re-stamped gateways belonging to the CURRENT epoch's
+// reward set -- destroying that epoch's payout, permissionlessly, for one tx
+// fee. A tally is now allowed only up to one full epoch span past the epoch's
+// own end.
+// -----------------------------------------
+
+/// Epoch 0 created and ready to tally. genesis 100 / duration 86_400, so the
+/// epoch window is [100, 86_500] and the tally deadline is 86_500 + 86_400 =
+/// 172_900. Returns `(ctx, setup, gateway, epoch_key, epoch_settings_key)`.
+async fn setup_epoch0_ready_for_tally() -> (ProgramTestContext, GarSetup, Pubkey, Pubkey, Pubkey) {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar_and_core(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+    let gateway = join_gateway(&mut ctx, &setup, 20_000_000_000u64).await;
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 150;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::CreateEpoch {
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                settings: setup.settings_key,
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::CreateEpoch {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    (ctx, setup, gateway, epoch_key, epoch_settings_key)
+}
+
+async fn try_tally_at(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    epoch_settings_key: Pubkey,
+    epoch_key: Pubkey,
+    gateway: Pubkey,
+    at: i64,
+) -> std::result::Result<(), BanksClientError> {
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = at;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    accounts.push(solana_sdk::instruction::AccountMeta::new(gateway, false));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts,
+            data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+#[tokio::test]
+async fn test_tally_weights_allowed_on_the_live_epoch_after_a_long_delay() {
+    // The live epoch stays tallyable however late it is. This is the property a
+    // time-window gate (end + one epoch span) would NOT have had, and it is why
+    // the gate keys off "is this the live epoch" instead:
+    //
+    //   * a time window applies retroactively to epochs that already exist, so
+    //     deploying it while one sat mid-tally past its deadline would strand
+    //     that epoch permanently and re-freeze the cluster on the spot;
+    //   * and a batched tally (~36 txs for 647 gateways) could cross the
+    //     deadline mid-run and leave the epoch permanently partial -- very
+    //     reachable on a compressed cadence, which staging ran in Aug 2026.
+    //
+    // Epoch 0 is [100, 86_500]; tally here at ~115 days past its end.
+    let (mut ctx, setup, gateway, epoch_key, epoch_settings_key) =
+        setup_epoch0_ready_for_tally().await;
+    try_tally_at(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        gateway,
+        10_000_000,
+    )
+    .await
+    .expect("the live epoch must stay tallyable regardless of elapsed time");
+
+    let ep = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let ep: &Epoch = bytemuck::from_bytes(&ep.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(ep.weights_tallied, 1, "tally completed");
+}
+
+#[tokio::test]
+async fn test_tally_weights_refused_on_a_non_live_epoch() {
+    // The attack this closes: tally an older, partially-tallied epoch and the
+    // stamp lands on gateways whose weights belong to the LIVE epoch, destroying
+    // its payout. Permissionless, one tx fee.
+    //
+    // `create_epoch` makes epoch[current_epoch_index] then increments, so the
+    // live epoch is current_epoch_index - 1. Epoch 0 was created, leaving
+    // current = 1 and epoch 0 live. Advance current to 2 so epoch 1 is live and
+    // epoch 0 is not, then try to tally epoch 0.
+    let (mut ctx, setup, gateway, epoch_key, epoch_settings_key) =
+        setup_epoch0_ready_for_tally().await;
+
+    let mut es = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(es.data[61..69].try_into().unwrap()),
+        1,
+        "EpochSettings layout drift: current_epoch_index"
+    );
+    es.data[61..69].copy_from_slice(&2u64.to_le_bytes());
+    ctx.set_account(&epoch_settings_key, &es.into());
+
+    let result = try_tally_at(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        gateway,
+        90_000,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::EpochNoLongerLive);
+
+    // Nothing half-applied: the stale epoch is untouched, and crucially no
+    // gateway's weights_epoch was re-stamped.
+    let ep = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let ep: &Epoch = bytemuck::from_bytes(&ep.data[8..8 + std::mem::size_of::<Epoch>()]);
+    assert_eq!(ep.weights_tallied, 0);
+    assert_eq!(ep.tally_index, 0);
+
+    let gw = ctx
+        .banks_client
+        .get_account(gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    let gw = Gateway::try_deserialize(&mut gw.data.as_slice()).unwrap();
+    assert_eq!(
+        gw.weights.weights_epoch, 0,
+        "the refused tally must not have stamped the gateway"
+    );
+}
