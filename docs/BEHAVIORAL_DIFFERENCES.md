@@ -833,6 +833,17 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | **Why** | Liveness of reward distribution is a protocol property and cannot depend on an arbitrary unaffiliated operator's behavior. Mainnet epoch 540 (2026-09-11): `lazygiraffe.io` joined 16.6 h in, three `finalize_gone` removals relocated it to registry index 622, and every cranker's `distribute_epoch` reverted with 6048 with the cursor pinned at 615 for ~15 h, leaving 32 positions and ≈3,646 ARIO undistributed. Staging epochs 790/791 hit the same guard via a different trigger on 2026-08-29. See ADR-0032. |
 | **Deliberate consequence** | The outcome for an untallied gateway is now **silent** (a `msg!` log, no error) rather than a loud failure, so an operator who joins after an epoch's tally receives nothing for that epoch with no on-chain error to point at. This is the intended trade. It is also strictly *safer* than the guard it replaces: `composite_weight > 0` alone would have paid a gateway that missed tally while its registry slot still carried a nonzero weight from an earlier epoch, which is the case the `require!` actually protected against. Note the guard was always vacuous at epoch index 0, where an untallied gateway's `weights_epoch` of 0 matches the epoch index. |
 
+### BD-116: An Epoch Can Only Be Tallied Within One Span of Its End (2026-09-11)
+
+| | |
+|---|---|
+| **Lua Behavior** | `gar.lua` computes weights inline while distributing a specific epoch; there is no separate tally step, no per-gateway "which epoch were these weights for" stamp, and therefore no way for one epoch's computation to overwrite another's. |
+| **Solana Behavior (before)** | `tally_weights`' only epoch precondition was `weights_tallied == 0`. No time gate and no ordering gate, so any epoch account that existed and had never been *fully* tallied could be tallied at any later moment. |
+| **Solana Behavior (now, ADR-0033)** | A tally is refused once `clock > epoch.end_timestamp + (epoch.end_timestamp - epoch.start_timestamp)` — one full epoch span past that epoch's own end — with `EpochTallyWindowClosed`. |
+| **Why** | `Gateway.weights.weights_epoch` and `GatewaySlot.composite_weight` are per-**tally**, not per-epoch: every tally overwrites them for whichever epoch it is tallying. A belated tally of an old epoch therefore re-stamps gateways that belong to the **current** epoch's reward set, destroying that epoch's payout — permissionlessly, for one transaction fee, with partial batches accepted so a chosen prefix of the registry can be targeted. The state arises routinely: staging epoch 818 sat at `tally_index 630/647, weights_tallied = 0` from nothing worse than a cranker restart, and such an epoch could never be cleaned up permissionlessly either (`close_epoch` requires `rewards_distributed != 0`, unreachable without a tally). See ADR-0033. |
+| **Deliberate consequence** | An epoch nobody tallies within two spans of its start is **permanently untallied**, hence never prescribed, distributed or closed by any permissionless path. Its rent stays reclaimable through `admin_close_stale_epoch`, which carries no tally or distribution requirement — but that instruction is `migration_active`-gated, so **after `finalize_migration` such an epoch's rent (~0.0664 SOL) is stranded for good**. Accepted because the capability removed was net-harmful: late-tallying an old epoch "recovers" it only by destroying the live epoch's weights. Operators whose cranker fleet is offline for more than a full epoch duration will see `EpochTallyWindowClosed` on the missed epoch rather than silently losing the *next* one. |
+| **Note** | The deadline is derived from the epoch's **own** `start_timestamp` / `end_timestamp`, not from `epoch_settings.epoch_duration`, because `admin_set_epoch_duration` can change the setting afterwards and would retroactively move the window for epochs created under the old cadence — staging compressed the duration to 60s in Aug 2026, which would have locked out in-flight 24 h epochs. |
+
 ---
 
 ## Summary Statistics
@@ -851,8 +862,8 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | Primary Name Authorization | 2 (BD-097, BD-109) |
 | ANT Program Routing | 1 (BD-100) |
 | Cranker Protocol | 1 (BD-101) |
-| Epoch Distribution Liveness | 1 (BD-115) |
-| **Total** | **78** |
+| Epoch Distribution Liveness | 2 (BD-115, BD-116) |
+| **Total** | **79** |
 
 ---
 

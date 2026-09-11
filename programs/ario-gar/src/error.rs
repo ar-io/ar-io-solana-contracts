@@ -376,4 +376,11 @@ pub enum GarError {
     // paid correctly and needs a human decision, not a retry.
     #[msg("A gateway in this epoch's reward set had its weights overwritten by another epoch's tally; this epoch can no longer be distributed correctly")]
     EpochWeightsClobbered,
+
+    // ADR-0033. An epoch nobody tallied within its own span after it ended can
+    // never be tallied, because doing so would destroy the CURRENT epoch's
+    // weights (they share one per-gateway field). The stale epoch stays
+    // closeable by `admin_close_stale_epoch`, which has no tally requirement.
+    #[msg("This epoch's tally window has closed; tallying it now would destroy the current epoch's weights")]
+    EpochTallyWindowClosed,
 }

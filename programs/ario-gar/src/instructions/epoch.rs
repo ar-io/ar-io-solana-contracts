@@ -669,6 +669,42 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
 
     require!(epoch.weights_tallied == 0, GarError::WeightsAlreadyTallied);
 
+    // ADR-0033. `weights_epoch` and the registry's `composite_weight` are
+    // per-TALLY, not per-epoch: every tally overwrites them for whichever epoch
+    // it is tallying. Combined with the fact that this used to be the ONLY
+    // epoch precondition here -- no time gate, no ordering gate -- an epoch
+    // left partially tallied stayed tallyable forever, and tallying it later
+    // re-stamped gateways that belong to the CURRENT epoch's reward set,
+    // destroying that epoch's payout. Permissionless, one transaction fee, and
+    // the stranded epoch could never be cleaned up permissionlessly either
+    // (`close_epoch` needs `rewards_distributed != 0`, unreachable without a
+    // tally). Staging epoch 818 sat at tally_index 630/647 with
+    // weights_tallied = 0 from nothing worse than a cranker restart.
+    //
+    // So a tally is allowed only up to one full epoch span past the epoch's own
+    // end. Deliberately derived from THIS epoch's timestamps rather than
+    // `epoch_settings.epoch_duration`: `admin_set_epoch_duration` can change
+    // the setting afterwards, which would retroactively shrink (or widen) the
+    // window for epochs created under the old cadence. Staging did exactly
+    // that in Aug 2026 when it compressed the duration to 60s.
+    //
+    // This removes no recovery path that was not already net-harmful: late
+    // tallying an old epoch "recovers" it only by destroying the live one. The
+    // stale epoch's rent stays reclaimable via `admin_close_stale_epoch`,
+    // which carries no tally or distribution requirement.
+    let epoch_span = epoch
+        .end_timestamp
+        .checked_sub(epoch.start_timestamp)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    let tally_deadline = epoch
+        .end_timestamp
+        .checked_add(epoch_span)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    require!(
+        clock.unix_timestamp <= tally_deadline,
+        GarError::EpochTallyWindowClosed
+    );
+
     let active_count = epoch.active_gateway_count as usize;
 
     for account_info in ctx.remaining_accounts.iter() {
