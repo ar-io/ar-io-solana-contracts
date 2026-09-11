@@ -823,6 +823,16 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | **Why** | Attribute syncs (and future metadata control) should run through the protocol, and a name bought by a non-owner should reconcile immediately. Parking UA at a program PDA achieves this while the holder keeps custody (`TransferV1` / `BurnV1` are Owner-gated, so transfers/sells are unaffected). See ADR-028. |
 | **Deliberate consequence** | The `Owner == UpdateAuthority` invariant (ADR-013) is intentionally broken for program-controlled ANTs. **`ario-ant-escrow` is unchanged** and still rotates UA with the depositor's signature, so program-controlled ANTs cannot be deposited into the current escrow (legacy ANTs still can); escrow compatibility is deferred to a later change coordinated with the migration importer. The asset's on-chain `name`/`uri` become program-only-mutable (effectively immutable post-mint until/unless a PDA-signed `update_metadata` is added; ANT display metadata lives in the `AntConfig` PDA, so this is not a functional gap today). |
 
+### BD-115: A Gateway With Stale Epoch Weights Earns Zero Instead of Blocking Distribution (2026-09-11)
+
+| | |
+|---|---|
+| **Lua Behavior** | `gar.lua` distributes rewards by iterating the gateway table. There is no per-gateway "weights were tallied for this epoch" stamp and no batch cursor, so a gateway added mid-epoch simply is not in the epoch's computed set. A single gateway cannot stop the distribution of the others. |
+| **Solana Behavior (before)** | `distribute_epoch` walks the registry positionally and `require!`d `gateway.weights.weights_epoch == epoch.epoch_index` for every `joined` gateway in the batch, raising `WeightsNotTallied (6048)`. Because `tally_weights` refuses to re-run once `weights_tallied == 1`, a gateway entering the registry after tally could never satisfy it; and because accounts are validated positionally against `distribution_index`, the offending slot could not be skipped at any batch size or offset. One such gateway halted that epoch's distribution **network-wide, permanently**. |
+| **Solana Behavior (now, ADR-0032)** | Staleness is a reward-eligibility term rather than a revert: `is_eligible = composite_weight > 0 && !weights_stale`. Such a gateway is traversed, earns 0, and has its stats left un-ticked — the same treatment a `leaving` gateway already received. The cursor advances and the epoch completes. `distribute_epoch` no longer raises 6048; `prescribe_epoch` still does, for the unrelated "prescribing before tally" condition. |
+| **Why** | Liveness of reward distribution is a protocol property and cannot depend on an arbitrary unaffiliated operator's behavior. Mainnet epoch 540 (2026-09-11): `lazygiraffe.io` joined 16.6 h in, three `finalize_gone` removals relocated it to registry index 622, and every cranker's `distribute_epoch` reverted with 6048 with the cursor pinned at 615 for ~15 h, leaving 32 positions and ≈3,646 ARIO undistributed. Staging epochs 790/791 hit the same guard via a different trigger on 2026-08-29. See ADR-0032. |
+| **Deliberate consequence** | The outcome for an untallied gateway is now **silent** (a `msg!` log, no error) rather than a loud failure, so an operator who joins after an epoch's tally receives nothing for that epoch with no on-chain error to point at. This is the intended trade. It is also strictly *safer* than the guard it replaces: `composite_weight > 0` alone would have paid a gateway that missed tally while its registry slot still carried a nonzero weight from an earlier epoch, which is the case the `require!` actually protected against. Note the guard was always vacuous at epoch index 0, where an untallied gateway's `weights_epoch` of 0 matches the epoch index. |
+
 ---
 
 ## Summary Statistics
@@ -841,7 +851,8 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | Primary Name Authorization | 2 (BD-097, BD-109) |
 | ANT Program Routing | 1 (BD-100) |
 | Cranker Protocol | 1 (BD-101) |
-| **Total** | **77** |
+| Epoch Distribution Liveness | 1 (BD-115) |
+| **Total** | **78** |
 
 ---
 

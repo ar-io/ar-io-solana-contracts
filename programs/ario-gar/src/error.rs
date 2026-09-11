@@ -368,4 +368,12 @@ pub enum GarError {
     // indentation still in it.
     #[msg("Epoch still exists — close_epoch is the path that refunds its rent to the creator")]
     EpochStillExists,
+
+    // ADR-0032. Distinct from WeightsNotTallied on purpose: that one means a
+    // gateway simply has no weights for this epoch and is owed nothing; this
+    // one means a gateway that IS in the epoch's reward divisor has had its
+    // weights destroyed by another epoch's tally. The epoch can no longer be
+    // paid correctly and needs a human decision, not a retry.
+    #[msg("A gateway in this epoch's reward set had its weights overwritten by another epoch's tally; this epoch can no longer be distributed correctly")]
+    EpochWeightsClobbered,
 }
