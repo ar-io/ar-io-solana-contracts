@@ -390,10 +390,14 @@ pub fn distribute_epoch<'info>(
         }
 
         // Stats update — Lua-parity skip for gateways that did not participate
-        // in this epoch's active set: leavers AND composite-ineligible
-        // late-joiners (excluded from the reward divisor above). Ticking
-        // total/passed epochs for a late-joiner would inflate its future
-        // gateway_performance_ratio for an epoch it was excluded from earning.
+        // in this epoch's active set: leavers, composite-ineligible
+        // late-joiners (excluded from the reward divisor above), and — since
+        // ADR-0032 — gateways with stale weights, which never reached tally for
+        // this epoch at all. Ticking total/passed epochs for any of them would
+        // inflate a future gateway_performance_ratio for an epoch they were
+        // excluded from earning. `eligible` is the only carrier of that
+        // decision and this is its only consumer; token accounting keys off
+        // `full_reward` instead, which is already 0 in all three cases.
         if !p.is_leaving && p.eligible {
             p.gateway.stats.total_epochs = p.gateway.stats.total_epochs.saturating_add(1);
             if !p.failed {

@@ -300,6 +300,6 @@ revisited rather than carried forward by inertia.
   fixed there with `delegated_at_tally`.
 * [ADR-029](0029-epoch-rent-refunds-creator.md) — the epoch whose distribution
   is blocked also strands its `EpochRentReceipt`.
-* Behavioral diff entry: BD-NNN _(to be assigned)_
+* Behavioral diff entry: [BD-115](../BEHAVIORAL_DIFFERENCES.md)
 * Incident report: vilenarios.com gateway operator, 2026-09-11 14:45Z
 * Staging precedent: `solana-ar-io/docs/EPOCH_RENT_TO_CREATOR_PLAN.md` §6.3
