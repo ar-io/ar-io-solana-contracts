@@ -119,6 +119,7 @@ Numbers claimed by unmerged PRs, so they do not look free to the next author:
 |---|---|---|
 | ADR-030 | [#125](https://github.com/ar-io/ar-io-solana-contracts/pull/125) (impl [#129](https://github.com/ar-io/ar-io-solana-contracts/pull/129)) | `0030-gateway-operations-address.md` |
 | ADR-031 | [#126](https://github.com/ar-io/ar-io-solana-contracts/pull/126) (impl [#127](https://github.com/ar-io/ar-io-solana-contracts/pull/127)) | `0031-transferable-epoch-settings-authority.md` |
+| ADR-034 | this PR | [`0034-an-unfinished-epoch-must-not-be-superseded.md`](0034-an-unfinished-epoch-must-not-be-superseded.md) |
 
 
 Delete a row once its PR merges and the ADR appears in the Index above.
