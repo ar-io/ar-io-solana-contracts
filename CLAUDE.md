@@ -539,8 +539,40 @@ node scripts/idl-event-snapshot.mjs --update  # bless intentional additions
 ```
 
 Adding a new event always lands in two commits (new event in source +
-snapshot bump). The CI `build-test.yml` workflow runs the check on
-every PR.
+snapshot bump). **This check runs only in `release.yml` and
+`upgrade-mainnet.yml`, not on pull requests** — it needs built IDLs, and
+`build-test.yml` deliberately does no `anchor build`. So a breaking
+event change surfaces at release/upgrade time, not in review. Run it
+locally after `anchor build` on any event-touching PR.
+
+### Anchor error-code ABI policy
+
+Per ADR-035: error variants are **append-only**. Anchor derives codes
+positionally (`6000 + variant index`) and the number appears nowhere in
+the source, so **inserting a variant mid-enum silently renumbers every
+later code** — invisible in the diff, and breaking for every off-chain
+consumer that matches on the old numbers. The cranker and observer both
+branch on numeric GAR codes; a +2 drift cost mainnet epoch 523 every
+observation, and PR #128 nearly shifted the live `EpochWeightsClobbered`
+(6097) and `EpochNoLongerLive` (6098) hours after they shipped.
+
+New variants go at the **END** of the enum. To retire one, keep the
+variant (so its code stays bound to its name) and stop returning it —
+never delete or reorder.
+
+The frozen surface lives in
+[`error-code-snapshots.json`](error-code-snapshots.json):
+
+```bash
+node scripts/error-code-snapshot.mjs           # check vs snapshot
+node scripts/error-code-snapshot.mjs --update  # bless intentional APPENDS only
+```
+
+Unlike the event check this parses Rust source rather than the IDL, so
+it needs no toolchain and **does run on every PR** via
+`build-test.yml`. When reviewing a `error-code-snapshots.json` diff,
+confirm it contains only additions at the tail. `ario-ant-escrow` is
+deliberately excluded (never deployed, so no consumers).
 
 ## Reference Material
 
