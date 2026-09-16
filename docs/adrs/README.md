@@ -110,7 +110,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
 | ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
-| ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | proposed | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
+| ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
 
 ### Reserved by open PRs
 

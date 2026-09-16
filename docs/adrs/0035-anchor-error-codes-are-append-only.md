@@ -1,6 +1,6 @@
 # ADR-0035: Anchor Error Codes Are a Published, Append-Only ABI
 
-* **Status:** proposed (2026-09-16; guard implemented in the same PR)
+* **Status:** accepted (2026-09-16; guard implemented in the same PR, merged in #136)
 * **Date:** 2026-09-16
 * **Deciders:** @vilenarios
 * **Consulted:** post-incident review of mainnet epochs 523 and 540; [PR #128](https://github.com/ar-io/ar-io-solana-contracts/pull/128) review
