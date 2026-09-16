@@ -38,9 +38,20 @@
  *                 moved, and any new code below the high-water mark are
  *                 rejected
  *
+ *   --baseline <f>  Additionally require the committed snapshot to EXTEND
+ *                   the snapshot in <f> (the target branch's copy) rather
+ *                   than rewrite it. CI passes this on pull requests: the
+ *                   snapshot is the guard, so a PR must not be able to
+ *                   regenerate or truncate it to launder a renumbering.
+ *
+ * A missing snapshot, or a snapshot missing any guarded program's entry, is
+ * a FAILURE rather than a pass -- both would otherwise disable the guard
+ * silently while still reporting success.
+ *
  * Usage:
- *   node scripts/error-code-snapshot.mjs            # check
- *   node scripts/error-code-snapshot.mjs --update   # bless intentional APPENDS only
+ *   node scripts/error-code-snapshot.mjs                        # check
+ *   node scripts/error-code-snapshot.mjs --baseline base.json   # check + integrity
+ *   node scripts/error-code-snapshot.mjs --update               # bless APPENDS only
  *
  * NOTE: ario_ant_escrow is deliberately absent from PROGRAMS. It is
  * never deployed to any cluster, so its codes have no off-chain
@@ -233,6 +244,9 @@ function check(current, snapshot) {
 }
 
 const update = process.argv.includes('--update');
+const baselineFlag = process.argv.indexOf('--baseline');
+const baselinePath =
+  baselineFlag >= 0 ? process.argv[baselineFlag + 1] : null;
 const current = currentTables();
 
 for (const n of crossCheckAgainstIdls(current)) console.log(`note: ${n}`);
@@ -257,11 +271,77 @@ const snapshot = existsSync(SNAPSHOT_PATH)
   : null;
 
 if (!snapshot) {
-  console.log(
-    `No snapshot at ${SNAPSHOT_PATH} yet — run with --update once you have ` +
-      `verified the current error tables are intentional.`,
+  console.error(
+    `Error-code ABI UNVERIFIABLE: no snapshot at ${SNAPSHOT_PATH}.\n` +
+      `The snapshot IS the guard, so a missing one is a failure, not a pass. ` +
+      `If you are genuinely bootstrapping, run with --update and commit the ` +
+      `result in the same PR.`,
   );
-  process.exit(0);
+  process.exit(1);
+}
+
+// A snapshot that is present but missing (or has emptied) a program's entry
+// would otherwise be skipped by check() and reported as "stable" — a false
+// pass. Require every guarded program to be represented.
+const missing = Object.keys(PROGRAMS).filter(
+  (p) => !Array.isArray(snapshot[p]) || snapshot[p].length === 0,
+);
+if (missing.length > 0) {
+  console.error(
+    `Error-code ABI UNVERIFIABLE: snapshot has no entries for ` +
+      `${missing.join(', ')}. Removing or emptying a program's entry ` +
+      `silently disables its guard.`,
+  );
+  process.exit(1);
+}
+
+// When a baseline (the target branch's snapshot) is supplied, the committed
+// snapshot must EXTEND it, never rewrite it. Without this, a PR could edit or
+// regenerate the snapshot to launder a renumbering past the check.
+if (baselinePath) {
+  if (!existsSync(baselinePath)) {
+    console.error(
+      `Error-code ABI UNVERIFIABLE: --baseline ${baselinePath} does not exist.`,
+    );
+    process.exit(1);
+  }
+  const baseline = JSON.parse(readFileSync(baselinePath, 'utf8'));
+  const drift = [];
+  for (const program of Object.keys(PROGRAMS)) {
+    const base = baseline[program] ?? [];
+    const head = snapshot[program] ?? [];
+    if (base.length === 0) continue; // program newly guarded by this PR
+    if (head.length < base.length) {
+      drift.push(
+        `[${program}] snapshot SHRANK vs the target branch ` +
+          `(${base.length} -> ${head.length} codes).`,
+      );
+      continue;
+    }
+    for (let i = 0; i < base.length; i++) {
+      if (base[i].code !== head[i].code || base[i].name !== head[i].name) {
+        drift.push(
+          `[${program}] snapshot REWRITTEN at index ${i}: target branch has ` +
+            `${base[i].code}='${base[i].name}', this PR has ` +
+            `${head[i].code}='${head[i].name}'. The committed snapshot must ` +
+            `extend the target's, not modify it.`,
+        );
+        break;
+      }
+    }
+  }
+  if (drift.length > 0) {
+    console.error('Committed snapshot diverges from the target branch:');
+    for (const d of drift) console.error(`  - ${d}`);
+    console.error(
+      '\nOnly tail additions are allowed. Re-run --update on top of the ' +
+        'target branch rather than regenerating from scratch.',
+    );
+    process.exit(1);
+  }
+  console.log(
+    `Snapshot extends the target branch's without rewriting it.`,
+  );
 }
 
 const issues = check(current, snapshot);

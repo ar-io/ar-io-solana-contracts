@@ -1,6 +1,6 @@
 # ADR-0035: Anchor Error Codes Are a Published, Append-Only ABI
 
-* **Status:** accepted (2026-09-16; guard implemented in the same PR)
+* **Status:** proposed (2026-09-16; guard implemented in the same PR)
 * **Date:** 2026-09-16
 * **Deciders:** @vilenarios
 * **Consulted:** post-incident review of mainnet epochs 523 and 540; [PR #128](https://github.com/ar-io/ar-io-solana-contracts/pull/128) review
@@ -140,9 +140,16 @@ error check out of PR-time CI — losing the property that motivated this ADR.
 ### Negative / risks
 
 * **The snapshot must be blessed when appending.** Adding a variant requires
-  `--update` in the same PR. The check's message says so, but it is one more
-  step that can be resolved by blessing a *bad* diff. Reviewers should confirm
-  that a `error-code-snapshots.json` diff contains only additions at the tail.
+  `--update` in the same PR. On its own that is a hole: `--update` would happily
+  bless a *bad* diff, and a PR could delete or truncate the snapshot to disable
+  the guard while still reporting success. Relying on reviewers to notice would
+  contradict this ADR's own premise that review cannot be the control, so the
+  snapshot's integrity is checked mechanically instead:
+  * a missing snapshot, or one missing any guarded program's entry, **fails**
+    rather than passes;
+  * on pull requests CI passes `--baseline <target branch's snapshot>`, and the
+    committed snapshot must **extend** it — preserving every existing
+    `code -> name` as an exact prefix, with additions only at the tail.
 * **Source parsing is a second implementation of Anchor's numbering.** It is
   validated against the IDLs at introduction and re-validated advisorily
   whenever built IDLs are present, but it is not the compiler. A future Anchor
@@ -162,9 +169,13 @@ error check out of PR-time CI — losing the property that motivated this ADR.
 ## Implementation notes
 
 * Check: `node scripts/error-code-snapshot.mjs`
+* Check + snapshot integrity: `... --baseline <target's snapshot>`
 * Bless an append: `node scripts/error-code-snapshot.mjs --update`
 * Wired into `.github/workflows/build-test.yml` (runs on every PR to
-  `main`/`develop`).
+  `main`/`develop`); the workflow resolves the baseline from
+  `github.event.pull_request.base.sha` and skips that comparison only when
+  there is no PR context (`workflow_dispatch` / `workflow_call`) or the target
+  branch predates the snapshot.
 
 ### A related gap this ADR does not close
 
