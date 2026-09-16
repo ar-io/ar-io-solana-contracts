@@ -29996,3 +29996,108 @@ async fn test_migration_must_not_clobber_a_deliberate_delegation() {
         "a third party's migration must NOT reset a delegation the operator set"
     );
 }
+
+/// The migration that will actually run in production, exactly as it will run.
+///
+/// Every live Gateway on mainnet AND staging was measured before this test was
+/// written: all 620 on each cluster are 964 bytes and stamped **1.1.0**, with no
+/// `operations_address` in their borsh content. The other migration tests start
+/// from `0.0.0` and walk the whole ladder, so the `1.1.0 -> 1.2.0` arm only ever
+/// ran as the last rung of a longer walk. This pins the real entry point: one
+/// arm, from the real stamp, at the real size.
+#[tokio::test]
+async fn test_migrate_gateway_from_production_shape_1_1_0() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Rebuild the gateway in the live shape: stamped 1.1.0, 964 bytes,
+    // operations_address absent from the content (it is the last field).
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    let expected_operator = gw.operator;
+    let expected_fqdn = gw.fqdn.clone();
+    let expected_observer = gw.observer_address;
+    let expected_stake = gw.operator_stake;
+    let expected_registry_index = gw.registry_index.index;
+    let expected_ratio = gw.settings.delegate_reward_share_ratio;
+    {
+        let acct = ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut legacy = gw.clone();
+        legacy.version = SchemaVersion::new(1, 1, 0);
+        let mut data = Vec::new();
+        legacy.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32);
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &gateway_key,
+            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+                lamports: acct.lamports.max(10_000_000),
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: acct.rent_epoch,
+            }),
+        );
+    }
+
+    // Sanity: the starting point really is the production shape.
+    let before = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.data.len(), ario_gar::state::GATEWAY_SIZE_AT_V1_1_0);
+    let pre = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(pre.version, SchemaVersion::new(1, 1, 0));
+    assert_eq!(
+        pre.operations_address,
+        Pubkey::default(),
+        "an un-migrated account reads operations_address out of zero padding"
+    );
+
+    // migrate_gateway is permissionless: a stranger pays for it, as a cranker would.
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &stranger)
+        .await
+        .expect("a 1.1.0 / 964-byte gateway must migrate");
+
+    let grown = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        grown.data.len(),
+        ario_gar::state::Gateway::SIZE,
+        "migration must grow the account to the current canonical size"
+    );
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.version, ario_gar::state::GATEWAY_VERSION);
+    assert_eq!(after.version, SchemaVersion::new(1, 2, 0));
+    assert_eq!(
+        after.operations_address, after.operator,
+        "the 1.1.0 -> 1.2.0 arm must default operations_address to the operator"
+    );
+    assert_ne!(after.operations_address, Pubkey::default());
+
+    // Nothing before the appended field may move.
+    assert_eq!(after.operator, expected_operator);
+    assert_eq!(after.fqdn, expected_fqdn);
+    assert_eq!(after.observer_address, expected_observer);
+    assert_eq!(after.operator_stake, expected_stake);
+    assert_eq!(after.registry_index.index, expected_registry_index);
+    assert_eq!(after.settings.delegate_reward_share_ratio, expected_ratio);
+
+    // Idempotent: a second run is refused, not re-applied.
+    let payer2 = Keypair::new();
+    fund_lamports(&mut ctx, &payer2.pubkey(), 10_000_000_000);
+    let again = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer2).await;
+    assert_anchor_error!(again, GarError::AlreadyLatestVersion);
+}
