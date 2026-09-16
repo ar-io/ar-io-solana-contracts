@@ -1,6 +1,6 @@
 # ADR-0030: A Gateway May Delegate Operations to a Second Address
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-16; implemented in contracts #129)
 * **Date:** 2026-09-02
 * **Deciders:** protocol engineering
 

@@ -1,6 +1,6 @@
 # ADR-0031: Transferable `EpochSettings.authority`
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-16; implemented in contracts #127)
 * **Date:** 2026-09-02
 * **Deciders:** protocol engineering
 

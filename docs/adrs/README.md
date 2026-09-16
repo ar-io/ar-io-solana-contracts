@@ -108,8 +108,8 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-027 | Restore the Escrow Active-Vault Re-lock via Direct CPI into ario-core's Existing ABI | accepted | [`0027-escrow-restore-active-vault-relock-direct-cpi.md`](0027-escrow-restore-active-vault-relock-direct-cpi.md) |
 | ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
 | ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
-| ADR-030 | A Gateway May Delegate Operations to a Second Address | proposed | [`0030-gateway-operations-address.md`](0030-gateway-operations-address.md) |
-| ADR-031 | Transferable `EpochSettings.authority` | proposed | [`0031-transferable-epoch-settings-authority.md`](0031-transferable-epoch-settings-authority.md) |
+| ADR-030 | A Gateway May Delegate Operations to a Second Address | accepted | [`0030-gateway-operations-address.md`](0030-gateway-operations-address.md) |
+| ADR-031 | Transferable `EpochSettings.authority` | accepted | [`0031-transferable-epoch-settings-authority.md`](0031-transferable-epoch-settings-authority.md) |
 | ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
 | ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
