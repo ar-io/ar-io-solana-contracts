@@ -581,6 +581,10 @@
     {
       "code": 6098,
       "name": "EpochNoLongerLive"
+    },
+    {
+      "code": 6099,
+      "name": "PreV110GatewayLayout"
     }
   ],
   "ario_arns": [

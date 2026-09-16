@@ -118,6 +118,23 @@ pub const GATEWAY_REGISTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 // `schema_migration::migrate_gateway_version`. Existing pre-1.1.0 accounts are
 // recreated (devnet/staging full redeploy), not migrated.
 pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
+/// Byte size of a `Gateway` account whose layout is 1.1.0 or later.
+///
+/// **This is a frozen historical constant. Never change it, and never redefine
+/// it in terms of `Gateway::SIZE`** — `Gateway::SIZE` grows with each appended
+/// field, while this value must keep meaning "large enough to already contain
+/// the 1.1.0 `GatewaySettings2`".
+///
+/// It is the layout fence for `migrate_gateway`. The 1.1.0 change grew
+/// `GatewaySettings2` by 12 bytes (`pending_delegate_reward_share_ratio`,
+/// `Option<u16>`, 3 + `delegation_disabled_at`, `Option<i64>`, 9), and
+/// `GatewaySettings2` sits **mid-struct** inside `Gateway`. A physically
+/// pre-1.1.0 account is therefore 952 bytes, and growing it would zero-fill the
+/// *tail* while every field after `settings` stayed shifted — silently
+/// corrupting `registry_index`, `observer_address`,
+/// `cumulative_reward_per_token`, `bump` and `version`. Such accounts cannot be
+/// migrated in place and are rejected outright.
+pub const GATEWAY_SIZE_AT_V1_1_0: usize = 964;
 pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
