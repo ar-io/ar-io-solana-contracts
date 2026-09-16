@@ -50,6 +50,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Anchor derives error codes positionally (6000 + variant index), so a
+      # mid-enum insertion silently renumbers every later code and breaks every
+      # off-chain consumer matching on the old numbers (ADR-035). This reads the
+      # Rust source directly, so it needs no Anchor/Solana toolchain and keeps
+      # this job's "no anchor build" property. Runs first: it is ~instant, and
+      # an ABI break should not wait behind a clippy cycle.
+      - name: Error-code ABI stability check
+        run: node scripts/error-code-snapshot.mjs
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

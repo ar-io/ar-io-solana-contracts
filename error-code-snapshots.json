@@ -1,0 +1,1034 @@
+{
+  "ario_core": [
+    {
+      "code": 6000,
+      "name": "AlreadyInitialized"
+    },
+    {
+      "code": 6001,
+      "name": "InsufficientBalance"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidAmount"
+    },
+    {
+      "code": 6003,
+      "name": "SelfTransfer"
+    },
+    {
+      "code": 6004,
+      "name": "VaultLocked"
+    },
+    {
+      "code": 6005,
+      "name": "VaultAlreadyReleased"
+    },
+    {
+      "code": 6006,
+      "name": "LockDurationTooShort"
+    },
+    {
+      "code": 6007,
+      "name": "LockDurationTooLong"
+    },
+    {
+      "code": 6008,
+      "name": "VaultNotFound"
+    },
+    {
+      "code": 6009,
+      "name": "InvalidVaultExtension"
+    },
+    {
+      "code": 6010,
+      "name": "VaultNotRevocable"
+    },
+    {
+      "code": 6011,
+      "name": "NotVaultController"
+    },
+    {
+      "code": 6012,
+      "name": "VaultExpired"
+    },
+    {
+      "code": 6013,
+      "name": "MaxVaultsExceeded"
+    },
+    {
+      "code": 6014,
+      "name": "VaultBelowMinimum"
+    },
+    {
+      "code": 6015,
+      "name": "PrimaryNameRequestExists"
+    },
+    {
+      "code": 6016,
+      "name": "PrimaryNameRequestNotFound"
+    },
+    {
+      "code": 6017,
+      "name": "PrimaryNameRequestExpired"
+    },
+    {
+      "code": 6018,
+      "name": "PrimaryNameRequestNotExpired"
+    },
+    {
+      "code": 6019,
+      "name": "NotNameOwner"
+    },
+    {
+      "code": 6020,
+      "name": "PrimaryNameAlreadySet"
+    },
+    {
+      "code": 6021,
+      "name": "NoPrimaryName"
+    },
+    {
+      "code": 6022,
+      "name": "MustRemoveExistingPrimaryName"
+    },
+    {
+      "code": 6023,
+      "name": "NameTooLong"
+    },
+    {
+      "code": 6024,
+      "name": "NameEmpty"
+    },
+    {
+      "code": 6025,
+      "name": "Unauthorized"
+    },
+    {
+      "code": 6026,
+      "name": "InvalidAuthority"
+    },
+    {
+      "code": 6027,
+      "name": "InvalidOwner"
+    },
+    {
+      "code": 6028,
+      "name": "ArithmeticOverflow"
+    },
+    {
+      "code": 6029,
+      "name": "ArithmeticUnderflow"
+    },
+    {
+      "code": 6030,
+      "name": "InvalidParameter"
+    },
+    {
+      "code": 6031,
+      "name": "AccountAlreadyExists"
+    },
+    {
+      "code": 6032,
+      "name": "InvalidAccountState"
+    },
+    {
+      "code": 6033,
+      "name": "ArnsRecordNotFound"
+    },
+    {
+      "code": 6034,
+      "name": "InvalidNameFormat"
+    },
+    {
+      "code": 6035,
+      "name": "InvalidTreasury"
+    },
+    {
+      "code": 6036,
+      "name": "InvalidAntAsset"
+    },
+    {
+      "code": 6037,
+      "name": "NotAntHolder"
+    },
+    {
+      "code": 6038,
+      "name": "UndernameRecordOwnerRequired"
+    },
+    {
+      "code": 6039,
+      "name": "MigrationInactive"
+    },
+    {
+      "code": 6040,
+      "name": "MigrationAlreadyFinalized"
+    },
+    {
+      "code": 6041,
+      "name": "InvalidAccountData"
+    },
+    {
+      "code": 6042,
+      "name": "InvalidPda"
+    },
+    {
+      "code": 6043,
+      "name": "MigrationExpired"
+    },
+    {
+      "code": 6044,
+      "name": "AlreadyLatestVersion"
+    },
+    {
+      "code": 6045,
+      "name": "UnknownSchemaVersion"
+    }
+  ],
+  "ario_gar": [
+    {
+      "code": 6000,
+      "name": "GatewayAlreadyRegistered"
+    },
+    {
+      "code": 6001,
+      "name": "GatewayNotFound"
+    },
+    {
+      "code": 6002,
+      "name": "GatewayNotJoined"
+    },
+    {
+      "code": 6003,
+      "name": "GatewayLeaving"
+    },
+    {
+      "code": 6004,
+      "name": "RegistryFull"
+    },
+    {
+      "code": 6005,
+      "name": "GatewayRegistryAlreadyExists"
+    },
+    {
+      "code": 6006,
+      "name": "InvalidFqdn"
+    },
+    {
+      "code": 6007,
+      "name": "InvalidLabel"
+    },
+    {
+      "code": 6008,
+      "name": "InvalidRewardShare"
+    },
+    {
+      "code": 6009,
+      "name": "InsufficientStake"
+    },
+    {
+      "code": 6010,
+      "name": "StakeBelowMinimum"
+    },
+    {
+      "code": 6011,
+      "name": "MustLeaveFirst"
+    },
+    {
+      "code": 6012,
+      "name": "InvalidAmount"
+    },
+    {
+      "code": 6013,
+      "name": "DelegationNotAllowed"
+    },
+    {
+      "code": 6014,
+      "name": "DelegationBelowMinimum"
+    },
+    {
+      "code": 6015,
+      "name": "DelegateNotAllowed"
+    },
+    {
+      "code": 6016,
+      "name": "DelegationNotFound"
+    },
+    {
+      "code": 6017,
+      "name": "InvalidDelegateStatus"
+    },
+    {
+      "code": 6018,
+      "name": "RedelegateSameGateway"
+    },
+    {
+      "code": 6019,
+      "name": "CannotDelegateToSelf"
+    },
+    {
+      "code": 6020,
+      "name": "WithdrawalNotReady"
+    },
+    {
+      "code": 6021,
+      "name": "WithdrawalNotFound"
+    },
+    {
+      "code": 6022,
+      "name": "InvalidWithdrawalAmount"
+    },
+    {
+      "code": 6023,
+      "name": "ExitVaultCannotBeExpedited"
+    },
+    {
+      "code": 6024,
+      "name": "NotOperator"
+    },
+    {
+      "code": 6025,
+      "name": "NotDelegator"
+    },
+    {
+      "code": 6026,
+      "name": "InvalidOwner"
+    },
+    {
+      "code": 6027,
+      "name": "Unauthorized"
+    },
+    {
+      "code": 6028,
+      "name": "ArithmeticOverflow"
+    },
+    {
+      "code": 6029,
+      "name": "ArithmeticUnderflow"
+    },
+    {
+      "code": 6030,
+      "name": "InvalidParameter"
+    },
+    {
+      "code": 6031,
+      "name": "EpochsNotEnabled"
+    },
+    {
+      "code": 6032,
+      "name": "EpochsAlreadyEnabled"
+    },
+    {
+      "code": 6033,
+      "name": "EpochCounterAlreadyAdvanced"
+    },
+    {
+      "code": 6034,
+      "name": "EpochNotStarted"
+    },
+    {
+      "code": 6035,
+      "name": "EpochEnded"
+    },
+    {
+      "code": 6036,
+      "name": "EpochInProgress"
+    },
+    {
+      "code": 6037,
+      "name": "NotPrescribedObserver"
+    },
+    {
+      "code": 6038,
+      "name": "AlreadyObserved"
+    },
+    {
+      "code": 6039,
+      "name": "RewardsAlreadyDistributed"
+    },
+    {
+      "code": 6040,
+      "name": "DistributionIncomplete"
+    },
+    {
+      "code": 6041,
+      "name": "InvalidObservation"
+    },
+    {
+      "code": 6042,
+      "name": "GatewayNotEligible"
+    },
+    {
+      "code": 6043,
+      "name": "EpochAlreadyExists"
+    },
+    {
+      "code": 6044,
+      "name": "NoObserversAvailable"
+    },
+    {
+      "code": 6045,
+      "name": "NoNamesAvailable"
+    },
+    {
+      "code": 6046,
+      "name": "InvalidEpochIndex"
+    },
+    {
+      "code": 6047,
+      "name": "WeightsAlreadyTallied"
+    },
+    {
+      "code": 6048,
+      "name": "WeightsNotTallied"
+    },
+    {
+      "code": 6049,
+      "name": "InvalidGatewayAccount"
+    },
+    {
+      "code": 6050,
+      "name": "PrescriptionsNotDone"
+    },
+    {
+      "code": 6051,
+      "name": "PrescriptionsAlreadyDone"
+    },
+    {
+      "code": 6052,
+      "name": "InvalidNameRegistry"
+    },
+    {
+      "code": 6053,
+      "name": "EpochNotCloseable"
+    },
+    {
+      "code": 6054,
+      "name": "MigrationInactive"
+    },
+    {
+      "code": 6055,
+      "name": "MigrationAlreadyFinalized"
+    },
+    {
+      "code": 6056,
+      "name": "InvalidAccountData"
+    },
+    {
+      "code": 6057,
+      "name": "InvalidPda"
+    },
+    {
+      "code": 6058,
+      "name": "ObserverAddressTaken"
+    },
+    {
+      "code": 6059,
+      "name": "MigrationExpired"
+    },
+    {
+      "code": 6060,
+      "name": "InsufficientDelegationForPayment"
+    },
+    {
+      "code": 6061,
+      "name": "InsufficientOperatorStakeForPayment"
+    },
+    {
+      "code": 6062,
+      "name": "InsufficientWithdrawalForPayment"
+    },
+    {
+      "code": 6063,
+      "name": "WithdrawalNotDrained"
+    },
+    {
+      "code": 6064,
+      "name": "EmptyFundingPlan"
+    },
+    {
+      "code": 6065,
+      "name": "TooManyFundingSources"
+    },
+    {
+      "code": 6066,
+      "name": "FundingPlanAmountMismatch"
+    },
+    {
+      "code": 6067,
+      "name": "ZeroFundingSourceAmount"
+    },
+    {
+      "code": 6068,
+      "name": "MissingGatewayForFundingSource"
+    },
+    {
+      "code": 6069,
+      "name": "MissingPayerTokenAccountForFundingSource"
+    },
+    {
+      "code": 6070,
+      "name": "MissingFundingSourceAccount"
+    },
+    {
+      "code": 6071,
+      "name": "ExtraneousFundingSourceAccount"
+    },
+    {
+      "code": 6072,
+      "name": "OnlyOneDelegationSource"
+    },
+    {
+      "code": 6073,
+      "name": "OnlyOneOperatorStakeSource"
+    },
+    {
+      "code": 6074,
+      "name": "TooManyDelegationSources"
+    },
+    {
+      "code": 6075,
+      "name": "DuplicateGatewayInSources"
+    },
+    {
+      "code": 6076,
+      "name": "MismatchedResidueVaultCount"
+    },
+    {
+      "code": 6077,
+      "name": "MissingResidueVault"
+    },
+    {
+      "code": 6078,
+      "name": "GatewayNotLeaving"
+    },
+    {
+      "code": 6079,
+      "name": "LeaveWindowNotExpired"
+    },
+    {
+      "code": 6080,
+      "name": "DelegationsOutstanding"
+    },
+    {
+      "code": 6081,
+      "name": "EpochObservationsNotClosed"
+    },
+    {
+      "code": 6082,
+      "name": "ProtectedVault"
+    },
+    {
+      "code": 6083,
+      "name": "MissingExcessWithdrawal"
+    },
+    {
+      "code": 6084,
+      "name": "InvalidExcessWithdrawalPda"
+    },
+    {
+      "code": 6085,
+      "name": "RegistryAlreadyShrunk"
+    },
+    {
+      "code": 6086,
+      "name": "ShrinkWouldLoseData"
+    },
+    {
+      "code": 6087,
+      "name": "AlreadyLatestVersion"
+    },
+    {
+      "code": 6088,
+      "name": "UnknownSchemaVersion"
+    },
+    {
+      "code": 6089,
+      "name": "DelegatesStillActive"
+    },
+    {
+      "code": 6090,
+      "name": "DelegationCooldownActive"
+    },
+    {
+      "code": 6091,
+      "name": "DelegationNotDisabled"
+    },
+    {
+      "code": 6092,
+      "name": "WrongObserverAccount"
+    },
+    {
+      "code": 6093,
+      "name": "MissingEpochRentReceipt"
+    },
+    {
+      "code": 6094,
+      "name": "InvalidEpochRentReceipt"
+    },
+    {
+      "code": 6095,
+      "name": "WrongEpochCreator"
+    },
+    {
+      "code": 6096,
+      "name": "EpochStillExists"
+    },
+    {
+      "code": 6097,
+      "name": "EpochWeightsClobbered"
+    },
+    {
+      "code": 6098,
+      "name": "EpochNoLongerLive"
+    }
+  ],
+  "ario_arns": [
+    {
+      "code": 6000,
+      "name": "InvalidNameFormat"
+    },
+    {
+      "code": 6001,
+      "name": "NameTooShort"
+    },
+    {
+      "code": 6002,
+      "name": "NameTooLong"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidCharacters"
+    },
+    {
+      "code": 6004,
+      "name": "ForbiddenNameLength"
+    },
+    {
+      "code": 6005,
+      "name": "NameAlreadyRegistered"
+    },
+    {
+      "code": 6006,
+      "name": "NameStillActive"
+    },
+    {
+      "code": 6007,
+      "name": "InsufficientFunds"
+    },
+    {
+      "code": 6008,
+      "name": "NotALease"
+    },
+    {
+      "code": 6009,
+      "name": "AlreadyPermanent"
+    },
+    {
+      "code": 6010,
+      "name": "LeaseExpired"
+    },
+    {
+      "code": 6011,
+      "name": "InvalidLeaseDuration"
+    },
+    {
+      "code": 6012,
+      "name": "CannotExtendPermanent"
+    },
+    {
+      "code": 6013,
+      "name": "ExtensionExceedsMax"
+    },
+    {
+      "code": 6014,
+      "name": "InGracePeriod"
+    },
+    {
+      "code": 6015,
+      "name": "RecordExpired"
+    },
+    {
+      "code": 6016,
+      "name": "InvalidUndernameQuantity"
+    },
+    {
+      "code": 6017,
+      "name": "InvalidAnt"
+    },
+    {
+      "code": 6018,
+      "name": "NotProcessOwner"
+    },
+    {
+      "code": 6019,
+      "name": "CannotReleaseLease"
+    },
+    {
+      "code": 6020,
+      "name": "NameNotReturned"
+    },
+    {
+      "code": 6021,
+      "name": "AuctionActive"
+    },
+    {
+      "code": 6022,
+      "name": "NameNotExpired"
+    },
+    {
+      "code": 6023,
+      "name": "NameReserved"
+    },
+    {
+      "code": 6024,
+      "name": "NotReservationHolder"
+    },
+    {
+      "code": 6025,
+      "name": "ReservationExpired"
+    },
+    {
+      "code": 6026,
+      "name": "ReservationNotExpired"
+    },
+    {
+      "code": 6027,
+      "name": "NotOwner"
+    },
+    {
+      "code": 6028,
+      "name": "NotAntHolder"
+    },
+    {
+      "code": 6029,
+      "name": "Unauthorized"
+    },
+    {
+      "code": 6030,
+      "name": "RegistryFull"
+    },
+    {
+      "code": 6031,
+      "name": "NameRegistryAlreadyExists"
+    },
+    {
+      "code": 6032,
+      "name": "NameNotInRegistry"
+    },
+    {
+      "code": 6033,
+      "name": "ArithmeticOverflow"
+    },
+    {
+      "code": 6034,
+      "name": "ArithmeticUnderflow"
+    },
+    {
+      "code": 6035,
+      "name": "GatewayNotActive"
+    },
+    {
+      "code": 6036,
+      "name": "NotGatewayOperator"
+    },
+    {
+      "code": 6037,
+      "name": "InvalidGatewayProgram"
+    },
+    {
+      "code": 6038,
+      "name": "InvalidTreasury"
+    },
+    {
+      "code": 6039,
+      "name": "InvalidParameter"
+    },
+    {
+      "code": 6040,
+      "name": "DemandFactorNotReady"
+    },
+    {
+      "code": 6041,
+      "name": "InvalidAntAsset"
+    },
+    {
+      "code": 6042,
+      "name": "MigrationInactive"
+    },
+    {
+      "code": 6043,
+      "name": "MigrationAlreadyFinalized"
+    },
+    {
+      "code": 6044,
+      "name": "InvalidAccountData"
+    },
+    {
+      "code": 6045,
+      "name": "InvalidPda"
+    },
+    {
+      "code": 6046,
+      "name": "MigrationExpired"
+    },
+    {
+      "code": 6047,
+      "name": "RegistryAlreadyShrunk"
+    },
+    {
+      "code": 6048,
+      "name": "ShrinkWouldLoseData"
+    },
+    {
+      "code": 6049,
+      "name": "AlreadyLatestVersion"
+    },
+    {
+      "code": 6050,
+      "name": "UnknownSchemaVersion"
+    }
+  ],
+  "ario_ant": [
+    {
+      "code": 6000,
+      "name": "Unauthorized"
+    },
+    {
+      "code": 6001,
+      "name": "UnauthorizedRecordAccess"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidUndername"
+    },
+    {
+      "code": 6003,
+      "name": "UndernameTooLong"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidTarget"
+    },
+    {
+      "code": 6005,
+      "name": "UnsupportedProtocol"
+    },
+    {
+      "code": 6006,
+      "name": "TargetTooLong"
+    },
+    {
+      "code": 6007,
+      "name": "InvalidTtl"
+    },
+    {
+      "code": 6008,
+      "name": "RecordNotFound"
+    },
+    {
+      "code": 6009,
+      "name": "RecordHasNoOwner"
+    },
+    {
+      "code": 6010,
+      "name": "RecordTransferToSelf"
+    },
+    {
+      "code": 6011,
+      "name": "ControllerAlreadyExists"
+    },
+    {
+      "code": 6012,
+      "name": "ControllerNotFound"
+    },
+    {
+      "code": 6013,
+      "name": "MaxControllersReached"
+    },
+    {
+      "code": 6014,
+      "name": "NameTooLong"
+    },
+    {
+      "code": 6015,
+      "name": "NameEmpty"
+    },
+    {
+      "code": 6016,
+      "name": "DescriptionTooLong"
+    },
+    {
+      "code": 6017,
+      "name": "TooManyKeywords"
+    },
+    {
+      "code": 6018,
+      "name": "KeywordTooLong"
+    },
+    {
+      "code": 6019,
+      "name": "InvalidKeyword"
+    },
+    {
+      "code": 6020,
+      "name": "DuplicateKeyword"
+    },
+    {
+      "code": 6021,
+      "name": "InvalidLogo"
+    },
+    {
+      "code": 6022,
+      "name": "CannotChangePriorityOfRoot"
+    },
+    {
+      "code": 6023,
+      "name": "PriorityRequiresOwnerOrController"
+    },
+    {
+      "code": 6024,
+      "name": "OnlyOwnerOrControllerCanCreate"
+    },
+    {
+      "code": 6025,
+      "name": "InvalidAsset"
+    },
+    {
+      "code": 6026,
+      "name": "NotNftHolder"
+    },
+    {
+      "code": 6027,
+      "name": "CannotRemoveRootRecord"
+    },
+    {
+      "code": 6028,
+      "name": "TickerTooLong"
+    },
+    {
+      "code": 6029,
+      "name": "TickerEmpty"
+    },
+    {
+      "code": 6030,
+      "name": "MigrationInactive"
+    },
+    {
+      "code": 6031,
+      "name": "MigrationAlreadyFinalized"
+    },
+    {
+      "code": 6032,
+      "name": "InvalidAccountData"
+    },
+    {
+      "code": 6033,
+      "name": "InvalidPda"
+    },
+    {
+      "code": 6034,
+      "name": "AlreadyLatestVersion"
+    },
+    {
+      "code": 6035,
+      "name": "UnknownSchemaVersion"
+    },
+    {
+      "code": 6036,
+      "name": "MigrationExpired"
+    },
+    {
+      "code": 6037,
+      "name": "RecordStillExists"
+    },
+    {
+      "code": 6038,
+      "name": "AclEntryAlreadyExists"
+    },
+    {
+      "code": 6039,
+      "name": "AclEntryNotFound"
+    },
+    {
+      "code": 6040,
+      "name": "AclPageFull"
+    },
+    {
+      "code": 6041,
+      "name": "AclConfigNotEmpty"
+    },
+    {
+      "code": 6042,
+      "name": "AclPageNotEmpty"
+    },
+    {
+      "code": 6043,
+      "name": "AclPageNotLast"
+    },
+    {
+      "code": 6044,
+      "name": "AclPageUserMismatch"
+    },
+    {
+      "code": 6045,
+      "name": "AclPageIndexMismatch"
+    },
+    {
+      "code": 6046,
+      "name": "AclPageOutOfBounds"
+    },
+    {
+      "code": 6047,
+      "name": "AclConfigUserMismatch"
+    },
+    {
+      "code": 6048,
+      "name": "AclUnknownRole"
+    },
+    {
+      "code": 6049,
+      "name": "NotCurrentOwner"
+    },
+    {
+      "code": 6050,
+      "name": "NotCurrentController"
+    },
+    {
+      "code": 6051,
+      "name": "StillCurrentOwner"
+    },
+    {
+      "code": 6052,
+      "name": "StillCurrentController"
+    },
+    {
+      "code": 6053,
+      "name": "TransferToSelf"
+    },
+    {
+      "code": 6054,
+      "name": "InvalidArnsRecord"
+    },
+    {
+      "code": 6055,
+      "name": "AssetStillExists"
+    },
+    {
+      "code": 6056,
+      "name": "ArithmeticOverflow"
+    },
+    {
+      "code": 6057,
+      "name": "OrphanRecordAssetMismatch"
+    },
+    {
+      "code": 6058,
+      "name": "InvalidAuthority"
+    },
+    {
+      "code": 6059,
+      "name": "AlreadyProgramControlled"
+    }
+  ]
+}
