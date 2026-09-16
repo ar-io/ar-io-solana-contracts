@@ -173,9 +173,20 @@ error check out of PR-time CI — losing the property that motivated this ADR.
 * Bless an append: `node scripts/error-code-snapshot.mjs --update`
 * Wired into `.github/workflows/build-test.yml` (runs on every PR to
   `main`/`develop`); the workflow resolves the baseline from
-  `github.event.pull_request.base.sha` and skips that comparison only when
-  there is no PR context (`workflow_dispatch` / `workflow_call`) or the target
-  branch predates the snapshot.
+  `github.event.pull_request.base.sha`.
+
+  The workflow deliberately distinguishes *why* a baseline is unavailable,
+  because the two reasons must not look alike:
+
+  * **base commit unresolvable** (not fetchable on the runner) — the integrity
+    comparison cannot run, so the step **fails loudly**. Degrading to a plain
+    check here would leave a guard that reports success while enforcing
+    nothing, which is the exact failure mode this ADR exists to prevent.
+  * **base commit resolved but carries no snapshot** — legitimately not
+    applicable; expected only for the PR that introduces the file. Prints a
+    note and proceeds.
+  * **no PR context** (`workflow_dispatch` / `workflow_call`) — no base SHA
+    exists; plain check.
 
 ### A related gap this ADR does not close
 
