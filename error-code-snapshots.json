@@ -585,6 +585,10 @@
     {
       "code": 6099,
       "name": "PreV110GatewayLayout"
+    },
+    {
+      "code": 6100,
+      "name": "NotGatewayAuthority"
     }
   ],
   "ario_arns": [
