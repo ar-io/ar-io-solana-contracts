@@ -542,13 +542,10 @@ pub fn update_gateway_metadata(
         GarError::GatewayLeaving
     );
 
-    // Authorisation. See `is_gateway_authority` for why the zero-pubkey case is
-    // handled there rather than inline: it is unreachable from an integration
-    // test, so it needs a unit test of its own to be verified at all.
-    require!(
-        is_gateway_authority(&signer, &gateway.operator, &gateway.operations_address),
-        GarError::NotGatewayAuthority
-    );
+    // Authorisation. `Gateway::authorises` honours the operations address only
+    // once the account is at 1.2.0 — below that the field is stale tail bytes —
+    // and never when it is the zero pubkey. Both refusals are unit-tested there.
+    require!(gateway.authorises(&signer), GarError::NotGatewayAuthority);
 
     // Same validation as update_gateway_settings — a delegated signer must not
     // be able to write values the operator could not.
@@ -613,6 +610,14 @@ pub fn update_operations_address(
     require!(
         gateway.status == GatewayStatus::Joined,
         GarError::GatewayLeaving
+    );
+    // Mandatory, not a convenience. Below 1.2.0 a delegation written here would
+    // be ignored by `Gateway::authorises` and then overwritten when the
+    // migration defaults the field to the operator — silently lost. Migration
+    // is permissionless and can ride in the same transaction.
+    require!(
+        operations_address_is_set(gateway.version),
+        GarError::GatewayNotMigrated
     );
     // A zeroed operations address would authorise nobody, but accepting it
     // silently turns "revoke" into "brick the delegation" — revocation is

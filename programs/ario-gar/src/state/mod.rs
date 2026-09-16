@@ -136,22 +136,52 @@ pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 2, 0);
 /// migrated in place and are rejected outright.
 pub const GATEWAY_SIZE_AT_V1_1_0: usize = 964;
 
-/// ADR-0030: may `signer` act for a gateway with these two addresses?
+/// First `Gateway` schema version in which `operations_address` holds a value
+/// this program wrote (ADR-0030).
+pub const OPERATIONS_ADDRESS_SINCE: SchemaVersion = SchemaVersion::new(1, 2, 0);
+
+/// Does a Gateway stamped `version` carry a real `operations_address`?
 ///
-/// Extracted as a pure function for one reason: the `Pubkey::default()` case is
-/// **unreachable from an integration test**, because the zero pubkey is the
-/// System Program and nobody can sign as it. A test that drives the instruction
-/// with an ordinary stranger passes whether or not the zero guard is present,
-/// so it proves nothing. This function makes the guard directly testable.
+/// **Below 1.2.0 the field is not data.** It is decoded from whatever bytes
+/// follow `version`, and those are not reliably zero: Anchor's `Account::exit`
+/// (and `schema_migration::write_account`) write the serialized struct from
+/// offset 0 and never clear the bytes past its new end. A gateway whose content
+/// ever shrank — a shorter label, fqdn or note, or an `Option` going
+/// `Some -> None` — keeps its old tail bytes there. Measured before this check
+/// was added: 30 of 620 mainnet gateways and 1 of 620 on staging had non-zero
+/// bytes in that position.
 ///
-/// A zeroed `operations_address` means "not yet migrated" and must authorise
-/// nobody. Never treat it as a wildcard.
+/// The gateway's last 52 serialized bytes are `observer_address` (32),
+/// `cumulative_reward_per_token` (16), `bump` (1) and `version` (3), so a shrink
+/// of exactly 52 bytes leaves the **previous `observer_address`** — a real key
+/// that someone else may hold — exactly where `operations_address` is read.
+pub fn operations_address_is_set(version: SchemaVersion) -> bool {
+    version >= OPERATIONS_ADDRESS_SINCE
+}
+
+/// ADR-0030: may `signer` act for a gateway with these addresses at `version`?
+///
+/// The operator always may. The `operations_address` may only when the account
+/// is at `OPERATIONS_ADDRESS_SINCE` or later (see `operations_address_is_set`),
+/// and never when it is `Pubkey::default()`.
+///
+/// Extracted as a pure function because both refusals are awkward to reach from
+/// an integration test: nobody can sign as the zero pubkey (it is the System
+/// Program), and a stale-tail key has to be planted deliberately. Driving the
+/// instruction with an ordinary stranger passes whether or not either guard is
+/// present, so it proves nothing on its own.
+///
+/// Prefer `Gateway::authorises`, which cannot be handed mismatched fields.
 pub fn is_gateway_authority(
     signer: &Pubkey,
     operator: &Pubkey,
     operations_address: &Pubkey,
+    version: SchemaVersion,
 ) -> bool {
-    signer == operator || (*operations_address != Pubkey::default() && signer == operations_address)
+    signer == operator
+        || (operations_address_is_set(version)
+            && *operations_address != Pubkey::default()
+            && signer == operations_address)
 }
 pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
@@ -393,8 +423,10 @@ pub struct Gateway {
     /// live account cannot shift anything already stored. See
     /// `GATEWAY_SIZE_AT_V1_1_0` for what happens when a field grows mid-struct.
     ///
-    /// A zeroed value means "not yet migrated" and must authorise **nobody** —
-    /// never treat `Pubkey::default()` as a wildcard.
+    /// **Only meaningful when `version >= OPERATIONS_ADDRESS_SINCE` (1.2.0).**
+    /// On an un-migrated account this field decodes from stale tail bytes, not
+    /// from zero padding — see `operations_address_is_set`. Always go through
+    /// `Gateway::authorises`, and never treat `Pubkey::default()` as a wildcard.
     pub operations_address: Pubkey,
 }
 
@@ -430,6 +462,18 @@ impl Gateway {
     pub fn total_stake(&self) -> u64 {
         self.operator_stake
             .saturating_add(self.total_delegated_stake)
+    }
+
+    /// ADR-0030: may `signer` act for this gateway? The single entry point for
+    /// every operator-or-operations-address check, in this program and in
+    /// ario-arns. See `is_gateway_authority`.
+    pub fn authorises(&self, signer: &Pubkey) -> bool {
+        is_gateway_authority(
+            signer,
+            &self.operator,
+            &self.operations_address,
+            self.version,
+        )
     }
 }
 
@@ -2157,9 +2201,11 @@ mod tests {
     ///
     /// After the upgrade, `Gateway::SIZE` is 996 but every live account is still
     /// 964 until `migrate_gateway` runs. Those accounts stay readable only
-    /// because the appended `operations_address` is read out of the zero padding
-    /// — which requires a real gateway's borsh content to leave 32 bytes of slack
-    /// inside the OLD 964-byte size.
+    /// because the appended `operations_address` is read out of the bytes after
+    /// the old content — which requires a real gateway's borsh content to leave
+    /// 32 bytes of slack inside the OLD 964-byte size. (Those bytes are readable,
+    /// not necessarily zero; `operations_address_is_set` is what stops them
+    /// being trusted.)
     ///
     /// The slack comes entirely from `properties`: `SIZE` reserves 4 + 256 for
     /// it, but `join_network`, `update_gateway_settings` and
@@ -2199,6 +2245,8 @@ mod tests {
         );
     }
 
+    const V1_1_0: SchemaVersion = SchemaVersion::new(1, 1, 0);
+
     #[test]
     fn zeroed_operations_address_authorises_nobody() {
         let operator = Pubkey::new_unique();
@@ -2206,16 +2254,25 @@ mod tests {
         let zero = Pubkey::default();
 
         // The case an integration test cannot reach: the zero pubkey is the
-        // System Program, so no keypair can present it as a signer. If this
-        // guard regressed, an un-migrated gateway would authorise it.
+        // System Program, so no keypair can present it as a signer. Checked at
+        // the current version, where the field IS trusted, so that it is the
+        // zero guard doing the refusing and not the version gate.
         assert!(
-            !is_gateway_authority(&zero, &operator, &zero),
+            !is_gateway_authority(&zero, &operator, &zero, GATEWAY_VERSION),
             "a zeroed operations_address must never authorise the zero pubkey"
         );
-        assert!(!is_gateway_authority(&stranger, &operator, &zero));
-
-        // The operator still works on an un-migrated gateway.
-        assert!(is_gateway_authority(&operator, &operator, &zero));
+        assert!(!is_gateway_authority(
+            &stranger,
+            &operator,
+            &zero,
+            GATEWAY_VERSION
+        ));
+        assert!(is_gateway_authority(
+            &operator,
+            &operator,
+            &zero,
+            GATEWAY_VERSION
+        ));
     }
 
     #[test]
@@ -2224,8 +2281,91 @@ mod tests {
         let ops = Pubkey::new_unique();
         let stranger = Pubkey::new_unique();
 
-        assert!(is_gateway_authority(&operator, &operator, &ops));
-        assert!(is_gateway_authority(&ops, &operator, &ops));
-        assert!(!is_gateway_authority(&stranger, &operator, &ops));
+        assert!(is_gateway_authority(
+            &operator,
+            &operator,
+            &ops,
+            GATEWAY_VERSION
+        ));
+        assert!(is_gateway_authority(&ops, &operator, &ops, GATEWAY_VERSION));
+        assert!(!is_gateway_authority(
+            &stranger,
+            &operator,
+            &ops,
+            GATEWAY_VERSION
+        ));
+    }
+
+    #[test]
+    fn operations_address_is_ignored_below_1_2_0() {
+        let operator = Pubkey::new_unique();
+        let ops = Pubkey::new_unique();
+
+        assert_eq!(OPERATIONS_ADDRESS_SINCE, SchemaVersion::new(1, 2, 0));
+        assert!(!operations_address_is_set(SchemaVersion::new(0, 0, 0)));
+        assert!(!operations_address_is_set(SchemaVersion::new(1, 0, 0)));
+        assert!(!operations_address_is_set(V1_1_0));
+        assert!(operations_address_is_set(SchemaVersion::new(1, 2, 0)));
+        assert!(
+            operations_address_is_set(SchemaVersion::new(1, 3, 0)),
+            "later layouts still carry the field"
+        );
+        assert!(operations_address_is_set(SchemaVersion::new(2, 0, 0)));
+
+        // Below 1.2.0 a non-zero value in the field authorises nobody...
+        assert!(!is_gateway_authority(&ops, &operator, &ops, V1_1_0));
+        // ...while the operator is unaffected.
+        assert!(is_gateway_authority(&operator, &operator, &ops, V1_1_0));
+    }
+
+    /// The defect this gate exists for, reproduced with the real types.
+    ///
+    /// The previous program (no `operations_address`) serializes a gateway, then
+    /// re-serializes it 52 bytes shorter. Anchor's `exit` does not clear the tail,
+    /// so the old `observer_address` is left exactly where the new layout reads
+    /// `operations_address`.
+    #[test]
+    fn stale_tail_can_hold_the_old_observer_and_is_not_trusted() {
+        // Previous-program layout = current layout minus the trailing 32 bytes.
+        let old_layout = |g: &Gateway| {
+            let mut v = Vec::new();
+            g.try_serialize(&mut v).unwrap();
+            v.truncate(v.len() - 32);
+            v
+        };
+        let old_observer = Pubkey::new_unique();
+        let new_observer = Pubkey::new_unique();
+
+        let mut before = gateway_at_max_size();
+        before.operator = Pubkey::new_unique();
+        before.properties = "x".repeat(43);
+        before.note = "n".repeat(100);
+        before.observer_address = old_observer;
+        before.version = V1_1_0;
+
+        let mut after = before.clone();
+        after.note = "n".repeat(48); // content shrinks by exactly 52 bytes
+        after.observer_address = new_observer;
+
+        let mut account = vec![0u8; GATEWAY_SIZE_AT_V1_1_0];
+        let first = old_layout(&before);
+        account[..first.len()].copy_from_slice(&first);
+        let second = old_layout(&after);
+        account[..second.len()].copy_from_slice(&second); // no tail clear, like Anchor
+        assert_eq!(first.len() - second.len(), 52);
+
+        let decoded = Gateway::try_deserialize(&mut &account[..]).unwrap();
+        assert_eq!(decoded.version, V1_1_0);
+        assert_eq!(decoded.observer_address, new_observer);
+        assert_eq!(
+            decoded.operations_address, old_observer,
+            "precondition: the stale tail really does decode as the old observer key"
+        );
+
+        assert!(
+            !decoded.authorises(&old_observer),
+            "an un-migrated gateway must not honour a key read from its stale tail"
+        );
+        assert!(decoded.authorises(&decoded.operator));
     }
 }

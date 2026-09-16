@@ -7118,9 +7118,8 @@ mod fund_from_stake {
     /// discount through that window — otherwise the deploy silently removes the
     /// benefit from all 648 gateways until the migration completes.
     ///
-    /// The un-migrated field reads out of the zero padding as `Pubkey::default()`,
-    /// which `is_gateway_authority` treats as "delegates to nobody" while still
-    /// honouring the operator.
+    /// Below schema 1.2.0 `Gateway::authorises` ignores `operations_address`
+    /// entirely (it is stale tail bytes there) and honours only the operator.
     #[tokio::test]
     async fn test_unmigrated_gateway_operator_keeps_discount() {
         let operator_kp = Keypair::new();
@@ -7152,6 +7151,9 @@ mod fund_from_stake {
             .unwrap();
         let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
         gw.start_timestamp = -(200 * 86_400i64);
+        // Stamped 1.1.0, as every live account is. join_network stamps the
+        // current version, which would model an account that does not exist.
+        gw.version = ario_gar::state::SchemaVersion::new(1, 1, 0);
         let mut data = Vec::new();
         gw.try_serialize(&mut data).unwrap();
         data.truncate(data.len() - 32); // no operations_address, as on chain today
@@ -7246,6 +7248,64 @@ mod fund_from_stake {
             UNDISCOUNTED_1Y_6CHAR * 8 / 10,
             "the discount must survive the pre-migration window"
         );
+    }
+
+    /// The ADR-0030 stale-tail defect, on the ArNS side. An un-migrated (1.1.0)
+    /// gateway whose tail bytes happen to decode as the buyer's key must NOT
+    /// give that buyer the discount. The same key IS honoured once the account
+    /// really is at 1.2.0 (test_gateway_discount_via_operations_address), so the
+    /// version is the only difference between the two outcomes.
+    #[tokio::test]
+    async fn test_stale_tail_key_gets_no_discount_before_migration() {
+        let (mut ctx, setup) = discount_scenario(None, false).await;
+        let buyer = ctx.payer.pubkey();
+        assert_ne!(buyer, setup.operator, "the buyer must not be the operator");
+
+        let acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        gw.version = ario_gar::state::SchemaVersion::new(1, 1, 0);
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32); // pre-ADR-0030 content
+        let content_end = data.len();
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        // What an earlier, longer serialization can leave behind.
+        data[content_end..content_end + 32].copy_from_slice(buyer.as_ref());
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: acct.lamports,
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
+        // Precondition: the planted key really decodes as the operations address.
+        let reread = Gateway::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(setup.gateway_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(reread.version, ario_gar::state::SchemaVersion::new(1, 1, 0));
+        assert_eq!(reread.operations_address, buyer);
+
+        // Refused for exactly this reason, not for an unrelated one.
+        let result = buy_name_claiming_discount(&mut ctx, &setup, "stltal").await;
+        assert_anchor_error!(result, ArnsError::NotGatewayOperator);
     }
 
     /// ADR-0030's headline capability: a wallet that is NOT the operator buys at

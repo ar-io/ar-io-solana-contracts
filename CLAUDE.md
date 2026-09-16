@@ -270,6 +270,18 @@ pre-version** account (old SIZE, no version bytes), not a full-size one with
 if a future escrow field exceeds `_reserved`, convert it to
 grow-then-deserialize. See [`docs/adrs/0020-…`](docs/adrs/0020-schema-migration-grow-then-deserialize.md).
 
+**Appended fields are only data once `version` says so.** Bytes past a borsh
+account's serialized end are **not** reliably zero: Anchor's `Account::exit` and
+`schema_migration::write_account` never clear them, so an account whose
+variable-length content ever shrank carries stale bytes there — exactly where a
+newly appended field is read before migration (30 of 620 mainnet Gateways did;
+see the ADR-0030 addendum). So, for every field appended at the end:
+
+* gate every read on `version >=` the version that introduced it;
+* in the migration arm, assign it **unconditionally** — never "only if zero";
+* make any instruction that writes it require the account to be migrated first;
+* build test fixtures with **stale tail bytes**, not zero padding.
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool
