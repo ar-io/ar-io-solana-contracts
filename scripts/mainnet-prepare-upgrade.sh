@@ -197,7 +197,14 @@ for prog in $PROGRAMS; do
   new_size="$(stat -f%z "$so" 2>/dev/null || stat -c%s "$so")"
   pd_addr="$(solana --url "$RPC_URL" program show "$prog_id" 2>/dev/null | awk '/ProgramData Address/{print $NF}')"
   if [[ -n "$pd_addr" ]]; then
-    pd_cap="$(solana --url "$RPC_URL" account "$pd_addr" 2>/dev/null | awk '/Length/{print $2}')"
+    # Read the capacity as JSON. `solana account | awk '/Length/{print $2}'`
+    # looks right but matches the "Length:" header AND any hex-dump row whose
+    # ASCII column happens to contain "Length" (e.g. "MaxSeedLengthExc"), so
+    # pd_cap became multi-line, the `[[ ]]` numeric compare below threw, and
+    # THE EXTEND WAS SILENTLY SKIPPED -- defeating the exact protection this
+    # block exists to provide. It only surfaces much later, as a Squads
+    # Execute failing with "account data too small".
+    pd_cap="$(solana --url "$RPC_URL" account "$pd_addr" --output json 2>/dev/null | jq -r '.account.space // empty')"
     need=$(( new_size + 45 ))   # 45-byte ProgramData header
     if [[ -n "$pd_cap" && "$need" -gt "$pd_cap" ]]; then
       extra=$(( need - pd_cap + 4096 ))

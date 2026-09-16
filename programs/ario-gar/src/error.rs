@@ -368,4 +368,29 @@ pub enum GarError {
     // indentation still in it.
     #[msg("Epoch still exists — close_epoch is the path that refunds its rent to the creator")]
     EpochStillExists,
+
+    // ADR-0032. Distinct from WeightsNotTallied on purpose: that one means a
+    // gateway simply has no weights for this epoch and is owed nothing; this
+    // one means a gateway that IS in the epoch's reward divisor has had its
+    // weights destroyed by another epoch's tally. The epoch can no longer be
+    // paid correctly and needs a human decision, not a retry.
+    #[msg("A gateway in this epoch's reward set had its weights overwritten by another epoch's tally; this epoch can no longer be distributed correctly")]
+    EpochWeightsClobbered,
+
+    // ADR-0033. Only the live epoch (current_epoch_index - 1) may be tallied:
+    // weights are per-tally rather than per-epoch, so tallying an older epoch
+    // would overwrite the live epoch's weights and destroy its payout. A stale
+    // epoch stays closeable by `admin_close_stale_epoch`, which carries no tally
+    // requirement.
+    #[msg("Only the live epoch may be tallied; tallying an older epoch would destroy the live epoch's weights")]
+    EpochNoLongerLive,
+
+    // ADR-035: appended at the END of the enum, deliberately. Anchor derives
+    // codes positionally (6000 + index), so placing this next to the other
+    // schema-migration errors -- where it belongs topically -- would renumber
+    // every variant after it, including EpochWeightsClobbered (6097) and
+    // EpochNoLongerLive (6098), both already live on mainnet. Topical grouping
+    // is not worth an ABI break; `scripts/error-code-snapshot.mjs` enforces this.
+    #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
+    PreV110GatewayLayout,
 }

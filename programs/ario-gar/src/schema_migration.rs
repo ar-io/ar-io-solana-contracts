@@ -153,6 +153,26 @@ pub fn migrate_gateway_version(account: &mut Gateway) -> Result<()> {
             } => {
                 account.version = SchemaVersion::new(1, 0, 0);
             }
+            // 1.0.0 -> 1.1.0 is a **version stamp only**, and deliberately so.
+            //
+            // The 1.1.0 change grew `GatewaySettings2` mid-struct, which is not
+            // expressible as a grow-then-deserialize migration (ADR-020 §3 is
+            // append-only for exactly this reason). So there is no field to
+            // populate here: an account that reaches this arm has already been
+            // proven to carry the 1.1.0 layout physically, because
+            // `migrate_gateway` rejects anything smaller than
+            // `GATEWAY_SIZE_AT_V1_1_0` before deserializing. Its `version` was
+            // simply never stamped forward.
+            //
+            // Do not "fix" this by writing defaults into `settings` — the
+            // fields are already populated and would be clobbered.
+            SchemaVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            } => {
+                account.version = SchemaVersion::new(1, 1, 0);
+            }
             _ => return err!(GarError::UnknownSchemaVersion),
         }
     }
