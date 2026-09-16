@@ -369,14 +369,35 @@ pub enum GarError {
     #[msg("Epoch still exists — close_epoch is the path that refunds its rent to the creator")]
     EpochStillExists,
 
+    // ADR-0032. Distinct from WeightsNotTallied on purpose: that one means a
+    // gateway simply has no weights for this epoch and is owed nothing; this
+    // one means a gateway that IS in the epoch's reward divisor has had its
+    // weights destroyed by another epoch's tally. The epoch can no longer be
+    // paid correctly and needs a human decision, not a retry.
+    #[msg("A gateway in this epoch's reward set had its weights overwritten by another epoch's tally; this epoch can no longer be distributed correctly")]
+    EpochWeightsClobbered,
+
+    // ADR-0033. Only the live epoch (current_epoch_index - 1) may be tallied:
+    // weights are per-tally rather than per-epoch, so tallying an older epoch
+    // would overwrite the live epoch's weights and destroy its payout. A stale
+    // epoch stays closeable by `admin_close_stale_epoch`, which carries no tally
+    // requirement.
+    #[msg("Only the live epoch may be tallied; tallying an older epoch would destroy the live epoch's weights")]
+    EpochNoLongerLive,
+
     // ── APPEND-ONLY BELOW ──────────────────────────────────────────────────
-    // Anchor assigns error codes by POSITION in this enum, so a variant
-    // inserted anywhere above renumbers every variant after it and breaks
-    // every client matching on the numeric code. New variants go here, at the
-    // end, always.
+    // ADR-035. Anchor assigns error codes by POSITION in this enum, so a
+    // variant inserted anywhere above renumbers every variant after it and
+    // breaks every client matching on the numeric code -- including the
+    // mainnet-live EpochWeightsClobbered (6097) and EpochNoLongerLive (6098).
+    // New variants go here, at the end, always.
+    // `scripts/error-code-snapshot.mjs` enforces this in CI.
+
+    // 6099 -- already published in develop's snapshot; do not move.
     #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
     PreV110GatewayLayout,
 
+    // 6100 -- ADR-0030.
     #[msg("Signer is neither the gateway operator nor its operations address")]
     NotGatewayAuthority,
 }
