@@ -316,17 +316,11 @@ pub fn try_apply_gateway_discount(
         ArnsError::NotGatewayOperator
     );
 
-    // ADR-0030: the operator, or the gateway's operations_address. Shares the
-    // predicate with ario-gar so the zero-pubkey rule cannot drift between the
-    // two programs.
-    require!(
-        ario_gar::state::is_gateway_authority(
-            signer,
-            &gateway.operator,
-            &gateway.operations_address
-        ),
-        ArnsError::NotGatewayOperator
-    );
+    // ADR-0030: the operator, or the gateway's operations_address. Uses
+    // ario-gar's own `Gateway::authorises`, so both rules — ignore the field
+    // below schema 1.2.0 (it is stale tail bytes there), and never honour the
+    // zero pubkey — cannot drift between the two programs.
+    require!(gateway.authorises(signer), ArnsError::NotGatewayOperator);
 
     // Verify gateway is active (Joined status)
     require!(

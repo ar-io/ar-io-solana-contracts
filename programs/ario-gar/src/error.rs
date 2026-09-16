@@ -400,4 +400,10 @@ pub enum GarError {
     // 6100 -- ADR-0030.
     #[msg("Signer is neither the gateway operator nor its operations address")]
     NotGatewayAuthority,
+
+    // 6101 -- ADR-0030. A gateway below 1.2.0 has no real operations_address:
+    // the bytes after `version` are whatever an earlier, longer serialization
+    // left behind. Run the permissionless `migrate_gateway` first.
+    #[msg("Gateway has not been migrated to the layout that carries an operations address; run migrate_gateway first")]
+    GatewayNotMigrated,
 }
