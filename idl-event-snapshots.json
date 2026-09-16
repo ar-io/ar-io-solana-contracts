@@ -842,6 +842,33 @@
       ]
     },
     {
+      "name": "EpochSettingsAuthorityTransferredEvent",
+      "discriminator": [
+        30,
+        203,
+        178,
+        65,
+        232,
+        221,
+        22,
+        206
+      ],
+      "fields": [
+        {
+          "name": "old_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "EpochsToggledEvent",
       "discriminator": [
         154,
