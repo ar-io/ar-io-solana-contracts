@@ -108,21 +108,24 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-027 | Restore the Escrow Active-Vault Re-lock via Direct CPI into ario-core's Existing ABI | accepted | [`0027-escrow-restore-active-vault-relock-direct-cpi.md`](0027-escrow-restore-active-vault-relock-direct-cpi.md) |
 | ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
 | ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
+| ADR-030 | A Gateway May Delegate Operations to a Second Address | proposed | [`0030-gateway-operations-address.md`](0030-gateway-operations-address.md) |
+| ADR-031 | Transferable `EpochSettings.authority` | proposed | [`0031-transferable-epoch-settings-authority.md`](0031-transferable-epoch-settings-authority.md) |
 | ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
+| ADR-034 | An Unfinished Epoch Must Not Be Superseded | proposed | [`0034-an-unfinished-epoch-must-not-be-superseded.md`](0034-an-unfinished-epoch-must-not-be-superseded.md) |
+| ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
 
 ### Reserved by open PRs
 
-Numbers claimed by unmerged PRs, so they do not look free to the next author:
+Numbers claimed by unmerged PRs, so they do not look free to the next author.
+**None currently** — every claimed number now has its ADR in the Index above.
 
 | # | claimed by | file |
 |---|---|---|
-| ADR-030 | [#125](https://github.com/ar-io/ar-io-solana-contracts/pull/125) (impl [#129](https://github.com/ar-io/ar-io-solana-contracts/pull/129)) | `0030-gateway-operations-address.md` |
-| ADR-031 | [#126](https://github.com/ar-io/ar-io-solana-contracts/pull/126) (impl [#127](https://github.com/ar-io/ar-io-solana-contracts/pull/127)) | `0031-transferable-epoch-settings-authority.md` |
-| ADR-034 | this PR | [`0034-an-unfinished-epoch-must-not-be-superseded.md`](0034-an-unfinished-epoch-must-not-be-superseded.md) |
 
 
-Delete a row once its PR merges and the ADR appears in the Index above.
+Add a row when you open a PR claiming a number; delete it once that PR merges
+and the ADR appears in the Index above.
 
 ### Numbering anomalies
 

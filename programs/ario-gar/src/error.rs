@@ -384,4 +384,20 @@ pub enum GarError {
     // requirement.
     #[msg("Only the live epoch may be tallied; tallying an older epoch would destroy the live epoch's weights")]
     EpochNoLongerLive,
+
+    // ── APPEND-ONLY BELOW ──────────────────────────────────────────────────
+    // ADR-035. Anchor assigns error codes by POSITION in this enum, so a
+    // variant inserted anywhere above renumbers every variant after it and
+    // breaks every client matching on the numeric code -- including the
+    // mainnet-live EpochWeightsClobbered (6097) and EpochNoLongerLive (6098).
+    // New variants go here, at the end, always.
+    // `scripts/error-code-snapshot.mjs` enforces this in CI.
+
+    // 6099 -- already published in develop's snapshot; do not move.
+    #[msg("Gateway predates the 1.1.0 layout and cannot be migrated in place")]
+    PreV110GatewayLayout,
+
+    // 6100 -- ADR-0030.
+    #[msg("Signer is neither the gateway operator nor its operations address")]
+    NotGatewayAuthority,
 }

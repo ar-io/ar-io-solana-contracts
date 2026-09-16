@@ -949,6 +949,212 @@ async fn test_admin_set_reward_ratios() {
     assert_eq!(es.observer_reward_ratio, 100_000);
 }
 
+/// Verify `transfer_epoch_settings_authority` (ADR-0031).
+///
+/// `ario-gar` is the only program with two authority-bearing accounts, and
+/// `transfer_authority` moves only `GatewaySettings`. Without this instruction
+/// `EpochSettings.authority` is immutable after `initialize_epochs`, which would
+/// strand all seven epoch admin instructions on the deploy key after an ADR-026
+/// handoff — the split currently visible on staging.
+///
+/// Mirrors `test_transfer_authority` step for step, and additionally asserts
+/// that rotating `EpochSettings` does NOT disturb `GatewaySettings.authority`,
+/// since the whole point is that the two move independently.
+#[tokio::test]
+async fn test_transfer_epoch_settings_authority() {
+    let mint = Keypair::new();
+    let stake_token = Keypair::new();
+    let protocol_token = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &Pubkey::new_unique(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (gar_settings_key, _) = settings_pda();
+
+    // Make ctx.payer the EpochSettings authority (authority = bytes 8..40).
+    let mut es = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    es.data[8..40].copy_from_slice(ctx.payer.pubkey().as_ref());
+    // Capture `epoch_duration` (bytes 40..48) to prove the sibling is untouched.
+    let duration_before = es.data[40..48].to_vec();
+    ctx.set_account(
+        &epoch_settings_key,
+        &solana_sdk::account::AccountSharedData::from(es),
+    );
+
+    // Capture GatewaySettings.authority — it must NOT move.
+    let gar_auth_before = ctx
+        .banks_client
+        .get_account(gar_settings_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[8..40]
+        .to_vec();
+
+    let ix = |new_authority: Pubkey, signer: Pubkey| Instruction {
+        program_id: ario_gar::ID,
+        accounts: ario_gar::accounts::TransferEpochSettingsAuthority {
+            epoch_settings: epoch_settings_key,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_gar::instruction::TransferEpochSettingsAuthority { new_authority }.data(),
+    };
+
+    // Step 1: null pubkey rejected.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(Pubkey::default(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::InvalidParameter
+    );
+
+    // Step 2: non-authority signer rejected.
+    let bad = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund_bad = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &bad.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client
+        .process_transaction(fund_bad)
+        .await
+        .unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(Pubkey::new_unique(), bad.pubkey())],
+        Some(&bad.pubkey()),
+        &[&bad],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 3: current authority rotates successfully.
+    let new_auth = Keypair::new();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(new_auth.pubkey(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let es = EpochSettings::try_deserialize(&mut acct.data.as_slice()).unwrap();
+    assert_eq!(es.authority, new_auth.pubkey());
+    assert_eq!(
+        &acct.data[40..48],
+        &duration_before[..],
+        "sibling field (epoch_duration) must be byte-identical after rotation"
+    );
+
+    // The OTHER authority-bearing account must be untouched — the two are
+    // independent, which is the reason this is a separate instruction.
+    let gar_auth_after = ctx
+        .banks_client
+        .get_account(gar_settings_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data[8..40]
+        .to_vec();
+    assert_eq!(
+        gar_auth_before, gar_auth_after,
+        "GatewaySettings.authority must not move when EpochSettings rotates"
+    );
+
+    // Step 4: old authority is now dead.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix(Pubkey::new_unique(), ctx.payer.pubkey())],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    assert_anchor_error!(
+        ctx.banks_client.process_transaction(tx).await,
+        GarError::Unauthorized
+    );
+
+    // Step 5: the NEW authority can now drive a gated epoch instruction.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let fund = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &ctx.payer.pubkey(),
+            &new_auth.pubkey(),
+            10_000_000,
+        )],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(fund).await.unwrap();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateEpochSettings {
+                epoch_settings: epoch_settings_key,
+                authority: new_auth.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetEpochDuration {
+                new_duration: 3_600,
+            }
+            .data(),
+        }],
+        Some(&new_auth.pubkey()),
+        &[&new_auth],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let es = EpochSettings::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(epoch_settings_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        es.epoch_duration, 3_600,
+        "rotated authority must be able to drive a gated epoch instruction"
+    );
+}
+
 /// Verify `transfer_authority` (ADR-026):
 ///   1. Null pubkey rejected (`InvalidParameter`).
 ///   2. Non-authority signer rejected (`Unauthorized`).
@@ -28827,5 +29033,966 @@ async fn test_tally_weights_refused_on_a_non_live_epoch() {
     assert_eq!(
         gw.weights.weights_epoch, 0,
         "the refused tally must not have stamped the gateway"
+    );
+}
+
+// =========================================
+// GATEWAY SCHEMA-MIGRATION LADDER
+//
+// Every live mainnet Gateway is stamped 0.0.0 while GATEWAY_VERSION is 1.1.0,
+// and before this suite the ladder had no 1.0.0 -> 1.1.0 arm: the loop stamped
+// 1.0.0, re-entered, fell through to `_` and returned UnknownSchemaVersion. So
+// `migrate_gateway` could not migrate any real account.
+//
+// The 1.1.0 change grew GatewaySettings2 *mid-struct*, which is not a
+// grow-then-deserialize migration, so the arm is a version stamp and
+// `migrate_gateway` fences out physically-pre-1.1.0 accounts by size.
+// =========================================
+
+/// Rewrite the Gateway PDA in place, padded to `len` bytes, so a test can
+/// present an account at an arbitrary schema version or historical size.
+async fn overwrite_gateway_raw(
+    ctx: &mut ProgramTestContext,
+    gateway_key: &Pubkey,
+    gateway: &ario_gar::state::Gateway,
+    len: usize,
+) {
+    let existing = ctx
+        .banks_client
+        .get_account(*gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut data = Vec::new();
+    gateway.try_serialize(&mut data).unwrap();
+    assert!(
+        data.len() <= len,
+        "serialized Gateway ({}) exceeds requested account length ({len})",
+        data.len()
+    );
+    data.resize(len, 0);
+
+    let mut account = solana_sdk::account::Account {
+        lamports: existing.lamports,
+        data,
+        owner: existing.owner,
+        executable: false,
+        rent_epoch: existing.rent_epoch,
+    };
+    // Keep it rent-exempt at the new length so realloc's top-up is not the
+    // thing under test.
+    account.lamports = account.lamports.max(10_000_000);
+    ctx.set_account(
+        gateway_key,
+        &solana_sdk::account::AccountSharedData::from(account),
+    );
+}
+
+async fn read_gateway(
+    ctx: &mut ProgramTestContext,
+    gateway_key: &Pubkey,
+) -> ario_gar::state::Gateway {
+    let acct = ctx
+        .banks_client
+        .get_account(*gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    ario_gar::state::Gateway::try_deserialize(&mut &acct.data[..]).unwrap()
+}
+
+/// Takes the payer explicitly: re-sending the same instruction from the same
+/// payer on the same blockhash produces an identical signature, which
+/// `solana-program-test` treats as an already-processed duplicate and reports
+/// as success. An "is it idempotent?" assertion needs a distinct signer.
+async fn send_migrate_gateway(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+    payer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let payer_pk = payer.pubkey();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::MigrateGateway {
+                operator: *operator,
+                gateway: *gateway_key,
+                payer: payer_pk,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::MigrateGateway {}.data(),
+        }],
+        Some(&payer_pk),
+        &[payer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+/// Fund a fresh keypair so it can pay for a transaction.
+fn fund_lamports(ctx: &mut ProgramTestContext, key: &Pubkey, lamports: u64) {
+    ctx.set_account(
+        key,
+        &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+            lamports,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        }),
+    );
+}
+
+/// A live-mainnet-shaped account: canonical 1.1.0 size, stamped 0.0.0.
+/// It must walk 0.0.0 -> 1.0.0 -> 1.1.0 without touching any other field.
+#[tokio::test]
+async fn test_migrate_gateway_stamps_legacy_version_to_latest() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator = ctx.payer.pubkey();
+
+    // Sanity: a freshly joined gateway is already canonical for the CURRENT
+    // schema, whatever that is — asserting a literal here just breaks on the
+    // next appended field.
+    let fresh = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fresh.data.len(),
+        ario_gar::state::Gateway::SIZE,
+        "a newly joined Gateway should be the current canonical size"
+    );
+
+    // Reproduce the live mainnet shape: correct bytes, stale version stamp.
+    let mut legacy = read_gateway(&mut ctx, &gateway_key).await;
+    let expected_fqdn = legacy.fqdn.clone();
+    let expected_observer = legacy.observer_address;
+    let expected_ratio = legacy.settings.delegate_reward_share_ratio;
+    let expected_stake = legacy.operator_stake;
+    legacy.version = SchemaVersion::new(0, 0, 0);
+    overwrite_gateway_raw(
+        &mut ctx,
+        &gateway_key,
+        &legacy,
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+    )
+    .await;
+
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer_kp)
+        .await
+        .expect("0.0.0 must walk all the way to GATEWAY_VERSION");
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        after.version,
+        ario_gar::state::GATEWAY_VERSION,
+        "ladder must reach GATEWAY_VERSION, not stall part-way"
+    );
+
+    // The account was grown from the 1.1.0 size to the current canonical size,
+    // and the appended tail is where operations_address landed.
+    let grown = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grown.data.len(), ario_gar::state::Gateway::SIZE);
+
+    // ADR-0030's 1.1.0 -> 1.2.0 arm: a migrated gateway delegates to nobody but
+    // its own operator. A zeroed value here would be an authorisation bypass,
+    // because the discount and metadata paths accept operations_address.
+    assert_eq!(
+        after.operations_address, after.operator,
+        "migration must default operations_address to the operator"
+    );
+    assert_ne!(
+        after.operations_address,
+        Pubkey::default(),
+        "operations_address must never survive migration as the zero pubkey"
+    );
+
+    // The 1.0.0 -> 1.1.0 arm is a stamp: it must not clobber settings that are
+    // already populated, nor disturb anything after `settings` in the struct.
+    assert_eq!(after.fqdn, expected_fqdn, "fqdn must survive the stamp");
+    assert_eq!(
+        after.observer_address, expected_observer,
+        "observer_address sits after settings and must not shift"
+    );
+    assert_eq!(
+        after.settings.delegate_reward_share_ratio, expected_ratio,
+        "populated settings must not be overwritten with defaults"
+    );
+    assert_eq!(after.operator_stake, expected_stake);
+
+    // Second call is now a no-op error rather than a re-stamp. A different
+    // payer keeps the signature distinct so this is a real re-execution.
+    let payer2 = Keypair::new();
+    fund_lamports(&mut ctx, &payer2.pubkey(), 10_000_000_000);
+    let again = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer2).await;
+    assert_anchor_error!(again, GarError::AlreadyLatestVersion);
+}
+
+/// A physically pre-1.1.0 account (952 bytes: GatewaySettings2 is 12 bytes
+/// smaller) must be refused. Growing it would zero-fill the tail while every
+/// field after `settings` stayed shifted, silently corrupting the account.
+#[tokio::test]
+async fn test_migrate_gateway_rejects_pre_v110_layout() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator = ctx.payer.pubkey();
+
+    let mut legacy = read_gateway(&mut ctx, &gateway_key).await;
+    legacy.version = SchemaVersion::new(0, 0, 0);
+    // 12 bytes smaller: pending_delegate_reward_share_ratio (Option<u16>, 3)
+    // + delegation_disabled_at (Option<i64>, 9) did not exist pre-1.1.0.
+    overwrite_gateway_raw(
+        &mut ctx,
+        &gateway_key,
+        &legacy,
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0 - 12,
+    )
+    .await;
+
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let result = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer_kp).await;
+    assert_anchor_error!(result, GarError::PreV110GatewayLayout);
+
+    // And it must be refused *before* any realloc — the account is untouched.
+    let acct = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        acct.data.len(),
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0 - 12,
+        "a rejected migration must not have grown the account"
+    );
+}
+
+/// The frozen layout fence must never be redefined in terms of the live
+/// `Gateway::SIZE`, which grows every time a field is appended.
+#[test]
+fn test_gateway_size_fence_is_frozen() {
+    assert_eq!(
+        ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+        964,
+        "GATEWAY_SIZE_AT_V1_1_0 is a historical constant and must never change"
+    );
+    assert!(
+        ario_gar::state::Gateway::SIZE >= ario_gar::state::GATEWAY_SIZE_AT_V1_1_0,
+        "Gateway::SIZE may only grow; a shrink below the fence makes it unsatisfiable"
+    );
+}
+
+// =========================================
+// ADR-0030 — update_operations_address
+// =========================================
+
+async fn send_update_operations_address(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+    new_ops: Pubkey,
+    signer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateOperationsAddress {
+                gateway: *gateway_key,
+                operator: *operator,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateOperationsAddress {
+                new_operations_address: new_ops,
+            }
+            .data(),
+        }],
+        Some(&signer.pubkey()),
+        &[signer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+async fn gar_ctx_with_gateway() -> (ProgramTestContext, Pubkey, Pubkey) {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+    let operator = ctx.payer.pubkey();
+    (ctx, operator, gateway_key)
+}
+
+#[tokio::test]
+async fn test_join_network_defaults_operations_address_to_operator() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        gw.operations_address, operator,
+        "a new gateway must delegate to nobody but its own operator"
+    );
+    assert_ne!(gw.operations_address, Pubkey::default());
+}
+
+#[tokio::test]
+async fn test_update_operations_address_by_operator() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = Pubkey::new_unique();
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops, &payer_kp)
+        .await
+        .expect("operator may rotate the operations address");
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.operations_address, ops);
+    // Rotation must not disturb the other delegated address or the operator.
+    assert_eq!(gw.operator, operator);
+    assert_eq!(gw.observer_address, operator);
+
+    // Revocation is setting it back to the operator.
+    let payer_kp2 = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, operator, &payer_kp2)
+        .await
+        .expect("revoking by pointing back at the operator must work");
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.operations_address, operator);
+}
+
+/// **The load-bearing rule of ADR-0030.** If the operations address could
+/// rotate itself, a compromised delegate would point it at an attacker key and
+/// the operator could never revoke it.
+#[tokio::test]
+async fn test_operations_address_cannot_rotate_itself() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = Keypair::new();
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .unwrap();
+
+    // The delegate now tries to rotate the delegation to a key it controls.
+    fund_lamports(&mut ctx, &ops.pubkey(), 10_000_000_000);
+    let attacker = Pubkey::new_unique();
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateOperationsAddress {
+                gateway: gateway_key,
+                // It can only present ITSELF as the operator, which fails the
+                // seeds check before the constraint even runs.
+                operator: ops.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateOperationsAddress {
+                new_operations_address: attacker,
+            }
+            .data(),
+        }],
+        Some(&ops.pubkey()),
+        &[&ops],
+        bh,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "the operations address must NOT be able to rotate the delegation"
+    );
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        gw.operations_address,
+        ops.pubkey(),
+        "delegation must be unchanged after the attempt"
+    );
+    assert_ne!(gw.operations_address, attacker);
+}
+
+#[tokio::test]
+async fn test_update_operations_address_rejects_zero_and_noop() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Zero would authorise nobody; accepting it turns "revoke" into "brick".
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let zero = send_update_operations_address(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        Pubkey::default(),
+        &payer_kp,
+    )
+    .await;
+    assert_anchor_error!(zero, GarError::InvalidParameter);
+
+    // Setting the value it already holds is a no-op and rejected, matching
+    // update_observer_address.
+    let payer_kp2 = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let noop =
+        send_update_operations_address(&mut ctx, &operator, &gateway_key, operator, &payer_kp2)
+            .await;
+    assert_anchor_error!(noop, GarError::InvalidParameter);
+}
+
+#[tokio::test]
+async fn test_update_operations_address_rejects_non_operator() {
+    let (mut ctx, _operator, gateway_key) = gar_ctx_with_gateway().await;
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+
+    let result = send_update_operations_address(
+        &mut ctx,
+        &stranger.pubkey(),
+        &gateway_key,
+        Pubkey::new_unique(),
+        &stranger,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a stranger must not be able to set a gateway's operations address"
+    );
+}
+
+// =========================================
+// ADR-0030 — update_gateway_metadata
+// =========================================
+
+async fn send_update_metadata(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+    params: ario_gar::UpdateGatewayMetadataParams,
+    signer: &Keypair,
+) -> std::result::Result<(), solana_program_test::BanksClientError> {
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewayMetadata {
+                operator: *operator,
+                gateway: *gateway_key,
+                signer: signer.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewayMetadata { params }.data(),
+        }],
+        Some(&signer.pubkey()),
+        &[signer],
+        bh,
+    );
+    ctx.banks_client.process_transaction(tx).await
+}
+
+fn fqdn_params(fqdn: &str) -> ario_gar::UpdateGatewayMetadataParams {
+    ario_gar::UpdateGatewayMetadataParams {
+        fqdn: Some(fqdn.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Delegate to a fresh key and return it.
+async fn delegate_operations_to(
+    ctx: &mut ProgramTestContext,
+    operator: &Pubkey,
+    gateway_key: &Pubkey,
+) -> Keypair {
+    let ops = Keypair::new();
+    fund_lamports(ctx, &ops.pubkey(), 10_000_000_000);
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_operations_address(ctx, operator, gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .unwrap();
+    ops
+}
+
+#[tokio::test]
+async fn test_update_gateway_metadata_by_operator() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("operator.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("the operator must retain every capability it had");
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.fqdn, "operator.example.com");
+}
+
+/// The point of ADR-0030: routine maintenance without the staking wallet.
+#[tokio::test]
+async fn test_update_gateway_metadata_by_operations_address() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        ario_gar::UpdateGatewayMetadataParams {
+            label: Some("delegated".to_string()),
+            fqdn: Some("ops.example.com".to_string()),
+            port: Some(8443),
+            ..Default::default()
+        },
+        &ops,
+    )
+    .await
+    .expect("the operations address must be able to update metadata");
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(gw.label, "delegated");
+    assert_eq!(gw.fqdn, "ops.example.com");
+    assert_eq!(gw.port, 8443);
+    // Custody is untouched.
+    assert_eq!(gw.operator, operator);
+    assert_eq!(gw.operations_address, ops.pubkey());
+}
+
+#[tokio::test]
+async fn test_update_gateway_metadata_rejects_stranger() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let _ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    let result = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("evil.example.com"),
+        &stranger,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::NotGatewayAuthority);
+
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    assert_ne!(gw.fqdn, "evil.example.com");
+}
+
+/// An un-migrated gateway (zeroed `operations_address`) is still operable by
+/// its operator and grants nothing to anyone else.
+///
+/// Note what this does NOT prove: the zero pubkey is the System Program, so no
+/// keypair can sign as it, and this test passes with or without the
+/// `!= Pubkey::default()` guard. That guard is verified by the unit test
+/// `zeroed_operations_address_authorises_nobody` against `is_gateway_authority`,
+/// which is the only place the case is reachable.
+#[tokio::test]
+async fn test_zeroed_operations_address_authorises_nobody() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Force the un-migrated shape: zeroed operations_address, canonical size.
+    let mut gw = read_gateway(&mut ctx, &gateway_key).await;
+    gw.operations_address = Pubkey::default();
+    overwrite_gateway_raw(&mut ctx, &gateway_key, &gw, ario_gar::state::Gateway::SIZE).await;
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key)
+            .await
+            .operations_address,
+        Pubkey::default()
+    );
+
+    // Nobody may ride the zero value in.
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    let result = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("bypass.example.com"),
+        &stranger,
+    )
+    .await;
+    assert_anchor_error!(result, GarError::NotGatewayAuthority);
+
+    // The operator still can, so the gateway is not bricked by the zero value.
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("operator-still-works.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("an un-migrated gateway must still be operable by its operator");
+}
+
+/// The security boundary of ADR-0030: metadata widens, delegation economics
+/// do not. A delegated key must not be able to eject delegators or change
+/// their reward share.
+#[tokio::test]
+async fn test_operations_address_cannot_reach_delegation_economics() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    let before = read_gateway(&mut ctx, &gateway_key).await;
+
+    // update_gateway_settings is operator-only and must reject the delegate.
+    let bh = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::UpdateGatewaySettings {
+                settings: settings_pda().0,
+                gateway: gateway_key,
+                operator: ops.pubkey(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::UpdateGatewaySettings {
+                params: ario_gar::UpdateGatewayParams {
+                    allow_delegated_staking: Some(false),
+                    delegate_reward_share_ratio: Some(0),
+                    ..Default::default()
+                },
+            }
+            .data(),
+        }],
+        Some(&ops.pubkey()),
+        &[&ops],
+        bh,
+    );
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "the operations address must NOT reach delegation economics"
+    );
+
+    // A successful metadata update by the same key leaves economics untouched.
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("ops2.example.com"),
+        &ops,
+    )
+    .await
+    .unwrap();
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.fqdn, "ops2.example.com");
+    assert_eq!(
+        after.settings.allow_delegated_staking, before.settings.allow_delegated_staking,
+        "allow_delegated_staking must be unreachable from update_gateway_metadata"
+    );
+    assert_eq!(
+        after.settings.delegate_reward_share_ratio,
+        before.settings.delegate_reward_share_ratio
+    );
+    assert_eq!(
+        after.settings.pending_delegate_reward_share_ratio,
+        before.settings.pending_delegate_reward_share_ratio
+    );
+    assert_eq!(
+        after.settings.min_delegation_amount,
+        before.settings.min_delegation_amount
+    );
+    assert_eq!(after.operator_stake, before.operator_stake);
+}
+
+/// A delegated signer must not be able to write values the operator could not.
+#[tokio::test]
+async fn test_update_gateway_metadata_validation_is_signer_independent() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    let empty = ario_gar::UpdateGatewayMetadataParams {
+        label: Some(String::new()),
+        ..Default::default()
+    };
+    let by_ops = send_update_metadata(&mut ctx, &operator, &gateway_key, empty.clone(), &ops).await;
+    assert_anchor_error!(by_ops, GarError::InvalidLabel);
+
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let by_operator =
+        send_update_metadata(&mut ctx, &operator, &gateway_key, empty, &payer_kp).await;
+    assert_anchor_error!(by_operator, GarError::InvalidLabel);
+
+    // And an over-long fqdn is refused for the delegate too.
+    let long = fqdn_params(&"a".repeat(129));
+    let r = send_update_metadata(&mut ctx, &operator, &gateway_key, long, &ops).await;
+    assert_anchor_error!(r, GarError::InvalidFqdn);
+}
+
+/// **Deployment-safety regression.** After ADR-0030, `Gateway::SIZE` is 996 but
+/// every live account is still 964 until `migrate_gateway` runs on it. If
+/// Anchor could not deserialize those, the program upgrade would break every
+/// gateway instruction network-wide until the migration finished.
+///
+/// It works because accounts are allocated at SIZE with a zero-padded tail and
+/// the borsh content is much shorter than SIZE (the String fields reserve their
+/// maximum but rarely use it), so the appended field reads out of the padding as
+/// `Pubkey::default()` rather than hitting EOF. This test pins that, because the
+/// margin is a property of the layout and not something to assume.
+#[tokio::test]
+async fn test_unmigrated_964_byte_gateway_still_loads() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Build a genuinely pre-ADR-0030 account: serialize, then DROP the trailing
+    // 32 bytes of borsh content (operations_address is the last field), then pad
+    // to the old 964-byte size. Merely shrinking the account is not the same
+    // thing -- the field would still be present in the content.
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    {
+        let existing = ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32); // remove operations_address entirely
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &gateway_key,
+            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+                lamports: existing.lamports.max(10_000_000),
+                data,
+                owner: existing.owner,
+                executable: false,
+                rent_epoch: existing.rent_epoch,
+            }),
+        );
+    }
+
+    let shrunk = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        shrunk.data.len(),
+        964,
+        "simulating a live, un-migrated account"
+    );
+
+    // It must still deserialize, with the appended field reading as zero.
+    let reread = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(
+        reread.operations_address,
+        Pubkey::default(),
+        "the appended field must read out of the zero padding, not fail"
+    );
+    assert_eq!(reread.operator, gw.operator, "prior fields must be intact");
+    assert_eq!(reread.fqdn, gw.fqdn);
+    assert_eq!(reread.observer_address, gw.observer_address);
+
+    // And a real instruction against it must still work for the operator.
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("unmigrated.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("an un-migrated gateway must remain fully operable by its operator");
+
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key).await.fqdn,
+        "unmigrated.example.com"
+    );
+}
+
+/// Both ADR-0030 instructions carry a `Joined` guard mirroring
+/// `update_gateway_settings` / `update_observer_address`. A gateway on its way
+/// out must not be re-pointed or have its delegation changed.
+#[tokio::test]
+async fn test_adr0030_instructions_reject_leaving_gateway() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let ops = delegate_operations_to(&mut ctx, &operator, &gateway_key).await;
+
+    // Put the gateway into Leaving directly — leave_network's other effects are
+    // not what is under test here.
+    let mut gw = read_gateway(&mut ctx, &gateway_key).await;
+    gw.status = ario_gar::state::GatewayStatus::Leaving;
+    overwrite_gateway_raw(&mut ctx, &gateway_key, &gw, ario_gar::state::Gateway::SIZE).await;
+
+    // Metadata: refused for the operator AND for the delegate.
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let by_operator = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("leaving.example.com"),
+        &payer_kp,
+    )
+    .await;
+    assert_anchor_error!(by_operator, GarError::GatewayLeaving);
+
+    let by_ops = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("leaving2.example.com"),
+        &ops,
+    )
+    .await;
+    assert_anchor_error!(by_ops, GarError::GatewayLeaving);
+
+    // Rotation is refused too.
+    let payer_kp2 = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    let rotate = send_update_operations_address(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        Pubkey::new_unique(),
+        &payer_kp2,
+    )
+    .await;
+    assert_anchor_error!(rotate, GarError::GatewayLeaving);
+
+    // Nothing moved.
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.fqdn, gw.fqdn);
+    assert_eq!(after.operations_address, ops.pubkey());
+}
+
+/// **Adversarial: does a permissionless migration clobber a delegation the
+/// operator deliberately set?**
+///
+/// `update_operations_address` works on an un-migrated 964-byte account (the
+/// content has room to grow by 32 bytes). If an operator delegates BEFORE
+/// `migrate_gateway` runs, the 1.1.0 -> 1.2.0 arm then unconditionally writes
+/// `operations_address = operator` — and `migrate_gateway` is permissionless,
+/// so anyone can trigger that.
+#[tokio::test]
+async fn test_migration_must_not_clobber_a_deliberate_delegation() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+
+    // Put the gateway in the real pre-ADR-0030 shape: stamped 0.0.0, 964 bytes,
+    // operations_address absent from the content entirely.
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    {
+        let acct = ctx
+            .banks_client
+            .get_account(gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut legacy = gw.clone();
+        legacy.version = SchemaVersion::new(0, 0, 0);
+        let mut data = Vec::new();
+        legacy.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32);
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &gateway_key,
+            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+                lamports: acct.lamports.max(10_000_000),
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: acct.rent_epoch,
+            }),
+        );
+    }
+
+    // The operator delegates while still un-migrated.
+    let ops = Keypair::new();
+    fund_lamports(&mut ctx, &ops.pubkey(), 10_000_000_000);
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .expect("delegating before migration should work");
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key)
+            .await
+            .operations_address,
+        ops.pubkey(),
+        "delegation must have been recorded"
+    );
+
+    // Now ANYONE runs the permissionless migration.
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &stranger)
+        .await
+        .expect("migrate_gateway is permissionless");
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.version, ario_gar::state::GATEWAY_VERSION);
+    assert_eq!(
+        after.operations_address,
+        ops.pubkey(),
+        "a third party's migration must NOT reset a delegation the operator set"
     );
 }

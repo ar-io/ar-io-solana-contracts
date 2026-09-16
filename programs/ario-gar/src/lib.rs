@@ -139,6 +139,17 @@ pub mod ario_gar {
         instructions::initialize::transfer_authority(ctx, new_authority)
     }
 
+    /// Rotate `EpochSettings.authority` (ADR-0031). Gated on the current
+    /// `EpochSettings` authority; rejects the null pubkey. Separate from
+    /// `transfer_authority`, which moves only `GatewaySettings` — see the
+    /// handler doc comment for why both exist.
+    pub fn transfer_epoch_settings_authority(
+        ctx: Context<TransferEpochSettingsAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::transfer_epoch_settings_authority(ctx, new_authority)
+    }
+
     // =========================================
     // GATEWAY LIFECYCLE (F10-F12)
     // =========================================
@@ -179,6 +190,24 @@ pub mod ario_gar {
         new_observer: Pubkey,
     ) -> Result<()> {
         instructions::gateway::update_observer_address(ctx, new_observer)
+    }
+
+    /// ADR-0030: update routing/presentation metadata. Accepts the operator
+    /// **or** the gateway's `operations_address`.
+    pub fn update_gateway_metadata(
+        ctx: Context<UpdateGatewayMetadata>,
+        params: UpdateGatewayMetadataParams,
+    ) -> Result<()> {
+        instructions::gateway::update_gateway_metadata(ctx, params)
+    }
+
+    /// ADR-0030: rotate the delegated operations address. Operator-only — the
+    /// operations address must never be able to change itself.
+    pub fn update_operations_address(
+        ctx: Context<UpdateOperationsAddress>,
+        new_operations_address: Pubkey,
+    ) -> Result<()> {
+        instructions::gateway::update_operations_address(ctx, new_operations_address)
     }
 
     // =========================================
@@ -643,6 +672,13 @@ pub mod ario_gar {
 
     pub fn migrate_gateway(ctx: Context<MigrateGateway>) -> Result<()> {
         let info = ctx.accounts.gateway.to_account_info();
+        // Read the size BEFORE growing: afterwards every account looks canonical
+        // and the pre-1.1.0 ones are indistinguishable. See
+        // `GATEWAY_SIZE_AT_V1_1_0` for why growing one of those corrupts it.
+        require!(
+            info.data_len() >= state::GATEWAY_SIZE_AT_V1_1_0,
+            error::GarError::PreV110GatewayLayout
+        );
         schema_migration::grow_account(
             &info,
             &ctx.accounts.payer.to_account_info(),
@@ -1198,6 +1234,21 @@ pub struct JoinNetworkParams {
     pub observer_address: Pubkey,
 }
 
+/// ADR-0030: the routing/presentation subset of `UpdateGatewayParams`.
+///
+/// Deliberately a separate params type rather than a mode flag on the existing
+/// one: the delegation-economics fields are simply absent, so an
+/// `operations_address` signer cannot reach them even by malformed input.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct UpdateGatewayMetadataParams {
+    pub label: Option<String>,
+    pub fqdn: Option<String>,
+    pub port: Option<u16>,
+    pub protocol: Option<state::Protocol>,
+    pub properties: Option<String>,
+    pub note: Option<String>,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct UpdateGatewayParams {
     pub label: Option<String>,
@@ -1376,6 +1427,30 @@ pub struct ObserverAddressUpdatedEvent {
     pub timestamp: i64,
 }
 
+/// ADR-0030. Emitted on a metadata update.
+///
+/// Carries `signer` as well as `operator` precisely because this instruction
+/// accepts two different signers: if a delegated key is later found to be
+/// compromised, this is what lets you tell which changes it made.
+#[event]
+pub struct GatewayMetadataUpdatedEvent {
+    pub operator: Pubkey,
+    pub signer: Pubkey,
+    pub fields_changed: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0030. Emitted when the operator rotates the delegated operations
+/// address. Carries the old value too, so a subscriber can tell a first-time
+/// delegation from a revocation (`new == operator`) without prior state.
+#[event]
+pub struct OperationsAddressUpdatedEvent {
+    pub operator: Pubkey,
+    pub old_operations_address: Pubkey,
+    pub new_operations_address: Pubkey,
+    pub timestamp: i64,
+}
+
 /// Emitted by `increase_operator_stake`. Symmetric with
 /// `WithdrawalCreatedEvent` (decrease side).
 #[event]
@@ -1501,6 +1576,18 @@ pub struct WithdrawalPeriodUpdatedEvent {
 /// rotated. `old_authority` is the signer that authorized the rotation.
 #[event]
 pub struct AuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
+/// Emitted by `transfer_epoch_settings_authority` (ADR-0031) when
+/// `EpochSettings.authority` is rotated. Kept distinct from
+/// `AuthorityTransferredEvent` so subscribers can tell which of gar's two
+/// authority-bearing accounts moved. `old_authority` is the signer that
+/// authorized the rotation.
+#[event]
+pub struct EpochSettingsAuthorityTransferredEvent {
     pub old_authority: Pubkey,
     pub new_authority: Pubkey,
     pub timestamp: i64,

@@ -842,6 +842,33 @@
       ]
     },
     {
+      "name": "EpochSettingsAuthorityTransferredEvent",
+      "discriminator": [
+        30,
+        203,
+        178,
+        65,
+        232,
+        221,
+        22,
+        206
+      ],
+      "fields": [
+        {
+          "name": "old_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "EpochsToggledEvent",
       "discriminator": [
         154,
@@ -1047,6 +1074,37 @@
       ]
     },
     {
+      "name": "GatewayMetadataUpdatedEvent",
+      "discriminator": [
+        117,
+        143,
+        178,
+        185,
+        120,
+        138,
+        52,
+        165
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "signer",
+          "type": "pubkey"
+        },
+        {
+          "name": "fields_changed",
+          "type": "u32"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "GatewayPrunedEvent",
       "discriminator": [
         203,
@@ -1202,6 +1260,37 @@
         },
         {
           "name": "new_observer",
+          "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "OperationsAddressUpdatedEvent",
+      "discriminator": [
+        177,
+        117,
+        15,
+        124,
+        66,
+        84,
+        162,
+        200
+      ],
+      "fields": [
+        {
+          "name": "operator",
+          "type": "pubkey"
+        },
+        {
+          "name": "old_operations_address",
+          "type": "pubkey"
+        },
+        {
+          "name": "new_operations_address",
           "type": "pubkey"
         },
         {
