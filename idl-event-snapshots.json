@@ -1320,6 +1320,45 @@
       ]
     },
     {
+      "name": "RewardRatiosUpdatedEvent",
+      "discriminator": [
+        156,
+        129,
+        58,
+        88,
+        67,
+        228,
+        6,
+        226
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "old_gateway_ratio",
+          "type": "u64"
+        },
+        {
+          "name": "old_observer_ratio",
+          "type": "u64"
+        },
+        {
+          "name": "new_gateway_ratio",
+          "type": "u64"
+        },
+        {
+          "name": "new_observer_ratio",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "RewardsCompoundedEvent",
       "discriminator": [
         13,
