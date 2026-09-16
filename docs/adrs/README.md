@@ -114,6 +114,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
 | ADR-034 | An Unfinished Epoch Must Not Be Superseded | proposed | [`0034-an-unfinished-epoch-must-not-be-superseded.md`](0034-an-unfinished-epoch-must-not-be-superseded.md) |
 | ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
+| ADR-036 | Registry Positions Are Frozen While an Epoch Is Unfinished | proposed | [`0036-registry-positions-frozen-while-epoch-unfinished.md`](0036-registry-positions-frozen-while-epoch-unfinished.md) |
 
 ### Reserved by open PRs
 

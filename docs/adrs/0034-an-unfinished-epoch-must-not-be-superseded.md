@@ -1,10 +1,18 @@
 # ADR-0034: An Unfinished Epoch Must Not Be Superseded
 
 * **Status:** proposed
-* **Date:** 2026-09-15
+* **Date:** 2026-09-15 (decision resolved 2026-09-16)
 * **Deciders:** @vilenarios
-* **Consulted:** —
+* **Consulted:** mainnet incident review (epochs 540, 542, 543); observer-operator
+  report on epoch 542
 * **Informed:** gateway operators running crankers/observers
+
+> **TL;DR:** `create_epoch(N+1)` is refused unless epoch N is **finished**:
+> `rewards_distributed == 1`, or its account no longer exists (written off). The
+> write-off path, `admin_close_stale_epoch`, becomes permanent and gains its own
+> guard (ended + undistributed). Clients ship first; the program change follows.
+> Companion: [ADR-0036](0036-registry-positions-frozen-while-epoch-unfinished.md)
+> uses the same predicate to stop registry reordering mid-epoch.
 
 ## Context and problem statement
 
@@ -21,11 +29,12 @@ direction is still open, and it is the one that has actually cost money:
 > `tally_weights` (N+1). That tally re-stamps every gateway in N's undistributed
 > range, and N can never be paid correctly again.
 
-Both instructions are permissionless, and neither is gated on N's state:
+Both instructions are permissionless (their only signer is `payer`), and neither
+is gated on N's state:
 
 | instruction | its only preconditions today |
 |---|---|
-| `create_epoch` | `epoch_settings.enabled`, `clock >= epoch_start` |
+| `create_epoch` | `epoch_settings.enabled`, `disable_at` not reached, `clock >= epoch_start` |
 | `tally_weights` | `weights_tallied == 0`, epoch is the live one (ADR-0033) |
 
 **This is not hypothetical.** Mainnet epoch **540** stalled, epoch 541 was created
@@ -37,12 +46,15 @@ distribution before creating 544.
 
 ### What currently prevents it is client convention, not the program
 
-`crankEpochStep` creates the next epoch only after the live one reports
+The SDK's `crankEpochStep` creates the next epoch only after the live one reports
 `rewards_distributed == 1`, and since ar-io-sdk#726 a stalled cursor throws and
-stops the tick *before* `createEpoch`. That is the correct behaviour — and it is
-a convention held in client code, in a system whose whole premise is that these
-instructions are permissionless. At least one operator already runs a patched
-fork of the SDK; a fork that advances differently is enough to destroy an epoch.
+stops the tick *before* `createEpoch`. On 2026-09-16, epoch 545's last
+distribute batch landed at 00:32:16 UTC and the reference cranker created 546 at
+00:55:17. That is the correct
+behaviour — and it is a convention held in client code, in a system whose whole
+premise is that these instructions are permissionless. At least one operator
+already runs a patched fork of the SDK; a fork that advances differently is
+enough to destroy an epoch.
 
 ### ADR-0032 narrows the exposure but does not close it
 
@@ -53,102 +65,246 @@ exactly the same window, and the loss is permanent and silent.
 
 ## Decision drivers
 
+* **The epoch lifecycle is a strict chain.** `prescribe_epoch` requires
+  `weights_tallied != 0`; `save_observations` requires `prescriptions_done != 0`
+  and `clock < end_timestamp`; `distribute_epoch` requires
+  `prescriptions_done != 0`, `clock >= end_timestamp` and
+  `rewards_distributed == 0`. Blocking any link blocks everything after it.
 * **A written-off epoch must not freeze the network.** A naive "previous epoch
-  must be distributed" gate would have frozen mainnet epoch progression from
-  2026-09-11 until 540 was closed on 2026-09-15. Any gate must treat
-  *written-off* as finished.
-* **The instructions must stay permissionless.** No admin in the hot path.
+  must be distributed" gate would have frozen mainnet from 2026-09-11 until 540
+  was closed on 2026-09-15. Any gate must treat *written-off* as finished.
+* **The lifecycle instructions must stay permissionless.** Recovery from a
+  genuinely stuck epoch may use the admin authority — it is an exceptional path,
+  not the hot path.
+* **Recovery must not expire.** Whatever unblocks a stuck network must keep
+  working after `finalize_migration`.
 * **Bounded compute**, and no per-gateway work added to `create_epoch`.
-* **Client compatibility is already forfeit** — see below — so the cost to
-  weigh is the size of the coordinated rollout, not whether one is needed.
 
-### There is no backward-compatible option
+### No option is invisible to old clients — but the rollout can be client-first
 
 Neither `create_epoch` nor `tally_weights` receives the previous epoch's
-account, and `distribute_epoch` holds `epoch_settings` **read-only**. So every
-gate below requires either a new account in the instruction's list, or flipping
-an existing account to writable. Both break un-upgraded crankers, which supply
-the old account list. Any fix here therefore ships with a client release and an
-operator announcement.
+account, and `distribute_epoch` holds `epoch_settings` **read-only**, so every
+gate needs an extra account or a writability change. An un-upgraded cranker will
+therefore be refused once the program enforces the gate — which is the point.
+But `create_epoch` reads only the *first* remaining account (the ADR-029 rent
+receipt). So if the previous Epoch is appended **after** the receipt, a *new*
+client is also accepted by the *old* program. That lets clients ship first and
+removes the flag day.
 
 ## Considered options
 
 1. **Do nothing.** Keep relying on client ordering.
-2. **Gate `create_epoch` on the previous Epoch account**, passed via
-   `remaining_accounts`; the program derives the expected PDA and requires it to
-   be either finished (`rewards_distributed == 1`) or **absent** (written off).
+2. **Gate `create_epoch` on the previous Epoch account** — it must be finished
+   (`rewards_distributed == 1`) or **absent** (written off).
 3. **Gate `create_epoch` on a marker in `EpochSettings`** — e.g.
    `last_finished_epoch_index`, advanced by `distribute_epoch` on completion and
-   by `admin_close_stale_epoch`. Needs `epoch_settings` writable in
-   `distribute_epoch` and a schema migration (ADR-020 grow-then-deserialize;
-   `migrate_epoch_settings` already exists).
-4. **Gate `tally_weights(N)` instead**, on N-1 being finished. Same mechanics,
-   later in the sequence: it permits a useless epoch to be created but stops the
-   destructive step.
+   by the write-off. Needs `epoch_settings` writable in `distribute_epoch` and a
+   schema migration.
+4. **Gate `tally_weights(N+1)` instead**, on N being finished. It permits the
+   next epoch to be created but stops the destructive step.
 5. **Make weights per-epoch** — snapshot composite weights into the Epoch
    account at tally instead of onto the Gateway/registry slot. Removes the class
-   entirely rather than ordering around it. Epoch grows by roughly
-   `active_gateway_count × 8` bytes (~5 KB at today's 620), plus a migration and
-   changes to tally and distribute.
+   entirely rather than ordering around it.
+6. **A permissionless write-off** of a stuck epoch after a grace period, instead
+   of relying on the admin path.
 
 ## Decision
 
-**Proposed: option 2 now, option 5 as the structural end-state.**
+**Option 2, with a permanent, guarded admin write-off. Option 5 remains the
+structural end-state.**
 
-Option 2 keeps the check adjacent to the thing being protected — you cannot
-supersede an epoch without presenting it — and "absent counts as finished" falls
-out naturally, because `admin_close_stale_epoch` closes the account. Option 3
-needs a schema migration and a second writer of `EpochSettings` on the hot
-distribution path; its marker can also drift from reality, whereas the account
-either exists or does not.
+### Why creation, not tally (option 4 rejected)
 
-Option 5 is the only one that makes the hazard unrepresentable, and it should be
-scheduled deliberately rather than bolted onto an incident fix.
+The two fail in opposite directions, and the lifecycle chain decides it.
 
-**Open questions for the decision:**
+Under option 4, epoch N+1 exists but cannot be tallied while N is stuck. Because
+prescription requires a tally and observation requires prescription, **N+1
+collects no observations at all**. Epoch creation is not gated, so once the
+schedule reaches N+2, N+2 is created too — and N+1 is no longer the live epoch.
+ADR-0033 then forbids tallying it **ever**. It can never be prescribed or
+distributed, and its payout is forfeited (the tokens stay in the treasury; the
+period simply goes unpaid). Every epoch created during the stall becomes a
+further write-off. That is the 540 failure mode reproduced systematically, and
+silently.
 
-* Should `create_epoch` reject, or should `tally_weights` reject (option 4)?
-  Rejecting at creation is earlier and clearer; rejecting at tally leaves the
-  network able to create epochs during an outage and catch up afterwards.
-* Does "finished" include an epoch that is distributed but whose observations
-  are still open? (`close_epoch` needs those closed; distribution does not.)
+Under option 2, nothing is created while N is stuck. The stop is loud, N's
+weights stay intact because nothing tallies over them, and N remains
+distributable by anyone. Recovery is completing N's distribution — which is
+permissionless — or writing N off.
+
+With option 2 in place, `EpochWeightsClobbered` (6097) becomes unreachable in
+normal operation: the only tally that could overwrite N's weights is N+1's, and
+N+1 cannot exist until N is finished.
+
+Option 3 is rejected as before: a second writer of `EpochSettings` on the hot
+distribution path, a schema migration, and a marker that can drift from
+reality, whereas an account either exists or does not.
+
+### What "finished" means
+
+**Finished = `rewards_distributed == 1`, or the Epoch account does not exist.**
+Whether the epoch's Observation PDAs have been closed is **not** part of it:
+
+* `close_observation` is permissionless but requires `rewards_distributed != 0`,
+  so observations can only ever be closed *after* distribution.
+* Once `rewards_distributed == 1` the incentive protocol has done its job:
+  `failure_counts` were consumed and every payout was made. Closing the
+  Observation PDAs afterwards is rent reclamation with no effect on any payout.
+* Requiring it would add up to 50 extra transactions between distribution and
+  the next epoch's creation, for no correctness gain.
+
+The asymmetry with `close_epoch` is deliberate and stays: `close_epoch` still
+requires `observations_closed == observations_submitted`, because it destroys
+the account that holds `failure_counts` and `has_observed`. Gating *advancement*
+on a rent sweep is a different — and unnecessary — requirement.
+
+### The write-off path becomes permanent and guarded
+
+Option 2 makes `admin_close_stale_epoch` the release valve for a stuck network.
+Today it is unfit for that role:
+
+* It is gated on `GatewaySettings.migration_active`, so it goes inert when
+  `finalize_migration` runs. With option 2 deployed, that would leave a stuck
+  epoch with **no** recovery path — a permanent halt.
+* Its handler body is empty, and its only constraints are the authority check
+  and `migration_active`. It will close **any** epoch named — including the live
+  one mid-observation, or a distributed one before its observations are closed.
+
+Decision:
+
+* **Remove the `migration_active` constraint.** Its sibling
+  `admin_close_orphaned_epoch_rent_receipt` is already deliberately permanent
+  for the same reason, and ADR-0031 keeps `EpochSettings.authority` usable for
+  the other epoch admin instructions indefinitely.
+* **Add guards:** the epoch must have ended (`clock >= end_timestamp`) and must
+  be undistributed (`rewards_distributed == 0`). A distributed epoch goes
+  through `close_epoch`, which refunds the creator; a live one must not be
+  closeable at all.
+* **No on-chain grace period.** The authority already holds strictly greater
+  power (the program upgrade key), so a grace period would not constrain a
+  malicious operator; the two guards above remove the two costly mistakes. The
+  remaining one — writing off an epoch whose distribution is still advancing —
+  is an operational check: confirm `distribution_index` has stopped moving before
+  writing off. Distribution can legitimately run for hours — epoch 542's
+  distribute transactions spanned 00:04–11:39 UTC on 2026-09-13.
+
+**Option 6 is rejected.** A permissionless write-off needs a grace period long
+enough that a slow-but-progressing distribution is never killed; any third party
+could otherwise forfeit a day of payouts for the whole network the moment the
+grace period lapses during a cranker outage. It also adds an instruction.
+Keeping the write-off with the transferable epoch authority (ADR-0031, e.g. a
+Squads vault) avoids both.
 
 ## Consequences
 
 ### Positive
 
-* The 540 loss mode becomes unrepresentable rather than merely unlikely.
+* The 540 loss mode becomes unrepresentable rather than merely unlikely, and
+  `EpochWeightsClobbered` stops being reachable in normal operation.
 * The protection stops depending on every client — including forks — behaving.
+* The admin write-off can no longer destroy a live epoch or bypass `close_epoch`.
+* The gate creates a well-defined interval — *N distributed, N+1 not yet
+  created* — in which no epoch snapshot is in use. ADR-0036 relies on it.
 
 ### Negative / risks
 
-* **Breaks un-upgraded crankers** on the release that ships it. Needs the same
-  coordinated rollout just completed for SDK 4.3.1, plus an operator notice.
-* A genuinely unrecoverable epoch now **blocks progression until it is written
-  off**, converting a silent loss into a visible, admin-gated stop. That is the
-  intended trade, but it puts `admin_close_stale_epoch` — currently gated on
-  `migration_active`, which `finalize_migration` will switch off — on the
-  critical path. That interaction must be resolved before this ships.
+* **Un-upgraded crankers are refused** once the program enforces the gate. The
+  client-first rollout below makes this a non-event for anyone who upgrades.
+* **A stuck epoch now stops the network until it is distributed or written
+  off.** That converts a silent loss into a visible, admin-resolved stop — the
+  intended trade. It makes the epoch authority's availability part of liveness,
+  which is one more reason to move it to the Squads vault (ADR-0031).
+* **Catch-up after a stop.** Epoch start times are schedule-based
+  (`genesis_timestamp + index × epoch_duration`), not "now". After a stop longer
+  than one epoch, the next epochs are created back-to-back with windows that have
+  partly or fully elapsed; an epoch whose window has fully elapsed can be tallied
+  and prescribed but accepts no observations. This already happens today after a
+  cranker outage — the gate does not introduce it — but it becomes the recovery
+  shape.
 
 ### Neutral
 
-* `create_epoch` gains one account; the crank's call site changes.
+* The reference cranker already orders distribute → create, so it gains no
+  delay.
+* Option 5 (per-epoch weights) is still the only change that removes the shared
+  state entirely, and should be scheduled deliberately.
 
 ## Implementation notes
 
-* `admin_close_stale_epoch` has **no precondition of its own** — it will close
-  any epoch named, including the live one. If it becomes the release valve for a
-  blocked network, it should gain its own guard.
-* Staging holds ~112 never-tallied epochs (496–745) from the August cranker
-  restarts. Under a creation-time gate those would each have blocked
-  progression; they are a useful test corpus for whichever predicate is chosen.
+### `create_epoch`
+
+* **`remaining_accounts` is already in use.** ADR-029 reads
+  `ctx.remaining_accounts.first()` as the epoch rent receipt, and sets
+  `has_rent_receipt` from whether *any* remaining account was passed. The SDK
+  always passes the receipt there.
+* Ordering contract, for compatibility with the **current** program: the
+  receipt stays first; the previous Epoch is appended **after** it. The current
+  program reads only `first()`, so it ignores the extra account.
+* In the **new** program, identify both accounts **by key**, not by position:
+  the receipt is the entry whose key is `PDA(["epoch_rent_receipt", idx])`, and
+  `has_rent_receipt` is set from that match rather than from "list non-empty".
+  Otherwise a caller that passes the previous Epoch but no receipt would have
+  the Epoch misread as a receipt (today that fails with
+  `InvalidEpochRentReceipt`, from the key check in `init_epoch_rent_receipt`).
+* Let `idx = epoch_settings.current_epoch_index`. If `idx == 0`, no check.
+* Otherwise derive `prev = PDA(["epoch", (idx - 1).to_le_bytes()])` and find it
+  among `remaining_accounts` by key. Missing → error.
+* If `prev.owner == program_id`: load it as `Epoch` (discriminator checked) and
+  require `rewards_distributed == 1`.
+* Otherwise treat it as **absent**. Only this program can create an account at
+  its own PDA, so a non-program-owned account at that address — including a
+  system account someone sent lamports to — cannot be an Epoch.
+* Implement the check once and share it with `finalize_gone` (ADR-0036): one
+  error appended at the end of `GarError` (ADR-035), e.g.
+  `LatestEpochUnfinished`, blessed into `error-code-snapshots.json`.
+
+### `admin_close_stale_epoch`
+
+* Drop `constraint = settings.migration_active` (and the `settings` account if
+  nothing else needs it — an account-list change, so this ships with the client
+  release).
+* Handler: `require!(clock >= epoch.end_timestamp)` and
+  `require!(epoch.rewards_distributed == 0)`.
+* Unchanged: it still orphans the ADR-029 rent receipt, collected by
+  `admin_close_orphaned_epoch_rent_receipt`; and the epoch's Observation PDAs
+  remain unclosable afterwards (`close_observation` needs the Epoch account).
+  Both are pre-existing — epoch 540 left 23 stranded Observation PDAs.
+
+### Rollout (client-first)
+
+1. SDK: on `create_epoch`, keep the receipt as the first remaining account and
+   append the previous Epoch PDA after it. The current program reads only the
+   first entry and ignores the rest.
+2. Release; cranker and observer pin it; operators upgrade.
+3. Upgrade the program. Un-upgraded crankers now get the new error on
+   `create_epoch` and nothing else changes for them.
+
+### Tests
+
+* `create_epoch(N+1)` refused while N is undistributed; accepted once N is
+  distributed; accepted when N has been written off; `idx == 0` needs no account.
+* Refused when the previous-epoch account is missing, or when a different
+  account is supplied in its place.
+* `admin_close_stale_epoch`: refused for a live epoch and for a distributed
+  epoch; accepted for an ended, undistributed one; still works with
+  `migration_active == false`.
+* End to end: stall N → N+1 refused → write N off → N+1 created, tallied,
+  prescribed, distributed.
+* Staging: both client orders (new client + old program, new client + new
+  program) before the mainnet upgrade.
 
 ## Related
 
-* [ADR-0032](0032-distribution-skips-untallied-gateways.md) — removed the
-  mid-epoch-joiner stall trigger
+* [ADR-0036](0036-registry-positions-frozen-while-epoch-unfinished.md) — the
+  companion registry-ordering rule, which depends on this gate
 * [ADR-0033](0033-epoch-weights-are-destroyed-by-the-next-tally.md) — closed the
   belated-tally direction of the same shared-state hazard
-* [ADR-029](0029-epoch-rent-refunds-creator.md) — epoch rent receipts, which
-  `admin_close_stale_epoch` orphans
+* [ADR-0032](0032-distribution-skips-untallied-gateways.md) — removed the
+  mid-epoch-joiner stall trigger
+* [ADR-0031](0031-transferable-epoch-settings-authority.md) — makes the write-off
+  authority transferable to a multisig
+* [ADR-029](0029-epoch-rent-refunds-creator.md) — epoch rent receipts, which the
+  write-off orphans
+* [ADR-035](0035-anchor-error-codes-are-append-only.md) — the new error variant
+  must be appended
 * ar-io-sdk#726 — the client-side stall fix that removes the most common window
