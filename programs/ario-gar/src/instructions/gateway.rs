@@ -693,7 +693,7 @@ pub fn update_observer_address(
 ///     (30 days default), as if the operator had used
 ///     `withdraw_operator_stake`. Until 2026-09-17 this vault was given the
 ///     90-day leave period here, locking a pruned operator's excess three
-///     times longer than a voluntary leaver's — see BD-102.
+///     times longer than a voluntary leaver's — see ADR-0038 and BD-102.
 pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let settings = &ctx.accounts.settings;
