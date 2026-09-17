@@ -22,6 +22,8 @@
  *   AR_IO_RPC_URL=<mainnet rpc> node scripts/delegated-stake-audit.mjs --cluster mainnet
  *   ... --json out.json      # also write the per-gateway reconcile plan
  *   ... --snapshot <dir>     # genesis snapshot dir (gateways.json + delegations.json)
+ *   ... --adjust <file>      # known post-genesis changes to subtract from the
+ *                            # snapshot overcount (staging: delegated-stake-adjustments/staging.json)
  *
  * The plan's `expected_removed` must NOT come from the same getProgramAccounts
  * read as its Delegation list: a Delegation missing from that read would shrink
@@ -51,7 +53,7 @@ const opt = (name) => {
 };
 const cluster = opt('--cluster');
 if (!['mainnet', 'staging'].includes(cluster)) {
-  console.error('usage: delegated-stake-audit.mjs --cluster mainnet|staging [--json out.json] [--snapshot dir]');
+  console.error('usage: delegated-stake-audit.mjs --cluster mainnet|staging [--json out.json] [--snapshot dir [--adjust file]]');
   process.exit(2);
 }
 const RPC =
@@ -149,6 +151,17 @@ function snapshotOvercount(dir) {
     if (!byOperator.has(op)) throw new Error(`snapshot delegation for unknown gateway ${op}`);
     byOperator.set(op, byOperator.get(op) - d.readBigUInt64LE(72));
   }
+  const adjustFile = opt('--adjust');
+  if (adjustFile) {
+    const { cluster: adjCluster, adjustments } = JSON.parse(readFileSync(adjustFile));
+    if (adjCluster !== cluster) throw new Error(`${adjustFile} is for ${adjCluster}, not ${cluster}`);
+    for (const [op, { amount }] of Object.entries(adjustments)) {
+      if (!byOperator.has(op)) throw new Error(`adjustment for gateway ${op}, which is not in the snapshot`);
+      const cut = BigInt(amount);
+      if (cut <= 0n || cut > byOperator.get(op)) throw new Error(`adjustment ${amount} for ${op} is out of range`);
+      byOperator.set(op, byOperator.get(op) - cut);
+    }
+  }
   return byOperator;
 }
 
@@ -224,6 +237,7 @@ async function main() {
   console.log(`    remainder                                     ${pad(surplus - sum((g) => g.unsettled) - phantomCredited)}`);
 
   const snapshotDir = opt('--snapshot');
+  if (opt('--adjust') && !snapshotDir) throw new Error('--adjust needs --snapshot');
   const genesis = snapshotDir ? snapshotOvercount(snapshotDir) : null;
   const disagreements = [];
   if (genesis) {

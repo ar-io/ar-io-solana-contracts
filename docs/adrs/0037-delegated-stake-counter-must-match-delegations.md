@@ -393,10 +393,13 @@ epoch.
   before building the plan.
   * Exit 1 means a gateway is under-counted or disagrees with the snapshot.
   * Exit 2 means an operational error.
-  * On staging, `--snapshot` disagrees on exactly the 6 gateways listed under
-    "Staging". Their expected removal is the snapshot figure minus that
-    remediation delegation. The implementation should take that adjustment as
-    explicit input rather than trust the live figure.
+  * On staging, `--snapshot` alone disagrees on exactly the 6 gateways listed under
+    "Staging". `--adjust scripts/delegated-stake-adjustments/staging.json` subtracts
+    those remediation delegations. The file was derived from the import
+    transactions and cites each signature. With it, staging verifies 620 of 620
+    gateways and 132 of 132 plan entries.
+  * Adjustments must name a snapshot gateway, stay within its overcount, and match
+    the cluster.
 * **Decided, 2026-09-17:** no repayment of past rewards. The phantom-credited share
   (about 17,221 ARIO that real delegates did not receive and about 2,970 ARIO taken
   out of operator rewards on mainnet) and the 9,459.8 ARIO of remediation double
