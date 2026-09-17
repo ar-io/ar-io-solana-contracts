@@ -862,10 +862,6 @@ pub mod extend_lease_from_withdrawal {
 
         let record = &mut ctx.accounts.arns_record;
         record.end_timestamp = Some(new_end);
-        record.purchase_price = record
-            .purchase_price
-            .checked_add(token_cost)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
 
         let config = &mut ctx.accounts.config;
         let prune_ts = new_end
@@ -963,10 +959,6 @@ pub mod increase_undername_limit_from_withdrawal {
 
         let record = &mut ctx.accounts.arns_record;
         record.undername_limit = new_limit as u16;
-        record.purchase_price = record
-            .purchase_price
-            .checked_add(token_cost)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
 
         let demand = &mut ctx.accounts.demand_factor;
         demand.purchases_this_period = demand
@@ -1187,10 +1179,6 @@ pub mod extend_lease_from_funding_plan {
 
         let record = &mut ctx.accounts.arns_record;
         record.end_timestamp = Some(new_end);
-        record.purchase_price = record
-            .purchase_price
-            .checked_add(token_cost)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
 
         let config = &mut ctx.accounts.config;
         let prune_ts = new_end
@@ -1306,10 +1294,6 @@ pub mod increase_undername_limit_from_funding_plan {
 
         let record = &mut ctx.accounts.arns_record;
         record.undername_limit = new_limit as u16;
-        record.purchase_price = record
-            .purchase_price
-            .checked_add(token_cost)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
 
         let demand = &mut ctx.accounts.demand_factor;
         demand.purchases_this_period = demand
