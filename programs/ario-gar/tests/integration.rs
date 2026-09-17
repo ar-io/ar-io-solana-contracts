@@ -30215,3 +30215,324 @@ async fn test_migrate_gateway_from_production_shape_1_1_0() {
     let again = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer2).await;
     assert_anchor_error!(again, GarError::AlreadyLatestVersion);
 }
+
+// -----------------------------------------
+// Vault lock periods on the leave and prune paths
+//
+// Both paths create the same two vaults, and each vault has its OWN lock:
+//   * protected exit vault (min portion) -> GATEWAY_LEAVE_PERIOD, 90 days
+//   * excess vault (above-min portion)   -> settings.withdrawal_period, 30d
+//
+// Nothing pinned these before, and `prune_gateway` had drifted to the 90-day
+// lock for BOTH of its vaults — locking a pruned operator's excess three times
+// longer than a voluntary leaver's (3 mainnet operators, BD-102). These tests
+// pin both vaults on both paths so it cannot drift again silently.
+// -----------------------------------------
+
+const LEAVE_PERIOD_SECONDS: i64 = 7_776_000; // 90 days
+const WITHDRAWAL_PERIOD_SECONDS: i64 = 2_592_000; // 30 days, the settings default
+
+async fn read_withdrawal(ctx: &mut ProgramTestContext, key: Pubkey) -> Withdrawal {
+    Withdrawal::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap()
+}
+
+/// Make `gateway_key` eligible for pruning by injecting the failure count.
+async fn make_prunable(ctx: &mut ProgramTestContext, gateway_key: Pubkey) {
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    gw.stats.failed_consecutive = 30;
+    let mut new_data = Vec::new();
+    gw.try_serialize(&mut new_data).unwrap();
+    new_data.resize(gw_account.data.len(), 0);
+    ctx.set_account(
+        &gateway_key,
+        &solana_sdk::account::Account {
+            lamports: gw_account.lamports,
+            data: new_data,
+            owner: gw_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+}
+
+#[tokio::test]
+async fn test_leave_network_vault_lock_periods() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    // 50k: above 2 x min, so both vaults exist.
+    let gateway_key = join_gateway(&mut ctx, &setup, 50_000_000_000).await;
+    let (counter_key, _) = withdrawal_counter_pda(&payer_pk);
+    let (exit_key, _) = withdrawal_pda(&payer_pk, 0);
+    let (excess_key, _) = withdrawal_pda(&payer_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::LeaveNetwork {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_pda().0,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: counter_key,
+                withdrawal: exit_key,
+                excess_withdrawal: Some(excess_key),
+                operator: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::LeaveNetwork {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let exit = read_withdrawal(&mut ctx, exit_key).await;
+    let excess = read_withdrawal(&mut ctx, excess_key).await;
+    assert!(exit.is_protected, "min portion is the protected vault");
+    assert!(!excess.is_protected);
+    assert_eq!(
+        exit.available_at,
+        exit.created_at + LEAVE_PERIOD_SECONDS,
+        "protected exit vault holds the 90-day leave lock"
+    );
+    assert_eq!(
+        excess.available_at,
+        excess.created_at + WITHDRAWAL_PERIOD_SECONDS,
+        "excess vault holds the regular 30-day withdrawal lock"
+    );
+    assert!(
+        excess.available_at < exit.available_at,
+        "the two locks must differ: excess {} vs protected {}",
+        excess.available_at,
+        exit.available_at
+    );
+}
+
+#[tokio::test]
+async fn test_prune_gateway_vault_lock_periods() {
+    // Same two locks as leaving voluntarily. `gar.lua::pruneGateways` slashes
+    // and then calls `gar.leaveNetwork`, so the vaults ARE the leave path's.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    // 60k: slash 20k, protect 20k, leaving 20k of excess.
+    let gateway_key = join_gateway(&mut ctx, &setup, 60_000_000_000).await;
+    make_prunable(&mut ctx, gateway_key).await;
+
+    let (counter_key, _) = withdrawal_counter_pda(&payer_pk);
+    let (exit_key, _) = withdrawal_pda(&payer_pk, 0);
+    let (excess_key, _) = withdrawal_pda(&payer_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::PruneGateway {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_pda().0,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: counter_key,
+                withdrawal: exit_key,
+                excess_withdrawal: Some(excess_key),
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::PruneGateway {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let exit = read_withdrawal(&mut ctx, exit_key).await;
+    let excess = read_withdrawal(&mut ctx, excess_key).await;
+    assert_eq!(exit.amount, 20_000_000_000, "protected holds one min stake");
+    assert_eq!(
+        excess.amount, 20_000_000_000,
+        "excess holds post_slash - min"
+    );
+    assert!(exit.is_protected);
+    assert!(!excess.is_protected);
+    assert_eq!(
+        exit.available_at,
+        exit.created_at + LEAVE_PERIOD_SECONDS,
+        "protected exit vault holds the 90-day leave lock"
+    );
+    assert_eq!(
+        excess.available_at,
+        excess.created_at + WITHDRAWAL_PERIOD_SECONDS,
+        "a pruned operator's excess must not be locked longer than a leaver's"
+    );
+}
+
+#[tokio::test]
+async fn test_prune_gateway_excess_follows_withdrawal_period_setting() {
+    // The excess lock is read from settings, so `admin_set_withdrawal_period`
+    // applies to it; the protected vault's 90 days is a const and does not move.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    // `admin_set_withdrawal_period` is authority-gated and `setup_gar` leaves a
+    // different authority, so point it at the payer (same trick as the
+    // admin_set_withdrawal_period test above): authority is the first field
+    // after the 8-byte discriminator.
+    let mut settings_account = ctx
+        .banks_client
+        .get_account(setup.settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    settings_account.data[8..40].copy_from_slice(payer_pk.as_ref());
+    ctx.set_account(
+        &setup.settings_key,
+        &solana_sdk::account::AccountSharedData::from(settings_account),
+    );
+
+    let new_period: i64 = 14 * 86_400;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: setup.settings_key,
+                authority: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: new_period,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 60_000_000_000).await;
+    make_prunable(&mut ctx, gateway_key).await;
+
+    let (counter_key, _) = withdrawal_counter_pda(&payer_pk);
+    let (exit_key, _) = withdrawal_pda(&payer_pk, 0);
+    let (excess_key, _) = withdrawal_pda(&payer_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::PruneGateway {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_pda().0,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: counter_key,
+                withdrawal: exit_key,
+                excess_withdrawal: Some(excess_key),
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::PruneGateway {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let exit = read_withdrawal(&mut ctx, exit_key).await;
+    let excess = read_withdrawal(&mut ctx, excess_key).await;
+    assert_eq!(
+        excess.available_at,
+        excess.created_at + new_period,
+        "excess vault must follow the admin-set withdrawal period"
+    );
+    assert_eq!(
+        exit.available_at,
+        exit.created_at + LEAVE_PERIOD_SECONDS,
+        "the protected vault's 90-day lock is a const and must not follow it"
+    );
+}

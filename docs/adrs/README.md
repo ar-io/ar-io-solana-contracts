@@ -114,6 +114,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
 | ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
 | ADR-037 | A Gateway's Delegated-Stake Counter Must Equal the Delegations Behind It | proposed | [`0037-delegated-stake-counter-must-match-delegations.md`](0037-delegated-stake-counter-must-match-delegations.md) |
+| ADR-038 | A Departing Operator's Unlock Schedule Is Set by the Vault, Not by the Exit Path | accepted | [`0038-operator-exit-unlock-schedule.md`](0038-operator-exit-unlock-schedule.md) |
 
 ### Reserved by open PRs
 
