@@ -127,9 +127,7 @@ The 622 genesis gateways were never corrected.
    | remainder (integer-division rounding in reward math) | 0.012390 |
 
 Staging was imported from the same genesis data: its v2 snapshot has the same
-2,226,210.675676 overcount. Three months of test activity and its own remediations
-have moved the live figure, and its pool and `total_staked` show further
-staging-only differences (see Implementation notes).
+2,226,210.675676 overcount. See "Staging" below for why its live figure differs.
 
 ### Consequences today
 
@@ -172,6 +170,43 @@ counters. It was last written by `migrate_settings_supply_counters` on 2026-06-1
 before the first `distribute_epoch` (2026-06-17 00:04Z). So the whole gap is
 rewards settled since then. The seeded value also included the phantom counters,
 which the reconcile below removes as well.
+
+### Staging
+
+Staging went through an earlier version of the same remediation (2026-06-11), and
+that explains every staging-only difference. The figures come from a replay of all
+51,199 successful transactions of staging's migration authority `FHgQn4W9…`.
+
+* **Live overcount is 2,091,475.086100, not 2,226,210.675676.**
+  * That run imported 6 delegations onto existing gateways **without raising those
+    gateways' counters** (mainnet's later script raised them).
+  * Those delegations total 134,735.589576, which is exactly the difference.
+  * The audit against the staging snapshot disagrees on those 6 gateways only, each
+    by its delegation: Turbo Gateway 100,148.839994, Fllstck 31,935.021490, Tomris
+    2,079.125971, ionode 234.106863, Horizon 223.765993, Stilucky 114.729265.
+  * The other 614 agree.
+  * These 6 counters are therefore also *short* of their real delegations; the
+    phantom amount just hides it.
+* **`total_staked` is 525,057.873339 below Σ operator stake.**
+  * Staging's supply counters were backfilled on 2026-06-03 at 21:30Z, *before* the
+    remediation.
+  * The remediation then imported 525,057.873339 of operator stake through
+    `import_account`, which never updates the settings counters.
+  * Mainnet was backfilled after its remediation, so it has no such gap.
+* **Pool remainder is 9,857.704648.**
+  * Three remediation delegations were skipped as "pre-existing" but still funded.
+    They are `AvkDcqdH…` 397.857433, `HaCqCEtE…` 9,364.646096 and `6Gm9LDSh…`
+    95.158401, and all three were imported at genesis on 06-03.
+  * Together they total 9,857.661930, the same double funding as on mainnet.
+  * The remaining 0.042718 is rounding.
+* **Rewards from before the import.**
+  * The 8 staging remediation delegations were imported with `reward_debt = 0`, a
+    week after staging's first distribution (06-04).
+  * Their first settlement therefore paid them rewards accrued before they existed,
+    out of the unowned phantom share.
+  * Mainnet is unaffected: all 538 of its delegation imports, and the gateway
+    re-imports, predate its first distribution (2026-06-17), when every
+    accumulator was still 0.
 
 ### Migration is still open
 
@@ -274,10 +309,13 @@ epoch.
   ADR-0034.
 * Every compound then write-locks `settings`, as delegation instructions already do.
   That serializes concurrent compounds but does not change results.
-* A new `admin_resync_total_delegated(expected_current: u64, new_value: u64)`,
-  authority-only, sets `settings.total_delegated` once after the fix is live.
-  `new_value` is Σ counters from the audit, and the call fails if `expected_current`
-  is stale.
+* A new `admin_resync_supply_counters(expected_staked, new_staked,
+  expected_delegated, new_delegated)`, authority-only, sets
+  `settings.total_staked` and `settings.total_delegated` once after the fix is live.
+  * The new values are Σ operator stake and Σ counters from the audit.
+  * The call fails if either expected value is stale.
+  * `total_withdrawn` is left alone; it is exact on both clusters.
+  * On mainnet only `total_delegated` changes; staging also needs `total_staked`.
 * `migrate_settings_supply_counters` is **not** reused: it has no staleness guard,
   and it stops working once migration is finalized.
 * `INVARIANTS.md` Invariant 2 is corrected, and the property test gains a
@@ -293,9 +331,12 @@ epoch.
    gateways prunable, and each prune moves a registry slot (the epoch-542 hazard).
 4. **Run the verified plan** gateway by gateway, re-reading each one. On mainnet that is 132
    transactions; on staging they go through Squads.
-5. Resync `settings.total_delegated`; re-run the audit, which must show 0
+5. Resync the supply counters; re-run the audit, which must show 0
    over-counted and 0 under-counted gateways.
-6. Decide separately whether to run `finalize_migration` on both clusters.
+6. Run `finalize_migration` on both clusters once every pending ADR (Wave 1 and
+   Wave 2, including this reconcile and resync) is deployed and verified. Decided
+   2026-09-17. Until then the migration authority can still overwrite GAR
+   accounts, so that key must stay tightly held.
 
 ## Consequences
 
@@ -352,19 +393,18 @@ epoch.
   before building the plan.
   * Exit 1 means a gateway is under-counted or disagrees with the snapshot.
   * Exit 2 means an operational error.
-  * Staging's live state has moved away from its snapshot (remediations and test
-    activity), so its plan needs a staging-specific expected-removal source before
-    it can be verified.
-* **Out of scope, still to be decided:**
-  * Whether to repay the phantom-credited share from the per-gateway list (the
-    `phantom_credited_rewards` field of the plan): about 17,221 ARIO to real
-    delegates and about 2,970 ARIO to operators on mainnet. The tokens are in the
-    pool, but no instruction can move unowned pool surplus, and this ADR adds none.
+  * On staging, `--snapshot` disagrees on exactly the 6 gateways listed under
+    "Staging". Their expected removal is the snapshot figure minus that
+    remediation delegation. The implementation should take that adjustment as
+    explicit input rather than trust the live figure.
+* **Decided, 2026-09-17:** no repayment of past rewards. The phantom-credited share
+  (about 17,221 ARIO that real delegates did not receive and about 2,970 ARIO taken
+  out of operator rewards on mainnet) and the 9,459.8 ARIO of remediation double
+  funding stay in the pool, unowned. The per-gateway amounts remain in the plan's
+  `phantom_credited_rewards` field for the record.
+* **Out of scope:**
   * `transform.ts` should set each counter to the sum of the Delegation accounts it
     emits, in case the import tooling is ever reused.
-  * Staging-only differences to investigate separately: `total_staked` is
-    525,057.873339 below Σ operator stake, and a 9,857.7 ARIO pool remainder is
-    not yet attributed.
   * `claimDelegateFromLeavingGateway` in the SDK should accept a delegator, as the
     disabled-gateway variant does, so crankers can clear real delegations from
     leaving gateways.
