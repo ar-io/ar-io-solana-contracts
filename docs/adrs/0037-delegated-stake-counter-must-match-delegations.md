@@ -255,7 +255,10 @@ epoch.
     stake), which the audit reproduced exactly for all 622 gateways.
 
   If a Delegation were left out, check 5 fails unless both sources are wrong by the
-  same amount.
+  same amount. The plan must therefore take `expected_removed` from the snapshot
+  (`--snapshot`), never from the same read as the Delegation list. Only entries the
+  audit marks `verified` (live overcount == genesis overcount) may be executed. On
+  mainnet today that is 132 of 132, and 620 of 620 gateways agree.
 * **Size.** The largest over-counted gateway has 50 Delegations today. A v0
   transaction with a lookup table fits that (about 55 accounts, under the 64
   account-lock limit). A gateway with more Delegations than fit cannot be reconciled
@@ -288,7 +291,7 @@ epoch.
 2. **One GAR upgrade** carrying ADR-0034, ADR-0036 and ADR-0037, staging first.
 3. **Reconcile only after ADR-0036 is live.** The correction makes up to 65 leaving
    gateways prunable, and each prune moves a registry slot (the epoch-542 hazard).
-4. **Run the plan** gateway by gateway, re-reading each one. On mainnet that is 132
+4. **Run the verified plan** gateway by gateway, re-reading each one. On mainnet that is 132
    transactions; on staging they go through Squads.
 5. Resync `settings.total_delegated`; re-run the audit, which must show 0
    over-counted and 0 under-counted gateways.
@@ -345,7 +348,13 @@ epoch.
     Σ counters. Extend `assert_global_stake_invariants` scenarios with a distributed
     reward and a compound.
 * **Audit tool.** `scripts/delegated-stake-audit.mjs --cluster mainnet|staging
-  [--json plan.json]` is read-only. Re-run it right before building the plan.
+  [--json plan.json] [--snapshot <genesis dir>]` is read-only. Re-run it right
+  before building the plan.
+  * Exit 1 means a gateway is under-counted or disagrees with the snapshot.
+  * Exit 2 means an operational error.
+  * Staging's live state has moved away from its snapshot (remediations and test
+    activity), so its plan needs a staging-specific expected-removal source before
+    it can be verified.
 * **Out of scope, still to be decided:**
   * Whether to repay the phantom-credited share from the per-gateway list (the
     `phantom_credited_rewards` field of the plan): about 17,221 ARIO to real
