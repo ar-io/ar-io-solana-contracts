@@ -222,10 +222,25 @@ Squads vault) avoids both.
   cranker outage — the gate does not introduce it — but it becomes the recovery
   shape.
 
+  **What those epochs pay.** `save_observations` requires
+  `clock < end_timestamp`, and `distribute_epoch` marks a gateway failed only when
+  `observations_submitted > 0`. An epoch that accepted no observations therefore
+  pays **every** eligible gateway, including ones that were down during the
+  outage. Under this ADR every such epoch must be distributed (or written off)
+  before the next can be created, so after a k-epoch stop, k unobserved epochs
+  pay out in sequence. The reference cranker already behaves this way; the gate
+  makes it mandatory. **Open decision before implementation:** accept this, or
+  have the crank write off epochs that were created after their own
+  `end_timestamp` (the authority's `admin_close_stale_epoch` already allows it,
+  and a program-side rule could make it automatic).
+
 ### Neutral
 
 * The reference cranker already orders distribute → create, so it gains no
   delay.
+* The predicate cannot be sidestepped by moving the epoch counter:
+  `admin_set_current_epoch_index` works only while epochs are disabled and
+  `current_epoch_index == 0`, so it cannot later skip past an unfinished epoch.
 * Option 5 (per-epoch weights) is still the only change that removes the shared
   state entirely, and should be scheduled deliberately.
 
