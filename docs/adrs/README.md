@@ -113,6 +113,7 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
 | ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
+| ADR-037 | A Gateway's Delegated-Stake Counter Must Equal the Delegations Behind It | proposed | [`0037-delegated-stake-counter-must-match-delegations.md`](0037-delegated-stake-counter-must-match-delegations.md) |
 
 ### Reserved by open PRs
 
