@@ -112,7 +112,9 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-031 | Transferable `EpochSettings.authority` | accepted | [`0031-transferable-epoch-settings-authority.md`](0031-transferable-epoch-settings-authority.md) |
 | ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
 | ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
+| ADR-034 | An Unfinished Epoch Must Not Be Superseded | proposed | [`0034-an-unfinished-epoch-must-not-be-superseded.md`](0034-an-unfinished-epoch-must-not-be-superseded.md) |
 | ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
+| ADR-036 | Registry Positions Are Frozen While an Epoch Is Unfinished | proposed | [`0036-registry-positions-frozen-while-epoch-unfinished.md`](0036-registry-positions-frozen-while-epoch-unfinished.md) |
 | ADR-037 | A Gateway's Delegated-Stake Counter Must Equal the Delegations Behind It | proposed | [`0037-delegated-stake-counter-must-match-delegations.md`](0037-delegated-stake-counter-must-match-delegations.md) |
 | ADR-038 | A Departing Operator's Unlock Schedule Is Set by the Vault, Not by the Exit Path | accepted | [`0038-operator-exit-unlock-schedule.md`](0038-operator-exit-unlock-schedule.md) |
 
