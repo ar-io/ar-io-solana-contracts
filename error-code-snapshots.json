@@ -589,6 +589,10 @@
     {
       "code": 6100,
       "name": "NotGatewayAuthority"
+    },
+    {
+      "code": 6101,
+      "name": "GatewayNotMigrated"
     }
   ],
   "ario_arns": [

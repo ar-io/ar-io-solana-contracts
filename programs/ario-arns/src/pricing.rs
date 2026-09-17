@@ -266,9 +266,16 @@ pub fn get_base_fee_for_name_length(fees: &[u64; 51], name_length: usize) -> Res
 ///
 /// If a Gateway account is provided (first remaining_account):
 ///   1. Validates the account is owned by the ario-gar program
-///   2. Validates the PDA seeds match ["gateway", signer_pubkey]
-///   3. Deserializes and checks operator == signer and status == Joined
-///   4. Applies 20% discount
+///   2. Deserializes it, then validates it is the canonical PDA for the
+///      operator it stores: seeds = ["gateway", gateway.operator]
+///   3. Checks the signer is authorised for it (`Gateway::authorises`: the
+///      operator, or from schema 1.2.0 its non-zero operations address —
+///      ADR-0030)
+///   4. Checks status == Joined, 180-day tenure and a 90% epoch pass rate
+///   5. Applies the 20% discount
+///
+/// Any failed check REJECTS the purchase; it never falls back to full price.
+/// Clients must attach the gateway only when it qualifies.
 ///
 /// If no Gateway account is provided, returns the original cost unchanged.
 pub fn try_apply_gateway_discount(
@@ -316,17 +323,11 @@ pub fn try_apply_gateway_discount(
         ArnsError::NotGatewayOperator
     );
 
-    // ADR-0030: the operator, or the gateway's operations_address. Shares the
-    // predicate with ario-gar so the zero-pubkey rule cannot drift between the
-    // two programs.
-    require!(
-        ario_gar::state::is_gateway_authority(
-            signer,
-            &gateway.operator,
-            &gateway.operations_address
-        ),
-        ArnsError::NotGatewayOperator
-    );
+    // ADR-0030: the operator, or the gateway's operations_address. Uses
+    // ario-gar's own `Gateway::authorises`, so both rules — ignore the field
+    // below schema 1.2.0 (it is stale tail bytes there), and never honour the
+    // zero pubkey — cannot drift between the two programs.
+    require!(gateway.authorises(signer), ArnsError::NotGatewayOperator);
 
     // Verify gateway is active (Joined status)
     require!(

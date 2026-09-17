@@ -29815,8 +29815,12 @@ async fn test_unmigrated_964_byte_gateway_still_loads() {
             .await
             .unwrap()
             .unwrap();
+        // Stamped 1.1.0, as every live account is. (Left at the joined
+        // version, this would model an account that does not exist on chain.)
+        let mut legacy = gw.clone();
+        legacy.version = SchemaVersion::new(1, 1, 0);
         let mut data = Vec::new();
-        gw.try_serialize(&mut data).unwrap();
+        legacy.try_serialize(&mut data).unwrap();
         data.truncate(data.len() - 32); // remove operations_address entirely
         data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
         ctx.set_account(
@@ -29843,12 +29847,15 @@ async fn test_unmigrated_964_byte_gateway_still_loads() {
         "simulating a live, un-migrated account"
     );
 
-    // It must still deserialize, with the appended field reading as zero.
+    // It must still deserialize. This construction zero-pads, so the appended
+    // field reads as zero here; real accounts can instead carry stale bytes in
+    // that position -- see test_stale_tail_key_cannot_act_before_or_after_migration.
     let reread = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(reread.version, SchemaVersion::new(1, 1, 0));
     assert_eq!(
         reread.operations_address,
         Pubkey::default(),
-        "the appended field must read out of the zero padding, not fail"
+        "the appended field must read out of the bytes after the content, not fail"
     );
     assert_eq!(reread.operator, gw.operator, "prior fields must be intact");
     assert_eq!(reread.fqdn, gw.fqdn);
@@ -29926,73 +29933,606 @@ async fn test_adr0030_instructions_reject_leaving_gateway() {
     assert_eq!(after.operations_address, ops.pubkey());
 }
 
-/// **Adversarial: does a permissionless migration clobber a delegation the
-/// operator deliberately set?**
-///
-/// `update_operations_address` works on an un-migrated 964-byte account (the
-/// content has room to grow by 32 bytes). If an operator delegates BEFORE
-/// `migrate_gateway` runs, the 1.1.0 -> 1.2.0 arm then unconditionally writes
-/// `operations_address = operator` — and `migrate_gateway` is permissionless,
-/// so anyone can trigger that.
-#[tokio::test]
-async fn test_migration_must_not_clobber_a_deliberate_delegation() {
-    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
-
-    // Put the gateway in the real pre-ADR-0030 shape: stamped 0.0.0, 964 bytes,
-    // operations_address absent from the content entirely.
-    let gw = read_gateway(&mut ctx, &gateway_key).await;
-    {
-        let acct = ctx
-            .banks_client
-            .get_account(gateway_key)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut legacy = gw.clone();
-        legacy.version = SchemaVersion::new(0, 0, 0);
-        let mut data = Vec::new();
-        legacy.try_serialize(&mut data).unwrap();
-        data.truncate(data.len() - 32);
-        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
-        ctx.set_account(
-            &gateway_key,
-            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
-                lamports: acct.lamports.max(10_000_000),
-                data,
-                owner: acct.owner,
-                executable: false,
-                rent_epoch: acct.rent_epoch,
-            }),
-        );
-    }
-
-    // The operator delegates while still un-migrated.
-    let ops = Keypair::new();
-    fund_lamports(&mut ctx, &ops.pubkey(), 10_000_000_000);
-    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
-    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops.pubkey(), &payer_kp)
+/// Build a gateway in the shape every live account has before ADR-0030 is
+/// deployed: stamped 1.1.0, 964 bytes, `operations_address` absent from the
+/// content. `stale_tail`, when set, is written where the new layout reads
+/// `operations_address` -- reproducing what an earlier, longer serialization
+/// leaves behind (Anchor's `exit` never clears bytes past the new end).
+async fn plant_v110_gateway(
+    ctx: &mut ProgramTestContext,
+    gateway_key: &Pubkey,
+    stale_tail: Option<Pubkey>,
+) {
+    let acct = ctx
+        .banks_client
+        .get_account(*gateway_key)
         .await
-        .expect("delegating before migration should work");
+        .unwrap()
+        .unwrap();
+    let mut legacy = read_gateway(ctx, gateway_key).await;
+    legacy.version = SchemaVersion::new(1, 1, 0);
+    let mut data = Vec::new();
+    legacy.try_serialize(&mut data).unwrap();
+    data.truncate(data.len() - 32);
+    let content_end = data.len();
+    data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+    if let Some(stale) = stale_tail {
+        data[content_end..content_end + 32].copy_from_slice(stale.as_ref());
+    }
+    ctx.set_account(
+        gateway_key,
+        &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+            lamports: acct.lamports.max(10_000_000),
+            data,
+            owner: acct.owner,
+            executable: false,
+            rent_epoch: acct.rent_epoch,
+        }),
+    );
+}
+
+/// A delegation cannot be written before migration. Below 1.2.0 it would be
+/// ignored by `Gateway::authorises` and then overwritten by the migration, so
+/// accepting it would lose it silently.
+#[tokio::test]
+async fn test_update_operations_address_requires_migration() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    plant_v110_gateway(&mut ctx, &gateway_key, None).await;
+
+    let ops = Keypair::new();
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    // A different key from the post-migration delegation below, so the two
+    // transactions are never byte-identical: the test harness does not execute
+    // a repeat of an already-processed transaction and returns the earlier
+    // result instead, which would make the second call look refused.
+    let early_ops = Pubkey::new_unique();
+    let early =
+        send_update_operations_address(&mut ctx, &operator, &gateway_key, early_ops, &payer_kp)
+            .await;
+    assert_anchor_error!(early, GarError::GatewayNotMigrated);
     assert_eq!(
-        read_gateway(&mut ctx, &gateway_key)
-            .await
-            .operations_address,
-        ops.pubkey(),
-        "delegation must have been recorded"
+        read_gateway(&mut ctx, &gateway_key).await.version,
+        SchemaVersion::new(1, 1, 0),
+        "a refused delegation must leave the account untouched"
     );
 
-    // Now ANYONE runs the permissionless migration.
     let stranger = Keypair::new();
     fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
     send_migrate_gateway(&mut ctx, &operator, &gateway_key, &stranger)
         .await
         .expect("migrate_gateway is permissionless");
 
+    send_update_operations_address(&mut ctx, &operator, &gateway_key, ops.pubkey(), &payer_kp)
+        .await
+        .expect("after migration the operator can delegate");
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key)
+            .await
+            .operations_address,
+        ops.pubkey()
+    );
+}
+
+/// The defect behind the ADR-0030 fix, end to end.
+///
+/// A live 1.1.0 gateway can carry stale bytes where the new layout reads
+/// `operations_address` (30 of 620 on mainnet did). If those bytes are a real
+/// key -- e.g. the gateway's previous `observer_address`, which a shrink of
+/// exactly 52 bytes leaves in that position -- whoever holds it must not be able
+/// to act for the gateway, before or after migration.
+#[tokio::test]
+async fn test_stale_tail_key_cannot_act_before_or_after_migration() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let stale = Keypair::new();
+    fund_lamports(&mut ctx, &stale.pubkey(), 10_000_000_000);
+    plant_v110_gateway(&mut ctx, &gateway_key, Some(stale.pubkey())).await;
+
+    // Precondition: the planted key really decodes as the operations address.
+    let pre = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(pre.version, SchemaVersion::new(1, 1, 0));
+    assert_eq!(pre.operations_address, stale.pubkey());
+
+    // Before migration: the stale key is refused...
+    let by_stale = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("stale.example.com"),
+        &stale,
+    )
+    .await;
+    assert_anchor_error!(by_stale, GarError::NotGatewayAuthority);
+
+    // ...the operator still works...
+    let payer_kp = Keypair::from_bytes(&ctx.payer.to_bytes()).unwrap();
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("operator.example.com"),
+        &payer_kp,
+    )
+    .await
+    .expect("the operator of an un-migrated gateway must keep working");
+    // (Anchor re-wrote the account; the stale key is still in the field, and the
+    // account is still 1.1.0, so the refusal above is still the live case.)
+    let mid = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(mid.version, SchemaVersion::new(1, 1, 0));
+    assert_eq!(mid.operations_address, stale.pubkey());
+    let again = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("stale-again.example.com"),
+        &stale,
+    )
+    .await;
+    assert_anchor_error!(again, GarError::NotGatewayAuthority);
+
+    // ...and a delegation cannot be written yet.
+    let early = send_update_operations_address(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        Pubkey::new_unique(),
+        &payer_kp,
+    )
+    .await;
+    assert_anchor_error!(early, GarError::GatewayNotMigrated);
+
+    // Migration replaces the stale bytes with the operator, unconditionally.
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &stranger)
+        .await
+        .expect("migrate_gateway is permissionless");
     let after = read_gateway(&mut ctx, &gateway_key).await;
     assert_eq!(after.version, ario_gar::state::GATEWAY_VERSION);
     assert_eq!(
-        after.operations_address,
-        ops.pubkey(),
-        "a third party's migration must NOT reset a delegation the operator set"
+        after.operations_address, after.operator,
+        "migration must not keep a stale key as the operations address"
+    );
+    assert_ne!(after.operations_address, stale.pubkey());
+
+    // After migration the stale key is still refused.
+    let post = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("stale-post.example.com"),
+        &stale,
+    )
+    .await;
+    assert_anchor_error!(post, GarError::NotGatewayAuthority);
+
+    // A real delegation now works, and only for the delegate.
+    let delegate = Keypair::new();
+    fund_lamports(&mut ctx, &delegate.pubkey(), 10_000_000_000);
+    send_update_operations_address(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        delegate.pubkey(),
+        &payer_kp,
+    )
+    .await
+    .expect("the operator can delegate after migration");
+    send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("delegate.example.com"),
+        &delegate,
+    )
+    .await
+    .expect("the delegated operations address can update metadata");
+    assert_eq!(
+        read_gateway(&mut ctx, &gateway_key).await.fqdn,
+        "delegate.example.com"
+    );
+    let still = send_update_metadata(
+        &mut ctx,
+        &operator,
+        &gateway_key,
+        fqdn_params("stale-final.example.com"),
+        &stale,
+    )
+    .await;
+    assert_anchor_error!(still, GarError::NotGatewayAuthority);
+}
+
+/// The migration that will run in production, from the shape production has.
+///
+/// Measured on both clusters before this was written: all 620 gateways on each
+/// are 964 bytes and stamped 1.1.0, and some carry stale bytes after `version`.
+/// So every real migration enters the ladder at the 1.1.0 -> 1.2.0 arm, and
+/// that arm must not trust what it reads there.
+#[tokio::test]
+async fn test_migrate_gateway_from_production_shape_1_1_0() {
+    let (mut ctx, operator, gateway_key) = gar_ctx_with_gateway().await;
+    let gw = read_gateway(&mut ctx, &gateway_key).await;
+    let expected_operator = gw.operator;
+    let expected_fqdn = gw.fqdn.clone();
+    let expected_observer = gw.observer_address;
+    let expected_stake = gw.operator_stake;
+    let expected_registry_index = gw.registry_index.index;
+    let expected_ratio = gw.settings.delegate_reward_share_ratio;
+
+    // A non-zero, non-key stale tail, like the fragments seen on mainnet.
+    let garbage = Pubkey::new_from_array([
+        0xfd, 0x01, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 1,
+    ]);
+    plant_v110_gateway(&mut ctx, &gateway_key, Some(garbage)).await;
+
+    let before = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.data.len(), ario_gar::state::GATEWAY_SIZE_AT_V1_1_0);
+    let pre = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(pre.version, SchemaVersion::new(1, 1, 0));
+    assert_eq!(
+        pre.operations_address, garbage,
+        "precondition: stale tail present"
+    );
+
+    let stranger = Keypair::new();
+    fund_lamports(&mut ctx, &stranger.pubkey(), 10_000_000_000);
+    send_migrate_gateway(&mut ctx, &operator, &gateway_key, &stranger)
+        .await
+        .expect("a 1.1.0 / 964-byte gateway must migrate");
+
+    let grown = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grown.data.len(), ario_gar::state::Gateway::SIZE);
+
+    let after = read_gateway(&mut ctx, &gateway_key).await;
+    assert_eq!(after.version, ario_gar::state::GATEWAY_VERSION);
+    assert_eq!(after.version, SchemaVersion::new(1, 2, 0));
+    assert_eq!(
+        after.operations_address, after.operator,
+        "the 1.1.0 -> 1.2.0 arm must set operations_address to the operator"
+    );
+
+    // Nothing before the appended field may move.
+    assert_eq!(after.operator, expected_operator);
+    assert_eq!(after.fqdn, expected_fqdn);
+    assert_eq!(after.observer_address, expected_observer);
+    assert_eq!(after.operator_stake, expected_stake);
+    assert_eq!(after.registry_index.index, expected_registry_index);
+    assert_eq!(after.settings.delegate_reward_share_ratio, expected_ratio);
+
+    // Idempotent: a second run is refused, not re-applied.
+    let payer2 = Keypair::new();
+    fund_lamports(&mut ctx, &payer2.pubkey(), 10_000_000_000);
+    let again = send_migrate_gateway(&mut ctx, &operator, &gateway_key, &payer2).await;
+    assert_anchor_error!(again, GarError::AlreadyLatestVersion);
+}
+
+// -----------------------------------------
+// Vault lock periods on the leave and prune paths
+//
+// Both paths create the same two vaults, and each vault has its OWN lock:
+//   * protected exit vault (min portion) -> GATEWAY_LEAVE_PERIOD, 90 days
+//   * excess vault (above-min portion)   -> settings.withdrawal_period, 30d
+//
+// Nothing pinned these before, and `prune_gateway` had drifted to the 90-day
+// lock for BOTH of its vaults — locking a pruned operator's excess three times
+// longer than a voluntary leaver's (3 mainnet operators, BD-102). These tests
+// pin both vaults on both paths so it cannot drift again silently.
+// -----------------------------------------
+
+const LEAVE_PERIOD_SECONDS: i64 = 7_776_000; // 90 days
+const WITHDRAWAL_PERIOD_SECONDS: i64 = 2_592_000; // 30 days, the settings default
+
+async fn read_withdrawal(ctx: &mut ProgramTestContext, key: Pubkey) -> Withdrawal {
+    Withdrawal::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap()
+}
+
+/// Make `gateway_key` eligible for pruning by injecting the failure count.
+async fn make_prunable(ctx: &mut ProgramTestContext, gateway_key: Pubkey) {
+    let gw_account = ctx
+        .banks_client
+        .get_account(gateway_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut gw = Gateway::try_deserialize(&mut gw_account.data.as_slice()).unwrap();
+    gw.stats.failed_consecutive = 30;
+    let mut new_data = Vec::new();
+    gw.try_serialize(&mut new_data).unwrap();
+    new_data.resize(gw_account.data.len(), 0);
+    ctx.set_account(
+        &gateway_key,
+        &solana_sdk::account::Account {
+            lamports: gw_account.lamports,
+            data: new_data,
+            owner: gw_account.owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+}
+
+#[tokio::test]
+async fn test_leave_network_vault_lock_periods() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    // 50k: above 2 x min, so both vaults exist.
+    let gateway_key = join_gateway(&mut ctx, &setup, 50_000_000_000).await;
+    let (counter_key, _) = withdrawal_counter_pda(&payer_pk);
+    let (exit_key, _) = withdrawal_pda(&payer_pk, 0);
+    let (excess_key, _) = withdrawal_pda(&payer_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::LeaveNetwork {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_pda().0,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: counter_key,
+                withdrawal: exit_key,
+                excess_withdrawal: Some(excess_key),
+                operator: payer_pk,
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::LeaveNetwork {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let exit = read_withdrawal(&mut ctx, exit_key).await;
+    let excess = read_withdrawal(&mut ctx, excess_key).await;
+    assert!(exit.is_protected, "min portion is the protected vault");
+    assert!(!excess.is_protected);
+    assert_eq!(
+        exit.available_at,
+        exit.created_at + LEAVE_PERIOD_SECONDS,
+        "protected exit vault holds the 90-day leave lock"
+    );
+    assert_eq!(
+        excess.available_at,
+        excess.created_at + WITHDRAWAL_PERIOD_SECONDS,
+        "excess vault holds the regular 30-day withdrawal lock"
+    );
+    assert!(
+        excess.available_at < exit.available_at,
+        "the two locks must differ: excess {} vs protected {}",
+        excess.available_at,
+        exit.available_at
+    );
+}
+
+#[tokio::test]
+async fn test_prune_gateway_vault_lock_periods() {
+    // Same two locks as leaving voluntarily. `gar.lua::pruneGateways` slashes
+    // and then calls `gar.leaveNetwork`, so the vaults ARE the leave path's.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    // 60k: slash 20k, protect 20k, leaving 20k of excess.
+    let gateway_key = join_gateway(&mut ctx, &setup, 60_000_000_000).await;
+    make_prunable(&mut ctx, gateway_key).await;
+
+    let (counter_key, _) = withdrawal_counter_pda(&payer_pk);
+    let (exit_key, _) = withdrawal_pda(&payer_pk, 0);
+    let (excess_key, _) = withdrawal_pda(&payer_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::PruneGateway {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_pda().0,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: counter_key,
+                withdrawal: exit_key,
+                excess_withdrawal: Some(excess_key),
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::PruneGateway {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let exit = read_withdrawal(&mut ctx, exit_key).await;
+    let excess = read_withdrawal(&mut ctx, excess_key).await;
+    assert_eq!(exit.amount, 20_000_000_000, "protected holds one min stake");
+    assert_eq!(
+        excess.amount, 20_000_000_000,
+        "excess holds post_slash - min"
+    );
+    assert!(exit.is_protected);
+    assert!(!excess.is_protected);
+    assert_eq!(
+        exit.available_at,
+        exit.created_at + LEAVE_PERIOD_SECONDS,
+        "protected exit vault holds the 90-day leave lock"
+    );
+    assert_eq!(
+        excess.available_at,
+        excess.created_at + WITHDRAWAL_PERIOD_SECONDS,
+        "a pruned operator's excess must not be locked longer than a leaver's"
+    );
+}
+
+#[tokio::test]
+async fn test_prune_gateway_excess_follows_withdrawal_period_setting() {
+    // The excess lock is read from settings, so `admin_set_withdrawal_period`
+    // applies to it; the protected vault's 90 days is a const and does not move.
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &dummy, 100, 86_400, true);
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+
+    let payer_pk = ctx.payer.pubkey();
+    // `admin_set_withdrawal_period` is authority-gated and `setup_gar` leaves a
+    // different authority, so point it at the payer (same trick as the
+    // admin_set_withdrawal_period test above): authority is the first field
+    // after the 8-byte discriminator.
+    let mut settings_account = ctx
+        .banks_client
+        .get_account(setup.settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    settings_account.data[8..40].copy_from_slice(payer_pk.as_ref());
+    ctx.set_account(
+        &setup.settings_key,
+        &solana_sdk::account::AccountSharedData::from(settings_account),
+    );
+
+    let new_period: i64 = 14 * 86_400;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::AdminSetWithdrawalPeriod {
+                settings: setup.settings_key,
+                authority: payer_pk,
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::AdminSetWithdrawalPeriod {
+                new_period_seconds: new_period,
+            }
+            .data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let gateway_key = join_gateway(&mut ctx, &setup, 60_000_000_000).await;
+    make_prunable(&mut ctx, gateway_key).await;
+
+    let (counter_key, _) = withdrawal_counter_pda(&payer_pk);
+    let (exit_key, _) = withdrawal_pda(&payer_pk, 0);
+    let (excess_key, _) = withdrawal_pda(&payer_pk, 1);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts: ario_gar::accounts::PruneGateway {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_pda().0,
+                registry: setup.registry_key,
+                gateway: gateway_key,
+                withdrawal_counter: counter_key,
+                withdrawal: exit_key,
+                excess_withdrawal: Some(excess_key),
+                stake_token_account: setup.stake_token.pubkey(),
+                protocol_token_account: setup.protocol_token.pubkey(),
+                payer: payer_pk,
+                token_program: spl_token::id(),
+                system_program: system_program::id(),
+            }
+            .to_account_metas(None),
+            data: ario_gar::instruction::PruneGateway {}.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+
+    let exit = read_withdrawal(&mut ctx, exit_key).await;
+    let excess = read_withdrawal(&mut ctx, excess_key).await;
+    assert_eq!(
+        excess.available_at,
+        excess.created_at + new_period,
+        "excess vault must follow the admin-set withdrawal period"
+    );
+    assert_eq!(
+        exit.available_at,
+        exit.created_at + LEAVE_PERIOD_SECONDS,
+        "the protected vault's 90-day lock is a const and must not follow it"
     );
 }

@@ -542,13 +542,10 @@ pub fn update_gateway_metadata(
         GarError::GatewayLeaving
     );
 
-    // Authorisation. See `is_gateway_authority` for why the zero-pubkey case is
-    // handled there rather than inline: it is unreachable from an integration
-    // test, so it needs a unit test of its own to be verified at all.
-    require!(
-        is_gateway_authority(&signer, &gateway.operator, &gateway.operations_address),
-        GarError::NotGatewayAuthority
-    );
+    // Authorisation. `Gateway::authorises` honours the operations address only
+    // once the account is at 1.2.0 — below that the field is stale tail bytes —
+    // and never when it is the zero pubkey. Both refusals are unit-tested there.
+    require!(gateway.authorises(&signer), GarError::NotGatewayAuthority);
 
     // Same validation as update_gateway_settings — a delegated signer must not
     // be able to write values the operator could not.
@@ -613,6 +610,14 @@ pub fn update_operations_address(
     require!(
         gateway.status == GatewayStatus::Joined,
         GarError::GatewayLeaving
+    );
+    // Mandatory, not a convenience. Below 1.2.0 a delegation written here would
+    // be ignored by `Gateway::authorises` and then overwritten when the
+    // migration defaults the field to the operator — silently lost. Migration
+    // is permissionless and can ride in the same transaction.
+    require!(
+        operations_address_is_set(gateway.version),
+        GarError::GatewayNotMigrated
     );
     // A zeroed operations address would authorise nobody, but accepting it
     // silently turns "revoke" into "brick the delegation" — revocation is
@@ -679,6 +684,16 @@ pub fn update_observer_address(
 /// Prune a gateway that has exceeded maximum consecutive failures (F21)
 /// Permissionless — anyone can call if gateway has 30+ consecutive failures.
 /// Matches Lua: slash min operator stake, return remainder in withdrawal, remove from registry.
+///
+/// The remainder splits into the same two vaults as `leave_network`, with the
+/// same two lock periods (`gar.lua::pruneGateways` slashes and then calls
+/// `gar.leaveNetwork`, so the vaults are literally the leave path's):
+///   - Protected exit vault (min portion): `GATEWAY_LEAVE_PERIOD` (90 days).
+///   - Excess vault (above-min portion): `settings.withdrawal_period`
+///     (30 days default), as if the operator had used
+///     `withdraw_operator_stake`. Until 2026-09-17 this vault was given the
+///     90-day leave period here, locking a pruned operator's excess three
+///     times longer than a voluntary leaver's — see ADR-0038 and BD-102.
 pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let settings = &ctx.accounts.settings;
@@ -702,8 +717,14 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
     let slash_amount = std::cmp::min(settings.min_operator_stake, gateway.operator_stake);
     let post_slash = gateway.operator_stake.saturating_sub(slash_amount);
     let now = clock.unix_timestamp;
+    // Protected exit vault: the 90-day leave lock.
     let available_at = now
         .checked_add(GATEWAY_LEAVE_PERIOD)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    // Excess vault: the regular withdrawal lock, read from settings so
+    // `admin_set_withdrawal_period` applies here as it does in `leave_network`.
+    let excess_available_at = now
+        .checked_add(settings.withdrawal_period)
         .ok_or(GarError::ArithmeticOverflow)?;
 
     // Lua-faithful split — same shape as leave_network, but operating on
@@ -814,7 +835,7 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
             gateway: operator_key,
             amount: excess_amount,
             created_at: now,
-            available_at,
+            available_at: excess_available_at,
             is_delegate: false,
             is_exit_vault: true,
             is_protected: false,

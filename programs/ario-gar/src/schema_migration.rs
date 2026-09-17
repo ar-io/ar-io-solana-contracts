@@ -174,31 +174,25 @@ pub fn migrate_gateway_version(account: &mut Gateway) -> Result<()> {
                 account.version = SchemaVersion::new(1, 1, 0);
             }
             // 1.1.0 -> 1.2.0 (ADR-0030): `operations_address` was appended after
-            // `version`, so `grow_account` has just zero-filled it. Default it to
-            // the operator, matching `join_network` and the M3 `observer_address`
-            // precedent.
+            // `version`. Set it to the operator, matching `join_network` and the
+            // M3 `observer_address` precedent.
             //
-            // It must never be left as `Pubkey::default()`: the ArNS discount and
-            // metadata checks accept `operations_address` as a signer, so a zeroed
-            // field that authorised anyone would be a privilege bypass.
+            // **Unconditionally.** What was just deserialized into this field is
+            // NOT zero padding: `grow_account` zero-fills only the bytes it adds
+            // (964 -> 996), while the field is read from right after `version`,
+            // inside the old 964 bytes, where an earlier and longer serialization
+            // can have left stale bytes — 30 of 620 mainnet gateways had them. A
+            // "default only if zero" rule would keep that garbage, and a shrink of
+            // exactly 52 bytes leaves the previous `observer_address` there.
+            //
+            // Overwriting cannot lose a real delegation: `update_operations_address`
+            // refuses accounts below 1.2.0, so none can exist yet.
             SchemaVersion {
                 major: 1,
                 minor: 1,
                 patch: 0,
             } => {
-                // Default ONLY if unset. `migrate_gateway` is permissionless, and
-                // `update_operations_address` works on an un-migrated account
-                // (its content has room to grow by 32 bytes), so an operator can
-                // delegate before the migration reaches their gateway. An
-                // unconditional write would let any third party silently reset
-                // that delegation by running the migration afterwards.
-                //
-                // A genuinely un-migrated account reads zero here because
-                // `grow_account` just zero-filled the appended tail, so the
-                // condition is exactly "the field was never set".
-                if account.operations_address == Pubkey::default() {
-                    account.operations_address = account.operator;
-                }
+                account.operations_address = account.operator;
                 account.version = SchemaVersion::new(1, 2, 0);
             }
             _ => return err!(GarError::UnknownSchemaVersion),

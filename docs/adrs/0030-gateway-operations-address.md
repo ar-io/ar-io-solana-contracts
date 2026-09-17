@@ -1,6 +1,6 @@
 # ADR-0030: A Gateway May Delegate Operations to a Second Address
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-16; implemented in contracts #129, stale-tail fix in #142)
 * **Date:** 2026-09-02
 * **Deciders:** protocol engineering
 
@@ -399,3 +399,69 @@ precisely the failure this ADR would otherwise have caused.
   live in `DECISIONS.md`, `docs/adrs/` restarts at 0020.
 * ADR: [ADR-0031](0031-transferable-epoch-settings-authority.md) — ships first,
   separately
+
+## Addendum — 2026-09-16: the un-migrated tail is not zero padding
+
+*Appended after merge; the body above is unchanged.*
+
+### What was wrong
+
+This ADR assumed that, on an un-migrated account, `operations_address` is read
+out of zero padding and so decodes as `Pubkey::default()`. **That is false for
+real accounts.** Anchor's `Account::exit` serializes the struct from offset 0
+and never clears bytes past its new end (`anchor-lang 0.31.1`,
+`accounts/account.rs`), and `schema_migration::write_account` likewise copies
+only the serialized length. Any gateway whose content ever shrank — a shorter
+label, fqdn or note, or an `Option` going `Some → None` — keeps its old tail
+bytes, and the new layout reads `operations_address` from exactly there.
+
+Measured before deployment, with the generated client decoding live accounts:
+**30 of 620 mainnet gateways** and **1 of 620 on staging** decode a non-zero
+`operations_address`. The ones seen were fragments of an old `bump`/`version`
+(e.g. `fd 01 01 00 …`), not keys anyone holds — but the rule is unsound in
+general. A gateway's last 52 serialized bytes are `observer_address`,
+`cumulative_reward_per_token`, `bump` and `version`, so a shrink of exactly 52
+bytes leaves the **previous `observer_address`** in that position: a real key,
+possibly held by a third party, which the merged `is_gateway_authority` would
+have accepted for metadata edits and the ArNS discount. This was reproduced with
+the real types. The merged migration arm also defaulted the field only when it
+read zero, so such a key would have survived migration permanently.
+
+Statements above that relied on the false premise:
+
+* *Consequences* — "An un-migrated `operations_address` reads as zeroes."
+* *Implementation notes* — "the appended field reads out of the padding as
+  `Pubkey::default()`".
+* *Implementation notes* — "`grow_account`'s tail zero-fill lands exactly on the
+  new field". The grow zero-fills bytes 964–996; the field is read immediately
+  after `version`, inside the old 964 bytes.
+* *Build notes* — "New arns, old gar — the appended field reads from the
+  zero-padded tail as `Pubkey::default()`."
+* *Build notes* test matrix — "a zeroed / un-migrated field authorises nobody"
+  (the right outcome, for the wrong reason).
+
+Still true: un-migrated accounts remain **readable** (the largest real gateway
+serializes to 467 bytes, 499 with the new field, against 964); appending the
+field after `version` means nothing already stored shifts; and gar and arns can
+still deploy independently.
+
+### Corrected rules (implemented with this addendum)
+
+1. **The field is data only from schema 1.2.0.** `Gateway::authorises` honours
+   `operations_address` only when `version >= OPERATIONS_ADDRESS_SINCE` (1.2.0),
+   and never when it is `Pubkey::default()`. Both `update_gateway_metadata` and
+   ario-arns' discount check go through it.
+2. **Migration sets the field unconditionally** to `operator` in the
+   1.1.0 → 1.2.0 arm.
+3. **`update_operations_address` requires a migrated account**, failing with
+   `GatewayNotMigrated` (6101). This is what makes rule 2 safe: no real
+   delegation can exist before migration, so overwriting cannot lose one. It
+   supersedes the earlier "migration must not clobber a deliberate pre-migration
+   delegation" behaviour, which could not tell a delegation from stale bytes.
+
+Operational effect: an operator must migrate before delegating. Migration is
+permissionless and can ride in the same transaction; the rollout sweep migrates
+every gateway anyway.
+
+Tests now plant **stale tail bytes**, not zero padding, including the case where
+they are a key someone holds; each rule has a negative control.
