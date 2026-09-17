@@ -411,3 +411,42 @@ epoch.
   * `claimDelegateFromLeavingGateway` in the SDK should accept a delegator, as the
     disabled-gateway variant does, so crankers can clear real delegations from
     leaving gateways.
+
+## Addendum — 2026-09-17: implementation notes from the Wave 1 security review
+
+*Appended after merge; the body above is unchanged.*
+
+A review of the Wave 1 code before its staging upgrade turned up these points
+for the Wave 2 implementation. None changes the decision.
+
+* **Every settlement site.** `settle_delegate_rewards` is called 11 times, in 10
+  instructions:
+  * `delegate.rs`: `delegate_stake`, `decrease_delegate_stake`,
+    `close_empty_delegation`, `claim_delegate_from_leaving_gateway`,
+    `claim_delegate_from_disabled_gateway`, `redelegate_stake` (twice, once per
+    side) and `compound_delegation_rewards`;
+  * `payment.rs`: `deduct_delegation_for_payment` and `pay_from_funding_plan`;
+  * `withdrawal.rs`: `cancel_withdrawal`.
+
+  The supply-counter fix must cover all of them. `close_empty_delegation`
+  settles only at `amount == 0`, which never adds anything, so it needs no
+  `settings` account. `compound_delegation_rewards` is the only settling
+  instruction that can add rewards and has no `settings` account today.
+* **The supply counters are reporting-only.** No instruction reads
+  `total_staked`, `total_delegated` or `total_withdrawn` for anything but
+  updating them, so the resync cannot change a payout.
+* **Reconcile can be delayed, not misled.** Anyone can delegate to a gateway
+  between the plan read and the reconcile. The counter then no longer matches
+  `expected_counter`, and the call fails without writing. Re-read and retry.
+* **Every Delegation account can be deserialized.** On both clusters all
+  Delegation accounts are 108 bytes at v1.0.0 (mainnet 497, staging 542), so a
+  typed load of each one in the reconcile works.
+* **`import_account` is not a fallback.** After the Wave 1 upgrade it can no
+  longer overwrite an un-migrated Gateway: re-imports require
+  `data_len() == Gateway::SIZE` (now 996), and un-migrated gateways are 964 bytes.
+  Option B above is unavailable, not just rejected.
+* **Stale comment to fix in the Wave 2 build, not before.**
+  `schema_migration.rs` still says there is "intentionally no 1.0.0 → 1.1.0
+  arm", but #137 added one. Anchor bakes source line numbers into its error
+  messages, so editing that file changes the GAR binary. Fix it in the Wave 2
+  build rather than invalidating the Wave 1 artifact now under review.
