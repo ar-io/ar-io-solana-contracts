@@ -93,6 +93,14 @@ pub const ARWEAVE_ADDRESS_LENGTH: usize = 43;
 /// Default number of undernames included with every registration
 pub const DEFAULT_UNDERNAME_COUNT: u16 = 10;
 
+/// Maximum undername limit per name (BD-048).
+///
+/// A deliberate divergence from Lua, which caps nothing: unbounded undername
+/// records per ANT would make enumeration and account management impractical.
+/// Enforced through [`ArnsRecord::checked_undername_limit`], which every
+/// `increase_undername_limit*` handler calls.
+pub const MAX_UNDERNAME_LIMIT: u16 = 10_000;
+
 /// Discount for gateway operators purchasing names (0.2 scaled)
 pub const GATEWAY_OPERATOR_DISCOUNT_PCT: u64 = 200_000;
 
@@ -507,6 +515,28 @@ impl ArnsRecord {
 
     /// Default undername limit for new registrations
     pub const DEFAULT_UNDERNAME_LIMIT: u16 = DEFAULT_UNDERNAME_COUNT;
+
+    /// The undername limit after adding `quantity`, or an error.
+    ///
+    /// One place, called by all five `increase_undername_limit*` handlers, so
+    /// the cap cannot hold on some funding modes and not others: BD-048's
+    /// 10,000 cap was enforced only by the two stake-funded variants (as a bare
+    /// literal), while the balance, delegation and operator-stake paths let a
+    /// name run to `u16::MAX`.
+    pub fn checked_undername_limit(current: u16, quantity: u16) -> Result<u16> {
+        require!(
+            quantity > 0,
+            crate::error::ArnsError::InvalidUndernameQuantity
+        );
+        let new_limit = current
+            .checked_add(quantity)
+            .ok_or(crate::error::ArnsError::UndernameLimitExceeded)?;
+        require!(
+            new_limit <= MAX_UNDERNAME_LIMIT,
+            crate::error::ArnsError::UndernameLimitExceeded
+        );
+        Ok(new_limit)
+    }
 
     /// Returns true if the name is currently active (not expired).
     /// A permabuy is always active. A lease is active while `end_timestamp >= timestamp`.
@@ -1020,6 +1050,44 @@ mod tests {
     fn permabuy_not_in_grace_period() {
         let record = make_permabuy_record();
         assert!(!record.is_in_grace_period(1_000_000, 14 * 86_400));
+    }
+
+    // =========================================
+    // Undername limit cap (BD-048)
+    // =========================================
+
+    /// Every `increase_undername_limit*` handler goes through this, so the cap
+    /// holds on all five funding modes. It used to be a bare `10_000` literal
+    /// in the two stake-funded handlers only.
+    #[test]
+    fn checked_undername_limit_enforces_the_cap() {
+        // Room below the cap.
+        assert_eq!(ArnsRecord::checked_undername_limit(10, 90).unwrap(), 100);
+        // Exactly at the cap is allowed.
+        assert_eq!(
+            ArnsRecord::checked_undername_limit(MAX_UNDERNAME_LIMIT - 1, 1).unwrap(),
+            MAX_UNDERNAME_LIMIT
+        );
+        assert_eq!(
+            ArnsRecord::checked_undername_limit(10, MAX_UNDERNAME_LIMIT - 10).unwrap(),
+            MAX_UNDERNAME_LIMIT
+        );
+        // One past it is not.
+        assert!(ArnsRecord::checked_undername_limit(MAX_UNDERNAME_LIMIT, 1).is_err());
+        assert!(ArnsRecord::checked_undername_limit(10, MAX_UNDERNAME_LIMIT - 9).is_err());
+        // And a u16 overflow cannot wrap past the cap.
+        assert!(ArnsRecord::checked_undername_limit(u16::MAX, 1).is_err());
+        assert!(ArnsRecord::checked_undername_limit(u16::MAX - 1, 5).is_err());
+    }
+
+    #[test]
+    fn checked_undername_limit_rejects_zero_quantity() {
+        assert!(ArnsRecord::checked_undername_limit(10, 0).is_err());
+    }
+
+    #[test]
+    fn max_undername_limit_is_10_000() {
+        assert_eq!(MAX_UNDERNAME_LIMIT, 10_000);
     }
 
     // =========================================
