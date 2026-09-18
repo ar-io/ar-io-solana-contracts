@@ -323,3 +323,74 @@ Squads vault) avoids both.
 * [ADR-035](0035-anchor-error-codes-are-append-only.md) — the new error variant
   must be appended
 * ar-io-sdk#726 — the client-side stall fix that removes the most common window
+
+## Addendum — 2026-09-17: an epoch with no observations pays nothing and credits nothing
+
+*Appended after merge; the body above is unchanged. This resolves the open
+decision left in "Catch-up after a stop".*
+
+**Decision (2026-09-17): `distribute_epoch` short-circuits when
+`observations_submitted == 0`.** It makes no payout, writes no gateway stats,
+and marks the epoch distributed so the chain advances. The period's reward share
+stays in the treasury.
+
+### Why
+
+The open question was framed as "does a catch-up epoch pay everyone?", and a
+second consequence decided it. `distribute_epoch` does not only pay: per
+gateway it also increments `stats.total_epochs`, and for any gateway it does not
+mark failed it increments `passed_epochs` and `passed_consecutive` **and resets
+`failed_consecutive` to 0**. A gateway is only marked failed when
+`observations_submitted > 0`.
+
+So under the previous behaviour an epoch that accepted no observations would
+have recorded a **pass for every gateway**, which:
+
+* wipes the failure streak of a gateway heading for the 30-consecutive-failure
+  prune, deferring or cancelling its removal; and
+* lifts its epoch pass rate, which gates ArNS operator-discount eligibility at
+  90% (`try_apply_gateway_discount`).
+
+An outage would have laundered the record of exactly the gateways the incentive
+protocol exists to catch, on top of paying them. Skipping the epoch entirely
+costs the honest operators that period's rewards — the tokens stay in the
+treasury and fund later epochs — and that is the lesser harm.
+
+The rule also keeps the ADR's own properties intact:
+
+* **Permissionless.** Recovery does not touch `EpochSettings.authority`, so
+  liveness does not depend on an admin key — which matters on staging, where
+  that authority is a 2-of-4 Squads vault (ADR-0031).
+* **Cheap.** A backlog epoch becomes `create_epoch` + one `distribute_epoch`
+  call, instead of ~36 tally transactions and ~50 distribute batches. After a
+  multi-day stop that is the difference between hours of cranking and minutes.
+* **Consistent.** ADR-0032 and ADR-0033 already accept that a period which
+  cannot be paid correctly simply goes unpaid; mainnet epoch 540 is that case.
+
+### Consequence to accept
+
+A **live** epoch in which every prescribed observer failed to submit also pays
+nobody and credits nobody. That is the same evidence vacuum as a catch-up epoch,
+and the alternative — paying blind and crediting a pass to everyone — is worse.
+It is a real behaviour change, not only a catch-up rule.
+
+### Implementation notes
+
+* Trigger on `observations_submitted == 0` at `distribute_epoch`, after the
+  existing `clock >= end_timestamp` check. Do not add a separate instruction and
+  do not depend on how late the epoch was created: the evidence vacuum is the
+  condition, not the schedule.
+* Set `rewards_distributed = 1` and advance `distribution_index` to
+  `active_gateway_count` so the epoch reads as complete and satisfies this ADR's
+  predicate and ADR-0036's.
+* Emit `EpochDistributedEvent` with zero totals so indexers see a finished epoch
+  rather than a gap; consider a distinguishing field rather than a new event
+  (ADR-018 keeps shipped events append-only).
+* Touch no `Gateway.stats`, no `cumulative_reward_per_token`, and no treasury
+  transfer.
+* `close_epoch` still works afterwards: it requires
+  `observations_closed == observations_submitted`, which holds trivially at 0.
+* Tests: an ended epoch with zero observations pays nothing, leaves
+  `failed_consecutive` intact (the laundering case), leaves pass rates intact,
+  and still satisfies `create_epoch`'s gate; and one epoch with a single
+  observation still distributes normally.
