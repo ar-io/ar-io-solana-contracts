@@ -7,7 +7,9 @@ use anchor_spl::token::{Token, TokenAccount};
 
 use crate::error::GarError;
 use crate::state::*;
-use crate::{EpochDistributedEvent, ARIO_CORE_PROGRAM_ID, RATE_SCALE};
+use crate::{
+    EpochDistributedEvent, EpochSkippedNoObservationsEvent, ARIO_CORE_PROGRAM_ID, RATE_SCALE,
+};
 
 /// Per-gateway intermediate computed during distribute_epoch's first pass.
 /// Holds the deserialized Gateway + the scalar per-gateway computations so
@@ -104,6 +106,71 @@ pub fn distribute_epoch<'info>(
         epoch.rewards_distributed == 0,
         GarError::RewardsAlreadyDistributed
     );
+
+    // ADR-0034 addendum: an epoch that collected no observations pays nothing
+    // and credits nothing.
+    //
+    // Distribution does not only pay. Per gateway it also increments
+    // `stats.total_epochs`, and for any gateway it does not mark failed it
+    // increments `passed_epochs` and `passed_consecutive` AND resets
+    // `failed_consecutive` to 0. A gateway is only ever marked failed when
+    // `observations_submitted > 0` (see the `failed` computation below). So
+    // paying out an unobserved epoch would record a PASS for every gateway —
+    // wiping the failure streak of any gateway heading for the
+    // 30-consecutive-failure prune, and lifting the epoch pass rate that gates
+    // ArNS operator-discount eligibility at 90%. An outage would launder the
+    // record of exactly the gateways the incentive protocol exists to catch, on
+    // top of paying them. Skipping costs honest operators that period's rewards
+    // — the tokens stay in the treasury and fund later epochs — and that is the
+    // lesser harm.
+    //
+    // The condition is the evidence vacuum, not the schedule: this fires for a
+    // live epoch in which every prescribed observer failed to submit, exactly
+    // as it does for a catch-up epoch created after its own window closed.
+    // That consequence is accepted in the addendum.
+    //
+    // `distribution_index == 0` is an UPGRADE-SAFETY guard, not part of the
+    // ADR's condition. The pre-Wave-2 program distributes a zero-observation
+    // epoch normally, so one can be *partially* paid when this upgrade lands:
+    // the treasury transfer has happened and gateways `0..k` already carry
+    // credited stake and a passed-epoch stat. Skipping from there would record
+    // a half-paid epoch as a clean skip and strand the remainder. When the
+    // cursor has already moved, fall through and finish the distribution the
+    // way the old program would have — the epoch is no longer an evidence
+    // vacuum, it is an in-progress payout.
+    if epoch.observations_submitted == 0 && epoch.distribution_index == 0 {
+        let epoch_index = epoch.epoch_index;
+        let active_gateway_count = epoch.active_gateway_count;
+
+        // Mark complete so the epoch satisfies ADR-0034's `create_epoch`
+        // predicate and ADR-0036's `finalize_gone` predicate. No `Gateway.stats`,
+        // no `cumulative_reward_per_token`, and no treasury transfer are touched.
+        epoch.distribution_index = active_gateway_count;
+        epoch.rewards_distributed = 1;
+
+        drop(epoch);
+        drop(registry);
+
+        // Emit both, in this order. `EpochDistributedEvent` cannot carry a
+        // discriminator — its shape is frozen (ADR-018), and a normal
+        // distribution can legitimately report zero totals when no gateway was
+        // eligible, so zero totals do not identify a skip. The new event is the
+        // stable discriminator; the old one is what the cranker, observer and
+        // SDK already watch to advance, so it must still fire.
+        emit!(EpochSkippedNoObservationsEvent {
+            epoch_index,
+            active_gateway_count,
+            timestamp: clock.unix_timestamp,
+        });
+        emit!(EpochDistributedEvent {
+            epoch_index,
+            gateways_processed: 0,
+            total_eligible_rewards: 0,
+            timestamp: clock.unix_timestamp,
+        });
+
+        return Ok(());
+    }
 
     let active_count = epoch.active_gateway_count as usize;
     let observations_submitted = epoch.observations_submitted;

@@ -593,6 +593,34 @@
     {
       "code": 6101,
       "name": "GatewayNotMigrated"
+    },
+    {
+      "code": 6102,
+      "name": "LatestEpochUnfinished"
+    },
+    {
+      "code": 6103,
+      "name": "MissingLatestEpochAccount"
+    },
+    {
+      "code": 6104,
+      "name": "StaleDelegatedStakeCounter"
+    },
+    {
+      "code": 6105,
+      "name": "DelegationReconcileMismatch"
+    },
+    {
+      "code": 6106,
+      "name": "DuplicateDelegationAccount"
+    },
+    {
+      "code": 6107,
+      "name": "InvalidDelegationAccount"
+    },
+    {
+      "code": 6108,
+      "name": "StaleSupplyCounters"
     }
   ],
   "ario_arns": [

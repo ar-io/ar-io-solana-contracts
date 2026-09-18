@@ -37,7 +37,7 @@ Full API in `sdk/src/solana/events.ts`.
 | Program | Events | Highlights |
 |---|---|---|
 | `ario-core` | 14 | Token transfer, vault CRUD, primary-name lifecycle, supply/migration finalized, config updates, admin-authority transfer (ADR-026) |
-| `ario-gar` | 38 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), multi-source funding plan, admin-authority transfer (ADR-026), EpochSettings authority transfer (ADR-0031), delegated operations address + metadata updates (ADR-0030) |
+| `ario-gar` | 41 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), skipped-epoch discriminator (ADR-0034), multi-source funding plan, admin-authority transfer (ADR-026), EpochSettings authority transfer (ADR-0031), delegated operations address + metadata updates (ADR-0030), delegated-stake reconcile + supply-counter resync (ADR-0037) |
 | `ario-arns` | 13 | Name purchases (5 base events × `funding_source: u8` covering 25 emit variants), reassign/release, reservation lifecycle, prune, demand-factor updates, admin-authority transfer (ADR-026) |
 | `ario-ant` | 22 | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`), admin record/ACL/orphan closes, admin-authority transfer (ADR-026), `adopt_authority` (ADR-028) |
 | `ario-ant-escrow` | 5 | Unified shapes for 15 instructions via `asset_type: u8` (ANT/Tokens/Vault) + `claim_protocol: u8` (Arweave/Ethereum), admin purge |
@@ -45,6 +45,32 @@ Full API in `sdk/src/solana/events.ts`.
 Full per-event field shapes: `BD-103` in
 [`BEHAVIORAL_DIFFERENCES.md`](./BEHAVIORAL_DIFFERENCES.md). Lua-parity
 mapping is in the same entry.
+
+### Wave 2 additions (ADR-0034 / ADR-0037)
+
+Three events were appended to `ario-gar`. All are additive; no shipped event
+changed shape (ADR-018).
+
+| Event | Emitted by | Why it exists |
+|---|---|---|
+| `EpochSkippedNoObservationsEvent { epoch_index: u64, active_gateway_count: u32, timestamp: i64 }` | `distribute_epoch` | The epoch collected **zero** observations, so it paid nothing and credited no gateway stats (ADR-0034 addendum). |
+| `DelegatedStakeReconciledEvent { gateway: Pubkey, previous: u64, removed: u64, new: u64, delegations_counted: u32, timestamp: i64 }` | `admin_reconcile_delegated_stake` | A gateway's `total_delegated_stake` was lowered to the sum of the Delegation accounts proven to back it, removing phantom stake left by the AO import (ADR-0037). |
+| `SupplyCountersResyncedEvent { previous_staked: u64, new_staked: u64, previous_delegated: u64, new_delegated: u64, timestamp: i64 }` | `admin_resync_supply_counters` | The reporting-only `GatewaySettings` supply counters were set to audited values (ADR-0037). |
+
+**Telling a skipped epoch from a normal one.** A skip emits
+`EpochSkippedNoObservationsEvent` **immediately before** an otherwise-normal
+`EpochDistributedEvent` carrying `gateways_processed: 0` and
+`total_eligible_rewards: 0`, in the same transaction.
+
+Do **not** try to detect a skip from those zero totals: a *normal* distribution
+whose eligible set happens to be empty reports exactly the same numbers.
+`EpochDistributedEvent`'s shape is frozen, so it cannot carry a flag — the new
+event is the only stable discriminator. Key on its presence.
+
+Consumers that only need "this epoch finished" should keep watching
+`EpochDistributedEvent` alone and ignore the new event; it is still emitted for
+every completed epoch, skipped or not, which is what lets the cranker, observer
+and SDK advance without an upgrade.
 
 ## Wire format
 

@@ -703,9 +703,24 @@ impl Delegation {
     pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1 + SCHEMA_VERSION_SIZE;
 }
 
-/// Settle pending delegate rewards using the reward-per-share accumulator.
-/// Called at the start of any delegate interaction to materialize pending rewards.
-pub fn settle_delegate_rewards(gateway: &mut Gateway, delegation: &mut Delegation) {
+/// Settle pending delegate rewards using the reward-per-share accumulator,
+/// materializing them into the delegation's principal. Called at the start of
+/// any delegate interaction.
+///
+/// **Returns the amount settled**, which the caller MUST add to
+/// `GatewaySettings.total_delegated` (ADR-0037). This function raises
+/// `gateway.total_delegated_stake`, and until ADR-0037 no caller raised the
+/// matching supply counter — `INVARIANTS.md` claimed the two stayed equal
+/// because both were "equally stale", which holds only until the first
+/// settlement. Measured on mainnet 2026-09-17, that drift was 80,442.894868
+/// ARIO.
+///
+/// Returning the amount rather than taking `settings` keeps this callable from
+/// `state`, which has no account context, and makes the obligation visible at
+/// every call site.
+#[must_use = "the settled amount must be added to GatewaySettings.total_delegated (ADR-0037)"]
+pub fn settle_delegate_rewards(gateway: &mut Gateway, delegation: &mut Delegation) -> u64 {
+    let mut settled: u64 = 0;
     if delegation.amount > 0 && gateway.cumulative_reward_per_token > delegation.reward_debt {
         let delta = gateway.cumulative_reward_per_token - delegation.reward_debt;
         // Overflow-safe reward calculation with precision-preserving fallback
@@ -726,9 +741,11 @@ pub fn settle_delegate_rewards(gateway: &mut Gateway, delegation: &mut Delegatio
             delegation.amount = delegation.amount.saturating_add(pending_u64);
             gateway.total_delegated_stake =
                 gateway.total_delegated_stake.saturating_add(pending_u64);
+            settled = pending_u64;
         }
     }
     delegation.reward_debt = gateway.cumulative_reward_per_token;
+    settled
 }
 
 // =========================================
@@ -1800,8 +1817,11 @@ mod tests {
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
         };
-        settle_delegate_rewards(&mut gateway, &mut delegation);
+        let settled = settle_delegate_rewards(&mut gateway, &mut delegation);
         assert_eq!(delegation.amount, 50_000_000); // unchanged
+                                                   // ADR-0037: nothing settled, so the caller adds nothing to
+                                                   // `settings.total_delegated`.
+        assert_eq!(settled, 0);
     }
 
     #[test]
@@ -1849,11 +1869,20 @@ mod tests {
             version: SchemaVersion::new(1, 0, 0),
         };
         let old_total = gateway.total_delegated_stake;
-        settle_delegate_rewards(&mut gateway, &mut delegation);
+        let settled = settle_delegate_rewards(&mut gateway, &mut delegation);
         // pending = 100_000_000 * 1e18 / 1e18 = 100_000_000
         assert_eq!(delegation.amount, 200_000_000); // 100 + 100
         assert_eq!(delegation.reward_debt, 2_000_000_000_000_000_000);
         assert_eq!(gateway.total_delegated_stake, old_total + 100_000_000);
+        // ADR-0037: the returned amount is exactly what the gateway counter
+        // gained, and is what the caller must add to
+        // `settings.total_delegated`. Before ADR-0037 nothing did, which is how
+        // mainnet drifted 80,442.894868 ARIO.
+        assert_eq!(settled, 100_000_000);
+        assert_eq!(
+            gateway.total_delegated_stake,
+            old_total.saturating_add(settled)
+        );
     }
 
     // =========================================

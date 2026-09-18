@@ -279,9 +279,24 @@ advanced since every delegation last settled, which is fleeting in
 production.
 
 The supply-counter shadow ([Invariant 2](#invariant-2--supply-counter-shadow))
-is unaffected — `settings.total_delegated` is equally stale as
-`Σ Gateway.total_delegated_stake`, so both sides agree. Only the
-SPL-pool-vs-accounting equation depends on the fourth term.
+is unaffected by the *accumulator* staleness: while nothing settles, both
+`settings.total_delegated` and `Σ Gateway.total_delegated_stake` are equally
+stale, so they agree. Only the SPL-pool-vs-accounting equation depends on the
+fourth term.
+
+> **Corrected 2026-09-18 (ADR-0037).** The "equally stale" argument held only
+> until the first *settlement*. `settle_delegate_rewards` raises
+> `Gateway.total_delegated_stake`, and before ADR-0037 no caller raised
+> `settings.total_delegated` to match — `compound_delegation_rewards` had no
+> `settings` account at all. So every settled reward widened a permanent gap,
+> which reached **80,442.894868 ARIO** on mainnet. The property test could not
+> catch it because it never settled a reward.
+>
+> Fixed in the Wave 2 GAR upgrade: `settle_delegate_rewards` now returns the
+> settled amount and every one of its callers adds it to the supply counter.
+> `admin_resync_supply_counters` corrects the accumulated drift once. Any health
+> check that ran before that upgrade should expect this gap on mainnet rather
+> than treat it as a fresh bug.
 
 ## Known limits
 
@@ -390,8 +405,12 @@ const sumPendingRewards = delegations.reduce((s, d) => {
 // Invariant 1 — stake-pool conservation with all four terms.
 assert(poolBalance === sumOperator + sumDelegated + sumWithdrawn + sumPendingRewards);
 
-// Invariant 2 — supply-counter shadow (independent of distribute_epoch staleness;
-// both sides are equally stale, so they always agree).
+// Invariant 2 — supply-counter shadow. Independent of distribute_epoch
+// staleness, because while nothing settles both sides are equally stale.
+// NOTE (ADR-0037): before the Wave 2 GAR upgrade, settlement raised the gateway
+// counter without raising settings.total_delegated, so this assertion legitimately
+// fails on any cluster that settled rewards under the old code until
+// admin_resync_supply_counters has run.
 assert(sumOperator  === BigInt(settings.total_staked));
 assert(sumDelegated === BigInt(settings.total_delegated));
 assert(sumWithdrawn === BigInt(settings.total_withdrawn));

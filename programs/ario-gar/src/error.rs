@@ -406,4 +406,54 @@ pub enum GarError {
     // left behind. Run the permissionless `migrate_gateway` first.
     #[msg("Gateway has not been migrated to the layout that carries an operations address; run migrate_gateway first")]
     GatewayNotMigrated,
+
+    // 6102 -- ADR-0034 / ADR-0036. The shared "latest epoch is finished"
+    // predicate, enforced by `create_epoch` (an unfinished epoch must not be
+    // superseded) and by `finalize_gone` (registry positions are frozen while
+    // an epoch is unfinished). Finished means `rewards_distributed == 1`, or
+    // the Epoch account no longer exists.
+    #[msg("The latest epoch is not finished: distribute it, or write it off with admin_close_stale_epoch, before continuing")]
+    LatestEpochUnfinished,
+
+    // 6103 -- ADR-0034 / ADR-0036. The caller did not pass the latest Epoch
+    // PDA in `remaining_accounts`, so the predicate above cannot be evaluated.
+    // Distinct from `LatestEpochUnfinished` so an un-upgraded client gets a
+    // diagnosis ("you are missing an account") rather than a false "the epoch
+    // is unfinished".
+    #[msg("The latest epoch's account must be supplied in remaining_accounts")]
+    MissingLatestEpochAccount,
+
+    // 6104 -- ADR-0037. `admin_reconcile_delegated_stake` guards against a
+    // stale plan: the gateway's counter moved between the off-chain read and
+    // this call. Re-read and retry.
+    #[msg(
+        "Gateway's delegated-stake counter does not match the expected value; the plan is stale"
+    )]
+    StaleDelegatedStakeCounter,
+
+    // 6105 -- ADR-0037. `expected_counter - Σ delegation.amount` did not equal
+    // `expected_removed`, or `expected_removed` was zero. This is what makes a
+    // missing Delegation account fail closed: the two sides of the plan come
+    // from independent sources (getProgramAccounts and the genesis snapshot)
+    // and must agree. Also rejects any call that would RAISE the counter.
+    #[msg("Reconcile amount does not agree with the delegations supplied; the counter may only be lowered to their sum")]
+    DelegationReconcileMismatch,
+
+    // 6106 -- ADR-0037. The same Delegation account was passed twice, which
+    // would double-count its amount and under-remove from the counter.
+    #[msg("A delegation account was supplied more than once")]
+    DuplicateDelegationAccount,
+
+    // 6107 -- ADR-0037. A `remaining_accounts` entry was not a Delegation of
+    // this gateway at its canonical PDA: wrong owner, wrong discriminator,
+    // undeserializable, a different gateway's delegation, or an off-curve
+    // address.
+    #[msg("A supplied account is not a canonical Delegation account of this gateway")]
+    InvalidDelegationAccount,
+
+    // 6108 -- ADR-0037. `admin_resync_supply_counters` guards against a stale
+    // read the same way the reconcile does: both expected values must match
+    // what is stored before either is overwritten.
+    #[msg("Supply counters do not match the expected values; the resync plan is stale")]
+    StaleSupplyCounters,
 }

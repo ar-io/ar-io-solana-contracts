@@ -193,6 +193,9 @@ pub fn cancel_withdrawal(ctx: Context<CancelWithdrawal>) -> Result<()> {
     );
 
     let amount = withdrawal.amount;
+    // ADR-0037: rewards settled into principal on the delegate branch below.
+    // Stays 0 on the operator branch, which does not settle.
+    let settled: u64;
 
     if withdrawal.is_delegate {
         // Cancel delegate withdrawal: return to delegation
@@ -209,7 +212,9 @@ pub fn cancel_withdrawal(ctx: Context<CancelWithdrawal>) -> Result<()> {
         // Settle pending rewards BEFORE adding cancelled amount back.
         // Without this, the returned tokens would retroactively earn rewards
         // from the period they were in the withdrawal vault.
-        settle_delegate_rewards(gateway, delegation);
+        // ADR-0037: the settled amount is added to the supply counter below,
+        // alongside the cancelled amount returning to the delegated pool.
+        settled = settle_delegate_rewards(gateway, delegation);
         delegation.amount = delegation
             .amount
             .checked_add(amount)
@@ -222,6 +227,7 @@ pub fn cancel_withdrawal(ctx: Context<CancelWithdrawal>) -> Result<()> {
             .ok_or(GarError::ArithmeticOverflow)?;
     } else {
         // Cancel operator withdrawal: return to operator_stake
+        settled = 0;
         gateway.operator_stake = gateway
             .operator_stake
             .checked_add(amount)
@@ -244,6 +250,7 @@ pub fn cancel_withdrawal(ctx: Context<CancelWithdrawal>) -> Result<()> {
         settings.total_delegated = settings
             .total_delegated
             .checked_add(amount)
+            .and_then(|v| v.checked_add(settled))
             .ok_or(GarError::ArithmeticOverflow)?;
     } else {
         settings.total_staked = settings
