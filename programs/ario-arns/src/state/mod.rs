@@ -95,8 +95,10 @@ pub const DEFAULT_UNDERNAME_COUNT: u16 = 10;
 
 /// Maximum undername limit per name (BD-048).
 ///
-/// A deliberate divergence from Lua, which caps nothing: unbounded undername
-/// records per ANT would make enumeration and account management impractical.
+/// The v3.0.0 whitepaper's number (§9.2, alongside the default of 10), so this
+/// is whitepaper parity rather than a port invention — Lua caps nothing, and
+/// the whitepaper is canonical where the two disagree. Raising it later is a
+/// non-breaking relaxation within `u16`; enforcing a lower number would not be.
 /// Enforced through [`ArnsRecord::checked_undername_limit`], which every
 /// `increase_undername_limit*` handler calls.
 pub const MAX_UNDERNAME_LIMIT: u16 = 10_000;
