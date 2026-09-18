@@ -383,14 +383,30 @@ It is a real behaviour change, not only a catch-up rule.
 * Set `rewards_distributed = 1` and advance `distribution_index` to
   `active_gateway_count` so the epoch reads as complete and satisfies this ADR's
   predicate and ADR-0036's.
-* Emit `EpochDistributedEvent` with zero totals so indexers see a finished epoch
-  rather than a gap; consider a distinguishing field rather than a new event
-  (ADR-018 keeps shipped events append-only).
+* **Events — emit both, in this order.** `EpochDistributedEvent` cannot carry a
+  discriminator: its shape is frozen (ADR-018), and a normal distribution can
+  legitimately emit `gateways_processed: 0, total_eligible_rewards: 0` when no
+  gateway was eligible, so zero totals do not identify the skip.
+  1. A **new** `EpochSkippedNoObservationsEvent { epoch_index: u64,
+     active_gateway_count: u32, timestamp: i64 }`, appended to the event surface
+     (ADR-018 allows new events; bless it into `idl-event-snapshots.json` and
+     document it in `docs/EVENTS.md`). This is the stable discriminator.
+  2. Then `EpochDistributedEvent { epoch_index, gateways_processed: 0,
+     total_eligible_rewards: 0, timestamp }`, unchanged in shape, so every
+     existing consumer that tracks "this epoch finished" keeps working without
+     an upgrade.
+
+  An indexer that wants to tell the two apart keys on the presence of the new
+  event in the same transaction; one that only needs "finished" ignores it. Do
+  not skip the `EpochDistributedEvent`: it is what the cranker, the observer and
+  the SDK already watch to advance.
 * Touch no `Gateway.stats`, no `cumulative_reward_per_token`, and no treasury
   transfer.
 * `close_epoch` still works afterwards: it requires
   `observations_closed == observations_submitted`, which holds trivially at 0.
 * Tests: an ended epoch with zero observations pays nothing, leaves
   `failed_consecutive` intact (the laundering case), leaves pass rates intact,
-  and still satisfies `create_epoch`'s gate; and one epoch with a single
-  observation still distributes normally.
+  emits both events, and still satisfies `create_epoch`'s gate; one epoch with a
+  single observation still distributes normally; and a normal distribution whose
+  eligible set is empty emits `EpochDistributedEvent` with zero totals and **no**
+  skip event, which is the case the discriminator exists to separate.
