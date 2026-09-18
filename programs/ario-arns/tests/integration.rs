@@ -9153,6 +9153,210 @@ mod fund_from_stake {
         assert_eq!(treasury_after - treasury_before, cost);
     }
 
+    /// `purchase_price` records what the NAME cost, and only `buy_name`,
+    /// `buy_returned_name` and `upgrade_name` write it — extending a lease or
+    /// buying undernames leaves it alone (`arns.lua`: only `buyRecord` and
+    /// `upgradeRecord` touch `purchasePrice`).
+    ///
+    /// The withdrawal- and funding-plan-funded variants of extend/increase used
+    /// to ADD their fee into it, so the same action produced different stored
+    /// state depending on how it was paid. Nothing asserted it, on any path.
+    #[tokio::test]
+    async fn test_extend_and_increase_from_withdrawal_leave_purchase_price() {
+        let ant_keypair = Keypair::new();
+        let ant_key = ant_keypair.pubkey();
+        let operator_kp = Keypair::new();
+        let mint_kp = Keypair::new();
+        let stake_kp = Keypair::new();
+        let treasury_kp = Keypair::new();
+        let pt = program_test_with_arns_and_gar(
+            treasury_kp.pubkey(),
+            stake_kp.pubkey(),
+            mint_kp.pubkey(),
+        );
+        let mut ctx = pt.start_with_context().await;
+        mint_test_ant(&mut ctx, &ant_keypair).await;
+        let setup = setup_full_environment_with_keys(
+            &mut ctx,
+            &operator_kp,
+            mint_kp,
+            stake_kp,
+            treasury_kp,
+        )
+        .await;
+        let payer_clone = ctx.payer.insecure_clone();
+        transfer_test_ant(&mut ctx, ant_key, &payer_clone, setup.operator).await;
+
+        let (gar_settings_key, _) = gar_settings_pda();
+        let (withdrawal_counter_key, _) = Pubkey::find_program_address(
+            &[WITHDRAWAL_COUNTER_SEED, setup.operator.as_ref()],
+            &ario_gar::ID,
+        );
+        let (withdrawal_key, _) = Pubkey::find_program_address(
+            &[
+                WITHDRAWAL_SEED,
+                setup.operator.as_ref(),
+                &0u64.to_le_bytes(),
+            ],
+            &ario_gar::ID,
+        );
+
+        // Fund a withdrawal vault to pay from.
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DecreaseOperatorStake {
+                    settings: gar_settings_key,
+                    gateway: setup.gateway_key,
+                    withdrawal_counter: withdrawal_counter_key,
+                    withdrawal: withdrawal_key,
+                    operator: setup.operator,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DecreaseOperatorStake {
+                    amount: 30_000_000_000,
+                }
+                .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        // Buy a 1-year lease from that vault, so the record is the operator's.
+        let name = "pxwithdraw".to_string();
+        let (record_key, _) = arns_record_pda(&name);
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::BuyNameFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    name_registry: name_registry_key(),
+                    reserved_name_check: reserved_name_pda(&name).0,
+                    returned_name_check: returned_name_pda(&name).0,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    buyer: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::BuyNameFromWithdrawal {
+                    params: ario_arns::BuyNameParams {
+                        name: name.clone(),
+                        purchase_type: PurchaseType::Lease,
+                        years: 1,
+                        ant: ant_key,
+                    },
+                }
+                .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        async fn read_record(ctx: &mut ProgramTestContext, key: Pubkey) -> ArnsRecord {
+            ArnsRecord::try_deserialize(
+                &mut ctx
+                    .banks_client
+                    .get_account(key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+            )
+            .unwrap()
+        }
+        let bought = read_record(&mut ctx, record_key).await;
+        let price_at_buy = bought.purchase_price;
+        assert!(price_at_buy > 0, "the buy set a purchase price");
+
+        // Extend the lease from the same vault.
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::ExtendLeaseFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    caller: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::ExtendLeaseFromWithdrawal { years: 1 }.data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let extended = read_record(&mut ctx, record_key).await;
+        assert!(
+            extended.end_timestamp.unwrap() > bought.end_timestamp.unwrap(),
+            "the extension landed"
+        );
+        assert_eq!(
+            extended.purchase_price, price_at_buy,
+            "extending a lease must not change purchase_price"
+        );
+
+        // Buy undernames from the same vault.
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::IncreaseUndernameFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    caller: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::IncreaseUndernameLimitFromWithdrawal { quantity: 1 }
+                    .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let increased = read_record(&mut ctx, record_key).await;
+        assert!(
+            increased.undername_limit > extended.undername_limit,
+            "the undername increase landed"
+        );
+        assert_eq!(
+            increased.purchase_price, price_at_buy,
+            "buying undernames must not change purchase_price"
+        );
+    }
+
     #[tokio::test]
     async fn test_buy_name_from_funding_plan_balance_only() {
         // 1-source funding plan: pure Balance source. Equivalent to the
@@ -10286,6 +10490,20 @@ mod fund_from_stake {
 
         let name = "fp-mg-ext".to_string();
         let record_key = buy_lease_for_manage(&mut ctx, &setup, ant_key, &name, 1).await;
+        // Extending must not move `purchase_price` — see
+        // `test_extend_and_increase_from_withdrawal_leave_purchase_price`.
+        let price_before = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(record_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap()
+        .purchase_price;
 
         // Upgrade fee = base × 4 (permabuy formula). 8-char base = 500 ARIO →
         // upgrade cost ~2000 ARIO. Stake 1500 ARIO per gateway covers split.
@@ -10359,6 +10577,22 @@ mod fund_from_stake {
             read_delegation_amount(&mut ctx, del2).await,
             stake_per - pay2
         );
+        assert_eq!(
+            ArnsRecord::try_deserialize(
+                &mut ctx
+                    .banks_client
+                    .get_account(record_key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+            )
+            .unwrap()
+            .purchase_price,
+            price_before,
+            "extending from a funding plan must not change purchase_price"
+        );
     }
 
     #[tokio::test]
@@ -10389,6 +10623,19 @@ mod fund_from_stake {
 
         let name = "fp-mg-und".to_string();
         let record_key = buy_lease_for_manage(&mut ctx, &setup, ant_key, &name, 1).await;
+        // Buying undernames must not move `purchase_price`.
+        let price_before = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(record_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap()
+        .purchase_price;
 
         // Upgrade fee = base × 4 (permabuy formula). 8-char base = 500 ARIO →
         // upgrade cost ~2000 ARIO. Stake 1500 ARIO per gateway covers split.
@@ -10463,6 +10710,22 @@ mod fund_from_stake {
         assert_eq!(
             read_delegation_amount(&mut ctx, del2).await,
             stake_per - pay2
+        );
+        assert_eq!(
+            ArnsRecord::try_deserialize(
+                &mut ctx
+                    .banks_client
+                    .get_account(record_key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+            )
+            .unwrap()
+            .purchase_price,
+            price_before,
+            "buying undernames from a funding plan must not change purchase_price"
         );
     }
 }
