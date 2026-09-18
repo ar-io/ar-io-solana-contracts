@@ -33342,3 +33342,83 @@ async fn test_partially_distributed_zero_observation_epoch_does_not_skip() {
     let epoch: &Epoch = bytemuck::from_bytes(&epoch_acct.data[8..8 + std::mem::size_of::<Epoch>()]);
     assert_eq!(epoch.rewards_distributed, 1, "and must still complete");
 }
+
+/// The reconcile must work on a live, UN-MIGRATED 964-byte gateway.
+///
+/// Ordering on mainnet makes this reachable: Wave 1 migrates 620 gateways from
+/// the 964-byte 1.1.0 layout, and the Wave 2 reconcile plan targets 132 of them.
+/// If a reconcile were attempted before that gateway's `migrate_gateway` ran —
+/// or if the migration were still in flight — `Account<Gateway>` would be
+/// deserializing an account 32 bytes shorter than the current struct.
+///
+/// It works for the same reason `test_unmigrated_964_byte_gateway_still_loads`
+/// does (the appended field reads out of the zero padding rather than hitting
+/// EOF), and the reconcile touches only `operator`, `total_delegated_stake` and
+/// `bump`, all of which precede `version`. Pinned here because "the reconcile is
+/// safe before migration" is an ordering assumption the rollout depends on, not
+/// something to infer.
+#[tokio::test]
+async fn test_reconcile_works_on_unmigrated_964_byte_gateway() {
+    let mut f = setup_phantom_delegated_stake().await;
+
+    // Rewrite the gateway as a genuine pre-ADR-0030 account: drop the trailing
+    // 32 bytes of borsh content, stamp 1.1.0, pad back to 964.
+    {
+        let gw = read_gateway(&mut f.ctx, &f.gateway_key).await;
+        let existing = f
+            .ctx
+            .banks_client
+            .get_account(f.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut legacy = gw.clone();
+        legacy.version = SchemaVersion::new(1, 1, 0);
+        let mut data = Vec::new();
+        legacy.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32);
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        f.ctx.set_account(
+            &f.gateway_key,
+            &solana_sdk::account::AccountSharedData::from(solana_sdk::account::Account {
+                lamports: existing.lamports.max(10_000_000),
+                data,
+                owner: existing.owner,
+                executable: false,
+                rent_epoch: existing.rent_epoch,
+            }),
+        );
+    }
+    assert_eq!(
+        f.ctx
+            .banks_client
+            .get_account(f.gateway_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .len(),
+        964,
+        "simulating a live, un-migrated account"
+    );
+
+    reconcile_as(
+        &mut f.ctx,
+        &f.setup,
+        &f.gateway_key,
+        &f.admin,
+        f.real_delegated + f.phantom,
+        f.phantom,
+        &[f.delegation_key],
+    )
+    .await
+    .expect("reconcile must not require the gateway to be migrated first");
+
+    let after = read_gateway(&mut f.ctx, &f.gateway_key).await;
+    assert_eq!(after.total_delegated_stake, f.real_delegated);
+    assert_eq!(
+        after.version,
+        SchemaVersion::new(1, 1, 0),
+        "and must not silently restamp the schema version"
+    );
+}
