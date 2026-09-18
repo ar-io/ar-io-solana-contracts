@@ -419,8 +419,9 @@ pub mod increase_undername_limit_from_delegation {
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
 
-        require!(quantity > 0, ArnsError::InvalidUndernameQuantity);
         require!(record.is_active(timestamp), ArnsError::RecordExpired);
+        // BD-048 cap, shared by all five funding modes.
+        let new_limit = ArnsRecord::checked_undername_limit(record.undername_limit, quantity)?;
 
         crate::instructions::demand::maybe_roll_demand_period(
             &mut ctx.accounts.demand_factor,
@@ -455,10 +456,7 @@ pub mod increase_undername_limit_from_delegation {
         )?;
 
         let record = &mut ctx.accounts.arns_record;
-        record.undername_limit = record
-            .undername_limit
-            .checked_add(quantity)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        record.undername_limit = new_limit;
 
         let demand = &mut ctx.accounts.demand_factor;
         demand.purchases_this_period = demand
@@ -504,8 +502,9 @@ pub mod increase_undername_limit_from_operator_stake {
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
 
-        require!(quantity > 0, ArnsError::InvalidUndernameQuantity);
         require!(record.is_active(timestamp), ArnsError::RecordExpired);
+        // BD-048 cap, shared by all five funding modes.
+        let new_limit = ArnsRecord::checked_undername_limit(record.undername_limit, quantity)?;
 
         crate::instructions::demand::maybe_roll_demand_period(
             &mut ctx.accounts.demand_factor,
@@ -539,10 +538,7 @@ pub mod increase_undername_limit_from_operator_stake {
         )?;
 
         let record = &mut ctx.accounts.arns_record;
-        record.undername_limit = record
-            .undername_limit
-            .checked_add(quantity)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        record.undername_limit = new_limit;
 
         let demand = &mut ctx.accounts.demand_factor;
         demand.purchases_this_period = demand
@@ -907,24 +903,15 @@ pub mod increase_undername_limit_from_withdrawal {
     use super::*;
 
     pub fn handler(ctx: Context<IncreaseUndernameFromWithdrawal>, quantity: u16) -> Result<()> {
-        require!(
-            quantity >= 1 && quantity <= 9990,
-            ArnsError::InvalidParameter
-        );
-
         let clock = Clock::get()?;
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
-        let grace = ctx.accounts.config.grace_period_seconds;
-        require!(
-            record.is_active(timestamp) || record.is_in_grace_period(timestamp, grace),
-            ArnsError::RecordExpired
-        );
-
-        let new_limit = (record.undername_limit as u32)
-            .checked_add(quantity as u32)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
-        require!(new_limit <= 10_000, ArnsError::InvalidParameter);
+        // Lua's `assertValidIncreaseUndername` requires an ACTIVE record
+        // (`arns.lua:938`); a name in its grace period has expired. These two
+        // funding modes used to accept grace, unlike the other three.
+        require!(record.is_active(timestamp), ArnsError::RecordExpired);
+        // BD-048 cap, shared by all five funding modes.
+        let new_limit = ArnsRecord::checked_undername_limit(record.undername_limit, quantity)?;
 
         crate::instructions::demand::maybe_roll_demand_period(
             &mut ctx.accounts.demand_factor,
@@ -958,7 +945,7 @@ pub mod increase_undername_limit_from_withdrawal {
         )?;
 
         let record = &mut ctx.accounts.arns_record;
-        record.undername_limit = new_limit as u16;
+        record.undername_limit = new_limit;
 
         let demand = &mut ctx.accounts.demand_factor;
         demand.purchases_this_period = demand
@@ -1230,25 +1217,17 @@ pub mod increase_undername_limit_from_funding_plan {
         discount_account_count: u8,
         residue_vault_count: u8,
     ) -> Result<()> {
-        require!(
-            quantity >= 1 && quantity <= 9990,
-            ArnsError::InvalidParameter
-        );
         require!(discount_account_count <= 1, ArnsError::InvalidParameter);
 
         let clock = Clock::get()?;
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
-        let grace = ctx.accounts.config.grace_period_seconds;
-        require!(
-            record.is_active(timestamp) || record.is_in_grace_period(timestamp, grace),
-            ArnsError::RecordExpired
-        );
-
-        let new_limit = (record.undername_limit as u32)
-            .checked_add(quantity as u32)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
-        require!(new_limit <= 10_000, ArnsError::InvalidParameter);
+        // Lua's `assertValidIncreaseUndername` requires an ACTIVE record
+        // (`arns.lua:938`); a name in its grace period has expired. These two
+        // funding modes used to accept grace, unlike the other three.
+        require!(record.is_active(timestamp), ArnsError::RecordExpired);
+        // BD-048 cap, shared by all five funding modes.
+        let new_limit = ArnsRecord::checked_undername_limit(record.undername_limit, quantity)?;
 
         crate::instructions::demand::maybe_roll_demand_period(
             &mut ctx.accounts.demand_factor,
@@ -1293,7 +1272,7 @@ pub mod increase_undername_limit_from_funding_plan {
         )?;
 
         let record = &mut ctx.accounts.arns_record;
-        record.undername_limit = new_limit as u16;
+        record.undername_limit = new_limit;
 
         let demand = &mut ctx.accounts.demand_factor;
         demand.purchases_this_period = demand

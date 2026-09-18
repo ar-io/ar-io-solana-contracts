@@ -1427,6 +1427,89 @@ async fn test_increase_undername_limit() {
     assert_eq!(record.undername_limit, DEFAULT_UNDERNAME_COUNT + 5);
 }
 
+/// BD-048 caps a name at `MAX_UNDERNAME_LIMIT` undernames. Only the two
+/// stake-funded handlers enforced it (as a bare `10_000` literal); the balance,
+/// delegation and operator-stake paths let a name run to `u16::MAX`, and
+/// nothing asserted the cap on any path.
+#[tokio::test]
+async fn test_increase_undername_limit_respects_the_cap() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "capundername";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let increase = |ctx: &ProgramTestContext, quantity: u16, blockhash| {
+        Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::IncreaseUndernameLimit {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: arns_record_key,
+                    caller_token_account: setup.buyer_token.pubkey(),
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    caller: ctx.payer.pubkey(),
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::IncreaseUndernameLimit { quantity }.data(),
+            }],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer],
+            blockhash,
+        )
+    };
+
+    // Landing exactly on the cap is fine: 10 + 9,990 = 10,000.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = increase(
+        &ctx,
+        MAX_UNDERNAME_LIMIT - DEFAULT_UNDERNAME_COUNT,
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let record = ArnsRecord::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(arns_record_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(record.undername_limit, MAX_UNDERNAME_LIMIT);
+
+    // One more is refused, and the record is untouched.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = increase(&ctx, 1, blockhash);
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::UndernameLimitExceeded);
+    let record = ArnsRecord::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(arns_record_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        record.undername_limit, MAX_UNDERNAME_LIMIT,
+        "the refused increase must not have moved the limit"
+    );
+}
+
 #[tokio::test]
 async fn test_demand_factor_update() {
     let ant_keypair = Keypair::new();
@@ -9355,6 +9438,48 @@ mod fund_from_stake {
             increased.purchase_price, price_at_buy,
             "buying undernames must not change purchase_price"
         );
+
+        // Lua requires an ACTIVE record to buy undernames
+        // (`assertValidIncreaseUndername`, `arns.lua:938`), and so do the
+        // balance, delegation and operator-stake paths. This path used to
+        // accept a record in its grace period as well. Warp past the lease end
+        // but stay inside grace, and it must now refuse.
+        let current_slot = ctx.banks_client.get_root_slot().await.unwrap();
+        ctx.warp_to_slot(current_slot + 2).unwrap();
+        let mut clock = ctx
+            .banks_client
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .await
+            .unwrap();
+        clock.unix_timestamp = increased.end_timestamp.unwrap() + 86_400;
+        ctx.set_sysvar(&clock);
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::IncreaseUndernameFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    caller: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::IncreaseUndernameLimitFromWithdrawal { quantity: 1 }
+                    .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        let result = ctx.banks_client.process_transaction(tx).await;
+        assert_anchor_error!(result, ArnsError::RecordExpired);
     }
 
     #[tokio::test]
