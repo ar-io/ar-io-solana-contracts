@@ -323,3 +323,90 @@ Squads vault) avoids both.
 * [ADR-035](0035-anchor-error-codes-are-append-only.md) — the new error variant
   must be appended
 * ar-io-sdk#726 — the client-side stall fix that removes the most common window
+
+## Addendum — 2026-09-17: an epoch with no observations pays nothing and credits nothing
+
+*Appended after merge; the body above is unchanged. This resolves the open
+decision left in "Catch-up after a stop".*
+
+**Decision (2026-09-17): `distribute_epoch` short-circuits when
+`observations_submitted == 0`.** It makes no payout, writes no gateway stats,
+and marks the epoch distributed so the chain advances. The period's reward share
+stays in the treasury.
+
+### Why
+
+The open question was framed as "does a catch-up epoch pay everyone?", and a
+second consequence decided it. `distribute_epoch` does not only pay: per
+gateway it also increments `stats.total_epochs`, and for any gateway it does not
+mark failed it increments `passed_epochs` and `passed_consecutive` **and resets
+`failed_consecutive` to 0**. A gateway is only marked failed when
+`observations_submitted > 0`.
+
+So under the previous behaviour an epoch that accepted no observations would
+have recorded a **pass for every gateway**, which:
+
+* wipes the failure streak of a gateway heading for the 30-consecutive-failure
+  prune, deferring or cancelling its removal; and
+* lifts its epoch pass rate, which gates ArNS operator-discount eligibility at
+  90% (`try_apply_gateway_discount`).
+
+An outage would have laundered the record of exactly the gateways the incentive
+protocol exists to catch, on top of paying them. Skipping the epoch entirely
+costs the honest operators that period's rewards — the tokens stay in the
+treasury and fund later epochs — and that is the lesser harm.
+
+The rule also keeps the ADR's own properties intact:
+
+* **Permissionless.** Recovery does not touch `EpochSettings.authority`, so
+  liveness does not depend on an admin key — which matters on staging, where
+  that authority is a 2-of-4 Squads vault (ADR-0031).
+* **Cheap.** A backlog epoch becomes `create_epoch` + one `distribute_epoch`
+  call, instead of ~36 tally transactions and ~50 distribute batches. After a
+  multi-day stop that is the difference between hours of cranking and minutes.
+* **Consistent.** ADR-0032 and ADR-0033 already accept that a period which
+  cannot be paid correctly simply goes unpaid; mainnet epoch 540 is that case.
+
+### Consequence to accept
+
+A **live** epoch in which every prescribed observer failed to submit also pays
+nobody and credits nobody. That is the same evidence vacuum as a catch-up epoch,
+and the alternative — paying blind and crediting a pass to everyone — is worse.
+It is a real behaviour change, not only a catch-up rule.
+
+### Implementation notes
+
+* Trigger on `observations_submitted == 0` at `distribute_epoch`, after the
+  existing `clock >= end_timestamp` check. Do not add a separate instruction and
+  do not depend on how late the epoch was created: the evidence vacuum is the
+  condition, not the schedule.
+* Set `rewards_distributed = 1` and advance `distribution_index` to
+  `active_gateway_count` so the epoch reads as complete and satisfies this ADR's
+  predicate and ADR-0036's.
+* **Events — emit both, in this order.** `EpochDistributedEvent` cannot carry a
+  discriminator: its shape is frozen (ADR-018), and a normal distribution can
+  legitimately emit `gateways_processed: 0, total_eligible_rewards: 0` when no
+  gateway was eligible, so zero totals do not identify the skip.
+  1. A **new** `EpochSkippedNoObservationsEvent { epoch_index: u64,
+     active_gateway_count: u32, timestamp: i64 }`, appended to the event surface
+     (ADR-018 allows new events; bless it into `idl-event-snapshots.json` and
+     document it in `docs/EVENTS.md`). This is the stable discriminator.
+  2. Then `EpochDistributedEvent { epoch_index, gateways_processed: 0,
+     total_eligible_rewards: 0, timestamp }`, unchanged in shape, so every
+     existing consumer that tracks "this epoch finished" keeps working without
+     an upgrade.
+
+  An indexer that wants to tell the two apart keys on the presence of the new
+  event in the same transaction; one that only needs "finished" ignores it. Do
+  not skip the `EpochDistributedEvent`: it is what the cranker, the observer and
+  the SDK already watch to advance.
+* Touch no `Gateway.stats`, no `cumulative_reward_per_token`, and no treasury
+  transfer.
+* `close_epoch` still works afterwards: it requires
+  `observations_closed == observations_submitted`, which holds trivially at 0.
+* Tests: an ended epoch with zero observations pays nothing, leaves
+  `failed_consecutive` intact (the laundering case), leaves pass rates intact,
+  emits both events, and still satisfies `create_epoch`'s gate; one epoch with a
+  single observation still distributes normally; and a normal distribution whose
+  eligible set is empty emits `EpochDistributedEvent` with zero totals and **no**
+  skip event, which is the case the discriminator exists to separate.

@@ -183,3 +183,13 @@ not a protocol one; no migration is needed to give them access.
   correct values are `GATEWAY_LEAVE_PERIOD` (90 days, a program constant, not in
   settings) and a 100% slash rate applied to the minimum stake. The Network
   Portal reads these, and the wrong values are what prompted this review.
+
+## Addendum — 2026-09-17: no compensation for the three affected operators
+
+*Appended after merge; the body above is unchanged.*
+
+The "Not retroactive" section left one operations question open. **Decided
+(2026-09-17): no compensation.** The three operators pruned under the old
+behaviour keep the 90-day `available_at` already stored in their excess vaults,
+and the 10% minimum expedite penalty stands if they choose not to wait. Their
+protected vaults are unaffected and were always 90 days.
