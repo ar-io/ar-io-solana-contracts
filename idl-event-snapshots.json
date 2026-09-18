@@ -539,6 +539,45 @@
       ]
     },
     {
+      "name": "DelegatedStakeReconciledEvent",
+      "discriminator": [
+        93,
+        40,
+        124,
+        102,
+        50,
+        59,
+        37,
+        123
+      ],
+      "fields": [
+        {
+          "name": "gateway",
+          "type": "pubkey"
+        },
+        {
+          "name": "previous",
+          "type": "u64"
+        },
+        {
+          "name": "removed",
+          "type": "u64"
+        },
+        {
+          "name": "new",
+          "type": "u64"
+        },
+        {
+          "name": "delegations_counted",
+          "type": "u32"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "DelegationClosedEvent",
       "discriminator": [
         135,
@@ -861,6 +900,33 @@
         {
           "name": "new_authority",
           "type": "pubkey"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "EpochSkippedNoObservationsEvent",
+      "discriminator": [
+        142,
+        168,
+        78,
+        194,
+        234,
+        183,
+        122,
+        221
+      ],
+      "fields": [
+        {
+          "name": "epoch_index",
+          "type": "u64"
+        },
+        {
+          "name": "active_gateway_count",
+          "type": "u32"
         },
         {
           "name": "timestamp",
@@ -1506,6 +1572,41 @@
         {
           "name": "is_delegate",
           "type": "bool"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "SupplyCountersResyncedEvent",
+      "discriminator": [
+        197,
+        7,
+        226,
+        54,
+        10,
+        67,
+        70,
+        62
+      ],
+      "fields": [
+        {
+          "name": "previous_staked",
+          "type": "u64"
+        },
+        {
+          "name": "new_staked",
+          "type": "u64"
+        },
+        {
+          "name": "previous_delegated",
+          "type": "u64"
+        },
+        {
+          "name": "new_delegated",
+          "type": "u64"
         },
         {
           "name": "timestamp",
