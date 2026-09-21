@@ -741,7 +741,7 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | | |
 |---|---|
 | **Lua Behavior** | Each state-changing handler emits an AO "notice" via `ao.send({Target=..., Tags={Action="<X>-Notice"}})`. There are dozens of these — `Joined-Network-Notice`, `Stake-Notice`, `Buy-Record-Notice`, `Set-Record-Notice`, `Vault-Notice`, etc. — typically including the actor address, the affected resource, and the per-handler payload (cost, amount, settings). Reads are *also* notice-bearing in AO because the message-based model requires a response per query. There is no separate "events" namespace; everything is a notice. |
-| **Solana Behavior** | Anchor `#[event]` emits surface as `Program data: <base64>` log lines that decode to `[discriminator(8) || borsh_payload]`. **Total surface:  74 events / 127+ emit sites across 5 programs:** ario-core (13), ario-gar (30), ario-arns (12), ario-ant (15), ario-ant-escrow (4). Every state-changing instruction emits exactly one event after all state mutations succeed (batched ops emit one summary event per tx, never inside the loop, to avoid log-truncation). The SDK exposes `parseTransactionEvents(rpc, signature)` and `parseEventsFromLogs(logs)` returning typed discriminated unions; see `sdk/src/solana/events.ts`. CPI-emitted events are correctly attributed to the emitting program (the log walker tracks `Program <id> invoke/success` frames). |
+| **Solana Behavior** | Anchor `#[event]` emits surface as `Program data: <base64>` log lines that decode to `[discriminator(8) || borsh_payload]`. **Total surface: 95 events across 5 programs:** ario-core (14), ario-gar (41), ario-arns (13), ario-ant (22), ario-ant-escrow (5) — the authoritative count is `idl-event-snapshots.json`. Every state-changing instruction emits **at least** one event after all state mutations succeed (batched ops emit one summary event per tx, never inside the loop, to avoid log-truncation). **One path emits two:** a skipped distribution emits `EpochSkippedNoObservationsEvent` followed by the unchanged `EpochDistributedEvent` (ADR-0034 addendum) — the first is the stable discriminator, the second is what existing consumers already watch. The SDK exposes `parseTransactionEvents(rpc, signature)` and `parseEventsFromLogs(logs)` returning typed discriminated unions; see `sdk/src/solana/events.ts`. CPI-emitted events are correctly attributed to the emitting program (the log walker tracks `Program <id> invoke/success` frames). |
 | **Lua-parity coverage** | Most Lua notices have a 1:1 Solana event: `Joined-Network-Notice`→`GatewayJoinedEvent`, `Stake-Notice`→`DelegationEvent`, `Buy-Record-Notice`→`NamePurchasedEvent`, `Set-Record-Notice`→`RecordSetEvent`, `Vault-Notice`→`VaultCreatedEvent`/`VaultExtendedEvent`/`VaultIncreasedEvent`, `Reserve-Name-Notice`→`NameReservedEvent`, `Update-Gateway-Settings-Notice`→`GatewaySettingsUpdatedEvent`, etc. Lua's per-field setters (`Set-Name-Notice`, `Set-Ticker-Notice`, ...) collapse onto one Solana shape with a `field: u8` discriminator (`AntMetadataUpdatedEvent`). |
 | **Solana-only events** | (a) ANT NFT-level transfer / reconcile / Attributes-sync (Lua had no asset abstraction); (b) ACL events (Lua had no per-asset ACL pages); (c) `EpochWeightsTalliedEvent` / `EpochClosedEvent` (Solana batches what Lua does inline in epoch tick); (d) all 4 ario-ant-escrow events (entire program is Solana-only); (e) `*MigrationFinalizedEvent` / `SupplyFinalizedEvent` / `ConfigUpdatedEvent` / `*ToggledEvent` (one-time / admin watershed markers indexers need); (f) `StakePaymentEvent` / `WithdrawalPaymentEvent` / `FundingPlanAppliedEvent` / `ResidueVaultCreatedEvent` (multi-source funding payment paths). |
 | **Lua reads we deliberately don't port** | `Record-Notice`, `Records-Notice`, `Balance-Notice`, `Controllers-Notice`, `State-Notice` — read paths are served by RPC on Solana. No transaction, no event, no cost. |
@@ -920,8 +920,14 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | Primary Name Authorization | 2 (BD-097, BD-109) |
 | ANT Program Routing | 1 (BD-100) |
 | Cranker Protocol | 1 (BD-101) |
-| Epoch Distribution Liveness | 2 (BD-115, BD-116) |
-| **Total** | **79** |
+| Epoch Distribution Liveness | 5 (BD-115, BD-116, BD-118, BD-119, BD-120) |
+| **Total** | **82** |
+
+> These categories enumerate explicit `BD-NNN` ranges and have not been extended
+> for every later entry: **BD-098, BD-099, BD-102–BD-108, BD-110–BD-114 and
+> BD-117 are uncategorised**, so the file currently holds 97 entries against the
+> 82 counted here. The `### BD-` headings are authoritative; this table is a
+> reading aid.
 
 ---
 

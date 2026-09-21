@@ -393,13 +393,26 @@ pub mod ario_gar {
         instructions::epoch::close_epoch_settings(ctx)
     }
 
-    /// Recovery-only: close an Epoch PDA orphaned by a prior
-    /// `close_epoch_settings` + `initialize_epochs` reinit, where the
-    /// reset `current_epoch_index` collides with PDAs from the prior
-    /// lifecycle. Authority-gated AND `migration_active`-gated; inert
-    /// after `finalize_migration`. **Closing an in-flight epoch
-    /// orphans Observation PDAs** — only safe on epochs the new
-    /// lifecycle won't re-use.
+    /// Recovery-only: close an Epoch PDA that the lifecycle can no longer
+    /// reach — one orphaned by a prior `close_epoch_settings` +
+    /// `initialize_epochs` reinit, or one that has stalled undistributed.
+    ///
+    /// **Authority-gated and PERMANENT (ADR-0034).** It is no longer
+    /// `migration_active`-gated and does NOT go inert after
+    /// `finalize_migration`: `create_epoch` now refuses to advance past an
+    /// unfinished epoch, so this is the only path that unsticks a stalled
+    /// chain and it must outlive the migration window.
+    ///
+    /// Guarded: the epoch must have **ended** (`clock >= end_timestamp`) and be
+    /// **undistributed** (`rewards_distributed == 0`). A distributed epoch goes
+    /// through `close_epoch`, which refunds its creator (ADR-0029); a live one
+    /// is not closeable at all.
+    ///
+    /// **Closing an epoch with submitted-but-unclosed Observations orphans
+    /// those PDAs** — their rent becomes unreclaimable, because
+    /// `close_observation` needs the Epoch account. Before writing an epoch
+    /// off, confirm its `distribution_index` has stopped advancing:
+    /// distribution can legitimately run for hours.
     pub fn admin_close_stale_epoch(
         ctx: Context<AdminCloseStaleEpoch>,
         epoch_index: u64,
