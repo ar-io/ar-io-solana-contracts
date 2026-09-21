@@ -827,6 +827,10 @@
     {
       "code": 6050,
       "name": "UnknownSchemaVersion"
+    },
+    {
+      "code": 6051,
+      "name": "UndernameLimitExceeded"
     }
   ],
   "ario_ant": [
