@@ -1,6 +1,6 @@
 # ADR-0037: A Gateway's Delegated-Stake Counter Must Equal the Delegations Behind It
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-21; implemented in contracts #149; the reconcile plan is executed after ADR-0036 is live)
 * **Date:** 2026-09-17
 * **Deciders:** @vilenarios
 * **Consulted:** observer-operator report ("`finalize_gone` is blocked for 92 leaving

@@ -1,6 +1,6 @@
 # ADR-0036: Registry Positions Are Frozen While an Epoch Is Unfinished
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-21; implemented in contracts #149 — ships with ADR-0034, never before it)
 * **Date:** 2026-09-16
 * **Deciders:** @vilenarios
 * **Consulted:** observer-operator report and on-chain audit of mainnet epoch 542;
