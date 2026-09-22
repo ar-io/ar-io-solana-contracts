@@ -1,6 +1,6 @@
 # ADR-0034: An Unfinished Epoch Must Not Be Superseded
 
-* **Status:** proposed
+* **Status:** accepted (2026-09-21; implemented in contracts #149, with the addendum resolved in #148)
 * **Date:** 2026-09-15 (decision resolved 2026-09-16)
 * **Deciders:** @vilenarios
 * **Consulted:** mainnet incident review (epochs 540, 542, 543); observer-operator

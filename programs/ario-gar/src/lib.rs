@@ -393,13 +393,26 @@ pub mod ario_gar {
         instructions::epoch::close_epoch_settings(ctx)
     }
 
-    /// Recovery-only: close an Epoch PDA orphaned by a prior
-    /// `close_epoch_settings` + `initialize_epochs` reinit, where the
-    /// reset `current_epoch_index` collides with PDAs from the prior
-    /// lifecycle. Authority-gated AND `migration_active`-gated; inert
-    /// after `finalize_migration`. **Closing an in-flight epoch
-    /// orphans Observation PDAs** — only safe on epochs the new
-    /// lifecycle won't re-use.
+    /// Recovery-only: close an Epoch PDA that the lifecycle can no longer
+    /// reach — one orphaned by a prior `close_epoch_settings` +
+    /// `initialize_epochs` reinit, or one that has stalled undistributed.
+    ///
+    /// **Authority-gated and PERMANENT (ADR-0034).** It is no longer
+    /// `migration_active`-gated and does NOT go inert after
+    /// `finalize_migration`: `create_epoch` now refuses to advance past an
+    /// unfinished epoch, so this is the only path that unsticks a stalled
+    /// chain and it must outlive the migration window.
+    ///
+    /// Guarded: the epoch must have **ended** (`clock >= end_timestamp`) and be
+    /// **undistributed** (`rewards_distributed == 0`). A distributed epoch goes
+    /// through `close_epoch`, which refunds its creator (ADR-0029); a live one
+    /// is not closeable at all.
+    ///
+    /// **Closing an epoch with submitted-but-unclosed Observations orphans
+    /// those PDAs** — their rent becomes unreclaimable, because
+    /// `close_observation` needs the Epoch account. Before writing an epoch
+    /// off, confirm its `distribution_index` has stopped advancing:
+    /// distribution can legitimately run for hours.
     pub fn admin_close_stale_epoch(
         ctx: Context<AdminCloseStaleEpoch>,
         epoch_index: u64,
@@ -431,7 +444,9 @@ pub mod ario_gar {
     /// as the creator, so `close_epoch` refunds this epoch's rent to you
     /// rather than to whoever closes it. Omitting it preserves the old
     /// behavior exactly.
-    pub fn create_epoch<'info>(ctx: Context<'_, '_, '_, 'info, CreateEpoch<'info>>) -> Result<()> {
+    pub fn create_epoch<'info>(
+        ctx: Context<'_, '_, 'info, 'info, CreateEpoch<'info>>,
+    ) -> Result<()> {
         instructions::epoch::create_epoch(ctx)
     }
 
@@ -508,6 +523,47 @@ pub mod ario_gar {
     /// Delegates call this to materialize pending rewards into their delegation amount.
     pub fn compound_delegation_rewards(ctx: Context<CompoundDelegationRewards>) -> Result<()> {
         instructions::delegate::compound_delegation_rewards(ctx)
+    }
+
+    /// ADR-0037. Lower a gateway's `total_delegated_stake` to the sum of the
+    /// Delegation accounts passed in `remaining_accounts`, removing the phantom
+    /// delegated stake the AO import left behind.
+    ///
+    /// Authority-only, and it can only ever *lower* the counter, to a sum proven
+    /// from canonical Delegation accounts. `expected_counter` guards against a
+    /// stale plan; `expected_removed` must come from the genesis snapshot, not
+    /// from the same read that produced the Delegation list — the two
+    /// independent sources having to agree is what makes a missing Delegation
+    /// fail closed.
+    pub fn admin_reconcile_delegated_stake<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminReconcileDelegatedStake<'info>>,
+        expected_counter: u64,
+        expected_removed: u64,
+    ) -> Result<()> {
+        instructions::delegate::admin_reconcile_delegated_stake(
+            ctx,
+            expected_counter,
+            expected_removed,
+        )
+    }
+
+    /// ADR-0037. Set the reporting-only supply counters to audited values, once,
+    /// after the settlement fix and the reconcile plan are live. Both expected
+    /// values must match what is stored or nothing is written.
+    pub fn admin_resync_supply_counters(
+        ctx: Context<AdminResyncSupplyCounters>,
+        expected_staked: u64,
+        new_staked: u64,
+        expected_delegated: u64,
+        new_delegated: u64,
+    ) -> Result<()> {
+        instructions::delegate::admin_resync_supply_counters(
+            ctx,
+            expected_staked,
+            new_staked,
+            expected_delegated,
+            new_delegated,
+        )
     }
 
     /// Prune a gateway that has exceeded maximum consecutive failures (F21)
@@ -1681,6 +1737,54 @@ pub struct RewardRatiosUpdatedEvent {
     pub old_observer_ratio: u64,
     pub new_gateway_ratio: u64,
     pub new_observer_ratio: u64,
+    pub timestamp: i64,
+}
+
+/// ADR-0034 addendum. Emitted by `distribute_epoch` when the epoch collected no
+/// observations at all: nothing is paid and no gateway stat is credited.
+///
+/// This exists because `EpochDistributedEvent` cannot be made to carry the
+/// distinction. Its shape is frozen (ADR-018), and a *normal* distribution can
+/// legitimately report `gateways_processed: 0, total_eligible_rewards: 0` when
+/// no gateway was eligible — so zero totals do not identify a skip. This event
+/// is the stable discriminator: it is emitted immediately before the
+/// (unchanged) `EpochDistributedEvent` in the same transaction. An indexer that
+/// needs to tell the two apart keys on its presence; one that only needs
+/// "this epoch finished" can keep ignoring it.
+#[event]
+pub struct EpochSkippedNoObservationsEvent {
+    pub epoch_index: u64,
+    pub active_gateway_count: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0037. Emitted by `admin_reconcile_delegated_stake` when a gateway's
+/// `total_delegated_stake` is lowered to the sum of the Delegation accounts that
+/// actually back it, removing phantom delegated stake left by the AO import.
+///
+/// `removed` is the phantom amount; `new` is the proven sum. The correction is
+/// always a reduction, and `delegations_counted` records how many Delegation
+/// accounts the proof was built from, so an indexer can tell a
+/// zero-delegation gateway apart from one whose delegations were omitted.
+#[event]
+pub struct DelegatedStakeReconciledEvent {
+    pub gateway: Pubkey,
+    pub previous: u64,
+    pub removed: u64,
+    pub new: u64,
+    pub delegations_counted: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0037. Emitted by `admin_resync_supply_counters` when the reporting-only
+/// `GatewaySettings` supply counters are set to audited values, after the
+/// settlement fix and the reconcile plan are live.
+#[event]
+pub struct SupplyCountersResyncedEvent {
+    pub previous_staked: u64,
+    pub new_staked: u64,
+    pub previous_delegated: u64,
+    pub new_delegated: u64,
     pub timestamp: i64,
 }
 

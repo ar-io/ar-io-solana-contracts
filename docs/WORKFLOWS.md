@@ -565,21 +565,38 @@ Each epoch lasts 24 hours. A cranker (or anyone) drives the pipeline through
 
 | Step | Instruction | Batched? | Guard | Done flag |
 |------|------------|----------|-------|-----------|
-| 1 | `create_epoch` | No | `clock ≥ genesis + index × duration` | Anchor `init` (PDA uniqueness) |
+| 1 | `create_epoch` | No | `clock ≥ genesis + index × duration`, **previous epoch finished** (ADR-0034) | Anchor `init` (PDA uniqueness) |
 | 2 | `tally_weights` | Yes (remaining_accounts) | `weights_tallied == 0` | `tally_index ≥ active_count → weights_tallied = 1` |
 | 3 | `prescribe_epoch` | No | `weights_tallied ≠ 0`, `prescriptions_done == 0` | `prescriptions_done = 1` |
 | 4 | `save_observations` | Per-observer | `prescriptions_done ≠ 0`, within epoch window | Observation PDA uniqueness |
-| 5 | `distribute_epoch` | Yes (remaining_accounts) | `prescriptions_done ≠ 0`, `clock ≥ end`, `rewards_distributed == 0` | `distribution_index ≥ active_count → rewards_distributed = 1` |
+| 5 | `distribute_epoch` | Yes (remaining_accounts) | `prescriptions_done ≠ 0`, `clock ≥ end`, `rewards_distributed == 0` | `distribution_index ≥ active_count → rewards_distributed = 1`; **or an immediate skip when `observations_submitted == 0`** (ADR-0034) |
 | 6 | `close_epoch` | No | `rewards_distributed ≠ 0`, `current_index ≥ epoch_index + 7` | Anchor `close` |
 
 **Idempotency:** All guards make it safe for multiple crankers to run simultaneously.
 The worst case is a wasted transaction fee (~0.000005 SOL).
 
 **Step 1 — `create_epoch`:**
+- **Refuses while the previous epoch is unfinished** (ADR-0034). Pass the
+  previous Epoch PDA `["epoch", index - 1]` in `remaining_accounts` (omit only
+  at index 0); the call is rejected with `LatestEpochUnfinished` (6102) unless
+  that epoch is distributed or no longer exists, and with
+  `MissingLatestEpochAccount` (6103) if the account is not supplied at all.
+  **Ordering:** the ADR-0029 rent receipt must remain FIRST and must be present
+  — the pre-upgrade program reads position 0 as the receipt, so a client that
+  appends the Epoch without a receipt is rejected by it.
 - Computes hashchain entropy: `SHA256(slot ∥ epoch_index ∥ timestamp)` (24 bytes)
 - Snapshots `active_gateway_count` from GatewayRegistry
 - Computes reward rate (linear decay: 0.1% → 0.05% over epochs 365–547)
 - Calculates `total_eligible_rewards = protocol_balance × reward_rate / RATE_SCALE`
+
+**Between epochs — garbage collection (ADR-0036).** `finalize_gone` is the only
+instruction that moves a registry slot, and it is refused while the latest epoch
+is unfinished, with the same two errors as above. Its window is therefore the gap
+between a completed distribution and the next `create_epoch`. A cranker makes the
+sweep race-free by putting `finalize_gone` in the **same transaction** as the
+final `distribute_epoch` batch; otherwise run it before `create_epoch` in the same
+tick. A sweep that misses the window simply succeeds in the next one. It also
+needs the latest Epoch PDA in `remaining_accounts`, after the swapped Gateway PDA.
 
 **Step 2 — `tally_weights`** (batched, ~15 gateways per tx):
 - For each gateway, computes 4-factor composite weight:

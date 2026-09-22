@@ -3,6 +3,7 @@ use anchor_lang::system_program::{self as anchor_system_program, Allocate, Assig
 use anchor_spl::token::{self, Token, TokenAccount, Transfer as SplTransfer};
 
 use crate::error::GarError;
+use crate::instructions::epoch::require_latest_epoch_finished;
 use crate::is_valid_arweave_id;
 use crate::state::*;
 use crate::{
@@ -1330,6 +1331,35 @@ pub fn finalize_gone<'info>(ctx: Context<'_, '_, 'info, 'info, FinalizeGone<'inf
         GarError::DelegationsOutstanding
     );
 
+    // ADR-0036: registry positions are frozen while an epoch is unfinished.
+    // This is the only instruction that moves a slot or decreases
+    // `registry.count`, and observations and distribution both address
+    // gateways by position (`epoch.failure_counts[i]` against
+    // `registry.gateways[i]`). A swap-remove between an epoch's snapshot and
+    // its distribution therefore mis-scores gateways — on mainnet epoch 542 it
+    // paid `lasaucisse` as passed when all 11 observers had failed it.
+    //
+    // Inspecting only the LATEST epoch is sufficient only because ADR-0034
+    // guarantees no older epoch can still be unfinished. See
+    // `require_latest_epoch_finished`.
+    //
+    // **This narrows GC to the gap between one epoch's distribution and the
+    // next epoch's creation**, which for a prompt cranker is short (23 minutes
+    // on mainnet 2026-09-16; in principle seconds). ADR-0036 accepts that and
+    // names the mitigation: a cranker makes its sweep race-free by putting
+    // `finalize_gone` in the SAME transaction as the final `distribute_epoch`
+    // batch — instructions execute in order, so they observe
+    // `rewards_distributed == 1` and no `create_epoch` can land in between. A
+    // sweep that misses the window simply succeeds in the next one; registry
+    // capacity is 3,000 slots against ~620 in use. If starvation is ever
+    // observed in practice, ADR-0036's option 3 (tombstone, compact later) is
+    // the escape hatch.
+    require_latest_epoch_finished(
+        ctx.accounts.epoch_settings.current_epoch_index,
+        ctx.remaining_accounts,
+        ctx.program_id,
+    )?;
+
     // Mark Gone. The PDA is closed by Anchor's `close = caller` on exit.
     gateway.status = GatewayStatus::Gone;
 
@@ -1357,24 +1387,27 @@ pub fn finalize_gone<'info>(ctx: Context<'_, '_, 'info, 'info, FinalizeGone<'inf
         let swapped_slot = registry.gateways[last_index];
         registry.gateways[index] = swapped_slot;
 
-        // Update the swapped gateway's stored registry_index.index via
-        // remaining_accounts[0]. Cranker MUST pass the swapped Gateway PDA
-        // (writable) at this position when index != last_index.
-        let remaining = ctx.remaining_accounts;
-        require!(!remaining.is_empty(), GarError::InvalidParameter);
-        let swapped_info = &remaining[0];
-        require!(swapped_info.is_writable, GarError::InvalidParameter);
-        require!(
-            swapped_info.owner == ctx.program_id,
-            GarError::InvalidParameter
-        );
-
+        // Update the swapped gateway's stored registry_index.index. The cranker
+        // MUST pass the swapped Gateway PDA (writable) in `remaining_accounts`
+        // when index != last_index.
+        //
+        // ADR-0036 changed this from `remaining_accounts[0]` to a match on the
+        // gateway's own PDA, because `remaining_accounts` now also carries the
+        // latest Epoch. Clients should still keep the swapped gateway first —
+        // the pre-ADR-0036 program reads position 0 — but this program does not
+        // depend on the order.
         let (expected_pda, _) = Pubkey::find_program_address(
             &[GATEWAY_SEED, swapped_slot.address.as_ref()],
             ctx.program_id,
         );
+        let swapped_info = ctx
+            .remaining_accounts
+            .iter()
+            .find(|info| info.key() == expected_pda)
+            .ok_or(GarError::InvalidParameter)?;
+        require!(swapped_info.is_writable, GarError::InvalidParameter);
         require!(
-            swapped_info.key() == expected_pda,
+            swapped_info.owner == ctx.program_id,
             GarError::InvalidParameter
         );
 

@@ -326,10 +326,31 @@ pub fn close_epoch_settings(_ctx: Context<CloseEpochSettings>) -> Result<()> {
 /// i.e., after a reinit, against indices that the new lifecycle won't
 /// re-use.
 ///
-/// Authority-gated AND `migration_active`-gated: after mainnet
-/// `finalize_migration` flips `GatewaySettings.migration_active` to
-/// false, this ix becomes inert. By design, it is migration-window
-/// recovery infrastructure only.
+/// Authority-gated, and **permanent** as of ADR-0034.
+///
+/// It used to be `migration_active`-gated, which would have made it inert once
+/// `finalize_migration` ran. ADR-0034 makes this instruction the release valve
+/// for a stuck network — `create_epoch` now refuses to advance past an
+/// unfinished epoch — so a gate that expires would leave a stuck epoch with no
+/// recovery path at all: a permanent halt. Its sibling
+/// `admin_close_orphaned_epoch_rent_receipt` is already deliberately permanent
+/// for the same reason, and ADR-0031 keeps `EpochSettings.authority`
+/// transferable (to a multisig) indefinitely.
+///
+/// **Guards (ADR-0034).** The epoch must have **ended** and must be
+/// **undistributed**. Before ADR-0034 the handler body was empty and the only
+/// constraints were the authority check and `migration_active`, so it would
+/// close *any* epoch named — including the live one mid-observation, or a
+/// distributed one whose rent `close_epoch` should have refunded to its
+/// creator. A distributed epoch goes through `close_epoch`; a live one must not
+/// be closeable at all.
+///
+/// There is deliberately **no on-chain grace period**: the authority already
+/// holds strictly greater power (the program upgrade key), so a grace period
+/// would not constrain a malicious operator. The remaining risk — writing off
+/// an epoch whose distribution is still advancing — is operational: confirm
+/// `distribution_index` has stopped moving first. Distribution can legitimately
+/// run for hours (mainnet epoch 542 spanned 00:04–11:39 UTC).
 ///
 /// Does not touch the epoch's `EpochRentReceipt` (ADR-0029), so an orphaned
 /// 41-byte receipt survives at that index. It blocks nothing: a later
@@ -337,10 +358,28 @@ pub fn close_epoch_settings(_ctx: Context<CloseEpochSettings>) -> Result<()> {
 /// that epoch *without* a receipt still works, degrading only that one index
 /// to the pre-ADR-0029 `close = payer` refund.
 pub fn admin_close_stale_epoch(
-    _ctx: Context<AdminCloseStaleEpoch>,
+    ctx: Context<AdminCloseStaleEpoch>,
     _epoch_index: u64,
 ) -> Result<()> {
-    // Anchor's `close = authority` on the Epoch account does the rest.
+    let clock = Clock::get()?;
+    let epoch = ctx.accounts.epoch.load()?;
+
+    // Must have ended: a live epoch is still collecting observations, and
+    // closing it destroys the `failure_counts` its payout depends on.
+    require!(
+        clock.unix_timestamp >= epoch.end_timestamp,
+        GarError::EpochInProgress
+    );
+
+    // Must be undistributed: a distributed epoch's rent belongs to its creator
+    // via `close_epoch` (ADR-0029), not to the authority.
+    require!(
+        epoch.rewards_distributed == 0,
+        GarError::RewardsAlreadyDistributed
+    );
+
+    // Release the zero-copy borrow before Anchor's `close = authority` runs.
+    drop(epoch);
     Ok(())
 }
 
@@ -395,6 +434,75 @@ pub fn admin_close_orphaned_epoch_rent_receipt(
     Ok(())
 }
 
+/// The shared "the latest epoch is finished" predicate of ADR-0034 and
+/// ADR-0036.
+///
+/// **Finished** means `rewards_distributed == 1`, **or** the Epoch account no
+/// longer exists (it was written off by `admin_close_stale_epoch`). Whether the
+/// epoch's Observation PDAs have been closed is deliberately not part of it —
+/// `close_observation` already requires distribution, so closing them is rent
+/// reclamation that cannot affect any payout (ADR-0034, "What 'finished'
+/// means").
+///
+/// Two callers enforce it, for the same underlying reason — epoch payouts are
+/// addressed by registry position against per-tally weights, so anything that
+/// supersedes or reorders while an epoch is open corrupts it:
+///
+/// * `create_epoch` — an unfinished epoch must not be superseded (ADR-0034).
+/// * `finalize_gone` — registry positions are frozen while an epoch is
+///   unfinished (ADR-0036).
+///
+/// `finalize_gone`'s correctness argument inspects only the **latest** epoch,
+/// which is sufficient only because `create_epoch` enforces this same
+/// predicate: no older epoch can still be unfinished. **ADR-0036 must never
+/// ship without ADR-0034.**
+///
+/// # `remaining_accounts` contract
+///
+/// The latest Epoch PDA is located **by key**, not by position, so it composes
+/// with the `remaining_accounts` each caller already uses (the ADR-0029 rent
+/// receipt for `create_epoch`, the swapped Gateway PDA for `finalize_gone`) and
+/// so clients can append it while the *current* program still ignores it. That
+/// is what makes the client-first rollout possible.
+///
+/// "Absent" means **not owned by this program**. Only this program can create
+/// an account at its own PDA, so a non-program-owned account at that address —
+/// including a system account someone sent lamports to — cannot be an Epoch.
+pub(crate) fn require_latest_epoch_finished<'info>(
+    current_epoch_index: u64,
+    remaining_accounts: &'info [AccountInfo<'info>],
+    program_id: &Pubkey,
+) -> Result<()> {
+    // No epoch has ever been created, so none can be unfinished.
+    let Some(latest_index) = current_epoch_index.checked_sub(1) else {
+        return Ok(());
+    };
+
+    let (expected_pda, _) =
+        Pubkey::find_program_address(&[EPOCH_SEED, &latest_index.to_le_bytes()], program_id);
+
+    let latest_info = remaining_accounts
+        .iter()
+        .find(|info| info.key() == expected_pda)
+        .ok_or(GarError::MissingLatestEpochAccount)?;
+
+    // Written off (or never existed): only this program can own an account at
+    // this PDA, so anything else means there is no Epoch here.
+    if latest_info.owner != program_id {
+        return Ok(());
+    }
+
+    // Owned by us at the Epoch PDA — `try_from` also checks the discriminator.
+    let loader = AccountLoader::<Epoch>::try_from(latest_info)?;
+    let latest = loader.load()?;
+    require!(
+        latest.rewards_distributed == 1,
+        GarError::LatestEpochUnfinished
+    );
+
+    Ok(())
+}
+
 /// Create a new epoch (F23)
 /// This is permissionless - anyone can call when the previous epoch has ended
 ///
@@ -412,9 +520,33 @@ pub fn admin_close_orphaned_epoch_rent_receipt(
 /// against the pre-upgrade IDL would submit one account too few and fail with
 /// `AccountNotEnoughKeys`. Epoch creation is permissionless, unpaid, mandatory
 /// work — a change that could stall it network-wide the moment we upgrade is
-/// not worth the ergonomics. `remaining_accounts` is genuinely absent when
-/// unused, so un-upgraded crankers keep creating epochs untouched.
-pub fn create_epoch<'info>(ctx: Context<'_, '_, '_, 'info, CreateEpoch<'info>>) -> Result<()> {
+/// not worth the ergonomics.
+///
+/// **Previous epoch (ADR-0034).** `remaining_accounts` must also carry the
+/// previous Epoch PDA, `["epoch", current_epoch_index - 1]`, so
+/// [`require_latest_epoch_finished`] can confirm it is distributed or written
+/// off. Since ADR-0034 it is therefore never empty for `index > 0` — superseding
+/// the pre-ADR-0034 note that `remaining_accounts` is "genuinely absent when
+/// unused".
+///
+/// This program finds both accounts **by key**, so their order does not matter
+/// to it. Ordering and completeness still matter to the *old* program, which is
+/// what the client-first rollout runs against until the upgrade lands:
+///
+/// * The receipt must be **first** — the old program reads only
+///   `remaining_accounts.first()`.
+/// * A receipt must be **present**. The old program treats whatever sits at
+///   position 0 as the receipt, so a client that appends the previous Epoch and
+///   omits the receipt hands the Epoch to `init_epoch_rent_receipt`, which
+///   rejects it with `InvalidEpochRentReceipt`. Epoch creation is
+///   permissionless, unpaid, mandatory work, so that would stall the lifecycle
+///   network-wide until the upgrade lands — the opposite of what the staged
+///   rollout is for.
+///
+/// So the client-first property is real but conditional: **receipt first,
+/// previous Epoch second.** A client that sends both works against the old and
+/// the new program alike, and there is no flag day.
+pub fn create_epoch<'info>(ctx: Context<'_, '_, 'info, 'info, CreateEpoch<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let epoch_settings = &mut ctx.accounts.epoch_settings;
 
@@ -441,6 +573,13 @@ pub fn create_epoch<'info>(ctx: Context<'_, '_, '_, 'info, CreateEpoch<'info>>) 
         clock.unix_timestamp >= epoch_start,
         GarError::EpochNotStarted
     );
+
+    // ADR-0034: an unfinished epoch must not be superseded. `weights_epoch` and
+    // `GatewaySlot.composite_weight` are per-tally, not per-epoch, so tallying
+    // N+1 re-stamps every gateway in N's undistributed range and N can never be
+    // paid correctly again. That is what cost mainnet epoch 540. Refuse to
+    // create N+1 until N is distributed or written off.
+    require_latest_epoch_finished(expected_epoch_index, ctx.remaining_accounts, ctx.program_id)?;
 
     // Compute reward rate for this epoch (linear decay from 0.1% to 0.05%)
     let reward_rate = compute_reward_rate(
@@ -479,12 +618,23 @@ pub fn create_epoch<'info>(ctx: Context<'_, '_, '_, 'info, CreateEpoch<'info>>) 
         .checked_div(RATE_SCALE as u128)
         .unwrap_or(0) as u64;
 
-    // ADR-0029: a receipt was supplied iff the caller passed a remaining
-    // account. Recorded on the Epoch itself so `close_epoch` decides the
-    // refund target from program state rather than from the account list it
-    // happens to be handed — see the rejected "branch on what was passed"
-    // option in the ADR.
-    let receipt_info = ctx.remaining_accounts.first();
+    // ADR-0029: a receipt was supplied iff the caller passed the receipt PDA.
+    // Recorded on the Epoch itself so `close_epoch` decides the refund target
+    // from program state rather than from the account list it happens to be
+    // handed — see the rejected "branch on what was passed" option in the ADR.
+    //
+    // ADR-0034 changed this from "the first remaining account" to a match on
+    // the receipt's own PDA, because `remaining_accounts` now also carries the
+    // previous Epoch. Under the positional rule a caller that passed the
+    // previous Epoch but no receipt would have had the Epoch misread as one.
+    let (receipt_pda, _) = Pubkey::find_program_address(
+        &[EPOCH_RENT_RECEIPT_SEED, &expected_epoch_index.to_le_bytes()],
+        ctx.program_id,
+    );
+    let receipt_info = ctx
+        .remaining_accounts
+        .iter()
+        .find(|info| info.key() == receipt_pda);
 
     // Initialize epoch (zero-copy)
     let mut epoch = ctx.accounts.epoch.load_init()?;
@@ -1371,14 +1521,21 @@ pub struct CloseEpochSettings<'info> {
 #[derive(Accounts)]
 #[instruction(epoch_index: u64)]
 pub struct AdminCloseStaleEpoch<'info> {
-    /// Authority gate via `has_one` (matches `EpochSettings.authority`)
-    /// + `migration_active` gate via `GatewaySettings`. After mainnet
-    /// `finalize_migration` flips `migration_active` to false, this ix
-    /// becomes inert.
+    /// ADR-0034 removed this account's `migration_active` constraint: this
+    /// instruction is now the permanent release valve for a stuck network, so a
+    /// gate that expires at `finalize_migration` would mean a stuck epoch with
+    /// no recovery path. The authority gate is `has_one` on `epoch_settings`
+    /// below; the ended/undistributed guards are in the handler.
+    ///
+    /// The account itself is **retained even though nothing reads it**. ADR-0034
+    /// allows dropping it, but it is the first entry in the list, so removing it
+    /// would shift every later account and break any client built against the
+    /// current IDL. This is the instruction reached for when the network is
+    /// already stuck — keeping an older cranker or a hand-built recovery
+    /// transaction able to call it is worth one redundant account.
     #[account(
         seeds = [SETTINGS_SEED],
         bump = settings.bump,
-        constraint = settings.migration_active @ GarError::MigrationInactive,
     )]
     pub settings: Account<'info, GatewaySettings>,
 

@@ -27,8 +27,10 @@ pub fn deduct_delegation_for_payment(
         GarError::GatewayNotJoined
     );
 
-    // Settle pending rewards before deduction (same as decrease_delegate_stake)
-    settle_delegate_rewards(gateway, delegation);
+    // Settle pending rewards before deduction (same as decrease_delegate_stake).
+    // ADR-0037: the settled amount is added to the supply counter below, before
+    // the payment is subtracted from it.
+    let settled = settle_delegate_rewards(gateway, delegation);
 
     require!(
         delegation.amount >= amount,
@@ -76,9 +78,13 @@ pub fn deduct_delegation_for_payment(
         timestamp: Clock::get()?.unix_timestamp,
     });
 
-    // Supply counter: delegated stake paid to protocol
+    // Supply counter: rewards settled into principal are added (ADR-0037),
+    // then the payment leaves the delegated pool for the protocol.
     let settings = &mut ctx.accounts.settings;
-    settings.total_delegated = settings.total_delegated.saturating_sub(amount);
+    settings.total_delegated = settings
+        .total_delegated
+        .saturating_add(settled)
+        .saturating_sub(amount);
 
     Ok(())
 }
@@ -462,6 +468,12 @@ pub fn pay_from_funding_plan<'info>(
     let mut stake_pool_drain: u64 = 0;
     // Supply counter accumulators — aggregated across all sources, applied once.
     let mut counter_delegated_sub: u64 = 0;
+    // ADR-0037: rewards settled into principal inside the loop below raise each
+    // gateway's counter, so they must raise the supply counter too.
+    let mut counter_delegated_add: u64 = 0;
+    // Sub-min residue that auto-vaults into a Withdrawal — it leaves delegated
+    // stake on the gateway, so it must leave the supply counter too.
+    let mut counter_delegated_residue_sub: u64 = 0;
     let mut counter_staked_sub: u64 = 0;
     let mut counter_withdrawn_sub: u64 = 0;
     // Per-Delegation residue tracking: (gateway_operator, residue_amount) in
@@ -535,7 +547,8 @@ pub fn pay_from_funding_plan<'info>(
                 // Settle pending rewards before deduction (matches the existing
                 // single-source path; per-Delegation, since each gateway has
                 // its own reward accumulator).
-                settle_delegate_rewards(&mut gateway, &mut delegation);
+                counter_delegated_add = counter_delegated_add
+                    .saturating_add(settle_delegate_rewards(&mut gateway, &mut delegation));
 
                 require!(
                     delegation.amount >= source.amount,
@@ -570,6 +583,16 @@ pub fn pay_from_funding_plan<'info>(
                         .total_delegated_stake
                         .checked_sub(combined)
                         .ok_or(GarError::ArithmeticUnderflow)?;
+                    // The residue leaves delegated stake too — it becomes a
+                    // Withdrawal vault. The gateway counter drops by `combined`
+                    // here, so the supply counter must drop by the residue as
+                    // well as by `source.amount` (accumulated below), or
+                    // `settings.total_delegated` is left high by exactly the
+                    // residue on every auto-vaulted payment. Same invariant
+                    // ADR-0037 restores for settlement; this is the other way it
+                    // was breaking.
+                    counter_delegated_residue_sub =
+                        counter_delegated_residue_sub.saturating_add(post);
                 }
 
                 let gateway_operator = gateway.operator;
@@ -873,9 +896,14 @@ pub fn pay_from_funding_plan<'info>(
     );
 
     // Supply counters: apply accumulated drains + residue vault transitions.
-    // Residue vaults move tokens from delegated → withdrawn (the delegation
-    // drain already subtracted the full amount from total_delegated; the
-    // residue portion was re-materialized as a Withdrawal vault above).
+    // Residue vaults move tokens from delegated → withdrawn.
+    //
+    // This comment used to claim the delegation drain "already subtracted the
+    // full amount from total_delegated". It did not: the loop accumulates only
+    // `source.amount` into `counter_delegated_sub`, while the gateway counter
+    // drops by `source.amount + residue`. That gap is why
+    // `counter_delegated_residue_sub` exists — it is subtracted below so the
+    // supply counter tracks Σ gateway counters through this path.
     let mut counter_withdrawn_add: u64 = 0;
     for (_gw, residue) in &residue_targets {
         counter_withdrawn_add = counter_withdrawn_add.saturating_add(*residue);
@@ -883,7 +911,9 @@ pub fn pay_from_funding_plan<'info>(
     let settings = &mut ctx.accounts.settings;
     settings.total_delegated = settings
         .total_delegated
-        .saturating_sub(counter_delegated_sub);
+        .saturating_add(counter_delegated_add)
+        .saturating_sub(counter_delegated_sub)
+        .saturating_sub(counter_delegated_residue_sub);
     settings.total_staked = settings.total_staked.saturating_sub(counter_staked_sub);
     settings.total_withdrawn = settings
         .total_withdrawn
