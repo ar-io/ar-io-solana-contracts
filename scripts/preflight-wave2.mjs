@@ -48,6 +48,10 @@ import { fileURLToPath } from 'node:url';
 // every unexpected failure is funnelled to 2. Registered before any work
 // starts so even an early import or RPC failure is covered.
 const bail = (e) => {
+  // EPIPE just means the reader went away (`| head`, `| less` and quit). That
+  // is not a verification failure, and reporting it as status 2 would teach
+  // operators to distrust the status codes.
+  if (e?.code === 'EPIPE' || e?.errno === -32) process.exit(0);
   console.error(`\n  ERROR: ${e?.stack ?? e?.message ?? e}`);
   console.error('  NOTHING WAS VERIFIED — do NOT proceed.\n');
   process.exit(2);
@@ -65,7 +69,7 @@ const opt = (n) => {
 const cluster = opt('--cluster');
 if (!['mainnet', 'staging'].includes(cluster)) {
   console.error(
-    'usage: preflight-wave2.mjs --cluster mainnet|staging [--json out.json]',
+    'usage: preflight-wave2.mjs --cluster mainnet|staging [--json out.json] [--program-ids <path>]',
   );
   process.exit(2);
 }
@@ -79,29 +83,78 @@ if (!RPC) {
   process.exit(2);
 }
 
-const ids = JSON.parse(readFileSync(join(REPO, `program-ids/${cluster}.json`)));
-const GAR = ids.programs.ario_gar;
-
-const LIB = join(REPO, 'clients/ts/lib/gar');
-let dec;
+// Program IDs. Defaults to the in-repo manifest, but `--program-ids` lets an
+// operator run this from a gateway box that has no checkout.
+const idsPath = opt('--program-ids') ?? join(REPO, `program-ids/${cluster}.json`);
+let GAR;
 try {
-  const [gw, ep, es, gs] = await Promise.all([
-    import(join(LIB, 'accounts/gateway.js')),
-    import(join(LIB, 'accounts/epoch.js')),
-    import(join(LIB, 'accounts/epochSettings.js')),
-    import(join(LIB, 'accounts/gatewaySettings.js')),
-  ]);
-  dec = {
-    gateway: gw.getGatewayDecoder(),
-    epoch: ep.getEpochDecoder(),
-    epochSettings: es.getEpochSettingsDecoder(),
-    gatewaySettings: gs.getGatewaySettingsDecoder(),
-  };
+  GAR = JSON.parse(readFileSync(idsPath)).programs.ario_gar;
+  if (!GAR) throw new Error('programs.ario_gar missing');
 } catch (e) {
-  console.error(`cannot load generated decoders from ${LIB}: ${e.message}`);
-  console.error('build them first:  cd clients/ts && yarn build:tsc');
+  console.error(`cannot read program ids from ${idsPath}: ${e.message}`);
+  console.error('pass --program-ids <path to program-ids/<cluster>.json>');
   process.exit(2);
 }
+
+/**
+ * Import the first candidate that resolves.
+ *
+ * This script is a SAFETY GATE, so it has to run where the operator is —
+ * including a gateway box with no Rust toolchain, where `clients/ts/lib` was
+ * never built. It therefore falls back from the in-repo build to the published
+ * `@ar.io/solana-contracts` package, which contains the same generated code.
+ */
+async function importFirst(candidates, what) {
+  const tried = [];
+  for (const c of candidates) {
+    try {
+      return { mod: await import(c), from: c };
+    } catch (e) {
+      tried.push(`  ${c}\n    -> ${e.message.split('\n')[0]}`);
+    }
+  }
+  console.error(`cannot load ${what}. Tried:\n${tried.join('\n')}`);
+  console.error(
+    '\nEither build the in-repo client (cd clients/ts && yarn build:tsc),',
+  );
+  console.error(
+    'or install the published one:  npm i @ar.io/solana-contracts@<version>',
+  );
+  process.exit(2);
+}
+
+const kitSrc = await importFirst(
+  [
+    join(REPO, 'clients/ts/node_modules/@solana/kit/dist/index.node.mjs'),
+    '@solana/kit',
+  ],
+  '@solana/kit',
+);
+const { getProgramDerivedAddress } = kitSrc.mod;
+
+const garSrc = await importFirst(
+  [join(REPO, 'clients/ts/lib/gar/index.js'), '@ar.io/solana-contracts/gar'],
+  'the generated ario-gar client',
+);
+const g = garSrc.mod;
+for (const fn of [
+  'getGatewayDecoder',
+  'getEpochDecoder',
+  'getEpochSettingsDecoder',
+  'getGatewaySettingsDecoder',
+]) {
+  if (typeof g[fn] !== 'function') {
+    console.error(`the client at ${garSrc.from} does not export ${fn}()`);
+    console.error('it is too old or not the ario-gar client — nothing was verified');
+    process.exit(2);
+  }
+}
+const dec = {
+  gateway: g.getGatewayDecoder(),
+  epoch: g.getEpochDecoder(),
+  epochSettings: g.getEpochSettingsDecoder(),
+  gatewaySettings: g.getGatewaySettingsDecoder(),
+};
 
 async function rpc(method, params) {
   const res = await fetch(RPC, {
@@ -130,15 +183,7 @@ const b58 = (bytes) => {
   return out || '1';
 };
 const pda = async (seeds) => {
-  // Only fixed seeds are needed here, so shell out to the generated client's
-  // deriver rather than reimplementing curve checks.
-  const { getProgramDerivedAddress } = await import(
-    join(REPO, 'clients/ts/node_modules/@solana/kit/dist/index.node.mjs')
-  );
-  const [addr] = await getProgramDerivedAddress({
-    programAddress: GAR,
-    seeds,
-  });
+  const [addr] = await getProgramDerivedAddress({ programAddress: GAR, seeds });
   return addr;
 };
 
@@ -170,6 +215,42 @@ const redactRpc = (u) => {
 const report = { cluster, rpc: redactRpc(RPC), at: new Date().toISOString() };
 
 console.log(`\n=== Wave 2 pre-flight — ${cluster} ===\n`);
+// Provenance matters for a safety gate: the operator must be able to tell
+// whether the verdict came from the in-repo build or a published package, and
+// which version of it.
+let clientVersion = 'unknown';
+{
+  // Resolve the module that actually loaded, then walk up to its package.json.
+  // Reading `@ar.io/solana-contracts/package.json` directly does not work: the
+  // package's `exports` map does not list it, so Node refuses the subpath.
+  let start = garSrc.from;
+  if (!start.startsWith('/')) {
+    try {
+      const { createRequire } = await import('node:module');
+      start = createRequire(import.meta.url).resolve(garSrc.from);
+    } catch {
+      start = '';
+    }
+  }
+  let d = start ? dirname(start) : '';
+  for (let i = 0; i < 8 && d && d !== '/'; i++) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(d, 'package.json')));
+      if (pkg.version) {
+        clientVersion = `${pkg.name ?? '?'}@${pkg.version}`;
+        break;
+      }
+    } catch {
+      /* keep walking */
+    }
+    d = dirname(d);
+  }
+}
+console.log(`decoders : ${garSrc.from}`);
+console.log(`version  : ${clientVersion}`);
+console.log(`ids      : ${idsPath}\n`);
+report.decoderSource = garSrc.from;
+report.decoderVersion = clientVersion;
 
 // ---------------------------------------------------------------- 1. program
 console.log('[1] GAR program');
