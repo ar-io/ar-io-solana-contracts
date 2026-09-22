@@ -42,6 +42,19 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Exit-status contract: 1 means "I checked and found problems", 2 means "I
+// could not check". An uncaught throw at module scope would otherwise exit 1
+// and be read as a verified finding, which is the opposite of the truth — so
+// every unexpected failure is funnelled to 2. Registered before any work
+// starts so even an early import or RPC failure is covered.
+const bail = (e) => {
+  console.error(`\n  ERROR: ${e?.stack ?? e?.message ?? e}`);
+  console.error('  NOTHING WAS VERIFIED — do NOT proceed.\n');
+  process.exit(2);
+};
+process.on('uncaughtException', bail);
+process.on('unhandledRejection', bail);
+
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const opt = (n) => {
@@ -142,7 +155,19 @@ const ok = (msg) => console.log(`  ✓ ${msg}`);
 const info = (msg) => console.log(`    ${msg}`);
 
 const enc = new TextEncoder();
-const report = { cluster, rpc: RPC.replace(/\/\/.*@/, '//<redacted>@'), at: new Date().toISOString() };
+// Record only the ORIGIN. Managed RPC endpoints carry their API key in the
+// path (…/<key>/) or the query, not just in userinfo, so a userinfo-only
+// redaction would write a live credential into --json output — and that file
+// gets attached to rollout tickets and CI artifacts.
+const redactRpc = (u) => {
+  try {
+    const { protocol, host } = new URL(u);
+    return `${protocol}//${host}`;
+  } catch {
+    return '<unparseable rpc url>';
+  }
+};
+const report = { cluster, rpc: redactRpc(RPC), at: new Date().toISOString() };
 
 console.log(`\n=== Wave 2 pre-flight — ${cluster} ===\n`);
 
@@ -256,6 +281,16 @@ const gateways = gwAccounts.map((a) => ({
   pubkey: a.pubkey,
   raw: Buffer.from(a.account.data[0], 'base64'),
 }));
+// An empty result means the discriminator, the program id or the endpoint is
+// wrong — NOT that there are no gateways. Continuing would run every
+// downstream check over an empty list and print CLEAR TO PROCEED having
+// verified nothing, which is the one failure mode this script must never have.
+if (gateways.length === 0) {
+  console.error('  getProgramAccounts returned NO gateway accounts');
+  console.error('  the discriminator, program id or RPC endpoint is wrong');
+  bail(new Error('gateway scan returned nothing; refusing to report a verdict'));
+}
+
 const sizes = {};
 for (const g of gateways) sizes[g.raw.length] = (sizes[g.raw.length] ?? 0) + 1;
 info(`total gateways     : ${gateways.length}`);
