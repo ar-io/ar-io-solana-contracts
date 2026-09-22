@@ -33422,3 +33422,966 @@ async fn test_reconcile_works_on_unmigrated_964_byte_gateway() {
         "and must not silently restamp the schema version"
     );
 }
+
+// --- Wave 2 follow-up: the test gaps ADR-0034 / ADR-0036 named ---------------
+
+/// Force a registry slot's `composite_weight` to 0, making the gateway that
+/// occupies it ineligible for rewards without changing anything else.
+///
+/// `distribute_epoch`'s eligibility term is
+/// `registry.gateways[i].composite_weight > 0 && !weights_stale`, so this is
+/// the minimal edit that models "tallied, still Joined, but earning nothing" —
+/// a gateway whose stake and tenure produced a zero composite. Doing it on the
+/// registry rather than the Gateway PDA matches where the program reads it.
+async fn clear_registry_composite_weight(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    slot_index: usize,
+) {
+    let mut reg_acct = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .expect("registry must exist");
+    {
+        let registry: &mut GatewayRegistry = bytemuck::from_bytes_mut(
+            &mut reg_acct.data[8..8 + std::mem::size_of::<GatewayRegistry>()],
+        );
+        assert!(
+            (slot_index as u32) < registry.count,
+            "slot {slot_index} is outside the registry"
+        );
+        assert!(
+            registry.gateways[slot_index].composite_weight > 0,
+            "slot {slot_index} was already ineligible — the edit would be a no-op"
+        );
+        registry.gateways[slot_index].composite_weight = 0;
+    }
+    ctx.set_account(&setup.registry_key, &reg_acct.into());
+}
+
+/// Read the registry's occupied slots as `(address, composite_weight)`.
+async fn read_registry_slots(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+) -> (u32, Vec<(Pubkey, u64)>) {
+    let acct = ctx
+        .banks_client
+        .get_account(setup.registry_key)
+        .await
+        .unwrap()
+        .expect("registry must exist");
+    let registry: &GatewayRegistry =
+        bytemuck::from_bytes(&acct.data[8..8 + std::mem::size_of::<GatewayRegistry>()]);
+    let slots = (0..registry.count as usize)
+        .map(|i| {
+            (
+                registry.gateways[i].address,
+                registry.gateways[i].composite_weight,
+            )
+        })
+        .collect();
+    (registry.count, slots)
+}
+
+/// **Gap 1 (ADR-0034 addendum).** An epoch that WAS observed but in which no
+/// gateway is eligible must complete as a normal distribution and emit **no**
+/// skip event.
+///
+/// This is the case `EpochSkippedNoObservationsEvent` exists to separate. The
+/// existing `test_normal_distribution_emits_no_skip_event` runs a scenario in
+/// which `keep_gateway` is eligible and paid, so it never approaches the
+/// ambiguity. Here every gateway earns 0 — the payout is as empty as a skip's —
+/// and the only thing distinguishing the two outcomes is the discriminator.
+///
+/// The assertions below also pin what the frozen `EpochDistributedEvent`
+/// actually reports in this case, which is **not** what a skip reports:
+/// `gateways_processed` is the slot count traversed (2), not the number paid,
+/// and `total_eligible_rewards` is the epoch's pool, snapshotted at
+/// `create_epoch` and independent of eligibility. A skip emits `0` for both.
+/// So the two events are distinguishable on payload as well — but only for a
+/// non-empty registry, and only by a consumer that knows to compare against
+/// `active_gateway_count`. The discriminator event is the contract.
+#[tokio::test]
+async fn test_observed_epoch_with_no_eligible_gateway_emits_no_skip_event() {
+    ario_test_utils::bpf_required!();
+    let (mut ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key) =
+        setup_untallied_joiner_scenario_with_observations(1).await;
+
+    // Slot 1 (the untallied joiner) is already ineligible: composite 0 AND
+    // stale weights. Knock out slot 0 too, so the eligible set is empty while
+    // `observations_submitted` stays at 1.
+    clear_registry_composite_weight(&mut ctx, &setup, 0).await;
+
+    let keep_before = read_gateway(&mut ctx, &keep_gateway).await;
+    let new_before = read_gateway(&mut ctx, &new_gateway).await;
+    let treasury_before = get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    accounts.push(solana_sdk::instruction::AccountMeta::new(
+        keep_gateway,
+        false,
+    ));
+    accounts.push(solana_sdk::instruction::AccountMeta::new(
+        new_gateway,
+        false,
+    ));
+    let tx = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: ario_gar::ID,
+            accounts,
+            data: ario_gar::instruction::DistributeEpoch { _epoch_index: 1 }.data(),
+        }],
+        Some(&payer_pk),
+        &[&ctx.payer],
+        blockhash,
+    );
+    let result = ctx
+        .banks_client
+        .process_transaction_with_metadata(tx)
+        .await
+        .unwrap();
+    assert!(
+        result.result.is_ok(),
+        "an empty eligible set is a normal, successful distribution: {:?}",
+        result.result
+    );
+    let logs = result.metadata.expect("metadata").log_messages;
+
+    // The contract under test.
+    assert!(
+        !ario_test_utils::has_event::<ario_gar::EpochSkippedNoObservationsEvent>(&logs),
+        "an OBSERVED epoch must never emit the skip discriminator, however empty its payout"
+    );
+
+    use ario_test_utils::expect_event;
+    let distributed = expect_event!(&logs, ario_gar::EpochDistributedEvent);
+    assert_eq!(distributed.epoch_index, 1);
+    assert_eq!(
+        distributed.gateways_processed, 2,
+        "the frozen event counts slots traversed, not gateways paid — a skip reports 0"
+    );
+    assert!(
+        distributed.total_eligible_rewards > 0,
+        "the pool is snapshotted at create_epoch and does not depend on eligibility — \
+         a skip reports 0"
+    );
+
+    // Nothing was actually paid, which is what makes this the ambiguous case.
+    let keep_after = read_gateway(&mut ctx, &keep_gateway).await;
+    let new_after = read_gateway(&mut ctx, &new_gateway).await;
+    assert_eq!(
+        keep_after.operator_stake, keep_before.operator_stake,
+        "an ineligible gateway earns nothing"
+    );
+    assert_eq!(new_after.operator_stake, new_before.operator_stake);
+    assert_eq!(
+        get_token_balance(&mut ctx, &setup.protocol_token.pubkey()).await,
+        treasury_before,
+        "and the treasury is untouched — identical to a skip's effect"
+    );
+
+    // And no gateway's stats moved either. `distribute_epoch` gates the stats
+    // tick on `!is_leaving && eligible` (ADR-0032, distribution.rs), so an
+    // empty eligible set credits nothing at all.
+    //
+    // **This is the finding that justifies the discriminator.** A skip and an
+    // observed-but-empty distribution are not merely similar — on this fixture
+    // they leave *identical* on-chain state: no payment, no treasury movement,
+    // no `total_epochs`, no `passed_epochs`, `rewards_distributed = 1`. An
+    // indexer replaying account state alone cannot tell them apart, and it must
+    // be able to: only one of them means "the network produced no evidence".
+    // `EpochSkippedNoObservationsEvent` is the sole carrier of that fact.
+    for (before, after, who) in [
+        (
+            &keep_before,
+            &keep_after,
+            "the tallied-but-zero-weight gateway",
+        ),
+        (&new_before, &new_after, "the untallied joiner"),
+    ] {
+        assert_eq!(
+            after.stats.total_epochs, before.stats.total_epochs,
+            "{who} is outside the earning set, so it must not be credited with participation"
+        );
+        assert_eq!(
+            after.stats.passed_epochs, before.stats.passed_epochs,
+            "{who} must not be credited with a pass it could not earn"
+        );
+        assert_eq!(
+            after.stats.passed_consecutive, before.stats.passed_consecutive,
+            "{who} must not have its pass streak extended"
+        );
+    }
+}
+
+/// **Gap 2 (ADR-0036).** `finalize_gone` is refused in the **swap** case, and
+/// the refusal leaves every registry position exactly where the epoch's
+/// observations were recorded against.
+///
+/// The swap branch is the one that mis-scored mainnet epoch 542: moving
+/// `lasaucisse` down a slot made it read a different gateway's failure count.
+/// `test_epoch_542_gate_preserves_failure_attribution` already drives
+/// `finalize_gone` in this shape and asserts the error code, then proves the
+/// payout downstream. This test isolates the *state* half of the claim, and
+/// closes the two ways that refusal could be an accident rather than the gate:
+///
+///  1. The swapped gateway's PDA is passed, writable, in `remaining_accounts`.
+///     Without it the swap branch would fail on `InvalidParameter` regardless
+///     of the epoch gate, so a refusal would prove nothing about ADR-0036.
+///  2. The registry is compared slot-for-slot before and after, so a partial
+///     mutation before the abort would be caught rather than rolled back
+///     silently by the transaction.
+#[tokio::test]
+async fn test_finalize_gone_refused_in_swap_case_leaves_registry_intact() {
+    let (mut ctx, setup, leaver, failed_gateway, _epoch_key, _epoch_settings_key) =
+        setup_epoch_542_shape().await;
+    let stranger = Keypair::new();
+    fund_keypair(&mut ctx, &stranger.pubkey(), 10_000_000_000).await;
+
+    let (count_before, slots_before) = read_registry_slots(&mut ctx, &setup).await;
+    let leaver_before = read_gateway(&mut ctx, &leaver).await;
+    let failed_before = read_gateway(&mut ctx, &failed_gateway).await;
+    assert_eq!(count_before, 2);
+    assert_eq!(
+        leaver_before.registry_index.index, 0,
+        "the leaver must be BELOW the last slot, or this is the last-slot case"
+    );
+    assert_eq!(failed_before.registry_index.index, 1);
+
+    // A well-formed swap-case request: the swapped gateway (slot 1) writable,
+    // plus the latest epoch. Only the ADR-0036 gate can refuse this.
+    let mut extra = vec![solana_sdk::instruction::AccountMeta::new(
+        failed_gateway,
+        false,
+    )];
+    extra.extend(latest_epoch_meta(2));
+
+    let swept = finalize_gone_as(&mut ctx, &setup, &leaver, &stranger, &extra).await;
+    assert_anchor_error!(swept, GarError::LatestEpochUnfinished);
+
+    let (count_after, slots_after) = read_registry_slots(&mut ctx, &setup).await;
+    assert_eq!(count_after, count_before, "registry.count must not move");
+    assert_eq!(
+        slots_after, slots_before,
+        "no slot may be swapped, zeroed or reweighted by a refused sweep"
+    );
+
+    let failed_after = read_gateway(&mut ctx, &failed_gateway).await;
+    assert_eq!(
+        failed_after.registry_index.index, 1,
+        "the swap victim's stored index must not follow a move that did not happen"
+    );
+
+    let leaver_after = read_gateway(&mut ctx, &leaver).await;
+    assert_eq!(
+        leaver_after.status,
+        GatewayStatus::Leaving,
+        "the Gateway PDA must survive — `close = caller` must not have run"
+    );
+}
+
+/// **Gap 3 (ADR-0036).** The cranker's race-free sweep: the final
+/// `distribute_epoch` batch and `finalize_gone` in the SAME transaction.
+///
+/// ADR-0036 narrows GC to the gap between one epoch's distribution and the
+/// next epoch's creation, and names this bundle as the mitigation — the two
+/// instructions execute in order, so `finalize_gone` observes
+/// `rewards_distributed == 1` and no `create_epoch` can land between them.
+///
+/// The test carries its own negative control: the **same two instructions in
+/// the opposite order** are refused. Without it this would only show that a
+/// bundle can succeed, not that the ordering is what makes it work.
+#[tokio::test]
+async fn test_bundled_distribute_then_finalize_gone_in_one_transaction() {
+    // --- Negative control: sweep FIRST is refused, exactly as if it had raced.
+    {
+        let (mut ctx, setup, leaver, failed_gateway, epoch_key, epoch_settings_key) =
+            setup_epoch_542_shape().await;
+        let payer_pk = ctx.payer.pubkey();
+        let reversed = ctx
+            .banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[
+                    build_finalize_gone_ix(&setup, &leaver, &payer_pk, &failed_gateway),
+                    build_distribute_ix(
+                        &setup,
+                        epoch_settings_key,
+                        epoch_key,
+                        1,
+                        &payer_pk,
+                        &[leaver, failed_gateway],
+                    ),
+                ],
+                Some(&payer_pk),
+                &[&ctx.payer],
+                ctx.banks_client.get_latest_blockhash().await.unwrap(),
+            ))
+            .await;
+        assert_anchor_error!(reversed, GarError::LatestEpochUnfinished);
+    }
+
+    // --- The prescribed bundle.
+    let (mut ctx, setup, leaver, failed_gateway, epoch_key, epoch_settings_key) =
+        setup_epoch_542_shape().await;
+    let payer_pk = ctx.payer.pubkey();
+    let failed_before = read_gateway(&mut ctx, &failed_gateway).await;
+
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[
+                build_distribute_ix(
+                    &setup,
+                    epoch_settings_key,
+                    epoch_key,
+                    1,
+                    &payer_pk,
+                    &[leaver, failed_gateway],
+                ),
+                build_finalize_gone_ix(&setup, &leaver, &payer_pk, &failed_gateway),
+            ],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            ctx.banks_client.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .expect("the bundle ADR-0036 prescribes must succeed");
+
+    // The sweep landed: the leaver's slot is reclaimed and its PDA closed.
+    let (count_after, slots_after) = read_registry_slots(&mut ctx, &setup).await;
+    assert_eq!(count_after, 1, "the leaver's slot was reclaimed");
+    assert_eq!(
+        slots_after[0].0, failed_before.operator,
+        "the survivor was swapped down into slot 0"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(leaver)
+            .await
+            .unwrap()
+            .is_none_or(|a| a.lamports == 0),
+        "`close = caller` must have run"
+    );
+
+    let failed_after = read_gateway(&mut ctx, &failed_gateway).await;
+    assert_eq!(
+        failed_after.registry_index.index, 0,
+        "the swapped gateway's stored index follows it down"
+    );
+
+    // And because the sweep ran AFTER distribution, attribution is intact —
+    // the gateway all 11 observers failed was still scored at slot 1.
+    assert_eq!(
+        failed_after.stats.failed_consecutive,
+        failed_before.stats.failed_consecutive + 1,
+        "bundling must not reintroduce the epoch-542 mis-score"
+    );
+    assert_eq!(
+        failed_after.stats.passed_epochs, failed_before.stats.passed_epochs,
+        "and must not credit a pass"
+    );
+}
+
+fn build_distribute_ix(
+    setup: &GarSetup,
+    epoch_settings_key: Pubkey,
+    epoch_key: Pubkey,
+    epoch_index: u64,
+    payer: &Pubkey,
+    slots: &[Pubkey],
+) -> Instruction {
+    let mut accounts = ario_gar::accounts::DistributeEpoch {
+        epoch_settings: epoch_settings_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        settings: setup.settings_key,
+        protocol_token_account: setup.protocol_token.pubkey(),
+        stake_token_account: setup.stake_token.pubkey(),
+        ario_config: ario_config_pda().0,
+        ario_core_program: ario_gar::ARIO_CORE_PROGRAM_ID,
+        token_program: spl_token::ID,
+        payer: *payer,
+    }
+    .to_account_metas(None);
+    for s in slots {
+        accounts.push(solana_sdk::instruction::AccountMeta::new(*s, false));
+    }
+    Instruction {
+        program_id: ario_gar::ID,
+        accounts,
+        data: ario_gar::instruction::DistributeEpoch {
+            _epoch_index: epoch_index,
+        }
+        .data(),
+    }
+}
+
+/// `finalize_gone` in the swap case: the swapped gateway writable, then the
+/// latest Epoch PDA — the order a correct client uses (ADR-0036 finds both by
+/// key, but the pre-upgrade program reads position 0).
+fn build_finalize_gone_ix(
+    setup: &GarSetup,
+    gateway_key: &Pubkey,
+    caller: &Pubkey,
+    swapped_gateway: &Pubkey,
+) -> Instruction {
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let mut accounts = ario_gar::accounts::FinalizeGone {
+        gateway: *gateway_key,
+        registry: setup.registry_key,
+        epoch_settings: epoch_settings_key,
+        caller: *caller,
+    }
+    .to_account_metas(None);
+    accounts.push(solana_sdk::instruction::AccountMeta::new(
+        *swapped_gateway,
+        false,
+    ));
+    accounts.extend(latest_epoch_meta(2));
+    Instruction {
+        program_id: ario_gar::ID,
+        accounts,
+        data: ario_gar::instruction::FinalizeGone {}.data(),
+    }
+}
+
+/// **Gap 4 (ADR-0037).** A reconcile landing BETWEEN `tally_weights` and
+/// `distribute_epoch`.
+///
+/// The two halves are covered separately; the interaction is what this test
+/// adds. It matters because the two sides of a delegate payout are read at
+/// different times:
+///
+/// * **whether** a delegate share is carved out comes from
+///   `registry.delegated_at_tally`, snapshotted at tally and therefore taken
+///   BEFORE the reconcile;
+/// * **who it is divided among** comes from the live
+///   `gateway.total_delegated_stake`, read at distribution and therefore AFTER
+///   the reconcile.
+///
+/// A reconcile in that window changes only the second. ADR-0037's claim is that
+/// the share then goes wholly to the real delegates — the phantom stake never
+/// dilutes it — and that when the corrected counter reaches 0 it falls to the
+/// orphaned path (ADR-025) rather than to the operator.
+///
+/// Returns the full-lifecycle fixture positioned just before distribution.
+struct ReconcileWindowFixture {
+    ctx: ProgramTestContext,
+    setup: GarSetup,
+    admin: Keypair,
+    gateway_key: Pubkey,
+    epoch_key: Pubkey,
+    epoch_settings_key: Pubkey,
+    delegation_key: Pubkey,
+    delegator: Keypair,
+    delegator_token: Pubkey,
+    real_delegated: u64,
+    phantom: u64,
+}
+
+/// Build a tallied, prescribed, observed epoch over one gateway that carries a
+/// real delegation plus phantom delegated stake, with the clock past the
+/// epoch's end. Nothing has been distributed or reconciled yet.
+async fn setup_reconcile_between_tally_and_distribution(
+    real_delegated: u64,
+    phantom: u64,
+) -> ReconcileWindowFixture {
+    let admin = Keypair::new();
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let mut pt = program_test_with_gar_and_core(
+        &admin.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &admin.pubkey(), 100, 86_400, true);
+    pt.add_account(
+        admin.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 50_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar_with_core_treasury(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 0;
+    ctx.set_sysvar(&clock);
+
+    let payer_pk = ctx.payer.pubkey();
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    let (delegator, delegator_token) =
+        create_funded_actor(&mut ctx, &setup, 5_000_000_000, 50_000_000_000).await;
+    if real_delegated > 0 {
+        delegate_to(
+            &mut ctx,
+            &setup,
+            &payer_pk,
+            &gateway_key,
+            &delegator,
+            &delegator_token.pubkey(),
+            real_delegated,
+        )
+        .await;
+    }
+    let (delegation_key, _) = delegation_pda(&payer_pk, &delegator.pubkey());
+
+    // The AO-import shape: the counter claims more than the Delegation
+    // accounts behind it. Injected BEFORE tally, so `delegated_at_tally` is
+    // non-zero either way and the delegate carve-out is taken.
+    inflate_phantom_delegated_stake(&mut ctx, &setup, &gateway_key, phantom).await;
+
+    let (epoch_settings_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100;
+    ctx.set_sysvar(&clock);
+
+    // create_epoch(0): current_epoch_index is 0, so ADR-0034's predicate has no
+    // previous epoch to inspect.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::CreateEpoch {
+                    epoch_settings: epoch_settings_key,
+                    epoch: epoch_key,
+                    registry: setup.registry_key,
+                    settings: setup.settings_key,
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    payer: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::CreateEpoch {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    for (data, extra) in [
+        (
+            ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+            true,
+        ),
+        (
+            ario_gar::instruction::PrescribeEpoch { _epoch_index: 0 }.data(),
+            false,
+        ),
+    ] {
+        let mut accounts = if extra {
+            ario_gar::accounts::TallyWeights {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                payer: payer_pk,
+            }
+            .to_account_metas(None)
+        } else {
+            ario_gar::accounts::PrescribeEpoch {
+                settings: setup.settings_key,
+                epoch_settings: epoch_settings_key,
+                epoch: epoch_key,
+                registry: setup.registry_key,
+                payer: payer_pk,
+            }
+            .to_account_metas(None)
+        };
+        accounts.push(solana_sdk::instruction::AccountMeta::new(
+            gateway_key,
+            false,
+        ));
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[Instruction {
+                    program_id: ario_gar::ID,
+                    accounts,
+                    data,
+                }],
+                Some(&payer_pk),
+                &[&ctx.payer],
+                blockhash,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // One observation, marking the single gateway as passed — so the epoch is
+    // NOT a skip and the gateway is eligible for the full reward.
+    let (observation_key, _) = observation_pda(0, &payer_pk);
+    let mut gateway_results = [0u8; 375];
+    gateway_results[0] = 0b0000_0001;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::SaveObservations {
+                    epoch: epoch_key,
+                    observation: observation_key,
+                    observer: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::SaveObservations {
+                    _epoch_index: 0,
+                    gateway_results,
+                    gateway_count: 1,
+                    report_tx_id: [1u8; 32],
+                }
+                .data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 100 + 86_400 + 1;
+    ctx.set_sysvar(&clock);
+
+    ReconcileWindowFixture {
+        ctx,
+        setup,
+        admin,
+        gateway_key,
+        epoch_key,
+        epoch_settings_key,
+        delegation_key,
+        delegator,
+        delegator_token: delegator_token.pubkey(),
+        real_delegated,
+        phantom,
+    }
+}
+
+/// Branch A — real delegates remain, so the delegate share is divided among
+/// them alone. The phantom stake must not dilute the per-token rate.
+#[tokio::test]
+async fn test_reconcile_between_tally_and_distribution_pays_real_delegates_whole() {
+    let real_delegated = 10_000_000_000u64;
+    let phantom = 7_500_000_000u64;
+    let mut f = setup_reconcile_between_tally_and_distribution(real_delegated, phantom).await;
+
+    let before = read_gateway(&mut f.ctx, &f.gateway_key).await;
+    assert_eq!(
+        before.total_delegated_stake,
+        real_delegated + phantom,
+        "the counter is inflated going into the window"
+    );
+
+    // The reconcile, landing in the window.
+    reconcile_as(
+        &mut f.ctx,
+        &f.setup,
+        &f.gateway_key,
+        &f.admin,
+        real_delegated + phantom,
+        phantom,
+        &[f.delegation_key],
+    )
+    .await
+    .expect("reconcile must be accepted between tally and distribution");
+
+    let reconciled = read_gateway(&mut f.ctx, &f.gateway_key).await;
+    assert_eq!(reconciled.total_delegated_stake, real_delegated);
+    let cumulative_before = reconciled.cumulative_reward_per_token;
+    let ratio = reconciled.settings.delegate_reward_share_ratio;
+
+    let payer_pk = f.ctx.payer.pubkey();
+    let blockhash = f.ctx.banks_client.get_latest_blockhash().await.unwrap();
+    f.ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_distribute_ix(
+                &f.setup,
+                f.epoch_settings_key,
+                f.epoch_key,
+                0,
+                &payer_pk,
+                &[f.gateway_key],
+            )],
+            Some(&payer_pk),
+            &[&f.ctx.payer],
+            blockhash,
+        ))
+        .await
+        .expect("distribution must complete after the reconcile");
+
+    let after = read_gateway(&mut f.ctx, &f.gateway_key).await;
+    assert!(
+        after.cumulative_reward_per_token > cumulative_before,
+        "a delegate share was carved out — `delegated_at_tally` was non-zero"
+    );
+
+    // The expected delegate pool, computed INDEPENDENTLY of the accumulator
+    // from the epoch's own reward figures. Deriving it from the observed
+    // increment instead would make every assertion below circular — the first
+    // draft of this test did exactly that and survived a mutation that diverted
+    // the whole share to the operator.
+    let (expected_full, expected_delegate_pool, expected_operator) =
+        expected_single_gateway_split(&mut f.ctx, f.epoch_key, ratio).await;
+    assert!(
+        expected_delegate_pool > 0,
+        "the fixture must carve a delegate share"
+    );
+
+    // The corrected denominator, not the inflated one.
+    let increment = after.cumulative_reward_per_token - cumulative_before;
+    let expected_increment =
+        (expected_delegate_pool as u128 * REWARD_PRECISION) / real_delegated as u128;
+    let diluted_increment =
+        (expected_delegate_pool as u128 * REWARD_PRECISION) / (real_delegated + phantom) as u128;
+    assert_eq!(
+        increment,
+        expected_increment,
+        "the delegate share must be divided by the RECONCILED stake ({real_delegated}), \
+         not the inflated counter ({})",
+        real_delegated + phantom
+    );
+    assert!(
+        expected_increment > diluted_increment,
+        "fixture sanity: the two denominators must actually differ"
+    );
+
+    assert_eq!(
+        after.operator_stake - reconciled.operator_stake,
+        expected_operator,
+        "the operator receives its own share and no more"
+    );
+
+    // And the real delegate can withdraw the WHOLE pool — the phantom holder,
+    // which no longer exists, takes none of it.
+    let settled = compound_delegation_for(
+        &mut f.ctx,
+        &f.setup,
+        &f.gateway_key,
+        &f.delegation_key,
+        &f.delegator,
+    )
+    .await;
+    assert!(
+        settled.abs_diff(expected_delegate_pool) <= 1,
+        "the sole surviving delegate must receive the whole pool: got {settled}, \
+         expected {expected_delegate_pool} (of a {expected_full} reward)"
+    );
+    let _ = f.delegator_token;
+}
+
+/// Branch B — the reconcile removes the last delegated stake, so the share has
+/// no live denominator. It must fall to ADR-025's orphaned path: held in the
+/// treasury, never credited to the operator.
+#[tokio::test]
+async fn test_reconcile_to_zero_between_tally_and_distribution_orphans_the_share() {
+    // No real delegation at all; the whole counter is phantom, exactly the
+    // shape ADR-0037 exists to correct.
+    let phantom = 10_000_000_000u64;
+    let mut f = setup_reconcile_between_tally_and_distribution(0, phantom).await;
+
+    reconcile_as(
+        &mut f.ctx,
+        &f.setup,
+        &f.gateway_key,
+        &f.admin,
+        phantom,
+        phantom,
+        &[],
+    )
+    .await
+    .expect("reconcile to zero must be accepted");
+
+    let reconciled = read_gateway(&mut f.ctx, &f.gateway_key).await;
+    assert_eq!(reconciled.total_delegated_stake, 0);
+    let operator_before = reconciled.operator_stake;
+    let cumulative_before = reconciled.cumulative_reward_per_token;
+    let ratio = reconciled.settings.delegate_reward_share_ratio;
+    let treasury_before = get_token_balance(&mut f.ctx, &f.setup.protocol_token.pubkey()).await;
+    let pool_before = get_token_balance(&mut f.ctx, &f.setup.stake_token.pubkey()).await;
+
+    let payer_pk = f.ctx.payer.pubkey();
+    let blockhash = f.ctx.banks_client.get_latest_blockhash().await.unwrap();
+    f.ctx
+        .banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[build_distribute_ix(
+                &f.setup,
+                f.epoch_settings_key,
+                f.epoch_key,
+                0,
+                &payer_pk,
+                &[f.gateway_key],
+            )],
+            Some(&payer_pk),
+            &[&f.ctx.payer],
+            blockhash,
+        ))
+        .await
+        .expect("distribution must complete");
+
+    let after = read_gateway(&mut f.ctx, &f.gateway_key).await;
+    assert_eq!(
+        after.cumulative_reward_per_token, cumulative_before,
+        "with no delegated stake there is no denominator to credit"
+    );
+
+    let operator_gain = after.operator_stake - operator_before;
+    let treasury_spent =
+        treasury_before - get_token_balance(&mut f.ctx, &f.setup.protocol_token.pubkey()).await;
+    let pool_gain =
+        get_token_balance(&mut f.ctx, &f.setup.stake_token.pubkey()).await - pool_before;
+
+    // Absolute expectations from the epoch's own figures. Comparing the three
+    // observed quantities only against EACH OTHER is not enough: diverting the
+    // orphaned share to the operator keeps all three equal (they just all rise
+    // by the delegate pool), and an earlier draft of this test passed under
+    // exactly that mutation.
+    let (expected_full, expected_delegate_pool, expected_operator) =
+        expected_single_gateway_split(&mut f.ctx, f.epoch_key, ratio).await;
+    assert!(
+        expected_delegate_pool > 0,
+        "fixture sanity: a delegate share must be carved out, or the orphaned \
+         path is never reached and this test proves nothing"
+    );
+
+    assert_eq!(
+        operator_gain, expected_operator,
+        "ADR-025: the operator receives ONLY its own {expected_operator} of the \
+         {expected_full} reward — the {expected_delegate_pool} delegate share \
+         must not be diverted to it"
+    );
+    assert_eq!(
+        treasury_spent, expected_operator,
+        "the orphaned share never leaves the treasury"
+    );
+    assert_eq!(
+        pool_gain, expected_operator,
+        "and never reaches the stake pool, where no accounting field claims it"
+    );
+}
+
+/// The reward a lone, passing, prescribed-and-observed gateway earns for an
+/// epoch, split by `ratio` basis points — read off the Epoch account rather
+/// than inferred from the result being checked.
+///
+/// Returns `(full, delegate_pool, operator)`.
+async fn expected_single_gateway_split(
+    ctx: &mut ProgramTestContext,
+    epoch_key: Pubkey,
+    ratio: u16,
+) -> (u64, u64, u64) {
+    let acct = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .expect("epoch must exist");
+    let epoch: &Epoch = bytemuck::from_bytes(&acct.data[8..8 + std::mem::size_of::<Epoch>()]);
+    // Scenario 1 in `distribute_epoch`: passed + prescribed + observed.
+    let full = epoch.per_gateway_reward + epoch.per_observer_reward;
+    let delegate_pool = ((full as u128 * ratio as u128) / 10_000) as u64;
+    (full, delegate_pool, full - delegate_pool)
+}
+
+/// Settle a delegation via `compound_delegation_rewards` and return the amount
+/// the delegate gained.
+async fn compound_delegation_for(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: &Pubkey,
+    delegation_key: &Pubkey,
+    delegator: &Keypair,
+) -> u64 {
+    let before = read_delegation_amount(ctx, delegation_key).await;
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let mut accounts = ario_gar::accounts::CompoundDelegationRewards {
+        gateway: *gateway_key,
+        delegation: *delegation_key,
+        delegator: delegator.pubkey(),
+        settings: setup.settings_key,
+    }
+    .to_account_metas(None);
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts,
+                data: ario_gar::instruction::CompoundDelegationRewards {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .expect("compound must settle the delegate");
+    read_delegation_amount(ctx, delegation_key).await - before
+}
+
+async fn read_delegation_amount(ctx: &mut ProgramTestContext, delegation_key: &Pubkey) -> u64 {
+    let acct = ctx
+        .banks_client
+        .get_account(*delegation_key)
+        .await
+        .unwrap()
+        .expect("delegation must exist");
+    Delegation::try_deserialize(&mut acct.data.as_slice())
+        .unwrap()
+        .amount
+}
