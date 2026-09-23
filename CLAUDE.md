@@ -391,8 +391,9 @@ bash scripts/cu-baseline.sh                     # capture baseline
 bash scripts/cu-baseline.sh --diff              # show deltas vs baseline
 
 # Rollout pre-flight — READ-ONLY. Run BEFORE and AFTER every program upgrade
-# and every migration batch. 0 = clear, 1 = findings, 2 = nothing was verified
-# (an RPC/decoder failure — do NOT read a non-zero 2 as "checked and fine").
+# and every migration batch. 0 = clear, 1 = findings, 2 = NOTHING WAS VERIFIED
+# (usage, RPC, program-id or decoder failure). A 2 is not a softer 1 — it means
+# the check did not run, so it must never be read as "checked and fine".
 node scripts/preflight-wave2.mjs --cluster staging
 AR_IO_RPC_URL=<rpc> node scripts/preflight-wave2.mjs --cluster mainnet --json out.json
 # Runs without a built checkout: falls back to the published

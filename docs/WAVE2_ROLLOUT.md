@@ -109,9 +109,22 @@ tally / distribute / compound before upgrading, and proceed.
 ### Release-note line for operators
 
 > **Action required for cranker operators and anyone calling `finalize_gone` or
-> `compound_delegation_rewards`:** update to `@ar.io/sdk` >= 4.4.0 before
-> *[date]*. These instructions gain a required account; older clients will fail
-> after the upgrade. Observers submitting `save_observations` are unaffected.
+> `compound_delegation_rewards`:** update to `@ar.io/sdk` >= `<STABLE VERSION>`
+> before `<DATE>`. These instructions gain a required account; older clients
+> will fail after the upgrade. Observers submitting `save_observations` are
+> unaffected.
+
+**Both placeholders must be filled before this is published, and the version
+must already exist on npm.** At the time of writing the Wave 2 client surface
+ships only as a PRERELEASE (`4.4.0-alpha.*`); there is no stable `4.4.0`, and
+`npm i @ar.io/sdk@^4.4.0` 404s — a caret range does not match prereleases. A
+release note naming a version an operator cannot install is worse than no note,
+because it looks actionable and is not.
+
+So **cutting the stable release is a prerequisite for the notification**, which
+in turn gates the mainnet Wave 2 upgrade. Sequence: cut stable -> pin the
+cranker/observer to it -> publish the note with that exact version and a date ->
+upgrade.
 
 A version and a date are what make this actionable — without them the only way
 an unknown operator learns is by breaking. No broader announcement is planned;
