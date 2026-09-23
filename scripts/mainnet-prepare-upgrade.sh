@@ -105,6 +105,48 @@ verify_v3_vault() {
   fi
 }
 
+# The check this script was missing: does the buffer-authority target ACTUALLY
+# hold the program's upgrade authority on chain?
+#
+# `verify_v3_vault` above proves the vault is a well-formed, System-owned V3
+# vault. It does NOT prove that vault is the program's upgrade authority — and
+# on 2026-09-23 it was not: every mainnet program (gar/core/arns/ant) had its
+# upgrade authority set to a plain hot wallet, not a Squads vault, while this
+# script's entire ceremony assumes the vault.
+#
+# Without this guard the run completes "successfully": it builds, writes a
+# multi-megabyte buffer (~6 SOL of rent on mainnet), hands buffer authority to
+# the vault, and emits ceremony instructions. The failure only surfaces later,
+# at Execute — BPFLoaderUpgradeable::Upgrade requires the buffer authority AND
+# the program's upgrade authority to be the same signing key, so the vault
+# cannot execute an upgrade for a program whose authority is someone else. The
+# money is spent and the buffer is unusable by the party that needs it.
+#
+# Fail before spending, with both addresses named.
+verify_upgrade_authority_matches() {
+  local prog_id="$1" prog="$2"
+  local live
+  live="$(solana --url "$RPC_URL" program show "$prog_id" 2>/dev/null | awk "/^Authority:/{print \$2}")"
+  if [[ -z "$live" ]]; then
+    echo "ERROR: could not read the upgrade authority for $prog ($prog_id)." >&2
+    echo "       Refusing to build a buffer for a program whose authority is unknown." >&2
+    exit 1
+  fi
+  if [[ "$live" != "$SQUADS_V3_VAULT" ]]; then
+    echo "ERROR: $prog ($prog_id) upgrade authority is NOT the buffer-authority target." >&2
+    echo "         on-chain authority : $live" >&2
+    echo "         SQUADS_V3_VAULT    : $SQUADS_V3_VAULT" >&2
+    echo "       BPFLoaderUpgradeable::Upgrade requires the buffer authority and the" >&2
+    echo "       program's upgrade authority to be the SAME signing key, so the" >&2
+    echo "       ceremony this script prepares could not execute." >&2
+    echo "       Either point SQUADS_V3_VAULT at the real authority, or transfer the" >&2
+    echo "       program's upgrade authority to the vault first. Aborting before" >&2
+    echo "       spending buffer rent." >&2
+    exit 1
+  fi
+  echo "[mainnet-prepare] $prog upgrade authority == buffer-authority target ($live)."
+}
+
 [[ -f "$PROGRAM_IDS_PATH" ]] || { echo "ERROR: $PROGRAM_IDS_PATH missing — populate program IDs before mainnet runs" >&2; exit 1; }
 command -v solana >/dev/null || { echo "solana CLI required" >&2; exit 1; }
 command -v jq >/dev/null    || { echo "jq required (parse program-ids manifest)" >&2; exit 1; }
@@ -188,6 +230,10 @@ for prog in $PROGRAMS; do
 
   echo
   echo "[mainnet-prepare] $prog ($prog_id)"
+
+  # Before ANY spend for this program: the ceremony is only executable if the
+  # buffer-authority target already holds the program's upgrade authority.
+  verify_upgrade_authority_matches "$prog_id" "$prog"
 
   # A Squads/BPFLoaderUpgradeable Upgrade CANNOT grow the program — it fails
   # to EXECUTE if the new .so exceeds the on-chain ProgramData capacity (Agave
