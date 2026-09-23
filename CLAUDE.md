@@ -390,6 +390,16 @@ bash scripts/start-localnet.sh
 bash scripts/cu-baseline.sh                     # capture baseline
 bash scripts/cu-baseline.sh --diff              # show deltas vs baseline
 
+# Rollout pre-flight — READ-ONLY. Run BEFORE and AFTER every program upgrade
+# and every migration batch. 0 = clear, 1 = findings, 2 = NOTHING WAS VERIFIED
+# (usage, RPC, program-id or decoder failure). A 2 is not a softer 1 — it means
+# the check did not run, so it must never be read as "checked and fine".
+node scripts/preflight-wave2.mjs --cluster staging
+AR_IO_RPC_URL=<rpc> node scripts/preflight-wave2.mjs --cluster mainnet --json out.json
+# Runs without a built checkout: falls back to the published
+# @ar.io/solana-contracts and accepts --program-ids <path>, so it works on a
+# gateway box. Prints which client decoded and its exact version.
+
 # Optional: install the pre-push hook (cargo fmt --check + clippy -D warnings)
 bash scripts/install-git-hooks.sh
 # Bypass in an emergency: AR_IO_SKIP_PREPUSH=1 git push
@@ -617,6 +627,12 @@ docs (start here, not the alphabetical list at the end):
   Lua-to-Solana mapping.
 * [`docs/WORKFLOWS.md`](docs/WORKFLOWS.md) — protocol workflows by
   actor type.
+* [`docs/WAVE2_ROLLOUT.md`](docs/WAVE2_ROLLOUT.md) — **the Wave 1 + Wave 2 GAR
+  rollout**: the ABI delta on `create_epoch` / `finalize_gone` /
+  `compound_delegation_rewards` (and the ordering rules that keep them working
+  against the pre-upgrade program), the 6102 two-meanings gotcha, why mainnet
+  is sequential rather than one upgrade, the pre-flight gate, and why
+  `ario-gar` must never be deployed `--final`.
 * [`docs/FUNDING_MODES.md`](docs/FUNDING_MODES.md) — integrator guide
   for fund-from-stakes (balance / delegation / operator / withdrawal /
   plan).
