@@ -306,6 +306,7 @@ if (es.authority === '11111111111111111111111111111111') {
 console.log('\n[3] Latest epoch — the ADR-0034 halt gate');
 const latestIndex = Number(es.currentEpochIndex) - 1;
 let epoch = null;
+let haltGatePending = null;
 if (latestIndex < 0) {
   ok('no epoch has ever been created — nothing can be unfinished');
 } else {
@@ -341,10 +342,20 @@ if (latestIndex < 0) {
     } else if (!ended) {
       ok('latest epoch is still live — it will distribute normally before the next create_epoch');
     } else {
-      fail(
-        'halt-gate',
-        `epoch ${latestIndex} has ENDED and is UNDISTRIBUTED — after the Wave 2 upgrade create_epoch is blocked until it distributes or is written off`,
+      // ENDED + UNDISTRIBUTED is ALSO the normal transient state for the whole
+      // distribution window — on a 617-gateway registry that is ~40 minutes of
+      // every epoch. Reporting a hard finding here would paint the tool red
+      // during every routine rollover and teach operators to ignore it.
+      //
+      // The distinguishing question is not "is it undistributed" but "CAN it
+      // be distributed". That is exactly what the EpochWeightsClobbered check
+      // in section 5 answers, so the verdict is deferred until after it.
+      const progressed = Number(epoch.distributionIndex) > 0;
+      info(
+        `epoch ${latestIndex} has ended and is mid-distribution (${epoch.distributionIndex}/${epoch.activeGatewayCount}${progressed ? '' : ', not yet started'})`,
       );
+      info('  -> verdict deferred to the EpochWeightsClobbered check below');
+      haltGatePending = latestIndex;
     }
   }
 }
@@ -453,10 +464,24 @@ if (epoch && Number(epoch.rewardsDistributed) !== 1) {
       'clobber',
       `${tripping.length} gateway(s) would revert distribute_epoch with EpochWeightsClobbered — epoch ${latestIndex} can NEVER be distributed and must be written off with admin_close_stale_epoch BEFORE the Wave 2 upgrade`,
     );
+    if (haltGatePending !== null) {
+      fail(
+        'halt-gate',
+        `epoch ${latestIndex} has ended, cannot be distributed, and would therefore BLOCK create_epoch after the Wave 2 upgrade — this is the halt condition`,
+      );
+    }
     for (const g of tripping.slice(0, 5)) {
       info(`  ${g.pubkey}  weights_epoch=${g.weights.weightsEpoch} (expected ${latestIndex})`);
     }
     if (tripping.length > 5) info(`  ... and ${tripping.length - 5} more`);
+  } else if (haltGatePending !== null) {
+    ok(
+      `epoch ${latestIndex} is DISTRIBUTABLE — no gateway trips EpochWeightsClobbered, so it will finish on its own and create_epoch is not at risk`,
+    );
+    info(
+      '  (an upgrade during the distribution window is safe: distribution_index',
+    );
+    info('   is a cursor, so distribution resumes where it left off)');
   } else {
     ok(`no gateway trips EpochWeightsClobbered — epoch ${latestIndex} is distributable`);
   }
