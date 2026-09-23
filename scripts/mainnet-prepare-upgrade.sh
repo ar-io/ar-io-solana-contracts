@@ -139,9 +139,18 @@ verify_upgrade_authority_matches() {
     echo "       BPFLoaderUpgradeable::Upgrade requires the buffer authority and the" >&2
     echo "       program's upgrade authority to be the SAME signing key, so the" >&2
     echo "       ceremony this script prepares could not execute." >&2
-    echo "       Either point SQUADS_V3_VAULT at the real authority, or transfer the" >&2
-    echo "       program's upgrade authority to the vault first. Aborting before" >&2
-    echo "       spending buffer rent." >&2
+    echo "       Transfer the program's upgrade authority to the vault before" >&2
+    echo "       running this script." >&2
+    echo "" >&2
+    echo "       Do NOT simply point SQUADS_V3_VAULT at the on-chain authority to" >&2
+    echo "       get past this check. A plain wallet is System-owned exactly like a" >&2
+    echo "       vault PDA, so it passes verify_v3_vault too — the variable would" >&2
+    echo "       silently hold a hot wallet while every downstream step, the" >&2
+    echo "       ceremony instructions and the operator reading them all assume a" >&2
+    echo "       multisig. If mainnet is genuinely to be upgraded by a single" >&2
+    echo "       wallet, that needs its own path, not this one wearing a Squads" >&2
+    echo "       label." >&2
+    echo "       Aborting before spending buffer rent." >&2
     exit 1
   fi
   echo "[mainnet-prepare] $prog upgrade authority == buffer-authority target ($live)."
@@ -218,6 +227,21 @@ mkdir -p "$OUT_DIR"
 MANIFEST="$OUT_DIR/buffer-manifest.json"
 echo "[]" > "$MANIFEST"
 
+# Validate the authority for EVERY program BEFORE the loop below, which spends:
+# `program extend` costs rent and `write-buffer` stages megabytes. Checking
+# inside the loop would let an earlier program be extended and staged and only
+# then abort on a later one — leaving exactly the half-paid state this guard
+# exists to prevent.
+for prog in $PROGRAMS; do
+  pre_id="$(jq -r --arg k "$prog" '.programs[$k]' "$PROGRAM_IDS_PATH")"
+  if [[ -z "$pre_id" || "$pre_id" == "null" ]]; then
+    echo "ERROR: program-id for $prog missing in $PROGRAM_IDS_PATH" >&2
+    exit 1
+  fi
+  verify_upgrade_authority_matches "$pre_id" "$prog"
+done
+echo "[mainnet-prepare] all $(echo $PROGRAMS | wc -w | tr -d ' ') program(s) confirmed upgradeable by the buffer-authority target."
+
 for prog in $PROGRAMS; do
   so="target/deploy/${prog}.so"
   [[ -f "$so" ]] || { echo "ERROR: $so missing" >&2; exit 1; }
@@ -230,10 +254,6 @@ for prog in $PROGRAMS; do
 
   echo
   echo "[mainnet-prepare] $prog ($prog_id)"
-
-  # Before ANY spend for this program: the ceremony is only executable if the
-  # buffer-authority target already holds the program's upgrade authority.
-  verify_upgrade_authority_matches "$prog_id" "$prog"
 
   # A Squads/BPFLoaderUpgradeable Upgrade CANNOT grow the program — it fails
   # to EXECUTE if the new .so exceeds the on-chain ProgramData capacity (Agave
