@@ -31291,6 +31291,54 @@ async fn test_distribute_epoch_skips_when_no_observations() {
     );
 }
 
+/// End to end: an epoch that collected no observations must not stall the
+/// chain. Before the skip, the next epoch is refused (so the gate is live in
+/// this setup); after the skip, the next epoch is created.
+///
+/// The skip test above proves the skipped epoch ends with
+/// `rewards_distributed == 1`, and the ADR-0034 gate reads only that field.
+/// This chains the two, so a change to either side that reintroduces a stall
+/// fails here.
+#[tokio::test]
+async fn test_zero_observation_skip_lets_next_epoch_be_created() {
+    let (mut ctx, setup, keep_gateway, new_gateway, epoch_key, epoch_settings_key) =
+        setup_untallied_joiner_scenario_with_observations(0).await;
+
+    let es = ctx
+        .banks_client
+        .get_account(epoch_settings_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let next_index = u64::from_le_bytes(es.data[61..69].try_into().unwrap());
+
+    // 1. The skipped epoch is still undistributed, so the next one is refused.
+    let early_creator = Keypair::new();
+    fund_keypair(&mut ctx, &early_creator.pubkey(), 2_000_000_000).await;
+    let blocked = create_epoch_as(&mut ctx, &setup, next_index, &early_creator, true).await;
+    assert_anchor_error!(blocked, GarError::LatestEpochUnfinished);
+
+    // 2. Distribution takes the zero-observation skip.
+    distribute_two_slots(
+        &mut ctx,
+        &setup,
+        epoch_settings_key,
+        epoch_key,
+        keep_gateway,
+        new_gateway,
+    )
+    .await
+    .expect("an unobserved epoch still completes");
+
+    // 3. The chain advances. A different creator signs, so the retry is not
+    //    served from the dedup cache as a copy of the refused transaction.
+    let creator = Keypair::new();
+    fund_keypair(&mut ctx, &creator.pubkey(), 2_000_000_000).await;
+    create_epoch_as(&mut ctx, &setup, next_index, &creator, true)
+        .await
+        .expect("a zero-observation epoch must not block the next one");
+}
+
 /// The treasury is untouched by a skip: the period's reward share stays put and
 /// funds later epochs.
 #[tokio::test]
