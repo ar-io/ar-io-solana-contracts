@@ -17,7 +17,7 @@ The following table lists each mainnet program upgrade, oldest first:
 | 2026-09-15 | `ario-gar` | `bbf6e6c` | 447280441 | ADR-0032 (an untallied gateway earns 0 instead of halting distribution) and ADR-0033 (a non-live epoch can't be tallied). #130, #132. |
 | 2026-09-25 | `ario-gar` | `ce5831b` | 450460260 | ADR-0030 (gateway operations address, `update_gateway_metadata`), ADR-0031 (transferable epoch settings authority), gateway schema migration fixes. #127, #129, #137, #142. |
 | 2026-09-25 | `ario-arns` | `6693717` | 450471477 | The gateway operator discount honors the operations address. Purchase price and undername cap fixes. #129, #142, #144, #146, #147. |
-| 2026-09-27 | `ario-gar` | `e48b6b4` | 451023184 | ADR-0034 (a new epoch requires the previous one distributed), ADR-0036 (`finalize_gone` only between epochs, so observations stay valid through an epoch), ADR-0037 (delegated stake reconcile and supply counter resync instructions), 30-day prune lock for excess stake. #145, #149. |
+| 2026-09-27 | `ario-gar` | `e48b6b4` | 451023184 | ADR-0034 (a new epoch requires the previous one distributed; an epoch with no observations pays no rewards), ADR-0036 (`finalize_gone` only between epochs, so observations stay valid through an epoch), ADR-0037 (delegated stake reconcile and supply counter resync instructions), 30-day prune lock for excess stake. #145, #149. |
 
 On 2026-09-25, between the `ario-gar` and `ario-arns` upgrades, all 578
 gateways were migrated to gateway schema 1.2.0 with `migrate_gateway`.
@@ -73,3 +73,11 @@ account. Clients must run `@ar.io/sdk` 4.4.0 or later (`@ar.io/solana-contracts`
 `save_observations` didn't change, so observers needed no update. During an
 epoch, `finalize_gone` returns `LatestEpochUnfinished` (6102): retry it after
 the epoch is distributed.
+
+From the 2026-09-27 `ario-gar` upgrade, an epoch that ends with no observations
+pays no rewards. Distribution marks it complete without touching gateway stats
+or the treasury, and emits `EpochSkippedNoObservationsEvent` followed by
+`EpochDistributedEvent`. The tokens stay in the treasury and fund later epochs.
+Paying an unobserved epoch would record a pass for every gateway, which resets
+failure streaks and raises the pass rates that pruning and the ArNS discount
+depend on. See the addendum to ADR-0034.
