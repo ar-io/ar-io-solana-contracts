@@ -229,8 +229,9 @@ pub mod increase_undername_limit {
         let timestamp = clock.unix_timestamp;
         let record = &ctx.accounts.arns_record;
 
-        require!(quantity > 0, ArnsError::InvalidUndernameQuantity);
         require!(record.is_active(timestamp), ArnsError::RecordExpired);
+        // BD-048 cap, shared by all five funding modes.
+        let new_limit = ArnsRecord::checked_undername_limit(record.undername_limit, quantity)?;
 
         // Lazy demand factor rollover (matches Lua tick() behavior)
         crate::instructions::demand::maybe_roll_demand_period(
@@ -266,10 +267,7 @@ pub mod increase_undername_limit {
 
         // Update record
         let record = &mut ctx.accounts.arns_record;
-        record.undername_limit = record
-            .undername_limit
-            .checked_add(quantity)
-            .ok_or(ArnsError::ArithmeticOverflow)?;
+        record.undername_limit = new_limit;
 
         // Tally demand
         let demand = &mut ctx.accounts.demand_factor;

@@ -1,4 +1,6 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::system_program;
+use anchor_lang::system_program::{self as anchor_system_program, Allocate, Assign, Transfer};
 use anchor_spl::token::TokenAccount;
 
 use crate::error::GarError;
@@ -324,21 +326,227 @@ pub fn close_epoch_settings(_ctx: Context<CloseEpochSettings>) -> Result<()> {
 /// i.e., after a reinit, against indices that the new lifecycle won't
 /// re-use.
 ///
-/// Authority-gated AND `migration_active`-gated: after mainnet
-/// `finalize_migration` flips `GatewaySettings.migration_active` to
-/// false, this ix becomes inert. By design, it is migration-window
-/// recovery infrastructure only.
+/// Authority-gated, and **permanent** as of ADR-0034.
+///
+/// It used to be `migration_active`-gated, which would have made it inert once
+/// `finalize_migration` ran. ADR-0034 makes this instruction the release valve
+/// for a stuck network — `create_epoch` now refuses to advance past an
+/// unfinished epoch — so a gate that expires would leave a stuck epoch with no
+/// recovery path at all: a permanent halt. Its sibling
+/// `admin_close_orphaned_epoch_rent_receipt` is already deliberately permanent
+/// for the same reason, and ADR-0031 keeps `EpochSettings.authority`
+/// transferable (to a multisig) indefinitely.
+///
+/// **Guards (ADR-0034).** The epoch must have **ended** and must be
+/// **undistributed**. Before ADR-0034 the handler body was empty and the only
+/// constraints were the authority check and `migration_active`, so it would
+/// close *any* epoch named — including the live one mid-observation, or a
+/// distributed one whose rent `close_epoch` should have refunded to its
+/// creator. A distributed epoch goes through `close_epoch`; a live one must not
+/// be closeable at all.
+///
+/// There is deliberately **no on-chain grace period**: the authority already
+/// holds strictly greater power (the program upgrade key), so a grace period
+/// would not constrain a malicious operator. The remaining risk — writing off
+/// an epoch whose distribution is still advancing — is operational: confirm
+/// `distribution_index` has stopped moving first. Distribution can legitimately
+/// run for hours (mainnet epoch 542 spanned 00:04–11:39 UTC).
+///
+/// Does not touch the epoch's `EpochRentReceipt` (ADR-0029), so an orphaned
+/// 41-byte receipt survives at that index. It blocks nothing: a later
+/// `create_epoch` at the same index refuses to overwrite it, but creating
+/// that epoch *without* a receipt still works, degrading only that one index
+/// to the pre-ADR-0029 `close = payer` refund.
 pub fn admin_close_stale_epoch(
-    _ctx: Context<AdminCloseStaleEpoch>,
+    ctx: Context<AdminCloseStaleEpoch>,
     _epoch_index: u64,
 ) -> Result<()> {
-    // Anchor's `close = authority` on the Epoch account does the rest.
+    let clock = Clock::get()?;
+    let epoch = ctx.accounts.epoch.load()?;
+
+    // Must have ended: a live epoch is still collecting observations, and
+    // closing it destroys the `failure_counts` its payout depends on.
+    require!(
+        clock.unix_timestamp >= epoch.end_timestamp,
+        GarError::EpochInProgress
+    );
+
+    // Must be undistributed: a distributed epoch's rent belongs to its creator
+    // via `close_epoch` (ADR-0029), not to the authority.
+    require!(
+        epoch.rewards_distributed == 0,
+        GarError::RewardsAlreadyDistributed
+    );
+
+    // Release the zero-copy borrow before Anchor's `close = authority` runs.
+    drop(epoch);
+    Ok(())
+}
+
+/// Close an `EpochRentReceipt` whose parent `Epoch` no longer exists,
+/// returning its 0.00119712 SOL to the creator that funded it.
+///
+/// `close_epoch` always closes an epoch's receipt alongside the epoch, so the
+/// only way to strand one is `admin_close_stale_epoch`, which closes the
+/// `Epoch` outside that path and leaves the receipt with no parent and no
+/// instruction able to reach it. Re-creating the epoch does not free it
+/// either: `create_epoch` refuses to overwrite an existing receipt rather than
+/// re-point someone else's rent.
+///
+/// The refund goes to `receipt.creator`, never to the authority. ADR-0029's
+/// principle is that epoch rent returns to whoever paid it, and an admin
+/// cleaning up after its own recovery instruction is not a reason for it to
+/// change hands — the authority pays the tx fee and nothing else.
+///
+/// Requiring the Epoch to be GONE is what keeps this from becoming an
+/// authority-only shortcut around `close_epoch`. While the epoch lives,
+/// `close_epoch` is the path that returns the full ~0.0664 SOL *and* the
+/// receipt's rent to the creator, and it stays permissionless; this
+/// instruction only reaches receipts that path can no longer see.
+///
+/// Naming `EpochRentReceipt` in a declared `Accounts` struct also restores the
+/// type to the IDL — Anchor only emits `#[account]` types some context
+/// references, and the receipt is otherwise reached solely through
+/// `remaining_accounts`.
+pub fn admin_close_orphaned_epoch_rent_receipt(
+    ctx: Context<AdminCloseOrphanedEpochRentReceipt>,
+    epoch_index: u64,
+) -> Result<()> {
+    // Post-close state: closing reassigns the account to the System Program
+    // and truncates its data (see `close_account_to`), and an index that never
+    // had an epoch reads identically. Both halves are required — a live Epoch
+    // is program-owned with `Epoch::SIZE` bytes, so either alone would reject
+    // it, but together they also reject a program-owned account that was
+    // merely emptied.
+    let epoch = &ctx.accounts.epoch;
+    require!(
+        epoch.data_is_empty() && epoch.owner == &system_program::ID,
+        GarError::EpochStillExists
+    );
+
+    msg!(
+        "Closed orphaned rent receipt for epoch {}; rent refunded to creator {}",
+        epoch_index,
+        ctx.accounts.receipt.creator
+    );
+
+    // Anchor's `close = creator` constraint drains the receipt.
+    Ok(())
+}
+
+/// The shared "the latest epoch is finished" predicate of ADR-0034 and
+/// ADR-0036.
+///
+/// **Finished** means `rewards_distributed == 1`, **or** the Epoch account no
+/// longer exists (it was written off by `admin_close_stale_epoch`). Whether the
+/// epoch's Observation PDAs have been closed is deliberately not part of it —
+/// `close_observation` already requires distribution, so closing them is rent
+/// reclamation that cannot affect any payout (ADR-0034, "What 'finished'
+/// means").
+///
+/// Two callers enforce it, for the same underlying reason — epoch payouts are
+/// addressed by registry position against per-tally weights, so anything that
+/// supersedes or reorders while an epoch is open corrupts it:
+///
+/// * `create_epoch` — an unfinished epoch must not be superseded (ADR-0034).
+/// * `finalize_gone` — registry positions are frozen while an epoch is
+///   unfinished (ADR-0036).
+///
+/// `finalize_gone`'s correctness argument inspects only the **latest** epoch,
+/// which is sufficient only because `create_epoch` enforces this same
+/// predicate: no older epoch can still be unfinished. **ADR-0036 must never
+/// ship without ADR-0034.**
+///
+/// # `remaining_accounts` contract
+///
+/// The latest Epoch PDA is located **by key**, not by position, so it composes
+/// with the `remaining_accounts` each caller already uses (the ADR-0029 rent
+/// receipt for `create_epoch`, the swapped Gateway PDA for `finalize_gone`) and
+/// so clients can append it while the *current* program still ignores it. That
+/// is what makes the client-first rollout possible.
+///
+/// "Absent" means **not owned by this program**. Only this program can create
+/// an account at its own PDA, so a non-program-owned account at that address —
+/// including a system account someone sent lamports to — cannot be an Epoch.
+pub(crate) fn require_latest_epoch_finished<'info>(
+    current_epoch_index: u64,
+    remaining_accounts: &'info [AccountInfo<'info>],
+    program_id: &Pubkey,
+) -> Result<()> {
+    // No epoch has ever been created, so none can be unfinished.
+    let Some(latest_index) = current_epoch_index.checked_sub(1) else {
+        return Ok(());
+    };
+
+    let (expected_pda, _) =
+        Pubkey::find_program_address(&[EPOCH_SEED, &latest_index.to_le_bytes()], program_id);
+
+    let latest_info = remaining_accounts
+        .iter()
+        .find(|info| info.key() == expected_pda)
+        .ok_or(GarError::MissingLatestEpochAccount)?;
+
+    // Written off (or never existed): only this program can own an account at
+    // this PDA, so anything else means there is no Epoch here.
+    if latest_info.owner != program_id {
+        return Ok(());
+    }
+
+    // Owned by us at the Epoch PDA — `try_from` also checks the discriminator.
+    let loader = AccountLoader::<Epoch>::try_from(latest_info)?;
+    let latest = loader.load()?;
+    require!(
+        latest.rewards_distributed == 1,
+        GarError::LatestEpochUnfinished
+    );
+
     Ok(())
 }
 
 /// Create a new epoch (F23)
 /// This is permissionless - anyone can call when the previous epoch has ended
-pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
+///
+/// **Rent receipt (ADR-0029).** Creating an epoch costs the payer ~0.0664 SOL
+/// of rent that `close_epoch` later reclaims. Pass the
+/// `["epoch_rent_receipt", epoch_index]` PDA as a single writable
+/// `remaining_accounts` entry to record yourself as the creator, and
+/// `close_epoch` will refund that rent to you no matter who signs the close.
+/// Omit it and the epoch is created exactly as before, with the rent going to
+/// whoever closes.
+///
+/// The receipt rides in `remaining_accounts` rather than as a declared
+/// `Option<Account>` because Anchor's optional accounts are *positional*: the
+/// caller must still pass the program ID as a placeholder, so a cranker built
+/// against the pre-upgrade IDL would submit one account too few and fail with
+/// `AccountNotEnoughKeys`. Epoch creation is permissionless, unpaid, mandatory
+/// work — a change that could stall it network-wide the moment we upgrade is
+/// not worth the ergonomics.
+///
+/// **Previous epoch (ADR-0034).** `remaining_accounts` must also carry the
+/// previous Epoch PDA, `["epoch", current_epoch_index - 1]`, so
+/// [`require_latest_epoch_finished`] can confirm it is distributed or written
+/// off. Since ADR-0034 it is therefore never empty for `index > 0` — superseding
+/// the pre-ADR-0034 note that `remaining_accounts` is "genuinely absent when
+/// unused".
+///
+/// This program finds both accounts **by key**, so their order does not matter
+/// to it. Ordering and completeness still matter to the *old* program, which is
+/// what the client-first rollout runs against until the upgrade lands:
+///
+/// * The receipt must be **first** — the old program reads only
+///   `remaining_accounts.first()`.
+/// * A receipt must be **present**. The old program treats whatever sits at
+///   position 0 as the receipt, so a client that appends the previous Epoch and
+///   omits the receipt hands the Epoch to `init_epoch_rent_receipt`, which
+///   rejects it with `InvalidEpochRentReceipt`. Epoch creation is
+///   permissionless, unpaid, mandatory work, so that would stall the lifecycle
+///   network-wide until the upgrade lands — the opposite of what the staged
+///   rollout is for.
+///
+/// So the client-first property is real but conditional: **receipt first,
+/// previous Epoch second.** A client that sends both works against the old and
+/// the new program alike, and there is no flag day.
+pub fn create_epoch<'info>(ctx: Context<'_, '_, 'info, 'info, CreateEpoch<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let epoch_settings = &mut ctx.accounts.epoch_settings;
 
@@ -365,6 +573,13 @@ pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
         clock.unix_timestamp >= epoch_start,
         GarError::EpochNotStarted
     );
+
+    // ADR-0034: an unfinished epoch must not be superseded. `weights_epoch` and
+    // `GatewaySlot.composite_weight` are per-tally, not per-epoch, so tallying
+    // N+1 re-stamps every gateway in N's undistributed range and N can never be
+    // paid correctly again. That is what cost mainnet epoch 540. Refuse to
+    // create N+1 until N is distributed or written off.
+    require_latest_epoch_finished(expected_epoch_index, ctx.remaining_accounts, ctx.program_id)?;
 
     // Compute reward rate for this epoch (linear decay from 0.1% to 0.05%)
     let reward_rate = compute_reward_rate(
@@ -403,6 +618,24 @@ pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
         .checked_div(RATE_SCALE as u128)
         .unwrap_or(0) as u64;
 
+    // ADR-0029: a receipt was supplied iff the caller passed the receipt PDA.
+    // Recorded on the Epoch itself so `close_epoch` decides the refund target
+    // from program state rather than from the account list it happens to be
+    // handed — see the rejected "branch on what was passed" option in the ADR.
+    //
+    // ADR-0034 changed this from "the first remaining account" to a match on
+    // the receipt's own PDA, because `remaining_accounts` now also carries the
+    // previous Epoch. Under the positional rule a caller that passed the
+    // previous Epoch but no receipt would have had the Epoch misread as one.
+    let (receipt_pda, _) = Pubkey::find_program_address(
+        &[EPOCH_RENT_RECEIPT_SEED, &expected_epoch_index.to_le_bytes()],
+        ctx.program_id,
+    );
+    let receipt_info = ctx
+        .remaining_accounts
+        .iter()
+        .find(|info| info.key() == receipt_pda);
+
     // Initialize epoch (zero-copy)
     let mut epoch = ctx.accounts.epoch.load_init()?;
     epoch.epoch_index = expected_epoch_index;
@@ -410,6 +643,7 @@ pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
     epoch.end_timestamp = epoch_start
         .checked_add(epoch_settings.epoch_duration)
         .ok_or(GarError::ArithmeticOverflow)?;
+    let epoch_end = epoch.end_timestamp;
     epoch.observer_count = 0;
     epoch.name_count = 0;
     epoch.observations_submitted = 0;
@@ -427,11 +661,27 @@ pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
     epoch.prescriptions_done = 0;
     epoch.hashchain = hashchain.to_bytes();
     epoch.bump = ctx.bumps.epoch;
+    epoch.has_rent_receipt = u8::from(receipt_info.is_some());
     epoch.version_bytes = [
         EPOCH_VERSION.major,
         EPOCH_VERSION.minor,
         EPOCH_VERSION.patch,
     ];
+
+    // Release the zero-copy borrow before the receipt's system-program CPIs.
+    // The flag is already written: if receipt creation fails below, the whole
+    // transaction unwinds, so flag and receipt can never disagree on chain.
+    drop(epoch);
+
+    if let Some(receipt) = receipt_info {
+        init_epoch_rent_receipt(
+            receipt,
+            &ctx.accounts.payer.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            expected_epoch_index,
+            ctx.program_id,
+        )?;
+    }
 
     // Increment current epoch for next creation
     epoch_settings.current_epoch_index = epoch_settings
@@ -440,12 +690,119 @@ pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
         .ok_or(GarError::ArithmeticOverflow)?;
 
     emit!(EpochCreatedEvent {
-        epoch_index: epoch.epoch_index,
-        start_timestamp: epoch.start_timestamp,
-        end_timestamp: epoch.end_timestamp,
+        epoch_index: expected_epoch_index,
+        start_timestamp: epoch_start,
+        end_timestamp: epoch_end,
         timestamp: clock.unix_timestamp,
     });
 
+    Ok(())
+}
+
+/// Create the `["epoch_rent_receipt", epoch_index]` PDA recording `payer` as
+/// the account that funded epoch `epoch_index`'s rent (ADR-0029).
+///
+/// Built by hand rather than by an Anchor `init` constraint because the
+/// account arrives through `remaining_accounts` — see `create_epoch`'s doc
+/// comment for why that positional-optionality difference matters to
+/// un-upgraded crankers.
+fn init_epoch_rent_receipt<'info>(
+    receipt: &AccountInfo<'info>,
+    payer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    epoch_index: u64,
+    program_id: &Pubkey,
+) -> Result<()> {
+    let index_bytes = epoch_index.to_le_bytes();
+    let (expected_pda, receipt_bump) =
+        Pubkey::find_program_address(&[EPOCH_RENT_RECEIPT_SEED, &index_bytes], program_id);
+    require_keys_eq!(
+        receipt.key(),
+        expected_pda,
+        GarError::InvalidEpochRentReceipt
+    );
+    // A receipt already at this address means the Epoch PDA was closed out
+    // from under the lifecycle (only `admin_close_stale_epoch` can do that,
+    // and it leaves the receipt behind). Rather than silently re-point
+    // someone else's rent, refuse — the caller can still create the epoch by
+    // omitting the receipt, so this cannot stall creation.
+    require!(receipt.data_is_empty(), GarError::InvalidEpochRentReceipt);
+
+    let lamports_required = Rent::get()?.minimum_balance(EpochRentReceipt::SIZE);
+    let signer_seeds: &[&[&[u8]]] = &[&[EPOCH_RENT_RECEIPT_SEED, &index_bytes, &[receipt_bump]]];
+
+    // Lamport-griefing defense (same shape as `leave_network`'s excess
+    // vault): the next epoch's receipt address is trivially derivable, so an
+    // attacker can pre-fund it with 1 lamport. `system_program::create_account`
+    // rejects any account that already holds lamports; transfer-the-shortfall
+    // then allocate + assign tolerates it.
+    let existing = receipt.lamports();
+    if existing < lamports_required {
+        anchor_system_program::transfer(
+            CpiContext::new(
+                system_program.clone(),
+                Transfer {
+                    from: payer.clone(),
+                    to: receipt.clone(),
+                },
+            ),
+            lamports_required - existing,
+        )?;
+    }
+    anchor_system_program::allocate(
+        CpiContext::new_with_signer(
+            system_program.clone(),
+            Allocate {
+                account_to_allocate: receipt.clone(),
+            },
+            signer_seeds,
+        ),
+        EpochRentReceipt::SIZE as u64,
+    )?;
+    anchor_system_program::assign(
+        CpiContext::new_with_signer(
+            system_program.clone(),
+            Assign {
+                account_to_assign: receipt.clone(),
+            },
+            signer_seeds,
+        ),
+        program_id,
+    )?;
+
+    let state = EpochRentReceipt {
+        creator: payer.key(),
+        bump: receipt_bump,
+        version: EPOCH_RENT_RECEIPT_VERSION,
+    };
+    let mut data = receipt.try_borrow_mut_data()?;
+    let mut cursor = std::io::Cursor::new(&mut data[..]);
+    state
+        .try_serialize(&mut cursor)
+        .map_err(|_| GarError::InvalidEpochRentReceipt)?;
+
+    Ok(())
+}
+
+/// Move an account's whole lamport balance to `destination` and mark the
+/// account closed — the runtime-target equivalent of Anchor's `close = …`
+/// constraint, which can only name a field at compile time.
+///
+/// Mirrors `anchor_lang::common::close` exactly (drain, assign to the System
+/// Program, truncate) so `AccountsExit` sees a closed account and skips
+/// rewriting the discriminator on the way out.
+fn close_account_to<'info>(
+    account: &AccountInfo<'info>,
+    destination: &AccountInfo<'info>,
+) -> Result<()> {
+    let refund = account.lamports();
+    **destination.try_borrow_mut_lamports()? = destination
+        .lamports()
+        .checked_add(refund)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    **account.try_borrow_mut_lamports()? = 0;
+    account.assign(&system_program::ID);
+    account.realloc(0, false)?;
     Ok(())
 }
 
@@ -461,6 +818,45 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
     let mut registry = ctx.accounts.registry.load_mut()?;
 
     require!(epoch.weights_tallied == 0, GarError::WeightsAlreadyTallied);
+
+    // ADR-0033. `weights_epoch` and the registry's `composite_weight` are
+    // per-TALLY, not per-epoch: every tally overwrites them for whichever epoch
+    // it is tallying. Combined with the fact that `weights_tallied == 0` used to
+    // be the ONLY epoch precondition here -- no ordering gate of any kind -- an
+    // epoch left partially tallied stayed tallyable forever, and tallying it
+    // later re-stamped gateways that belong to the CURRENT epoch's reward set,
+    // destroying that epoch's payout. Permissionless, one transaction fee,
+    // partial batches accepted so a chosen prefix of the registry could be
+    // targeted. Staging epoch 818 sat at tally_index 630/647 with
+    // weights_tallied = 0 from nothing worse than a cranker restart, and such an
+    // epoch can never be cleaned up permissionlessly either (`close_epoch`
+    // needs `rewards_distributed != 0`, unreachable without a tally).
+    //
+    // Only the LIVE epoch may be tallied. `create_epoch` always creates
+    // epoch[current_epoch_index] and then increments, so the live epoch is
+    // exactly `current_epoch_index - 1`. That is the precise harm condition --
+    // tallying anything older overwrites the live epoch's weights -- rather than
+    // a time-based proxy for it.
+    //
+    // A time window (end + one span) was implemented first and rejected on two
+    // edges this avoids entirely:
+    //   * Retroactive lockout. The gate applies to epochs that already exist, so
+    //     deploying while one sat mid-tally past its deadline would strand it
+    //     permanently and re-freeze the cluster on the spot.
+    //   * Mid-tally guillotine. A batched tally (~36 txs for 647 gateways) could
+    //     cross the deadline and leave the epoch permanently partial -- very
+    //     reachable on a compressed cadence, which staging ran in Aug 2026.
+    // The live-epoch test has neither: the live epoch stays tallyable however
+    // long it takes, and it stops being live only once the next epoch is
+    // created, which the crank does only after this one is fully distributed.
+    let live_epoch_index = epoch_settings
+        .current_epoch_index
+        .checked_sub(1)
+        .ok_or(GarError::InvalidParameter)?;
+    require!(
+        epoch.epoch_index == live_epoch_index,
+        GarError::EpochNoLongerLive
+    );
 
     let active_count = epoch.active_gateway_count as usize;
 
@@ -951,7 +1347,31 @@ pub fn prescribe_epoch(ctx: Context<PrescribeEpoch>, _epoch_index: u64) -> Resul
 /// Close a fully distributed epoch account, reclaiming rent.
 /// Permissionless — anyone can call once the epoch is distributed and
 /// at least `epoch_retention` epochs have passed.
-pub fn close_epoch(ctx: Context<CloseEpoch>, _epoch_index: u64) -> Result<()> {
+///
+/// **Where the rent goes (ADR-0029).** The Epoch's ~0.0664 SOL is refunded to
+/// the account that *created* the epoch whenever `create_epoch` recorded one,
+/// not to whoever signs the close. Closing stays permissionless — the signer
+/// pays the tx fee and nothing else — but a close-only cranker can no longer
+/// harvest rent funded by the operators running the mandatory pipeline. Same
+/// principle as `close_observation` refunding the observer (gar #116), at 16×
+/// the stake.
+///
+/// The branch is on `epoch.has_rent_receipt`, program state written at
+/// creation, never on which accounts the caller supplied: account presence is
+/// caller-controlled, so branching on it would let a scavenger simply omit
+/// the receipt to force the fallback and pocket the rent — the exact behavior
+/// this exists to remove.
+///
+/// - `has_rent_receipt == 1` → the receipt PDA and its recorded creator are
+///   **required** as the first two `remaining_accounts` (both writable); the
+///   Epoch's rent and the receipt's own rent both go to that creator.
+/// - `has_rent_receipt == 0` → every epoch created before this program
+///   version, plus any created without a receipt: today's `close = payer`
+///   behavior, so un-upgraded crankers keep closing them unchanged.
+pub fn close_epoch<'info>(
+    ctx: Context<'_, '_, '_, 'info, CloseEpoch<'info>>,
+    _epoch_index: u64,
+) -> Result<()> {
     let epoch = ctx.accounts.epoch.load()?;
     let epoch_settings = &ctx.accounts.epoch_settings;
 
@@ -976,12 +1396,86 @@ pub fn close_epoch(ctx: Context<CloseEpoch>, _epoch_index: u64) -> Result<()> {
     );
 
     let epoch_index = epoch.epoch_index;
+    // Read the flag off the Epoch, not off `ctx.remaining_accounts` — see the
+    // doc comment. Any non-zero value counts: the byte was padding before
+    // ADR-0029 and only ever written as 0 or 1 since.
+    let has_rent_receipt = epoch.has_rent_receipt != 0;
     drop(epoch);
 
-    // Capture the rent lamports BEFORE Anchor's `close = payer` constraint
-    // moves them on tx-exit. The full lamport balance becomes the rent
-    // refund, so this matches the post-close payer delta exactly.
-    let rent_recovered = ctx.accounts.epoch.to_account_info().lamports();
+    // Capture the rent lamports BEFORE the close drains them. The full
+    // lamport balance becomes the rent refund, so this matches the
+    // recipient's post-close delta exactly.
+    let epoch_info = ctx.accounts.epoch.to_account_info();
+    let rent_recovered = epoch_info.lamports();
+
+    if has_rent_receipt {
+        // Both accounts are mandatory here. A caller that omits them is
+        // either an un-upgraded cranker (which cannot close a receipted
+        // epoch at all) or a scavenger trying to fall through to the
+        // `payer` branch; both get the same rejection.
+        let receipt_info = ctx
+            .remaining_accounts
+            .first()
+            .ok_or(GarError::MissingEpochRentReceipt)?;
+        let creator_info = ctx
+            .remaining_accounts
+            .get(1)
+            .ok_or(GarError::MissingEpochRentReceipt)?;
+        // Both are drained below, so demand write access up front rather
+        // than letting the runtime reject the whole tx with an opaque
+        // "modified lamports of a read-only account" after the fact.
+        require!(
+            receipt_info.is_writable && creator_info.is_writable,
+            GarError::MissingEpochRentReceipt
+        );
+
+        // Ownership check first: only this program can have written a
+        // receipt, so anything else at that address is a forgery attempt
+        // (deserializing it would read attacker-chosen bytes as `creator`).
+        require_keys_eq!(
+            *receipt_info.owner,
+            *ctx.program_id,
+            GarError::InvalidEpochRentReceipt
+        );
+        let receipt = {
+            let data = receipt_info.try_borrow_data()?;
+            EpochRentReceipt::try_deserialize(&mut &data[..])?
+        };
+        // Bind the receipt to THIS epoch. `create_program_address` with the
+        // stored bump is the cheap form of the derivation — it also proves
+        // `receipt.bump` is the canonical bump, since a non-canonical one
+        // cannot reproduce the address the program itself created.
+        let expected_pda = Pubkey::create_program_address(
+            &[
+                EPOCH_RENT_RECEIPT_SEED,
+                &epoch_index.to_le_bytes(),
+                &[receipt.bump],
+            ],
+            ctx.program_id,
+        )
+        .map_err(|_| error!(GarError::InvalidEpochRentReceipt))?;
+        require_keys_eq!(
+            receipt_info.key(),
+            expected_pda,
+            GarError::InvalidEpochRentReceipt
+        );
+        // The refund target is the recorded creator and nothing else — the
+        // `address = observation.observer` constraint from `close_observation`,
+        // expressed in the handler because a `remaining_accounts` slot has no
+        // Anchor constraint to hang it on.
+        require_keys_eq!(
+            creator_info.key(),
+            receipt.creator,
+            GarError::WrongEpochCreator
+        );
+
+        close_account_to(&epoch_info, creator_info)?;
+        // The receipt's own rent follows the epoch's, so the creator is made
+        // whole and no PDA is left orphaned behind a closed epoch.
+        close_account_to(receipt_info, creator_info)?;
+    } else {
+        close_account_to(&epoch_info, &ctx.accounts.payer.to_account_info())?;
+    }
 
     emit!(EpochClosedEvent {
         epoch_index,
@@ -989,7 +1483,6 @@ pub fn close_epoch(ctx: Context<CloseEpoch>, _epoch_index: u64) -> Result<()> {
         timestamp: Clock::get()?.unix_timestamp,
     });
 
-    // Account is closed by the close constraint in CloseEpoch context
     Ok(())
 }
 
@@ -1028,14 +1521,21 @@ pub struct CloseEpochSettings<'info> {
 #[derive(Accounts)]
 #[instruction(epoch_index: u64)]
 pub struct AdminCloseStaleEpoch<'info> {
-    /// Authority gate via `has_one` (matches `EpochSettings.authority`)
-    /// + `migration_active` gate via `GatewaySettings`. After mainnet
-    /// `finalize_migration` flips `migration_active` to false, this ix
-    /// becomes inert.
+    /// ADR-0034 removed this account's `migration_active` constraint: this
+    /// instruction is now the permanent release valve for a stuck network, so a
+    /// gate that expires at `finalize_migration` would mean a stuck epoch with
+    /// no recovery path. The authority gate is `has_one` on `epoch_settings`
+    /// below; the ended/undistributed guards are in the handler.
+    ///
+    /// The account itself is **retained even though nothing reads it**. ADR-0034
+    /// allows dropping it, but it is the first entry in the list, so removing it
+    /// would shift every later account and break any client built against the
+    /// current IDL. This is the instruction reached for when the network is
+    /// already stuck — keeping an older cranker or a hand-built recovery
+    /// transaction able to call it is worth one redundant account.
     #[account(
         seeds = [SETTINGS_SEED],
         bump = settings.bump,
-        constraint = settings.migration_active @ GarError::MigrationInactive,
     )]
     pub settings: Account<'info, GatewaySettings>,
 
@@ -1058,6 +1558,73 @@ pub struct AdminCloseStaleEpoch<'info> {
     pub authority: Signer<'info>,
 }
 
+/// Close an `EpochRentReceipt` orphaned by `admin_close_stale_epoch`.
+///
+/// Everything is declared here rather than carried in `remaining_accounts`:
+/// the backward-compatibility reasoning that shapes `create_epoch` /
+/// `close_epoch` (un-upgraded crankers must keep working) does not apply to a
+/// brand-new authority-only instruction, so the checks live where Anchor can
+/// enforce them declaratively — and the declared `EpochRentReceipt` is what
+/// puts the type back in the IDL.
+#[derive(Accounts)]
+#[instruction(epoch_index: u64)]
+pub struct AdminCloseOrphanedEpochRentReceipt<'info> {
+    /// Authority gate via `has_one` (matches `EpochSettings.authority`).
+    /// Deliberately NOT `migration_active`-gated like `AdminCloseStaleEpoch`:
+    /// a receipt orphaned during the migration window must still be
+    /// collectable after `finalize_migration`, or its rent is stranded
+    /// forever.
+    #[account(
+        seeds = [EPOCH_SETTINGS_SEED],
+        bump = epoch_settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+    )]
+    pub epoch_settings: Account<'info, EpochSettings>,
+
+    /// CHECK: The receipt's parent Epoch, which must be GONE — proven in the
+    /// handler (System-Program-owned + zero data). Unchecked precisely because
+    /// the account legitimately does not exist; a typed `AccountLoader` would
+    /// fail before the handler could observe it. The `seeds` constraint still
+    /// pins the address to this program's Epoch PDA for `epoch_index`, so
+    /// "gone" is asserted about the right account.
+    #[account(
+        seeds = [EPOCH_SEED, &epoch_index.to_le_bytes()],
+        bump,
+    )]
+    pub epoch: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [EPOCH_RENT_RECEIPT_SEED, &epoch_index.to_le_bytes()],
+        bump = receipt.bump,
+        close = creator,
+    )]
+    pub receipt: Account<'info, EpochRentReceipt>,
+
+    /// CHECK: Rent recipient, bound to `receipt.creator` by the `address`
+    /// constraint below — that constraint IS the security check. An
+    /// `UncheckedAccount` rather than a `SystemAccount` for the same reason as
+    /// `close_observation`'s `observer`: a creator may be a PDA / multisig
+    /// (Squads) / smart-contract wallet that signed `create_epoch` via CPI,
+    /// and enforcing System-Program ownership would make that creator's
+    /// receipt permanently unclosable. Does not sign — it only receives
+    /// lamports.
+    #[account(mut, address = receipt.creator @ GarError::WrongEpochCreator)]
+    pub creator: UncheckedAccount<'info>,
+
+    /// Admin signer. Pays the tx fee and nothing else — the reclaimed rent
+    /// goes to `creator` (ADR-0029), so cleanup is never a way to collect
+    /// someone else's capital.
+    pub authority: Signer<'info>,
+}
+
+/// Create the next epoch.
+///
+/// One optional `remaining_accounts` entry (writable): the
+/// `["epoch_rent_receipt", epoch_settings.current_epoch_index]` PDA. Supplying
+/// it records the payer as the epoch's creator so `close_epoch` refunds this
+/// epoch's rent to them (ADR-0029). It is not a declared optional account
+/// because Anchor's optional accounts are positional — see `create_epoch`.
 #[derive(Accounts)]
 pub struct CreateEpoch<'info> {
     #[account(
@@ -1168,7 +1735,17 @@ pub struct PrescribeEpoch<'info> {
 }
 
 /// Close a distributed epoch account, reclaiming rent.
-/// The epoch's zero-copy account is closed and rent returned to payer.
+///
+/// There is deliberately no `close = payer` on `epoch`: ADR-0029 sends the
+/// rent to the epoch's recorded creator when one exists, and Anchor's `close`
+/// can only name a field at compile time. The handler closes the account
+/// itself so the target can be chosen from state.
+///
+/// Two optional `remaining_accounts` (both writable) carry the receipted
+/// path: `[0]` the `["epoch_rent_receipt", epoch_index]` PDA, `[1]` its
+/// recorded creator. They are required exactly when `epoch.has_rent_receipt`
+/// is set, and ignored otherwise, which is what keeps pre-ADR-0029 epochs
+/// closeable by clients built against the old account list.
 #[derive(Accounts)]
 #[instruction(epoch_index: u64)]
 pub struct CloseEpoch<'info> {
@@ -1182,10 +1759,11 @@ pub struct CloseEpoch<'info> {
         mut,
         seeds = [EPOCH_SEED, &epoch_index.to_le_bytes()],
         bump,
-        close = payer,
     )]
     pub epoch: AccountLoader<'info, Epoch>,
 
+    /// Permissionless closer — pays only the tx fee. Receives the rent only
+    /// for epochs created without a receipt (`has_rent_receipt == 0`).
     #[account(mut)]
     pub payer: Signer<'info>,
 }

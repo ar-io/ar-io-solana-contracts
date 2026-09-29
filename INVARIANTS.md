@@ -197,6 +197,51 @@ Refilling the treasury (e.g., from a future protocol mint or fee
 sweep) is not part of `ario-gar`'s public surface today; any future
 top-up instruction must be added here when introduced.
 
+## Invariant 4 — A gateway's delegated-stake counter equals its delegations
+
+```
+Gateway.total_delegated_stake = Σ Delegation.amount   (over that gateway's Delegation PDAs)
+```
+
+Both sides hold **settled principal** only: `distribute_epoch` credits
+delegates by raising `Gateway.cumulative_reward_per_token`, never by
+touching either side, and `settle_delegate_rewards` raises the
+Delegation **and** the counter together. Every other mover —
+`delegate_stake`, `decrease_delegate_stake`, `redelegate_stake`, both
+`claim_delegate_from_*` cranks, `cancel_withdrawal`, and the
+fund-from-stake paths — moves one Delegation and the counter by the same
+amount. A Delegation can only be closed at amount 0.
+
+So `counter − Σ Delegation.amount` is **invariant under every
+instruction**: whatever value a gateway is created with, it keeps
+forever. That is what makes a violation permanent rather than
+self-healing, and it is why this invariant is stated separately from
+Invariant 2 — the supply counter can drift and be resynced, but this one
+cannot be repaired by any ordinary instruction.
+
+**This invariant was violated at genesis and went unnoticed for months
+because it was not written down here.** The AO import wrote each
+counter from AO's total but created Delegation accounts only for
+delegators who had a Solana address; the rest of the stake went to the
+migration authority's pot and never entered the stake pool. On mainnet
+that is **2,226,210.675676 ARIO** over-counted across 132 gateways,
+reproduced to the mARIO from the genesis snapshot for 622 of 622
+gateways. Consequences: `finalize_gone` is permanently blocked on 65
+leaving gateways, delegation cannot be re-enabled on an over-counted
+gateway, 67 joined gateways draw stake weight and observer-selection
+odds for stake they do not hold, and every epoch carves a delegate
+share that is divided by the inflated counter.
+
+The only repair is the authority-only
+`admin_reconcile_delegated_stake` (ADR-0037), which lowers a counter to
+a sum proven from the Delegation accounts it is shown. **The program
+cannot enumerate those accounts**, so this invariant is not enforceable
+on-chain in the `>=` direction — it must be checked off-chain.
+`scripts/delegated-stake-audit.mjs --cluster mainnet|staging` does that;
+exit status 1 means a gateway is under-counted, which is the dangerous
+direction (a counter below the real sum lets `finalize_gone` close a
+Gateway PDA that live delegates still need in order to claim).
+
 ## Stale-by-design: delegate rewards
 
 This is the part most easily mis-coded by integrators.
@@ -279,9 +324,24 @@ advanced since every delegation last settled, which is fleeting in
 production.
 
 The supply-counter shadow ([Invariant 2](#invariant-2--supply-counter-shadow))
-is unaffected — `settings.total_delegated` is equally stale as
-`Σ Gateway.total_delegated_stake`, so both sides agree. Only the
-SPL-pool-vs-accounting equation depends on the fourth term.
+is unaffected by the *accumulator* staleness: while nothing settles, both
+`settings.total_delegated` and `Σ Gateway.total_delegated_stake` are equally
+stale, so they agree. Only the SPL-pool-vs-accounting equation depends on the
+fourth term.
+
+> **Corrected 2026-09-18 (ADR-0037).** The "equally stale" argument held only
+> until the first *settlement*. `settle_delegate_rewards` raises
+> `Gateway.total_delegated_stake`, and before ADR-0037 no caller raised
+> `settings.total_delegated` to match — `compound_delegation_rewards` had no
+> `settings` account at all. So every settled reward widened a permanent gap,
+> which reached **80,442.894868 ARIO** on mainnet. The property test could not
+> catch it because it never settled a reward.
+>
+> Fixed in the Wave 2 GAR upgrade: `settle_delegate_rewards` now returns the
+> settled amount and every one of its callers adds it to the supply counter.
+> `admin_resync_supply_counters` corrects the accumulated drift once. Any health
+> check that ran before that upgrade should expect this gap on mainnet rather
+> than treat it as a fresh bug.
 
 ## Known limits
 
@@ -342,7 +402,16 @@ reusable for any future scenario test.
 > `assert_global_stake_invariants` checks the three settled-state
 > terms only and is sufficient for the scenarios it's run against
 > (join / delegate / decrease / slash / payment — all of which leave
-> `sumPendingRewards == 0`). Extending the helper and adding a
+> `sumPendingRewards == 0`).
+>
+> **Partly closed 2026-09-18 (ADR-0037).**
+> `test_compound_keeps_supply_counter_in_step` now credits a gateway's
+> reward accumulator, funds the pool to match, compounds, and then runs
+> `assert_global_stake_invariants` — a settle-then-check that the earlier
+> scenarios could not perform. That is what exposed the Invariant 2
+> defect: settlement raised the gateway counter while nothing raised
+> `settings.total_delegated`. The full epoch-cycle test described below is
+> still outstanding. Extending the helper and adding a
 > `test_stake_conservation_distribute_window` test that exercises a
 > full epoch cycle (create → tally → prescribe → save_observations
 > → distribute → assert with the fourth term) is the obvious
@@ -390,12 +459,40 @@ const sumPendingRewards = delegations.reduce((s, d) => {
 // Invariant 1 — stake-pool conservation with all four terms.
 assert(poolBalance === sumOperator + sumDelegated + sumWithdrawn + sumPendingRewards);
 
-// Invariant 2 — supply-counter shadow (independent of distribute_epoch staleness;
-// both sides are equally stale, so they always agree).
+// Invariant 2 — supply-counter shadow. Independent of distribute_epoch
+// staleness, because while nothing settles both sides are equally stale.
+// NOTE (ADR-0037): before the Wave 2 GAR upgrade, settlement raised the gateway
+// counter without raising settings.total_delegated, so this assertion legitimately
+// fails on any cluster that settled rewards under the old code until
+// admin_resync_supply_counters has run.
 assert(sumOperator  === BigInt(settings.total_staked));
 assert(sumDelegated === BigInt(settings.total_delegated));
 assert(sumWithdrawn === BigInt(settings.total_withdrawn));
+
+// Invariant 4 — per gateway, the counter equals the delegations behind it.
+// This is the check whose absence let 2,226,210.675676 ARIO of phantom
+// delegated stake sit unnoticed on mainnet from genesis. It is per-gateway:
+// the totals above net out and will NOT reveal it.
+const delegatedByGateway = new Map();
+for (const d of delegations) {
+  delegatedByGateway.set(
+    d.gateway,
+    (delegatedByGateway.get(d.gateway) ?? 0n) + BigInt(d.amount),
+  );
+}
+for (const g of gateways) {
+  const backed = delegatedByGateway.get(g.address) ?? 0n;
+  const counter = BigInt(g.total_delegated_stake);
+  // counter > backed: phantom stake — blocks finalize_gone, inflates weight.
+  // counter < backed: DANGEROUS — finalize_gone could close a Gateway PDA
+  // that live delegates still need in order to claim.
+  assert(counter === backed, `${g.address}: counter ${counter} vs delegations ${backed}`);
+}
 ```
+
+`scripts/delegated-stake-audit.mjs --cluster mainnet|staging` is the
+maintained implementation of the Invariant 4 loop, with snapshot
+cross-checking; exit status 1 means a gateway is under-counted.
 
 Run this against every cluster (devnet, mainnet) on a schedule.
 Drift indicates a real bug and should page.

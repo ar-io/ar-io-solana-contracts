@@ -139,6 +139,17 @@ pub mod ario_gar {
         instructions::initialize::transfer_authority(ctx, new_authority)
     }
 
+    /// Rotate `EpochSettings.authority` (ADR-0031). Gated on the current
+    /// `EpochSettings` authority; rejects the null pubkey. Separate from
+    /// `transfer_authority`, which moves only `GatewaySettings` — see the
+    /// handler doc comment for why both exist.
+    pub fn transfer_epoch_settings_authority(
+        ctx: Context<TransferEpochSettingsAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::initialize::transfer_epoch_settings_authority(ctx, new_authority)
+    }
+
     // =========================================
     // GATEWAY LIFECYCLE (F10-F12)
     // =========================================
@@ -179,6 +190,24 @@ pub mod ario_gar {
         new_observer: Pubkey,
     ) -> Result<()> {
         instructions::gateway::update_observer_address(ctx, new_observer)
+    }
+
+    /// ADR-0030: update routing/presentation metadata. Accepts the operator
+    /// **or** the gateway's `operations_address`.
+    pub fn update_gateway_metadata(
+        ctx: Context<UpdateGatewayMetadata>,
+        params: UpdateGatewayMetadataParams,
+    ) -> Result<()> {
+        instructions::gateway::update_gateway_metadata(ctx, params)
+    }
+
+    /// ADR-0030: rotate the delegated operations address. Operator-only — the
+    /// operations address must never be able to change itself.
+    pub fn update_operations_address(
+        ctx: Context<UpdateOperationsAddress>,
+        new_operations_address: Pubkey,
+    ) -> Result<()> {
+        instructions::gateway::update_operations_address(ctx, new_operations_address)
     }
 
     // =========================================
@@ -364,13 +393,26 @@ pub mod ario_gar {
         instructions::epoch::close_epoch_settings(ctx)
     }
 
-    /// Recovery-only: close an Epoch PDA orphaned by a prior
-    /// `close_epoch_settings` + `initialize_epochs` reinit, where the
-    /// reset `current_epoch_index` collides with PDAs from the prior
-    /// lifecycle. Authority-gated AND `migration_active`-gated; inert
-    /// after `finalize_migration`. **Closing an in-flight epoch
-    /// orphans Observation PDAs** — only safe on epochs the new
-    /// lifecycle won't re-use.
+    /// Recovery-only: close an Epoch PDA that the lifecycle can no longer
+    /// reach — one orphaned by a prior `close_epoch_settings` +
+    /// `initialize_epochs` reinit, or one that has stalled undistributed.
+    ///
+    /// **Authority-gated and PERMANENT (ADR-0034).** It is no longer
+    /// `migration_active`-gated and does NOT go inert after
+    /// `finalize_migration`: `create_epoch` now refuses to advance past an
+    /// unfinished epoch, so this is the only path that unsticks a stalled
+    /// chain and it must outlive the migration window.
+    ///
+    /// Guarded: the epoch must have **ended** (`clock >= end_timestamp`) and be
+    /// **undistributed** (`rewards_distributed == 0`). A distributed epoch goes
+    /// through `close_epoch`, which refunds its creator (ADR-0029); a live one
+    /// is not closeable at all.
+    ///
+    /// **Closing an epoch with submitted-but-unclosed Observations orphans
+    /// those PDAs** — their rent becomes unreclaimable, because
+    /// `close_observation` needs the Epoch account. Before writing an epoch
+    /// off, confirm its `distribution_index` has stopped advancing:
+    /// distribution can legitimately run for hours.
     pub fn admin_close_stale_epoch(
         ctx: Context<AdminCloseStaleEpoch>,
         epoch_index: u64,
@@ -378,9 +420,33 @@ pub mod ario_gar {
         instructions::epoch::admin_close_stale_epoch(ctx, epoch_index)
     }
 
+    /// Close an `EpochRentReceipt` (ADR-0029) whose `Epoch` was closed out
+    /// from under it by `admin_close_stale_epoch` — the only path that
+    /// closes an epoch without closing its receipt, and therefore the only
+    /// way one is ever orphaned. The reclaimed rent goes to the recorded
+    /// creator, not to the authority, which pays only the tx fee.
+    ///
+    /// Rejects with `EpochStillExists` while the epoch is alive: that case
+    /// belongs to permissionless `close_epoch`, which returns the epoch's
+    /// rent to the creator too.
+    pub fn admin_close_orphaned_epoch_rent_receipt(
+        ctx: Context<AdminCloseOrphanedEpochRentReceipt>,
+        epoch_index: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_close_orphaned_epoch_rent_receipt(ctx, epoch_index)
+    }
+
     /// Create a new epoch (F23)
     /// This is permissionless - anyone can call when the previous epoch has ended
-    pub fn create_epoch(ctx: Context<CreateEpoch>) -> Result<()> {
+    ///
+    /// ADR-0029: optionally pass the `["epoch_rent_receipt", epoch_index]`
+    /// PDA as a single writable `remaining_accounts` entry to record yourself
+    /// as the creator, so `close_epoch` refunds this epoch's rent to you
+    /// rather than to whoever closes it. Omitting it preserves the old
+    /// behavior exactly.
+    pub fn create_epoch<'info>(
+        ctx: Context<'_, '_, 'info, 'info, CreateEpoch<'info>>,
+    ) -> Result<()> {
         instructions::epoch::create_epoch(ctx)
     }
 
@@ -401,7 +467,15 @@ pub mod ario_gar {
     /// Close a fully distributed epoch account, reclaiming rent.
     /// Permissionless — anyone can call once the epoch is distributed and
     /// at least `epoch_retention` epochs have passed.
-    pub fn close_epoch(ctx: Context<CloseEpoch>, _epoch_index: u64) -> Result<()> {
+    ///
+    /// ADR-0029: when the epoch carries a rent receipt, pass the receipt PDA
+    /// and its recorded creator as the first two writable
+    /// `remaining_accounts`; the rent is refunded to that creator, not to the
+    /// signer. Epochs created without a receipt still refund `payer`.
+    pub fn close_epoch<'info>(
+        ctx: Context<'_, '_, '_, 'info, CloseEpoch<'info>>,
+        _epoch_index: u64,
+    ) -> Result<()> {
         instructions::epoch::close_epoch(ctx, _epoch_index)
     }
 
@@ -449,6 +523,47 @@ pub mod ario_gar {
     /// Delegates call this to materialize pending rewards into their delegation amount.
     pub fn compound_delegation_rewards(ctx: Context<CompoundDelegationRewards>) -> Result<()> {
         instructions::delegate::compound_delegation_rewards(ctx)
+    }
+
+    /// ADR-0037. Lower a gateway's `total_delegated_stake` to the sum of the
+    /// Delegation accounts passed in `remaining_accounts`, removing the phantom
+    /// delegated stake the AO import left behind.
+    ///
+    /// Authority-only, and it can only ever *lower* the counter, to a sum proven
+    /// from canonical Delegation accounts. `expected_counter` guards against a
+    /// stale plan; `expected_removed` must come from the genesis snapshot, not
+    /// from the same read that produced the Delegation list — the two
+    /// independent sources having to agree is what makes a missing Delegation
+    /// fail closed.
+    pub fn admin_reconcile_delegated_stake<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AdminReconcileDelegatedStake<'info>>,
+        expected_counter: u64,
+        expected_removed: u64,
+    ) -> Result<()> {
+        instructions::delegate::admin_reconcile_delegated_stake(
+            ctx,
+            expected_counter,
+            expected_removed,
+        )
+    }
+
+    /// ADR-0037. Set the reporting-only supply counters to audited values, once,
+    /// after the settlement fix and the reconcile plan are live. Both expected
+    /// values must match what is stored or nothing is written.
+    pub fn admin_resync_supply_counters(
+        ctx: Context<AdminResyncSupplyCounters>,
+        expected_staked: u64,
+        new_staked: u64,
+        expected_delegated: u64,
+        new_delegated: u64,
+    ) -> Result<()> {
+        instructions::delegate::admin_resync_supply_counters(
+            ctx,
+            expected_staked,
+            new_staked,
+            expected_delegated,
+            new_delegated,
+        )
     }
 
     /// Prune a gateway that has exceeded maximum consecutive failures (F21)
@@ -613,6 +728,13 @@ pub mod ario_gar {
 
     pub fn migrate_gateway(ctx: Context<MigrateGateway>) -> Result<()> {
         let info = ctx.accounts.gateway.to_account_info();
+        // Read the size BEFORE growing: afterwards every account looks canonical
+        // and the pre-1.1.0 ones are indistinguishable. See
+        // `GATEWAY_SIZE_AT_V1_1_0` for why growing one of those corrupts it.
+        require!(
+            info.data_len() >= state::GATEWAY_SIZE_AT_V1_1_0,
+            error::GarError::PreV110GatewayLayout
+        );
         schema_migration::grow_account(
             &info,
             &ctx.accounts.payer.to_account_info(),
@@ -1168,6 +1290,21 @@ pub struct JoinNetworkParams {
     pub observer_address: Pubkey,
 }
 
+/// ADR-0030: the routing/presentation subset of `UpdateGatewayParams`.
+///
+/// Deliberately a separate params type rather than a mode flag on the existing
+/// one: the delegation-economics fields are simply absent, so an
+/// `operations_address` signer cannot reach them even by malformed input.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct UpdateGatewayMetadataParams {
+    pub label: Option<String>,
+    pub fqdn: Option<String>,
+    pub port: Option<u16>,
+    pub protocol: Option<state::Protocol>,
+    pub properties: Option<String>,
+    pub note: Option<String>,
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct UpdateGatewayParams {
     pub label: Option<String>,
@@ -1346,6 +1483,30 @@ pub struct ObserverAddressUpdatedEvent {
     pub timestamp: i64,
 }
 
+/// ADR-0030. Emitted on a metadata update.
+///
+/// Carries `signer` as well as `operator` precisely because this instruction
+/// accepts two different signers: if a delegated key is later found to be
+/// compromised, this is what lets you tell which changes it made.
+#[event]
+pub struct GatewayMetadataUpdatedEvent {
+    pub operator: Pubkey,
+    pub signer: Pubkey,
+    pub fields_changed: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0030. Emitted when the operator rotates the delegated operations
+/// address. Carries the old value too, so a subscriber can tell a first-time
+/// delegation from a revocation (`new == operator`) without prior state.
+#[event]
+pub struct OperationsAddressUpdatedEvent {
+    pub operator: Pubkey,
+    pub old_operations_address: Pubkey,
+    pub new_operations_address: Pubkey,
+    pub timestamp: i64,
+}
+
 /// Emitted by `increase_operator_stake`. Symmetric with
 /// `WithdrawalCreatedEvent` (decrease side).
 #[event]
@@ -1476,6 +1637,18 @@ pub struct AuthorityTransferredEvent {
     pub timestamp: i64,
 }
 
+/// Emitted by `transfer_epoch_settings_authority` (ADR-0031) when
+/// `EpochSettings.authority` is rotated. Kept distinct from
+/// `AuthorityTransferredEvent` so subscribers can tell which of gar's two
+/// authority-bearing accounts moved. `old_authority` is the signer that
+/// authorized the rotation.
+#[event]
+pub struct EpochSettingsAuthorityTransferredEvent {
+    pub old_authority: Pubkey,
+    pub new_authority: Pubkey,
+    pub timestamp: i64,
+}
+
 /// Emitted EXACTLY ONCE per epoch by `tally_weights`, on the final batch
 /// (the call that transitions `weights_tallied` from 0 to 1). Mid-batch
 /// calls are silent. Mirrors the `EpochDistributedEvent` summary pattern.
@@ -1488,8 +1661,14 @@ pub struct EpochWeightsTalliedEvent {
 }
 
 /// Emitted by `close_epoch` when the epoch PDA is closed. `rent_recovered`
-/// is the lamport delta refunded to the caller (captured pre/post account
-/// close). Marker for retention-window pruning in indexers.
+/// is the Epoch account's lamport balance immediately before the close, i.e.
+/// the rent refunded — to the epoch's recorded creator when it has a rent
+/// receipt (ADR-0029), otherwise to the caller. Marker for retention-window
+/// pruning in indexers.
+///
+/// The recipient is deliberately NOT a field: field shapes are frozen
+/// post-mainnet (ADR-018), and indexers can already read it from the
+/// transaction's account list.
 #[event]
 pub struct EpochClosedEvent {
     pub epoch_index: u64,
@@ -1558,6 +1737,54 @@ pub struct RewardRatiosUpdatedEvent {
     pub old_observer_ratio: u64,
     pub new_gateway_ratio: u64,
     pub new_observer_ratio: u64,
+    pub timestamp: i64,
+}
+
+/// ADR-0034 addendum. Emitted by `distribute_epoch` when the epoch collected no
+/// observations at all: nothing is paid and no gateway stat is credited.
+///
+/// This exists because `EpochDistributedEvent` cannot be made to carry the
+/// distinction. Its shape is frozen (ADR-018), and a *normal* distribution can
+/// legitimately report `gateways_processed: 0, total_eligible_rewards: 0` when
+/// no gateway was eligible — so zero totals do not identify a skip. This event
+/// is the stable discriminator: it is emitted immediately before the
+/// (unchanged) `EpochDistributedEvent` in the same transaction. An indexer that
+/// needs to tell the two apart keys on its presence; one that only needs
+/// "this epoch finished" can keep ignoring it.
+#[event]
+pub struct EpochSkippedNoObservationsEvent {
+    pub epoch_index: u64,
+    pub active_gateway_count: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0037. Emitted by `admin_reconcile_delegated_stake` when a gateway's
+/// `total_delegated_stake` is lowered to the sum of the Delegation accounts that
+/// actually back it, removing phantom delegated stake left by the AO import.
+///
+/// `removed` is the phantom amount; `new` is the proven sum. The correction is
+/// always a reduction, and `delegations_counted` records how many Delegation
+/// accounts the proof was built from, so an indexer can tell a
+/// zero-delegation gateway apart from one whose delegations were omitted.
+#[event]
+pub struct DelegatedStakeReconciledEvent {
+    pub gateway: Pubkey,
+    pub previous: u64,
+    pub removed: u64,
+    pub new: u64,
+    pub delegations_counted: u32,
+    pub timestamp: i64,
+}
+
+/// ADR-0037. Emitted by `admin_resync_supply_counters` when the reporting-only
+/// `GatewaySettings` supply counters are set to audited values, after the
+/// settlement fix and the reconcile plan are live.
+#[event]
+pub struct SupplyCountersResyncedEvent {
+    pub previous_staked: u64,
+    pub new_staked: u64,
+    pub previous_delegated: u64,
+    pub new_delegated: u64,
     pub timestamp: i64,
 }
 

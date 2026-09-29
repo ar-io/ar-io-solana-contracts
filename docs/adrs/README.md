@@ -20,7 +20,15 @@ decision**, monotonic four-digit numbering, append-only once merged to
 
 1. **Pick the next free number.** Look at the table below and the
    filenames in this directory; pick `max + 1`, zero-padded to four
-   digits.
+   digits. **Also check open PRs** — an unmerged PR reserves its number,
+   and the merged tree will not show it. `gh pr list --state open` plus
+   `gh pr view <n> --json files` is enough. Taking a number that an open
+   PR already claims forces one of the two to be renumbered after
+   review, which the append-only rule makes expensive.
+
+   A number reserved by an open PR leaves an apparent gap in the Index
+   table until that PR merges. That is expected; do not "close" the gap
+   by reusing the number.
 2. **Copy the template.**
    ```bash
    cp docs/adrs/0000-template.md docs/adrs/NNNN-kebab-case-title.md
@@ -99,6 +107,28 @@ directory — but format-wise they're free-form rather than strict MADR.
 | ADR-026 | Single-Step `transfer_authority` for the Admin Authority Across All Programs | accepted | [`0026-admin-authority-transfer.md`](0026-admin-authority-transfer.md) |
 | ADR-027 | Restore the Escrow Active-Vault Re-lock via Direct CPI into ario-core's Existing ABI | accepted | [`0027-escrow-restore-active-vault-relock-direct-cpi.md`](0027-escrow-restore-active-vault-relock-direct-cpi.md) |
 | ADR-028 | ario-ant Program PDA Holds the ANT UpdateAuthority | accepted | [`0028-ant-program-update-authority.md`](0028-ant-program-update-authority.md) |
+| ADR-029 | Epoch Rent Refunds the Creator, Not the Closer | accepted | [`0029-epoch-rent-refunds-creator.md`](0029-epoch-rent-refunds-creator.md) |
+| ADR-030 | A Gateway May Delegate Operations to a Second Address | accepted | [`0030-gateway-operations-address.md`](0030-gateway-operations-address.md) |
+| ADR-031 | Transferable `EpochSettings.authority` | accepted | [`0031-transferable-epoch-settings-authority.md`](0031-transferable-epoch-settings-authority.md) |
+| ADR-032 | A Gateway With Stale Weights Is Ineligible, Not a Distribution Halt | accepted | [`0032-distribution-skips-untallied-gateways.md`](0032-distribution-skips-untallied-gateways.md) |
+| ADR-033 | An Epoch's Weights Survive Only Until the Next Tally | accepted | [`0033-epoch-weights-are-destroyed-by-the-next-tally.md`](0033-epoch-weights-are-destroyed-by-the-next-tally.md) |
+| ADR-034 | An Unfinished Epoch Must Not Be Superseded | accepted | [`0034-an-unfinished-epoch-must-not-be-superseded.md`](0034-an-unfinished-epoch-must-not-be-superseded.md) |
+| ADR-035 | Anchor Error Codes Are a Published, Append-Only ABI | accepted | [`0035-anchor-error-codes-are-append-only.md`](0035-anchor-error-codes-are-append-only.md) |
+| ADR-036 | Registry Positions Are Frozen While an Epoch Is Unfinished | accepted | [`0036-registry-positions-frozen-while-epoch-unfinished.md`](0036-registry-positions-frozen-while-epoch-unfinished.md) |
+| ADR-037 | A Gateway's Delegated-Stake Counter Must Equal the Delegations Behind It | accepted | [`0037-delegated-stake-counter-must-match-delegations.md`](0037-delegated-stake-counter-must-match-delegations.md) |
+| ADR-038 | A Departing Operator's Unlock Schedule Is Set by the Vault, Not by the Exit Path | accepted | [`0038-operator-exit-unlock-schedule.md`](0038-operator-exit-unlock-schedule.md) |
+
+### Reserved by open PRs
+
+Numbers claimed by unmerged PRs, so they do not look free to the next author.
+**None currently** — every claimed number now has its ADR in the Index above.
+
+| # | claimed by | file |
+|---|---|---|
+
+
+Add a row when you open a PR claiming a number; delete it once that PR merges
+and the ADR appears in the Index above.
 
 ### Numbering anomalies
 

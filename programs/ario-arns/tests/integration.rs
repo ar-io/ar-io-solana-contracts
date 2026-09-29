@@ -1427,6 +1427,89 @@ async fn test_increase_undername_limit() {
     assert_eq!(record.undername_limit, DEFAULT_UNDERNAME_COUNT + 5);
 }
 
+/// BD-048 caps a name at `MAX_UNDERNAME_LIMIT` undernames. Only the two
+/// stake-funded handlers enforced it (as a bare `10_000` literal); the balance,
+/// delegation and operator-stake paths let a name run to `u16::MAX`, and
+/// nothing asserted the cap on any path.
+#[tokio::test]
+async fn test_increase_undername_limit_respects_the_cap() {
+    let ant_keypair = Keypair::new();
+    let ant_key = ant_keypair.pubkey();
+    let mut pt = program_test_with_registry();
+    let mut ctx = pt.start_with_context().await;
+    mint_test_ant(&mut ctx, &ant_keypair).await;
+    let setup = setup_arns(&mut ctx).await;
+
+    let name = "capundername";
+    let arns_record_key =
+        buy_name_helper(&mut ctx, &setup, name, PurchaseType::Permabuy, 0, ant_key).await;
+
+    let increase = |ctx: &ProgramTestContext, quantity: u16, blockhash| {
+        Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::IncreaseUndernameLimit {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: arns_record_key,
+                    caller_token_account: setup.buyer_token.pubkey(),
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    caller: ctx.payer.pubkey(),
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::IncreaseUndernameLimit { quantity }.data(),
+            }],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer],
+            blockhash,
+        )
+    };
+
+    // Landing exactly on the cap is fine: 10 + 9,990 = 10,000.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = increase(
+        &ctx,
+        MAX_UNDERNAME_LIMIT - DEFAULT_UNDERNAME_COUNT,
+        blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+    let record = ArnsRecord::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(arns_record_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(record.undername_limit, MAX_UNDERNAME_LIMIT);
+
+    // One more is refused, and the record is untouched.
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    let tx = increase(&ctx, 1, blockhash);
+    let result = ctx.banks_client.process_transaction(tx).await;
+    assert_anchor_error!(result, ArnsError::UndernameLimitExceeded);
+    let record = ArnsRecord::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(arns_record_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(
+        record.undername_limit, MAX_UNDERNAME_LIMIT,
+        "the refused increase must not have moved the limit"
+    );
+}
+
 #[tokio::test]
 async fn test_demand_factor_update() {
     let ant_keypair = Keypair::new();
@@ -6974,6 +7057,405 @@ mod fund_from_stake {
         );
     }
 
+    /// Shared scaffold for the ADR-0030 discount tests: a gateway old enough to
+    /// qualify, optionally delegating to `ops`, and optionally with a forged
+    /// stored operator.
+    async fn discount_scenario(
+        ops: Option<Pubkey>,
+        forge_operator: bool,
+    ) -> (ProgramTestContext, FundFromStakeSetup) {
+        let operator_kp = Keypair::new();
+        let mint_kp = Keypair::new();
+        let stake_kp = Keypair::new();
+        let treasury_kp = Keypair::new();
+        let pt = program_test_with_arns_and_gar(
+            treasury_kp.pubkey(),
+            stake_kp.pubkey(),
+            mint_kp.pubkey(),
+        );
+        let mut ctx = pt.start_with_context().await;
+        let setup = setup_full_environment_with_keys(
+            &mut ctx,
+            &operator_kp,
+            mint_kp,
+            stake_kp,
+            treasury_kp,
+        )
+        .await;
+
+        let gw_acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut gw_acct.data.as_slice()).unwrap();
+        gw.start_timestamp = -(200 * 86_400i64); // clears the 180-day tenure gate
+        if let Some(ops) = ops {
+            gw.operations_address = ops;
+        }
+        if forge_operator {
+            // Claim a different operator while staying at this address. The PDA
+            // re-derivation must catch it.
+            gw.operator = Pubkey::new_unique();
+        }
+        let mut new_data = Vec::new();
+        gw.try_serialize(&mut new_data).unwrap();
+        new_data.resize(gw_acct.data.len(), 0);
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: gw_acct.lamports,
+                data: new_data,
+                owner: gw_acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+        (ctx, setup)
+    }
+
+    /// Patch the gateway's delegated operations address after setup, so the test
+    /// can use the SAME context's payer (each ProgramTestContext has its own).
+    async fn set_gateway_operations_address(
+        ctx: &mut ProgramTestContext,
+        setup: &FundFromStakeSetup,
+        ops: Pubkey,
+    ) {
+        let acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        gw.operations_address = ops;
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.resize(acct.data.len(), 0);
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: acct.lamports,
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+    }
+
+    async fn buy_name_claiming_discount(
+        ctx: &mut ProgramTestContext,
+        setup: &FundFromStakeSetup,
+        name: &str,
+    ) -> std::result::Result<(), solana_program_test::BanksClientError> {
+        let (record_key, _) = arns_record_pda(name);
+        let mut accounts = ario_arns::accounts::BuyName {
+            config: setup.config_key,
+            demand_factor: setup.demand_factor_key,
+            arns_record: record_key,
+            name_registry: name_registry_key(),
+            buyer_token_account: setup.buyer_token.pubkey(),
+            protocol_token_account: setup.treasury.pubkey(),
+            reserved_name_check: reserved_name_pda(name).0,
+            returned_name_check: returned_name_pda(name).0,
+            buyer: ctx.payer.pubkey(),
+            token_program: spl_token::id(),
+            system_program: system_program::id(),
+        }
+        .to_account_metas(None);
+        // remaining_accounts[0] is the opt-in discount claim.
+        accounts.push(AccountMeta::new_readonly(setup.gateway_key, false));
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts,
+                data: ario_arns::instruction::BuyName {
+                    params: ario_arns::BuyNameParams {
+                        name: name.to_string(),
+                        purchase_type: PurchaseType::Lease,
+                        years: 1,
+                        ant: Pubkey::new_unique(),
+                    },
+                }
+                .data(),
+            }],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await
+    }
+
+    /// 6-char name, 1-year lease: base 1.5B * 1.2 = 1.8B undiscounted.
+    const UNDISCOUNTED_1Y_6CHAR: u64 = 1_500_000_000u64 * 12 / 10;
+
+    /// **Deployment-safety.** Immediately after the upgrade, every live gateway
+    /// is still 964 bytes with no `operations_address` in its content, and stays
+    /// that way until `migrate_gateway` runs on it. The operator MUST keep its
+    /// discount through that window — otherwise the deploy silently removes the
+    /// benefit from all 648 gateways until the migration completes.
+    ///
+    /// Below schema 1.2.0 `Gateway::authorises` ignores `operations_address`
+    /// entirely (it is stale tail bytes there) and honours only the operator.
+    #[tokio::test]
+    async fn test_unmigrated_gateway_operator_keeps_discount() {
+        let operator_kp = Keypair::new();
+        let mint_kp = Keypair::new();
+        let stake_kp = Keypair::new();
+        let treasury_kp = Keypair::new();
+        let pt = program_test_with_arns_and_gar(
+            treasury_kp.pubkey(),
+            stake_kp.pubkey(),
+            mint_kp.pubkey(),
+        );
+        let mut ctx = pt.start_with_context().await;
+        let setup = setup_full_environment_with_keys(
+            &mut ctx,
+            &operator_kp,
+            mint_kp,
+            stake_kp,
+            treasury_kp,
+        )
+        .await;
+
+        // Rebuild the gateway in its pre-ADR-0030 on-chain shape: qualifying
+        // tenure, and the trailing operations_address dropped from the content.
+        let acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        gw.start_timestamp = -(200 * 86_400i64);
+        // Stamped 1.1.0, as every live account is. join_network stamps the
+        // current version, which would model an account that does not exist.
+        gw.version = ario_gar::state::SchemaVersion::new(1, 1, 0);
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32); // no operations_address, as on chain today
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: acct.lamports,
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
+        // Confirm we really are in the un-migrated state.
+        let reread = Gateway::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(setup.gateway_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(reread.operations_address, Pubkey::default());
+
+        // The OPERATOR must still get the discount. buy_name_from_operator_stake
+        // is signed by the operator, which is the path a real gateway owner uses.
+        let name = "unmigr".to_string();
+        let (record_key, _) = arns_record_pda(&name);
+        let (gar_settings_key, _) = gar_settings_pda();
+        let mut accounts = ario_arns::accounts::BuyNameFromOperatorStake {
+            config: setup.config_key,
+            demand_factor: setup.demand_factor_key,
+            arns_record: record_key,
+            name_registry: name_registry_key(),
+            reserved_name_check: reserved_name_pda(&name).0,
+            returned_name_check: returned_name_pda(&name).0,
+            gar_settings: gar_settings_key,
+            gateway: setup.gateway_key,
+            stake_token_account: setup.stake_token.pubkey(),
+            protocol_token_account: setup.treasury.pubkey(),
+            buyer: setup.operator,
+            gar_program: ario_gar::ID,
+            token_program: spl_token::id(),
+            system_program: system_program::id(),
+        }
+        .to_account_metas(None);
+        accounts.push(AccountMeta::new_readonly(setup.gateway_key, false));
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts,
+                data: ario_arns::instruction::BuyNameFromOperatorStake {
+                    params: ario_arns::BuyNameParams {
+                        name: name.clone(),
+                        purchase_type: PurchaseType::Lease,
+                        years: 1,
+                        ant: Pubkey::new_unique(),
+                    },
+                }
+                .data(),
+            }],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer, &operator_kp],
+            blockhash,
+        );
+        ctx.banks_client
+            .process_transaction(tx)
+            .await
+            .expect("an un-migrated gateway's operator must keep its discount");
+
+        let record = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(record_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.purchase_price,
+            UNDISCOUNTED_1Y_6CHAR * 8 / 10,
+            "the discount must survive the pre-migration window"
+        );
+    }
+
+    /// The ADR-0030 stale-tail defect, on the ArNS side. An un-migrated (1.1.0)
+    /// gateway whose tail bytes happen to decode as the buyer's key must NOT
+    /// give that buyer the discount. The same key IS honoured once the account
+    /// really is at 1.2.0 (test_gateway_discount_via_operations_address), so the
+    /// version is the only difference between the two outcomes.
+    #[tokio::test]
+    async fn test_stale_tail_key_gets_no_discount_before_migration() {
+        let (mut ctx, setup) = discount_scenario(None, false).await;
+        let buyer = ctx.payer.pubkey();
+        assert_ne!(buyer, setup.operator, "the buyer must not be the operator");
+
+        let acct = ctx
+            .banks_client
+            .get_account(setup.gateway_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gw = Gateway::try_deserialize(&mut acct.data.as_slice()).unwrap();
+        gw.version = ario_gar::state::SchemaVersion::new(1, 1, 0);
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+        data.truncate(data.len() - 32); // pre-ADR-0030 content
+        let content_end = data.len();
+        data.resize(ario_gar::state::GATEWAY_SIZE_AT_V1_1_0, 0);
+        // What an earlier, longer serialization can leave behind.
+        data[content_end..content_end + 32].copy_from_slice(buyer.as_ref());
+        ctx.set_account(
+            &setup.gateway_key,
+            &solana_sdk::account::Account {
+                lamports: acct.lamports,
+                data,
+                owner: acct.owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
+        // Precondition: the planted key really decodes as the operations address.
+        let reread = Gateway::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(setup.gateway_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(reread.version, ario_gar::state::SchemaVersion::new(1, 1, 0));
+        assert_eq!(reread.operations_address, buyer);
+
+        // Refused for exactly this reason, not for an unrelated one.
+        let result = buy_name_claiming_discount(&mut ctx, &setup, "stltal").await;
+        assert_anchor_error!(result, ArnsError::NotGatewayOperator);
+    }
+
+    /// ADR-0030's headline capability: a wallet that is NOT the operator buys at
+    /// the gateway's discount because the operator delegated to it.
+    #[tokio::test]
+    async fn test_gateway_discount_via_operations_address() {
+        let (mut ctx, setup) = discount_scenario(None, false).await;
+        let buyer = ctx.payer.pubkey();
+        assert_ne!(buyer, setup.operator, "the buyer must not be the operator");
+
+        // Delegate to THIS context's payer. Building a second scenario here
+        // would hand back a different payer keypair and silently test nothing.
+        set_gateway_operations_address(&mut ctx, &setup, buyer).await;
+
+        buy_name_claiming_discount(&mut ctx, &setup, "opsdsc")
+            .await
+            .expect("the operations address must be able to spend the discount");
+
+        let record = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(arns_record_pda("opsdsc").0)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.purchase_price,
+            UNDISCOUNTED_1Y_6CHAR * 8 / 10,
+            "the delegated buyer must receive the 20% gateway discount"
+        );
+    }
+
+    /// The protection my change moved: the old code derived the PDA from the
+    /// SIGNER, so presenting someone else's gateway was structurally impossible.
+    /// Now any real gateway passes the PDA check and the signer test is the only
+    /// thing standing between a stranger and a free 20%.
+    #[tokio::test]
+    async fn test_gateway_discount_denied_to_unrelated_signer() {
+        let (mut ctx, setup) = discount_scenario(None, false).await;
+        assert_ne!(ctx.payer.pubkey(), setup.operator);
+
+        let result = buy_name_claiming_discount(&mut ctx, &setup, "strngr").await;
+        assert!(
+            result.is_err(),
+            "a signer who is neither operator nor operations address must NOT \
+             receive the discount by presenting the gateway"
+        );
+    }
+
+    /// A Gateway account claiming an operator it does not belong to must fail the
+    /// re-derivation, which is what makes seeding the PDA from stored state sound.
+    #[tokio::test]
+    async fn test_gateway_discount_rejects_forged_operator() {
+        let (mut ctx, setup) = discount_scenario(Some(Pubkey::new_unique()), true).await;
+
+        let result = buy_name_claiming_discount(&mut ctx, &setup, "forged").await;
+        assert!(
+            result.is_err(),
+            "a Gateway whose stored operator does not derive to its own address \
+             must be rejected"
+        );
+    }
+
     // -----------------------------------------
     // buy_returned_name from delegation (split payment)
     // -----------------------------------------
@@ -8754,6 +9236,252 @@ mod fund_from_stake {
         assert_eq!(treasury_after - treasury_before, cost);
     }
 
+    /// `purchase_price` records what the NAME cost, and only `buy_name`,
+    /// `buy_returned_name` and `upgrade_name` write it — extending a lease or
+    /// buying undernames leaves it alone (`arns.lua`: only `buyRecord` and
+    /// `upgradeRecord` touch `purchasePrice`).
+    ///
+    /// The withdrawal- and funding-plan-funded variants of extend/increase used
+    /// to ADD their fee into it, so the same action produced different stored
+    /// state depending on how it was paid. Nothing asserted it, on any path.
+    #[tokio::test]
+    async fn test_extend_and_increase_from_withdrawal_leave_purchase_price() {
+        let ant_keypair = Keypair::new();
+        let ant_key = ant_keypair.pubkey();
+        let operator_kp = Keypair::new();
+        let mint_kp = Keypair::new();
+        let stake_kp = Keypair::new();
+        let treasury_kp = Keypair::new();
+        let pt = program_test_with_arns_and_gar(
+            treasury_kp.pubkey(),
+            stake_kp.pubkey(),
+            mint_kp.pubkey(),
+        );
+        let mut ctx = pt.start_with_context().await;
+        mint_test_ant(&mut ctx, &ant_keypair).await;
+        let setup = setup_full_environment_with_keys(
+            &mut ctx,
+            &operator_kp,
+            mint_kp,
+            stake_kp,
+            treasury_kp,
+        )
+        .await;
+        let payer_clone = ctx.payer.insecure_clone();
+        transfer_test_ant(&mut ctx, ant_key, &payer_clone, setup.operator).await;
+
+        let (gar_settings_key, _) = gar_settings_pda();
+        let (withdrawal_counter_key, _) = Pubkey::find_program_address(
+            &[WITHDRAWAL_COUNTER_SEED, setup.operator.as_ref()],
+            &ario_gar::ID,
+        );
+        let (withdrawal_key, _) = Pubkey::find_program_address(
+            &[
+                WITHDRAWAL_SEED,
+                setup.operator.as_ref(),
+                &0u64.to_le_bytes(),
+            ],
+            &ario_gar::ID,
+        );
+
+        // Fund a withdrawal vault to pay from.
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DecreaseOperatorStake {
+                    settings: gar_settings_key,
+                    gateway: setup.gateway_key,
+                    withdrawal_counter: withdrawal_counter_key,
+                    withdrawal: withdrawal_key,
+                    operator: setup.operator,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DecreaseOperatorStake {
+                    amount: 30_000_000_000,
+                }
+                .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        // Buy a 1-year lease from that vault, so the record is the operator's.
+        let name = "pxwithdraw".to_string();
+        let (record_key, _) = arns_record_pda(&name);
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::BuyNameFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    name_registry: name_registry_key(),
+                    reserved_name_check: reserved_name_pda(&name).0,
+                    returned_name_check: returned_name_pda(&name).0,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    buyer: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::BuyNameFromWithdrawal {
+                    params: ario_arns::BuyNameParams {
+                        name: name.clone(),
+                        purchase_type: PurchaseType::Lease,
+                        years: 1,
+                        ant: ant_key,
+                    },
+                }
+                .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        async fn read_record(ctx: &mut ProgramTestContext, key: Pubkey) -> ArnsRecord {
+            ArnsRecord::try_deserialize(
+                &mut ctx
+                    .banks_client
+                    .get_account(key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+            )
+            .unwrap()
+        }
+        let bought = read_record(&mut ctx, record_key).await;
+        let price_at_buy = bought.purchase_price;
+        assert!(price_at_buy > 0, "the buy set a purchase price");
+
+        // Extend the lease from the same vault.
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::ExtendLeaseFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    caller: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::ExtendLeaseFromWithdrawal { years: 1 }.data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let extended = read_record(&mut ctx, record_key).await;
+        assert!(
+            extended.end_timestamp.unwrap() > bought.end_timestamp.unwrap(),
+            "the extension landed"
+        );
+        assert_eq!(
+            extended.purchase_price, price_at_buy,
+            "extending a lease must not change purchase_price"
+        );
+
+        // Buy undernames from the same vault.
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::IncreaseUndernameFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    caller: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::IncreaseUndernameLimitFromWithdrawal { quantity: 1 }
+                    .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+
+        let increased = read_record(&mut ctx, record_key).await;
+        assert!(
+            increased.undername_limit > extended.undername_limit,
+            "the undername increase landed"
+        );
+        assert_eq!(
+            increased.purchase_price, price_at_buy,
+            "buying undernames must not change purchase_price"
+        );
+
+        // Lua requires an ACTIVE record to buy undernames
+        // (`assertValidIncreaseUndername`, `arns.lua:938`), and so do the
+        // balance, delegation and operator-stake paths. This path used to
+        // accept a record in its grace period as well. Warp past the lease end
+        // but stay inside grace, and it must now refuse.
+        let current_slot = ctx.banks_client.get_root_slot().await.unwrap();
+        ctx.warp_to_slot(current_slot + 2).unwrap();
+        let mut clock = ctx
+            .banks_client
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .await
+            .unwrap();
+        clock.unix_timestamp = increased.end_timestamp.unwrap() + 86_400;
+        ctx.set_sysvar(&clock);
+
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_arns::ID,
+                accounts: ario_arns::accounts::IncreaseUndernameFromWithdrawal {
+                    config: setup.config_key,
+                    demand_factor: setup.demand_factor_key,
+                    arns_record: record_key,
+                    gar_settings: gar_settings_key,
+                    withdrawal: withdrawal_key,
+                    stake_token_account: setup.stake_token.pubkey(),
+                    protocol_token_account: setup.treasury.pubkey(),
+                    caller: setup.operator,
+                    gar_program: ario_gar::ID,
+                    token_program: spl_token::id(),
+                }
+                .to_account_metas(None),
+                data: ario_arns::instruction::IncreaseUndernameLimitFromWithdrawal { quantity: 1 }
+                    .data(),
+            }],
+            Some(&setup.operator),
+            &[&operator_kp],
+            blockhash,
+        );
+        let result = ctx.banks_client.process_transaction(tx).await;
+        assert_anchor_error!(result, ArnsError::RecordExpired);
+    }
+
     #[tokio::test]
     async fn test_buy_name_from_funding_plan_balance_only() {
         // 1-source funding plan: pure Balance source. Equivalent to the
@@ -9887,6 +10615,20 @@ mod fund_from_stake {
 
         let name = "fp-mg-ext".to_string();
         let record_key = buy_lease_for_manage(&mut ctx, &setup, ant_key, &name, 1).await;
+        // Extending must not move `purchase_price` — see
+        // `test_extend_and_increase_from_withdrawal_leave_purchase_price`.
+        let price_before = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(record_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap()
+        .purchase_price;
 
         // Upgrade fee = base × 4 (permabuy formula). 8-char base = 500 ARIO →
         // upgrade cost ~2000 ARIO. Stake 1500 ARIO per gateway covers split.
@@ -9960,6 +10702,22 @@ mod fund_from_stake {
             read_delegation_amount(&mut ctx, del2).await,
             stake_per - pay2
         );
+        assert_eq!(
+            ArnsRecord::try_deserialize(
+                &mut ctx
+                    .banks_client
+                    .get_account(record_key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+            )
+            .unwrap()
+            .purchase_price,
+            price_before,
+            "extending from a funding plan must not change purchase_price"
+        );
     }
 
     #[tokio::test]
@@ -9990,6 +10748,19 @@ mod fund_from_stake {
 
         let name = "fp-mg-und".to_string();
         let record_key = buy_lease_for_manage(&mut ctx, &setup, ant_key, &name, 1).await;
+        // Buying undernames must not move `purchase_price`.
+        let price_before = ArnsRecord::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(record_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice(),
+        )
+        .unwrap()
+        .purchase_price;
 
         // Upgrade fee = base × 4 (permabuy formula). 8-char base = 500 ARIO →
         // upgrade cost ~2000 ARIO. Stake 1500 ARIO per gateway covers split.
@@ -10064,6 +10835,22 @@ mod fund_from_stake {
         assert_eq!(
             read_delegation_amount(&mut ctx, del2).await,
             stake_per - pay2
+        );
+        assert_eq!(
+            ArnsRecord::try_deserialize(
+                &mut ctx
+                    .banks_client
+                    .get_account(record_key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .as_slice(),
+            )
+            .unwrap()
+            .purchase_price,
+            price_before,
+            "buying undernames from a funding plan must not change purchase_price"
         );
     }
 }

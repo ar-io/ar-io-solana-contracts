@@ -120,13 +120,32 @@ features_for() {
 
 if [[ "${1:-}" == "--all" ]]; then
     overall=0
+    # Full output goes to a per-program log so a failure stays diagnosable.
+    # Piping straight into `grep "test result"` (as this did) prints a tidy
+    # summary but discards the failing test's name and panic message -- which
+    # makes a CI-only failure impossible to triage from the log alone.
+    log_dir="${TMPDIR:-/tmp}/ario-integration-logs.$$"
+    mkdir -p "$log_dir"
     for prog in ario-core ario-ant ario-gar ario-arns ario-ant-escrow; do
         echo ""
         echo "=== $prog integration ==="
-        if ! cargo test -p "$prog" --release $(features_for "$prog") --test integration 2>&1 | grep -E "test result"; then
+        log="$log_dir/$prog.log"
+        # `|| status=$?` rather than `if !` so `set -e` doesn't abort the loop.
+        status=0
+        cargo test -p "$prog" --release $(features_for "$prog") \
+            --test integration > "$log" 2>&1 || status=$?
+        grep -E "^test result" "$log" || true
+        if [[ "$status" -ne 0 ]]; then
             overall=1
+            echo "--- $prog FAILED (exit $status) — failing tests and panics ---"
+            grep -E "\.\.\. FAILED|^failures:|^thread .* panicked|^ *assertion|^ +left:|^ +right:|^    [a-z_]+::[a-z_]+$" \
+                "$log" | head -60 || true
+            echo "--- full log: $log ---"
         fi
     done
+    if [[ "$overall" -eq 0 ]]; then
+        rm -rf "$log_dir"
+    fi
     exit $overall
 elif [[ -n "${1:-}" ]]; then
     prog="$1"

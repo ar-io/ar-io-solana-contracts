@@ -126,18 +126,19 @@ pub fn migrate_gateway_settings_version(account: &mut GatewaySettings) -> Result
 
 /// Walk a `Gateway` account from its current version to `GATEWAY_VERSION`.
 ///
-/// NOTE: there is intentionally **no 1.0.0 → 1.1.0 arm**. The 1.1.0 bump added
-/// fields to `GatewaySettings2`, which is embedded MID-struct inside `Gateway`
-/// (before `registry_index`, `observer_address`, `cumulative_reward_per_token`,
-/// `bump`, `version`). The grow-then-deserialize pattern this module uses only
-/// works for fields appended at the byte-end (so the zeroed tail reads as the
-/// new trailing field); a mid-struct insertion shifts every subsequent field
-/// and would be misread. A correct in-place migration would require reading the
-/// old layout via a shadow struct. Since 1.1.0 ships pre-mainnet with a full
-/// devnet/staging redeploy, pre-1.1.0 gateways are **recreated, not migrated** —
-/// so `migrate_gateway` deliberately refuses 1.0.0 accounts (the `_` arm). If a
-/// future field is appended at the byte-end (after `version` moves), restore the
-/// normal arm pattern here.
+/// NOTE on the 1.0.0 → 1.1.0 arm: it exists, but it is a **version stamp only**
+/// (added in #137; this note previously claimed there was no such arm at all).
+///
+/// The 1.1.0 bump added fields to `GatewaySettings2`, which is embedded
+/// MID-struct inside `Gateway` (before `registry_index`, `observer_address`,
+/// `cumulative_reward_per_token`, `bump`, `version`). The grow-then-deserialize
+/// pattern this module uses only works for fields appended at the byte-end (so
+/// the zeroed tail reads as the new trailing field); a mid-struct insertion
+/// shifts every subsequent field and would be misread. So nothing is populated
+/// in that arm — an account reaching it has already been proven to carry the
+/// 1.1.0 layout physically, because `migrate_gateway` rejects anything smaller
+/// than `GATEWAY_SIZE_AT_V1_1_0` before deserializing. Only its `version` was
+/// never stamped forward. See the arm's own comment before changing it.
 #[allow(
     clippy::never_loop,
     clippy::while_immutable_condition,
@@ -152,6 +153,48 @@ pub fn migrate_gateway_version(account: &mut Gateway) -> Result<()> {
                 patch: 0,
             } => {
                 account.version = SchemaVersion::new(1, 0, 0);
+            }
+            // 1.0.0 -> 1.1.0 is a **version stamp only**, and deliberately so.
+            //
+            // The 1.1.0 change grew `GatewaySettings2` mid-struct, which is not
+            // expressible as a grow-then-deserialize migration (ADR-020 §3 is
+            // append-only for exactly this reason). So there is no field to
+            // populate here: an account that reaches this arm has already been
+            // proven to carry the 1.1.0 layout physically, because
+            // `migrate_gateway` rejects anything smaller than
+            // `GATEWAY_SIZE_AT_V1_1_0` before deserializing. Its `version` was
+            // simply never stamped forward.
+            //
+            // Do not "fix" this by writing defaults into `settings` — the
+            // fields are already populated and would be clobbered.
+            SchemaVersion {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            } => {
+                account.version = SchemaVersion::new(1, 1, 0);
+            }
+            // 1.1.0 -> 1.2.0 (ADR-0030): `operations_address` was appended after
+            // `version`. Set it to the operator, matching `join_network` and the
+            // M3 `observer_address` precedent.
+            //
+            // **Unconditionally.** What was just deserialized into this field is
+            // NOT zero padding: `grow_account` zero-fills only the bytes it adds
+            // (964 -> 996), while the field is read from right after `version`,
+            // inside the old 964 bytes, where an earlier and longer serialization
+            // can have left stale bytes — 30 of 620 mainnet gateways had them. A
+            // "default only if zero" rule would keep that garbage, and a shrink of
+            // exactly 52 bytes leaves the previous `observer_address` there.
+            //
+            // Overwriting cannot lose a real delegation: `update_operations_address`
+            // refuses accounts below 1.2.0, so none can exist yet.
+            SchemaVersion {
+                major: 1,
+                minor: 1,
+                patch: 0,
+            } => {
+                account.operations_address = account.operator;
+                account.version = SchemaVersion::new(1, 2, 0);
             }
             _ => return err!(GarError::UnknownSchemaVersion),
         }

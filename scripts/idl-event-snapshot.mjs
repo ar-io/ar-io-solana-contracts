@@ -21,7 +21,7 @@
  *   # adding new events, never to "fix" a failing check):
  *   node scripts/idl-event-snapshot.mjs --update
  *
- * Per ADR-017 (Anchor `#[event]` ABI policy): if an existing event
+ * Per ADR-018 (Anchor `#[event]` ABI policy): if an existing event
  * needs to change shape, ship a new `*EventV2` and deprecate the old
  * one — never mutate in place.
  */
@@ -213,7 +213,7 @@ if (issues.length === 0) {
 console.error('IDL event ABI BROKEN:');
 for (const issue of issues) console.error(`  - ${issue}`);
 console.error(
-  '\nPer ADR-017: shipped events are append-only. To intentionally ' +
+  '\nPer ADR-018: shipped events are append-only. To intentionally ' +
     'change a shipped event, ship a *EventV2 alongside the original.',
 );
 process.exit(1);

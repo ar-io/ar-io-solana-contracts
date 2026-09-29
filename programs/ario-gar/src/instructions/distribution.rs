@@ -7,7 +7,9 @@ use anchor_spl::token::{Token, TokenAccount};
 
 use crate::error::GarError;
 use crate::state::*;
-use crate::{EpochDistributedEvent, ARIO_CORE_PROGRAM_ID, RATE_SCALE};
+use crate::{
+    EpochDistributedEvent, EpochSkippedNoObservationsEvent, ARIO_CORE_PROGRAM_ID, RATE_SCALE,
+};
 
 /// Per-gateway intermediate computed during distribute_epoch's first pass.
 /// Holds the deserialized Gateway + the scalar per-gateway computations so
@@ -105,6 +107,71 @@ pub fn distribute_epoch<'info>(
         GarError::RewardsAlreadyDistributed
     );
 
+    // ADR-0034 addendum: an epoch that collected no observations pays nothing
+    // and credits nothing.
+    //
+    // Distribution does not only pay. Per gateway it also increments
+    // `stats.total_epochs`, and for any gateway it does not mark failed it
+    // increments `passed_epochs` and `passed_consecutive` AND resets
+    // `failed_consecutive` to 0. A gateway is only ever marked failed when
+    // `observations_submitted > 0` (see the `failed` computation below). So
+    // paying out an unobserved epoch would record a PASS for every gateway —
+    // wiping the failure streak of any gateway heading for the
+    // 30-consecutive-failure prune, and lifting the epoch pass rate that gates
+    // ArNS operator-discount eligibility at 90%. An outage would launder the
+    // record of exactly the gateways the incentive protocol exists to catch, on
+    // top of paying them. Skipping costs honest operators that period's rewards
+    // — the tokens stay in the treasury and fund later epochs — and that is the
+    // lesser harm.
+    //
+    // The condition is the evidence vacuum, not the schedule: this fires for a
+    // live epoch in which every prescribed observer failed to submit, exactly
+    // as it does for a catch-up epoch created after its own window closed.
+    // That consequence is accepted in the addendum.
+    //
+    // `distribution_index == 0` is an UPGRADE-SAFETY guard, not part of the
+    // ADR's condition. The pre-Wave-2 program distributes a zero-observation
+    // epoch normally, so one can be *partially* paid when this upgrade lands:
+    // the treasury transfer has happened and gateways `0..k` already carry
+    // credited stake and a passed-epoch stat. Skipping from there would record
+    // a half-paid epoch as a clean skip and strand the remainder. When the
+    // cursor has already moved, fall through and finish the distribution the
+    // way the old program would have — the epoch is no longer an evidence
+    // vacuum, it is an in-progress payout.
+    if epoch.observations_submitted == 0 && epoch.distribution_index == 0 {
+        let epoch_index = epoch.epoch_index;
+        let active_gateway_count = epoch.active_gateway_count;
+
+        // Mark complete so the epoch satisfies ADR-0034's `create_epoch`
+        // predicate and ADR-0036's `finalize_gone` predicate. No `Gateway.stats`,
+        // no `cumulative_reward_per_token`, and no treasury transfer are touched.
+        epoch.distribution_index = active_gateway_count;
+        epoch.rewards_distributed = 1;
+
+        drop(epoch);
+        drop(registry);
+
+        // Emit both, in this order. `EpochDistributedEvent` cannot carry a
+        // discriminator — its shape is frozen (ADR-018), and a normal
+        // distribution can legitimately report zero totals when no gateway was
+        // eligible, so zero totals do not identify a skip. The new event is the
+        // stable discriminator; the old one is what the cranker, observer and
+        // SDK already watch to advance, so it must still fire.
+        emit!(EpochSkippedNoObservationsEvent {
+            epoch_index,
+            active_gateway_count,
+            timestamp: clock.unix_timestamp,
+        });
+        emit!(EpochDistributedEvent {
+            epoch_index,
+            gateways_processed: 0,
+            total_eligible_rewards: 0,
+            timestamp: clock.unix_timestamp,
+        });
+
+        return Ok(());
+    }
+
     let active_count = epoch.active_gateway_count as usize;
     let observations_submitted = epoch.observations_submitted;
     let per_gateway = epoch.per_gateway_reward;
@@ -170,13 +237,86 @@ pub fn distribute_epoch<'info>(
         );
 
         // Skip leaving gateways (matches Lua: gateway.status ~= "leaving").
-        // Leavers skip tally so their weights_epoch is stale; they get reward
-        // 0 regardless, so the freshness check is exempted for them.
+        // Leavers skip tally, so their weights_epoch is always stale.
         let is_leaving = gateway.status == GatewayStatus::Leaving;
-        if !is_leaving {
-            require!(
-                gateway.weights.weights_epoch == epoch.epoch_index,
-                GarError::WeightsNotTallied
+
+        // ADR-0032. A gateway whose weights were not stamped for THIS epoch was
+        // never tallied for it. Two ways to get there: it is leaving (leavers
+        // skip tally), or it entered the registry after `tally_weights` had
+        // already set `weights_tallied = 1` — which `WeightsAlreadyTallied`
+        // makes permanent for the epoch.
+        //
+        // This used to be a `require!(weights_epoch == epoch_index)` for
+        // non-leavers, which aborted the WHOLE batch. Because accounts are
+        // validated positionally against the cursor (the registry-vs-operator
+        // check above), the offending slot could not be skipped at any batch
+        // size or offset — so one mid-epoch join halted reward distribution
+        // network-wide until that operator left. That is exactly what happened
+        // on mainnet epoch 540 (2026-09-11) and to staging epochs 790/791.
+        //
+        // Staleness is now a reward-eligibility term instead of a revert: such
+        // a gateway is traversed and earns 0, the same outcome a leaver already
+        // gets. See `is_eligible` below for why this is strictly stronger than
+        // the guard it replaces.
+        let weights_epoch = gateway.weights.weights_epoch;
+        let weights_stale = weights_epoch != epoch.epoch_index;
+
+        // Was this gateway outside the epoch's earning set to begin with? Same
+        // test `tally_weights` uses to force `effective_composite = 0`
+        // (SHOULD-13, epoch.rs) and therefore the same population
+        // `prescribe_epoch` excluded from the `joined_count` divisor. Read off
+        // the Gateway account, not the registry slot, so it cannot drift from
+        // the copy tally consulted.
+        let outside_earning_set = gateway.start_timestamp > epoch.start_timestamp;
+
+        // ADR-0032, and the reason staleness is not simply "skip and pay 0".
+        //
+        // `weights_epoch` is a SINGLE shared field per Gateway, re-stamped by
+        // whichever epoch was tallied most recently, in EITHER direction --
+        // `tally_weights`' only epoch precondition is `weights_tallied == 0`
+        // (epoch.rs), with no time gate and no ordering gate, so a later tally
+        // of a *newer* epoch or a belated tally of an older, partially-tallied
+        // one both overwrite this epoch's stamp. Staleness therefore covers two
+        // populations the shared field cannot distinguish:
+        //
+        //   Outside the earning set (joined after this epoch started)
+        //     `prescribe_epoch` already excluded it from the `joined_count`
+        //     divisor, so it is owed nothing. Per-gateway: skip it, pay 0, and
+        //     do NOT let it block everyone else. This is the mainnet epoch 540
+        //     / lazygiraffe case this change exists to fix.
+        //
+        //   Inside the earning set, but its stamp was overwritten
+        //     It WAS tallied for this epoch and IS baked into
+        //     `per_gateway_reward` via the divisor -- yet its weights are gone
+        //     and cannot be reconstructed. Paying 0 here would under-allocate
+        //     the pool, permanently forfeit that gateway's and its DELEGATES'
+        //     rewards, and still set `rewards_distributed = 1` while emitting
+        //     EpochDistributedEvent -- indistinguishable from success, and
+        //     unrecoverable (`RewardsAlreadyDistributed` blocks any retry).
+        //     There is no correct payout to compute, so fail loudly and let an
+        //     operator decide; `admin_close_stale_epoch` is the deliberate
+        //     write-off. Staging 790/791 reached this state in Aug 2026 via
+        //     racing crankers, and mainnet 540 is in it now after epoch 541's
+        //     tally re-stamped every gateway in its undistributed range.
+        //
+        // Keying off `outside_earning_set` rather than the direction of the
+        // stamp is deliberate: it tests entitlement directly, using state a
+        // belated `tally_weights` cannot forge, instead of inferring it from
+        // which way the shared field happened to move.
+        //
+        // Leavers are exempt: tally zeroes their composite and skips the stamp
+        // entirely, so their weights_epoch is arbitrarily old and they earn 0
+        // regardless.
+        require!(
+            is_leaving || !weights_stale || outside_earning_set,
+            GarError::EpochWeightsClobbered
+        );
+        if weights_stale && !is_leaving {
+            msg!(
+                "slot {} untallied for epoch {} (weights_epoch={}); reward 0",
+                dist_idx,
+                epoch.epoch_index,
+                weights_epoch
             );
         }
 
@@ -197,16 +337,29 @@ pub fn distribute_epoch<'info>(
 
         // Reward eligibility — mirror of the divisor. prescribe_epoch divides
         // the gateway pool by `joined_count` = registry slots with
-        // composite_weight > 0; a late-joiner (joined after epoch_start →
+        // composite_weight > 0; a gateway that joined after epoch_start (its
         // composite forced to 0 at tally, SHOULD-13 in epoch.rs) is excluded
-        // from that divisor. Its weights ARE fresh (it was tallied) so the
-        // freshness gate above passes — but it must NOT collect per_gateway, or
-        // the pool is paid to (J + late-joiners) while divided by J → systematic
+        // from that divisor, so it must NOT collect per_gateway either, or the
+        // pool is paid to (J + late-joiners) while divided by J → systematic
         // over-allocation of the gateway pool vs. total_eligible × ratio. Gating
         // here aligns the recipient set with the divisor set, matching Lua where
         // the active set used for the divisor IS the recipient set. (Leavers and
         // cleared slots also carry composite 0 but are handled above.)
-        let is_eligible = registry.gateways[dist_idx].composite_weight > 0;
+        //
+        // ADR-0032: `!weights_stale` is the second term, and it is what makes
+        // removing the old `require!` strictly *safer* rather than merely more
+        // live. A gateway that joined after tally carries composite_weight 0
+        // (join_network writes 0), so the first term already zeroes it — but a
+        // gateway that MISSED tally while its registry slot still holds a
+        // NONZERO composite_weight from an earlier epoch is the case the
+        // `require!` actually protected against, and the first term alone would
+        // pay it on stale weights. Keeping staleness here preserves that
+        // protection without the liveness cost.
+        //
+        // Do NOT stamp `weights_epoch` anywhere other than `tally_weights`
+        // (epoch.rs) — a second writer makes a never-tallied gateway look fresh
+        // and silently turns this term into a no-op.
+        let is_eligible = registry.gateways[dist_idx].composite_weight > 0 && !weights_stale;
 
         // 6-scenario reward calculation (matches Lua exactly):
         //   1. passed + prescribed + observed  → per_gateway + per_observer
@@ -356,10 +509,14 @@ pub fn distribute_epoch<'info>(
         }
 
         // Stats update — Lua-parity skip for gateways that did not participate
-        // in this epoch's active set: leavers AND composite-ineligible
-        // late-joiners (excluded from the reward divisor above). Ticking
-        // total/passed epochs for a late-joiner would inflate its future
-        // gateway_performance_ratio for an epoch it was excluded from earning.
+        // in this epoch's active set: leavers, composite-ineligible
+        // late-joiners (excluded from the reward divisor above), and — since
+        // ADR-0032 — gateways with stale weights, which never reached tally for
+        // this epoch at all. Ticking total/passed epochs for any of them would
+        // inflate a future gateway_performance_ratio for an epoch they were
+        // excluded from earning. `eligible` is the only carrier of that
+        // decision and this is its only consumer; token accounting keys off
+        // `full_reward` instead, which is already 0 in all three cases.
         if !p.is_leaving && p.eligible {
             p.gateway.stats.total_epochs = p.gateway.stats.total_epochs.saturating_add(1);
             if !p.failed {

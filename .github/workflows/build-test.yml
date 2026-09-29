@@ -50,6 +50,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Anchor derives error codes positionally (6000 + variant index), so a
+      # mid-enum insertion silently renumbers every later code and breaks every
+      # off-chain consumer matching on the old numbers (ADR-035). This reads the
+      # Rust source directly, so it needs no Anchor/Solana toolchain and keeps
+      # this job's "no anchor build" property. Runs first: it is ~instant, and
+      # an ABI break should not wait behind a clippy cycle.
+      - name: Error-code ABI stability check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # On a pull request, also require the COMMITTED snapshot to EXTEND
+          # the target branch's rather than rewrite it. Without that, a PR
+          # could regenerate or truncate error-code-snapshots.json and launder
+          # a renumbering straight past this check -- the snapshot is the
+          # guard, so its own integrity has to be checked too.
+          #
+          # Two very different things can stop us resolving the baseline, and
+          # they must NOT look alike: the base commit being unfetchable (the
+          # check would be silently inert -- fail loudly) versus the base
+          # genuinely predating the snapshot file (legitimately not
+          # applicable). Conflating them is how a guard ends up looking
+          # healthy while enforcing nothing.
+          # workflow_dispatch / workflow_call have no base SHA: plain check.
+          BASELINE=""
+          if [ -n "${BASE_SHA:-}" ]; then
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --depth=1 origin "$BASE_SHA" 2>/dev/null || true
+            fi
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::Could not resolve base commit $BASE_SHA, so the" \
+                   "snapshot-integrity comparison could not run. Failing" \
+                   "rather than passing silently."
+              exit 1
+            fi
+            if git show "$BASE_SHA:error-code-snapshots.json" \
+                 > /tmp/base-snapshot.json 2>/dev/null; then
+              BASELINE="--baseline /tmp/base-snapshot.json"
+              echo "baseline: error-code-snapshots.json @ $BASE_SHA"
+            else
+              echo "note: base commit $BASE_SHA resolved but carries no" \
+                   "error-code-snapshots.json -- baseline comparison not" \
+                   "applicable (expected only for the PR that introduces it)"
+            fi
+          fi
+          node scripts/error-code-snapshot.mjs $BASELINE
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

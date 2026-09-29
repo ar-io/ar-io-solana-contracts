@@ -158,4 +158,10 @@ pub enum ArnsError {
 
     #[msg("Unknown schema version — no migration path exists from this version")]
     UnknownSchemaVersion,
+
+    // ── APPEND-ONLY BELOW ──────────────────────────────────────────────────
+    // ADR-035: Anchor derives codes positionally, so new variants go at the
+    // END, always. `scripts/error-code-snapshot.mjs` enforces it.
+    #[msg("Increase would push the undername limit above MAX_UNDERNAME_LIMIT (BD-048)")]
+    UndernameLimitExceeded,
 }

@@ -43,6 +43,7 @@ pub const OBSERVER_LOOKUP_SEED: &[u8] = b"observer_lookup";
 // Epoch seeds
 pub const EPOCH_SEED: &[u8] = b"epoch";
 pub const EPOCH_SETTINGS_SEED: &[u8] = b"epoch_settings";
+pub const EPOCH_RENT_RECEIPT_SEED: &[u8] = b"epoch_rent_receipt";
 pub const OBSERVATION_SEED: &[u8] = b"observation";
 
 // =========================================
@@ -116,7 +117,72 @@ pub const GATEWAY_REGISTRY_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 // inside Gateway, this is NOT an in-place grow-then-deserialize migration — see
 // `schema_migration::migrate_gateway_version`. Existing pre-1.1.0 accounts are
 // recreated (devnet/staging full redeploy), not migrated.
-pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 1, 0);
+pub const GATEWAY_VERSION: SchemaVersion = SchemaVersion::new(1, 2, 0);
+/// Byte size of a `Gateway` account whose layout is 1.1.0 or later.
+///
+/// **This is a frozen historical constant. Never change it, and never redefine
+/// it in terms of `Gateway::SIZE`** — `Gateway::SIZE` grows with each appended
+/// field, while this value must keep meaning "large enough to already contain
+/// the 1.1.0 `GatewaySettings2`".
+///
+/// It is the layout fence for `migrate_gateway`. The 1.1.0 change grew
+/// `GatewaySettings2` by 12 bytes (`pending_delegate_reward_share_ratio`,
+/// `Option<u16>`, 3 + `delegation_disabled_at`, `Option<i64>`, 9), and
+/// `GatewaySettings2` sits **mid-struct** inside `Gateway`. A physically
+/// pre-1.1.0 account is therefore 952 bytes, and growing it would zero-fill the
+/// *tail* while every field after `settings` stayed shifted — silently
+/// corrupting `registry_index`, `observer_address`,
+/// `cumulative_reward_per_token`, `bump` and `version`. Such accounts cannot be
+/// migrated in place and are rejected outright.
+pub const GATEWAY_SIZE_AT_V1_1_0: usize = 964;
+
+/// First `Gateway` schema version in which `operations_address` holds a value
+/// this program wrote (ADR-0030).
+pub const OPERATIONS_ADDRESS_SINCE: SchemaVersion = SchemaVersion::new(1, 2, 0);
+
+/// Does a Gateway stamped `version` carry a real `operations_address`?
+///
+/// **Below 1.2.0 the field is not data.** It is decoded from whatever bytes
+/// follow `version`, and those are not reliably zero: Anchor's `Account::exit`
+/// (and `schema_migration::write_account`) write the serialized struct from
+/// offset 0 and never clear the bytes past its new end. A gateway whose content
+/// ever shrank — a shorter label, fqdn or note, or an `Option` going
+/// `Some -> None` — keeps its old tail bytes there. Measured before this check
+/// was added: 30 of 620 mainnet gateways and 1 of 620 on staging had non-zero
+/// bytes in that position.
+///
+/// The gateway's last 52 serialized bytes are `observer_address` (32),
+/// `cumulative_reward_per_token` (16), `bump` (1) and `version` (3), so a shrink
+/// of exactly 52 bytes leaves the **previous `observer_address`** — a real key
+/// that someone else may hold — exactly where `operations_address` is read.
+pub fn operations_address_is_set(version: SchemaVersion) -> bool {
+    version >= OPERATIONS_ADDRESS_SINCE
+}
+
+/// ADR-0030: may `signer` act for a gateway with these addresses at `version`?
+///
+/// The operator always may. The `operations_address` may only when the account
+/// is at `OPERATIONS_ADDRESS_SINCE` or later (see `operations_address_is_set`),
+/// and never when it is `Pubkey::default()`.
+///
+/// Extracted as a pure function because both refusals are awkward to reach from
+/// an integration test: nobody can sign as the zero pubkey (it is the System
+/// Program), and a stale-tail key has to be planted deliberately. Driving the
+/// instruction with an ordinary stranger passes whether or not either guard is
+/// present, so it proves nothing on its own.
+///
+/// Prefer `Gateway::authorises`, which cannot be handed mismatched fields.
+pub fn is_gateway_authority(
+    signer: &Pubkey,
+    operator: &Pubkey,
+    operations_address: &Pubkey,
+    version: SchemaVersion,
+) -> bool {
+    signer == operator
+        || (operations_address_is_set(version)
+            && *operations_address != Pubkey::default()
+            && signer == operations_address)
+}
 pub const DELEGATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_COUNTER_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const WITHDRAWAL_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
@@ -125,6 +191,7 @@ pub const OBSERVER_LOOKUP_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const REDELEGATION_RECORD_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const EPOCH_SETTINGS_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const EPOCH_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
+pub const EPOCH_RENT_RECEIPT_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 pub const OBSERVATION_VERSION: SchemaVersion = SchemaVersion::new(1, 0, 0);
 
 // =========================================
@@ -343,6 +410,24 @@ pub struct Gateway {
     pub cumulative_reward_per_token: u128,
     pub bump: u8,
     pub version: SchemaVersion,
+    /// ADR-0030: a second signer the operator may authorise for non-custodial
+    /// work — gateway metadata updates and spending the ArNS discount.
+    ///
+    /// Defaults to `operator` at `join_network`, and is rotatable **only** by
+    /// the operator: if this address could change itself, a compromised
+    /// delegate would rotate to an attacker key and lock the operator out
+    /// permanently.
+    ///
+    /// **Appended after `version` deliberately.** `grow_account` zero-fills the
+    /// tail, so a field at the very end is the only placement where migrating a
+    /// live account cannot shift anything already stored. See
+    /// `GATEWAY_SIZE_AT_V1_1_0` for what happens when a field grows mid-struct.
+    ///
+    /// **Only meaningful when `version >= OPERATIONS_ADDRESS_SINCE` (1.2.0).**
+    /// On an un-migrated account this field decodes from stale tail bytes, not
+    /// from zero padding — see `operations_address_is_set`. Always go through
+    /// `Gateway::authorises`, and never treat `Pubkey::default()` as a wildcard.
+    pub operations_address: Pubkey,
 }
 
 impl Gateway {
@@ -367,7 +452,8 @@ impl Gateway {
         + 32  // observer_address
         + 16  // cumulative_reward_per_token
         + 1   // bump
-        + SCHEMA_VERSION_SIZE; // version
+        + SCHEMA_VERSION_SIZE // version
+        + 32; // operations_address (ADR-0030, appended after version)
 
     /// Minimum operator stake required to join (in base units)
     pub const MIN_OPERATOR_STAKE: u64 = 20_000_000_000; // 20,000 ARIO
@@ -376,6 +462,18 @@ impl Gateway {
     pub fn total_stake(&self) -> u64 {
         self.operator_stake
             .saturating_add(self.total_delegated_stake)
+    }
+
+    /// ADR-0030: may `signer` act for this gateway? The single entry point for
+    /// every operator-or-operations-address check, in this program and in
+    /// ario-arns. See `is_gateway_authority`.
+    pub fn authorises(&self, signer: &Pubkey) -> bool {
+        is_gateway_authority(
+            signer,
+            &self.operator,
+            &self.operations_address,
+            self.version,
+        )
     }
 }
 
@@ -605,9 +703,24 @@ impl Delegation {
     pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1 + SCHEMA_VERSION_SIZE;
 }
 
-/// Settle pending delegate rewards using the reward-per-share accumulator.
-/// Called at the start of any delegate interaction to materialize pending rewards.
-pub fn settle_delegate_rewards(gateway: &mut Gateway, delegation: &mut Delegation) {
+/// Settle pending delegate rewards using the reward-per-share accumulator,
+/// materializing them into the delegation's principal. Called at the start of
+/// any delegate interaction.
+///
+/// **Returns the amount settled**, which the caller MUST add to
+/// `GatewaySettings.total_delegated` (ADR-0037). This function raises
+/// `gateway.total_delegated_stake`, and until ADR-0037 no caller raised the
+/// matching supply counter — `INVARIANTS.md` claimed the two stayed equal
+/// because both were "equally stale", which holds only until the first
+/// settlement. Measured on mainnet 2026-09-17, that drift was 80,442.894868
+/// ARIO.
+///
+/// Returning the amount rather than taking `settings` keeps this callable from
+/// `state`, which has no account context, and makes the obligation visible at
+/// every call site.
+#[must_use = "the settled amount must be added to GatewaySettings.total_delegated (ADR-0037)"]
+pub fn settle_delegate_rewards(gateway: &mut Gateway, delegation: &mut Delegation) -> u64 {
+    let mut settled: u64 = 0;
     if delegation.amount > 0 && gateway.cumulative_reward_per_token > delegation.reward_debt {
         let delta = gateway.cumulative_reward_per_token - delegation.reward_debt;
         // Overflow-safe reward calculation with precision-preserving fallback
@@ -628,9 +741,11 @@ pub fn settle_delegate_rewards(gateway: &mut Gateway, delegation: &mut Delegatio
             delegation.amount = delegation.amount.saturating_add(pending_u64);
             gateway.total_delegated_stake =
                 gateway.total_delegated_stake.saturating_add(pending_u64);
+            settled = pending_u64;
         }
     }
     delegation.reward_debt = gateway.cumulative_reward_per_token;
+    settled
 }
 
 // =========================================
@@ -913,11 +1028,17 @@ pub struct Epoch {
     /// Bitmap tracking which prescribed observers have submitted (50 bits = 7 bytes)
     pub has_observed: [u8; 7],
     pub version_bytes: [u8; 3],
-    pub _padding2: [u8; 2],
+    /// 1 once `create_epoch` wrote an `EpochRentReceipt` for this epoch, so
+    /// `close_epoch` knows the rent belongs to a recorded creator. Program-
+    /// controlled: the refund branch must NOT depend on which accounts the
+    /// caller chose to pass. Replaces one `_padding2` byte — no layout change.
+    pub has_rent_receipt: u8,
+    pub _padding2: [u8; 1],
 }
 
 impl Epoch {
     // 9*8 + 32 + 3*4 + 8*1 + MAX_GATEWAYS*2 + 50*32*2 + 2*32 + 7 + 5.
+    // The trailing 5 is version_bytes(3) + has_rent_receipt(1) + _padding2(1).
     // Production (3000 slots): 9400. Devnet-shrunk (30 slots): 3460 +
     // 4 bytes trailing repr(C) alignment pad = 3464; use mem::size_of
     // to capture either layout exactly without manual arithmetic.
@@ -952,6 +1073,39 @@ impl Epoch {
             false
         }
     }
+}
+
+// =========================================
+// EPOCH RENT RECEIPT (ADR-0029)
+// =========================================
+
+/// Records which account funded an `Epoch`'s rent so `close_epoch` refunds
+/// the creator rather than whoever wins the race to close (ADR-0029).
+/// PDA: ["epoch_rent_receipt", epoch_index.to_le_bytes()]
+///
+/// Auxiliary PDA instead of a `creator` field on `Epoch`: `Epoch` is
+/// zero-copy, so growing it would break `AccountLoader` for every epoch
+/// already on chain and pull in ADR-020's grow-then-deserialize migration
+/// constraints. This account is purely additive — `create_epoch` funds it,
+/// `close_epoch` refunds its ~0.0012 SOL to the same creator alongside the
+/// epoch's own rent.
+#[account]
+pub struct EpochRentReceipt {
+    /// The `create_epoch` payer, and therefore the only valid recipient of
+    /// this epoch's reclaimed rent.
+    pub creator: Pubkey,
+    /// Canonical bump for `["epoch_rent_receipt", epoch_index]`. Stored so
+    /// `close_epoch` can re-derive the address with `create_program_address`
+    /// instead of re-running the `find_program_address` search, saving
+    /// ~1.5k CU on the close path.
+    pub bump: u8,
+    pub version: SchemaVersion,
+}
+
+impl EpochRentReceipt {
+    /// 8 (discriminator) + 32 (creator) + 1 (bump) + 3 (version) = 44 bytes.
+    pub const SIZE: usize =
+        ANCHOR_DISCRIMINATOR_SIZE + PUBKEY_SIZE + BUMP_SIZE + SCHEMA_VERSION_SIZE;
 }
 
 /// Compute reward rate for a given epoch index
@@ -1652,6 +1806,7 @@ mod tests {
             cumulative_reward_per_token: 1_000_000_000_000_000_000, // 1e18
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1662,8 +1817,11 @@ mod tests {
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
         };
-        settle_delegate_rewards(&mut gateway, &mut delegation);
+        let settled = settle_delegate_rewards(&mut gateway, &mut delegation);
         assert_eq!(delegation.amount, 50_000_000); // unchanged
+                                                   // ADR-0037: nothing settled, so the caller adds nothing to
+                                                   // `settings.total_delegated`.
+        assert_eq!(settled, 0);
     }
 
     #[test]
@@ -1699,6 +1857,7 @@ mod tests {
             cumulative_reward_per_token: 2_000_000_000_000_000_000, // 2e18
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         };
         let mut delegation = Delegation {
             gateway: Pubkey::default(),
@@ -1710,11 +1869,20 @@ mod tests {
             version: SchemaVersion::new(1, 0, 0),
         };
         let old_total = gateway.total_delegated_stake;
-        settle_delegate_rewards(&mut gateway, &mut delegation);
+        let settled = settle_delegate_rewards(&mut gateway, &mut delegation);
         // pending = 100_000_000 * 1e18 / 1e18 = 100_000_000
         assert_eq!(delegation.amount, 200_000_000); // 100 + 100
         assert_eq!(delegation.reward_debt, 2_000_000_000_000_000_000);
         assert_eq!(gateway.total_delegated_stake, old_total + 100_000_000);
+        // ADR-0037: the returned amount is exactly what the gateway counter
+        // gained, and is what the caller must add to
+        // `settings.total_delegated`. Before ADR-0037 nothing did, which is how
+        // mainnet drifted 80,442.894868 ARIO.
+        assert_eq!(settled, 100_000_000);
+        assert_eq!(
+            gateway.total_delegated_stake,
+            old_total.saturating_add(settled)
+        );
     }
 
     // =========================================
@@ -1930,6 +2098,7 @@ mod tests {
             cumulative_reward_per_token: 0,
             bump: 0,
             version: SchemaVersion::new(1, 0, 0),
+            operations_address: Pubkey::default(),
         }
     }
 
@@ -2013,5 +2182,219 @@ mod tests {
             AllowlistEntry::SIZE,
             "AllowlistEntry::SIZE drift"
         );
+    }
+
+    #[test]
+    fn epoch_rent_receipt_size_matches_serialized() {
+        let r = EpochRentReceipt {
+            creator: Pubkey::default(),
+            bump: 0,
+            version: SchemaVersion::new(1, 0, 0),
+        };
+        let mut buf = Vec::new();
+        r.try_serialize(&mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            EpochRentReceipt::SIZE,
+            "EpochRentReceipt::SIZE drift"
+        );
+        // ADR-0029 quotes 44 bytes / 0.00119712 SOL; a silent grow would
+        // change the transient rent every epoch creation carries.
+        assert_eq!(EpochRentReceipt::SIZE, 44);
+    }
+
+    /// ADR-0029 repurposed one `_padding2` byte as `has_rent_receipt`. The
+    /// whole point of that choice is that live `Epoch` accounts keep
+    /// decoding, so pin both the total size and the offset of the byte that
+    /// moved into the tail immediately before it.
+    #[test]
+    fn epoch_rent_receipt_flag_is_layout_neutral() {
+        assert_eq!(Epoch::SIZE, 9400);
+        let version_off = std::mem::offset_of!(Epoch, version_bytes);
+        let flag_off = std::mem::offset_of!(Epoch, has_rent_receipt);
+        // version_bytes(3) then has_rent_receipt(1) then _padding2(1),
+        // ending exactly at SIZE — no field shifted, no byte added.
+        assert_eq!(flag_off, version_off + 3);
+        assert_eq!(flag_off + 1 + 1, Epoch::SIZE);
+        // Pinned absolutely: the flag occupies a byte the pre-ADR-0029
+        // program only ever wrote as zero, so every live Epoch reads back
+        // as "no receipt" and takes the `close = payer` fallback.
+        assert_eq!(flag_off, 9398);
+    }
+
+    // =========================================
+    // ADR-0030 authorisation predicate
+    // =========================================
+
+    /// **Deployment-safety invariant for ADR-0030.**
+    ///
+    /// After the upgrade, `Gateway::SIZE` is 996 but every live account is still
+    /// 964 until `migrate_gateway` runs. Those accounts stay readable only
+    /// because the appended `operations_address` is read out of the bytes after
+    /// the old content — which requires a real gateway's borsh content to leave
+    /// 32 bytes of slack inside the OLD 964-byte size. (Those bytes are readable,
+    /// not necessarily zero; `operations_address_is_set` is what stops them
+    /// being trusted.)
+    ///
+    /// The slack comes entirely from `properties`: `SIZE` reserves 4 + 256 for
+    /// it, but `join_network`, `update_gateway_settings` and
+    /// `update_gateway_metadata` all enforce `is_valid_arweave_id`, capping it at
+    /// 43 characters and saving 213 bytes.
+    ///
+    /// So this is not a comfortable margin, it is a consequence of a validation
+    /// rule. **If `properties` is ever allowed to hold an arbitrary 256-byte
+    /// string, un-migrated accounts will fail to deserialize and every gateway
+    /// instruction will break until the migration completes.** This test is what
+    /// catches that.
+    #[test]
+    fn validated_max_gateway_fits_in_the_pre_migration_size() {
+        let mut gw = gateway_at_max_size();
+        // The real validated maximum: an Arweave ID, not 256 arbitrary bytes.
+        gw.properties = "x".repeat(43);
+
+        let mut data = Vec::new();
+        gw.try_serialize(&mut data).unwrap();
+
+        assert!(
+            data.len() <= GATEWAY_SIZE_AT_V1_1_0,
+            "a validated-maximum Gateway serializes to {} bytes, which does not \
+             fit the pre-migration size of {}; un-migrated accounts would EOF",
+            data.len(),
+            GATEWAY_SIZE_AT_V1_1_0
+        );
+
+        // And the theoretical SIZE-formula maximum genuinely does NOT fit, which
+        // is why the validation rule above is load-bearing rather than incidental.
+        let mut wide = Vec::new();
+        gateway_at_max_size().try_serialize(&mut wide).unwrap();
+        assert!(
+            wide.len() > GATEWAY_SIZE_AT_V1_1_0,
+            "if this ever fits, the margin no longer depends on properties \
+             validation and this test's premise needs revisiting"
+        );
+    }
+
+    const V1_1_0: SchemaVersion = SchemaVersion::new(1, 1, 0);
+
+    #[test]
+    fn zeroed_operations_address_authorises_nobody() {
+        let operator = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+        let zero = Pubkey::default();
+
+        // The case an integration test cannot reach: the zero pubkey is the
+        // System Program, so no keypair can present it as a signer. Checked at
+        // the current version, where the field IS trusted, so that it is the
+        // zero guard doing the refusing and not the version gate.
+        assert!(
+            !is_gateway_authority(&zero, &operator, &zero, GATEWAY_VERSION),
+            "a zeroed operations_address must never authorise the zero pubkey"
+        );
+        assert!(!is_gateway_authority(
+            &stranger,
+            &operator,
+            &zero,
+            GATEWAY_VERSION
+        ));
+        assert!(is_gateway_authority(
+            &operator,
+            &operator,
+            &zero,
+            GATEWAY_VERSION
+        ));
+    }
+
+    #[test]
+    fn operations_address_authorises_only_itself_and_the_operator() {
+        let operator = Pubkey::new_unique();
+        let ops = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+
+        assert!(is_gateway_authority(
+            &operator,
+            &operator,
+            &ops,
+            GATEWAY_VERSION
+        ));
+        assert!(is_gateway_authority(&ops, &operator, &ops, GATEWAY_VERSION));
+        assert!(!is_gateway_authority(
+            &stranger,
+            &operator,
+            &ops,
+            GATEWAY_VERSION
+        ));
+    }
+
+    #[test]
+    fn operations_address_is_ignored_below_1_2_0() {
+        let operator = Pubkey::new_unique();
+        let ops = Pubkey::new_unique();
+
+        assert_eq!(OPERATIONS_ADDRESS_SINCE, SchemaVersion::new(1, 2, 0));
+        assert!(!operations_address_is_set(SchemaVersion::new(0, 0, 0)));
+        assert!(!operations_address_is_set(SchemaVersion::new(1, 0, 0)));
+        assert!(!operations_address_is_set(V1_1_0));
+        assert!(operations_address_is_set(SchemaVersion::new(1, 2, 0)));
+        assert!(
+            operations_address_is_set(SchemaVersion::new(1, 3, 0)),
+            "later layouts still carry the field"
+        );
+        assert!(operations_address_is_set(SchemaVersion::new(2, 0, 0)));
+
+        // Below 1.2.0 a non-zero value in the field authorises nobody...
+        assert!(!is_gateway_authority(&ops, &operator, &ops, V1_1_0));
+        // ...while the operator is unaffected.
+        assert!(is_gateway_authority(&operator, &operator, &ops, V1_1_0));
+    }
+
+    /// The defect this gate exists for, reproduced with the real types.
+    ///
+    /// The previous program (no `operations_address`) serializes a gateway, then
+    /// re-serializes it 52 bytes shorter. Anchor's `exit` does not clear the tail,
+    /// so the old `observer_address` is left exactly where the new layout reads
+    /// `operations_address`.
+    #[test]
+    fn stale_tail_can_hold_the_old_observer_and_is_not_trusted() {
+        // Previous-program layout = current layout minus the trailing 32 bytes.
+        let old_layout = |g: &Gateway| {
+            let mut v = Vec::new();
+            g.try_serialize(&mut v).unwrap();
+            v.truncate(v.len() - 32);
+            v
+        };
+        let old_observer = Pubkey::new_unique();
+        let new_observer = Pubkey::new_unique();
+
+        let mut before = gateway_at_max_size();
+        before.operator = Pubkey::new_unique();
+        before.properties = "x".repeat(43);
+        before.note = "n".repeat(100);
+        before.observer_address = old_observer;
+        before.version = V1_1_0;
+
+        let mut after = before.clone();
+        after.note = "n".repeat(48); // content shrinks by exactly 52 bytes
+        after.observer_address = new_observer;
+
+        let mut account = vec![0u8; GATEWAY_SIZE_AT_V1_1_0];
+        let first = old_layout(&before);
+        account[..first.len()].copy_from_slice(&first);
+        let second = old_layout(&after);
+        account[..second.len()].copy_from_slice(&second); // no tail clear, like Anchor
+        assert_eq!(first.len() - second.len(), 52);
+
+        let decoded = Gateway::try_deserialize(&mut &account[..]).unwrap();
+        assert_eq!(decoded.version, V1_1_0);
+        assert_eq!(decoded.observer_address, new_observer);
+        assert_eq!(
+            decoded.operations_address, old_observer,
+            "precondition: the stale tail really does decode as the old observer key"
+        );
+
+        assert!(
+            !decoded.authorises(&old_observer),
+            "an un-migrated gateway must not honour a key read from its stale tail"
+        );
+        assert!(decoded.authorises(&decoded.operator));
     }
 }

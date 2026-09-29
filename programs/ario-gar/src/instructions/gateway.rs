@@ -3,6 +3,7 @@ use anchor_lang::system_program::{self as anchor_system_program, Allocate, Assig
 use anchor_spl::token::{self, Token, TokenAccount, Transfer as SplTransfer};
 
 use crate::error::GarError;
+use crate::instructions::epoch::require_latest_epoch_finished;
 use crate::is_valid_arweave_id;
 use crate::state::*;
 use crate::{
@@ -97,6 +98,8 @@ pub fn join_network(ctx: Context<JoinNetwork>, params: JoinNetworkParams) -> Res
     };
     // M3: Observer address (client passes operator key for default)
     gateway.observer_address = params.observer_address;
+    // ADR-0030: a new gateway delegates nothing until the operator says so.
+    gateway.operations_address = gateway.operator;
 
     // SHOULD-9: Initialize observer lookup for uniqueness enforcement
     let observer_lookup = &mut ctx.accounts.observer_lookup;
@@ -513,6 +516,136 @@ pub fn update_gateway_settings(
     Ok(())
 }
 
+/// ADR-0030: update the routing/presentation metadata of a gateway.
+///
+/// Accepts the operator **or** the gateway's `operations_address`, so routine
+/// maintenance no longer requires loading the staking wallet into a browser.
+///
+/// Deliberately separate from `update_gateway_settings`, which stays
+/// operator-only and byte-identical. The split is by signer rather than by a
+/// mode flag, so the delegation-economics fields are not merely rejected for a
+/// delegated signer — they are absent from this instruction's params entirely
+/// and cannot be reached by malformed input.
+///
+/// Blast radius of a compromised operations key is bounded to exactly this:
+/// misroute the gateway (costing its own rewards until the operator rotates)
+/// and spend the ArNS discount. It cannot touch stake, leave the network, harm
+/// delegators, or make itself permanent.
+pub fn update_gateway_metadata(
+    ctx: Context<UpdateGatewayMetadata>,
+    params: crate::UpdateGatewayMetadataParams,
+) -> Result<()> {
+    let signer = ctx.accounts.signer.key();
+    let gateway = &mut ctx.accounts.gateway;
+
+    require!(
+        gateway.status == GatewayStatus::Joined,
+        GarError::GatewayLeaving
+    );
+
+    // Authorisation. `Gateway::authorises` honours the operations address only
+    // once the account is at 1.2.0 — below that the field is stale tail bytes —
+    // and never when it is the zero pubkey. Both refusals are unit-tested there.
+    require!(gateway.authorises(&signer), GarError::NotGatewayAuthority);
+
+    // Same validation as update_gateway_settings — a delegated signer must not
+    // be able to write values the operator could not.
+    let mut fields_changed: u32 = 0;
+
+    if let Some(label) = params.label {
+        require!(
+            !label.is_empty() && label.len() <= 64,
+            GarError::InvalidLabel
+        );
+        gateway.label = label;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_LABEL;
+    }
+    if let Some(fqdn) = params.fqdn {
+        require!(!fqdn.is_empty() && fqdn.len() <= 128, GarError::InvalidFqdn);
+        gateway.fqdn = fqdn;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_FQDN;
+    }
+    if let Some(port) = params.port {
+        gateway.port = port;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_PORT;
+    }
+    if let Some(protocol) = params.protocol {
+        gateway.protocol = protocol;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_PROTOCOL;
+    }
+    if let Some(properties) = params.properties {
+        require!(is_valid_arweave_id(&properties), GarError::InvalidParameter);
+        gateway.properties = properties;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_PROPERTIES;
+    }
+    if let Some(note) = params.note {
+        require!(note.len() <= 256, GarError::InvalidParameter);
+        gateway.note = note;
+        fields_changed |= GATEWAY_SETTINGS_FIELD_NOTE;
+    }
+
+    emit!(crate::GatewayMetadataUpdatedEvent {
+        operator: gateway.operator,
+        signer,
+        fields_changed,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+
+/// ADR-0030: rotate the address authorised for non-custodial gateway work.
+///
+/// **Operator-gated, and that is the load-bearing rule of ADR-0030.** If
+/// `operations_address` could rotate itself, a compromised delegate would point
+/// it at an attacker key and the operator could never revoke it — the delegation
+/// would become irrevocable by the only party entitled to revoke it.
+///
+/// Setting it back to `operator` is how a delegation is revoked.
+pub fn update_operations_address(
+    ctx: Context<UpdateOperationsAddress>,
+    new_operations_address: Pubkey,
+) -> Result<()> {
+    let gateway = &mut ctx.accounts.gateway;
+
+    require!(
+        gateway.status == GatewayStatus::Joined,
+        GarError::GatewayLeaving
+    );
+    // Mandatory, not a convenience. Below 1.2.0 a delegation written here would
+    // be ignored by `Gateway::authorises` and then overwritten when the
+    // migration defaults the field to the operator — silently lost. Migration
+    // is permissionless and can ride in the same transaction.
+    require!(
+        operations_address_is_set(gateway.version),
+        GarError::GatewayNotMigrated
+    );
+    // A zeroed operations address would authorise nobody, but accepting it
+    // silently turns "revoke" into "brick the delegation" — revocation is
+    // setting it back to the operator, which is explicit and reversible.
+    require!(
+        new_operations_address != Pubkey::default(),
+        GarError::InvalidParameter
+    );
+    require!(
+        new_operations_address != gateway.operations_address,
+        GarError::InvalidParameter
+    );
+
+    let old_operations_address = gateway.operations_address;
+    gateway.operations_address = new_operations_address;
+
+    let clock = Clock::get()?;
+    emit!(crate::OperationsAddressUpdatedEvent {
+        operator: gateway.operator,
+        old_operations_address,
+        new_operations_address,
+        timestamp: clock.unix_timestamp,
+    });
+
+    Ok(())
+}
+
 /// Update the observer address for a gateway (SHOULD-9)
 /// Separate instruction because it needs Anchor-managed init/close for the lookup PDAs.
 pub fn update_observer_address(
@@ -552,6 +685,16 @@ pub fn update_observer_address(
 /// Prune a gateway that has exceeded maximum consecutive failures (F21)
 /// Permissionless — anyone can call if gateway has 30+ consecutive failures.
 /// Matches Lua: slash min operator stake, return remainder in withdrawal, remove from registry.
+///
+/// The remainder splits into the same two vaults as `leave_network`, with the
+/// same two lock periods (`gar.lua::pruneGateways` slashes and then calls
+/// `gar.leaveNetwork`, so the vaults are literally the leave path's):
+///   - Protected exit vault (min portion): `GATEWAY_LEAVE_PERIOD` (90 days).
+///   - Excess vault (above-min portion): `settings.withdrawal_period`
+///     (30 days default), as if the operator had used
+///     `withdraw_operator_stake`. Until 2026-09-17 this vault was given the
+///     90-day leave period here, locking a pruned operator's excess three
+///     times longer than a voluntary leaver's — see ADR-0038 and BD-102.
 pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'info>>) -> Result<()> {
     let clock = Clock::get()?;
     let settings = &ctx.accounts.settings;
@@ -575,8 +718,14 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
     let slash_amount = std::cmp::min(settings.min_operator_stake, gateway.operator_stake);
     let post_slash = gateway.operator_stake.saturating_sub(slash_amount);
     let now = clock.unix_timestamp;
+    // Protected exit vault: the 90-day leave lock.
     let available_at = now
         .checked_add(GATEWAY_LEAVE_PERIOD)
+        .ok_or(GarError::ArithmeticOverflow)?;
+    // Excess vault: the regular withdrawal lock, read from settings so
+    // `admin_set_withdrawal_period` applies here as it does in `leave_network`.
+    let excess_available_at = now
+        .checked_add(settings.withdrawal_period)
         .ok_or(GarError::ArithmeticOverflow)?;
 
     // Lua-faithful split — same shape as leave_network, but operating on
@@ -687,7 +836,7 @@ pub fn prune_gateway<'info>(ctx: Context<'_, '_, 'info, 'info, PruneGateway<'inf
             gateway: operator_key,
             amount: excess_amount,
             created_at: now,
-            available_at,
+            available_at: excess_available_at,
             is_delegate: false,
             is_exit_vault: true,
             is_protected: false,
@@ -968,6 +1117,43 @@ pub struct UpdateGatewaySettings<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateGatewayMetadata<'info> {
+    /// CHECK: identifies WHICH gateway, by seeding the PDA. Not a signer — that
+    /// is the whole point of this instruction. The `seeds` + `bump` check below
+    /// proves `gateway` is the canonical PDA for this operator, so a caller
+    /// cannot pair an arbitrary operator with someone else's gateway account.
+    pub operator: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, operator.key().as_ref()],
+        bump = gateway.bump,
+        constraint = gateway.operator == operator.key() @ GarError::NotOperator,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    /// Either the operator or the gateway's `operations_address`; checked in the
+    /// handler against the deserialized account, not by an Anchor constraint,
+    /// because the zero-pubkey case has to be excluded explicitly.
+    pub signer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateOperationsAddress<'info> {
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, operator.key().as_ref()],
+        bump = gateway.bump,
+        constraint = gateway.operator == operator.key() @ GarError::NotOperator,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    /// The staking wallet. Deliberately the only signer accepted here: see
+    /// `update_operations_address`.
+    pub operator: Signer<'info>,
+}
+
+#[derive(Accounts)]
 #[instruction(new_observer: Pubkey)]
 pub struct UpdateObserverAddress<'info> {
     #[account(
@@ -1145,6 +1331,35 @@ pub fn finalize_gone<'info>(ctx: Context<'_, '_, 'info, 'info, FinalizeGone<'inf
         GarError::DelegationsOutstanding
     );
 
+    // ADR-0036: registry positions are frozen while an epoch is unfinished.
+    // This is the only instruction that moves a slot or decreases
+    // `registry.count`, and observations and distribution both address
+    // gateways by position (`epoch.failure_counts[i]` against
+    // `registry.gateways[i]`). A swap-remove between an epoch's snapshot and
+    // its distribution therefore mis-scores gateways — on mainnet epoch 542 it
+    // paid `lasaucisse` as passed when all 11 observers had failed it.
+    //
+    // Inspecting only the LATEST epoch is sufficient only because ADR-0034
+    // guarantees no older epoch can still be unfinished. See
+    // `require_latest_epoch_finished`.
+    //
+    // **This narrows GC to the gap between one epoch's distribution and the
+    // next epoch's creation**, which for a prompt cranker is short (23 minutes
+    // on mainnet 2026-09-16; in principle seconds). ADR-0036 accepts that and
+    // names the mitigation: a cranker makes its sweep race-free by putting
+    // `finalize_gone` in the SAME transaction as the final `distribute_epoch`
+    // batch — instructions execute in order, so they observe
+    // `rewards_distributed == 1` and no `create_epoch` can land in between. A
+    // sweep that misses the window simply succeeds in the next one; registry
+    // capacity is 3,000 slots against ~620 in use. If starvation is ever
+    // observed in practice, ADR-0036's option 3 (tombstone, compact later) is
+    // the escape hatch.
+    require_latest_epoch_finished(
+        ctx.accounts.epoch_settings.current_epoch_index,
+        ctx.remaining_accounts,
+        ctx.program_id,
+    )?;
+
     // Mark Gone. The PDA is closed by Anchor's `close = caller` on exit.
     gateway.status = GatewayStatus::Gone;
 
@@ -1172,24 +1387,27 @@ pub fn finalize_gone<'info>(ctx: Context<'_, '_, 'info, 'info, FinalizeGone<'inf
         let swapped_slot = registry.gateways[last_index];
         registry.gateways[index] = swapped_slot;
 
-        // Update the swapped gateway's stored registry_index.index via
-        // remaining_accounts[0]. Cranker MUST pass the swapped Gateway PDA
-        // (writable) at this position when index != last_index.
-        let remaining = ctx.remaining_accounts;
-        require!(!remaining.is_empty(), GarError::InvalidParameter);
-        let swapped_info = &remaining[0];
-        require!(swapped_info.is_writable, GarError::InvalidParameter);
-        require!(
-            swapped_info.owner == ctx.program_id,
-            GarError::InvalidParameter
-        );
-
+        // Update the swapped gateway's stored registry_index.index. The cranker
+        // MUST pass the swapped Gateway PDA (writable) in `remaining_accounts`
+        // when index != last_index.
+        //
+        // ADR-0036 changed this from `remaining_accounts[0]` to a match on the
+        // gateway's own PDA, because `remaining_accounts` now also carries the
+        // latest Epoch. Clients should still keep the swapped gateway first —
+        // the pre-ADR-0036 program reads position 0 — but this program does not
+        // depend on the order.
         let (expected_pda, _) = Pubkey::find_program_address(
             &[GATEWAY_SEED, swapped_slot.address.as_ref()],
             ctx.program_id,
         );
+        let swapped_info = ctx
+            .remaining_accounts
+            .iter()
+            .find(|info| info.key() == expected_pda)
+            .ok_or(GarError::InvalidParameter)?;
+        require!(swapped_info.is_writable, GarError::InvalidParameter);
         require!(
-            swapped_info.key() == expected_pda,
+            swapped_info.owner == ctx.program_id,
             GarError::InvalidParameter
         );
 

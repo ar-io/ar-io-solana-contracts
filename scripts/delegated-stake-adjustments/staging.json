@@ -1,0 +1,42 @@
+{
+  "cluster": "staging",
+  "description": "Delegations the 2026-06-11 staging remediation imported onto existing gateways without raising the gateway counter. Each gateway's live overcount is its genesis-snapshot overcount minus this amount (mARIO). See ADR-0037, section Staging.",
+  "adjustments": {
+    "34LYvMptiDvBP5sqfh1oAd6Q4qFsy4PWaZ1HTFmML7h5": {
+      "amount": "100148839994",
+      "delegation": "YK2YEB9ScLXbpZ7sw93EYGrAzkWFoXaSWm7JiwNjLKp",
+      "delegator": "BzJrfJuorgy7Dn7RwL2YhQuaficvLTwx1mWWgFeWBZjz",
+      "import_signature": "5y7uf5hcpCwpdhL24SsXA7DyPWTd9DjXM8WZueBtHZaPPD3qX96aNKTFFhCANyqoZUxy2FiocW935CVH4cJRVF6f"
+    },
+    "CgfqkKjQyJcWhFT1dCM5cd6XJs4PDzHXHRWM2wRgRQVD": {
+      "amount": "223765993",
+      "delegation": "86upcYrgjie2HUa1DitVWq2QGvoCM3DQJ8Cu3cLhY3cw",
+      "delegator": "HzNDPYo5uwinWmX1TTXppSZZosc7cy3Kbz5ndxPSMUaK",
+      "import_signature": "4BRdHqBoBJQcJUmGBABb5K8zs7kXE9UhNazmSsuKEzhAaAjD81gY3SqnzEkBMEAPSvZM3LQbrTAZqDcKfzvY1pY"
+    },
+    "CXt8zVzh2Lmrvn4wLJNucpbwb999LRWu4qfx4iFdWF5C": {
+      "amount": "234106863",
+      "delegation": "4tyesB9LwfujNRwVRHheVJH868y5nkpzVks3Lfqaun5S",
+      "delegator": "Gd5WRBmG6dkpTHKydi7muk4YmMxmasZEU2r7Vo1B69mt",
+      "import_signature": "51xHTE9eRq8QFEq6sMaD7JU3Mz7Y6sKCjUKXKbEm72Q3dgwYp36ThueKjLFHwHssrs9sMq5vRTtV2aa7uJeXsC2y"
+    },
+    "GYu9bBgHkhgTfNp7izn4uFz19xMEufN9Ny1eS4RwRDBB": {
+      "amount": "31935021490",
+      "delegation": "HzkXNTqJF5jp2YDWdxWHCW8HLC9zpBYqvFNnLyhyxjBE",
+      "delegator": "4N5nrWQZBkHBvDJg3G2UQ4e4r9UNsK6tzSFMPmi5Uc9e",
+      "import_signature": "5VaDGnpbbFz5ve6r3q6gaa9uztcfMNqG4NS97R62CkrB8Yxpc6e5NZnqTrG8ZBArTVjHMiXJKqXcYVgS716RiH8m"
+    },
+    "CkEU4i91YutQPShwKuNxfFamJRMixPdCPvnKKeLfTVuY": {
+      "amount": "2079125971",
+      "delegation": "7FfCvMzJ2WM41CRe7jpVB3PZUg4D18Pp5fZZehDqsVZV",
+      "delegator": "DkqrTXvCfYZnf7BsMMJDbXKkJ3gwWgL3CLsAkzCvXZdD",
+      "import_signature": "5ffazS8xmrjyZM6BR8CZT6QXZ768BUUA61de6bw5Cbj8TrDbbKFbjkf2SeXZ1cSZ9UZxyZRxndeVGfACD5h5VZJL"
+    },
+    "Ag9giHyEvATMg8PkFdqFzmDizmFbsMAyA5KSnuJekPQc": {
+      "amount": "114729265",
+      "delegation": "Cz1DRHH9tSGJ5FJEGsT5GvGAk2LvrNiTPtXR5XdTtZwn",
+      "delegator": "6AubircogkWWzJbJKxJuaZYskBKFmNtt3KeYhyHBow6d",
+      "import_signature": "3M8MU1F9gXeZMdqx4CRBGXV4bZbXPdHMp5DCvqNRHetQff7Aowx6rmS1FdGJ9jsphXd9ZcUxSe4kDp9x7HRvB7rt"
+    }
+  }
+}

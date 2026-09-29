@@ -64,6 +64,7 @@ runs ~80K CU on surfpool, well below the budget. See `programs/ario-arns/src/mpl
 | `RedelegationRecord`| 61          | `["redelegation", delegator_pubkey]` | Redelegation fee tracking |
 | `EpochSettings`     | 159         | `["epoch_settings"]` | Singleton epoch config; includes `disable_at` timelock (GAR-007) and `failed_gateway_slash_rate` |
 | `Epoch`             | 9,400       | `["epoch", epoch_index.to_le_bytes()]` | Zero-copy; embeds prescriptions, failure tallies |
+| `EpochRentReceipt`  | 44          | `["epoch_rent_receipt", epoch_index.to_le_bytes()]` | Records the `create_epoch` payer. `close_epoch` closes it alongside the epoch; `admin_close_stale_epoch` leaves it for `admin_close_orphaned_epoch_rent_receipt` (ADR-0029) |
 | `Observation`       | 466         | `["observation", epoch_index.to_le_bytes(), observer_pubkey]` | Per-observer observation report |
 
 **Gateway SIZE breakdown (942 bytes):**
@@ -338,11 +339,29 @@ pt.add_account(registry_key, Account { data, .. });
 | `prescribe_epoch` | ~4 | N observer gateways + 1 NameRegistry | ~4 + N + 1 |
 | `distribute_epoch` | ~6 (+ protocol_token_account, stake_token_account) | N gateways | ~6 + N |
 | `save_observations` | ~4 (epoch, observation, observer, system) | 0 | ~4 |
+| `admin_reconcile_delegated_stake` | 3 (settings, gateway, authority) | N Delegations (**all** of them) | 3 + N |
 
 Given the ~64 account limit, **practical batch sizes** are:
 - `tally_weights`: ~55 gateways per tx
 - `distribute_epoch`: ~55 gateways per tx (though CU limits to ~15 practically)
 - `prescribe_epoch`: limited by 50 observer gateway PDAs + 1 NameRegistry = ~51 remaining
+- `admin_reconcile_delegated_stake`: **not batchable** — the proof is only sound
+  if every Delegation of the gateway is in the one transaction, so N is fixed by
+  the gateway. The largest over-counted mainnet gateway has 50, which fits (~53
+  accounts) with an address lookup table. Cost grows with N (per-entry
+  deserialize + PDA check, plus an O(N²) duplicate scan), so raise the limit with
+  `ComputeBudgetProgram.setComputeUnitLimit` rather than relying on the 200k
+  default. A gateway with more Delegations than fit one transaction cannot be
+  reconciled this way; none exist today (ADR-0037).
+
+**Epoch-lifecycle `remaining_accounts` additions (ADR-0034 / ADR-0036).**
+`create_epoch` and `finalize_gone` each take one extra read-only account — the
+latest Epoch PDA — located by key, not by position:
+
+| Instruction | Extra account | Ordering |
+|---|---|---|
+| `create_epoch` | `["epoch", current_epoch_index - 1]` (omit at index 0) | after the ADR-0029 rent receipt, which must stay first **and must be present** for the pre-upgrade program |
+| `finalize_gone` | `["epoch", current_epoch_index - 1]` | after the swapped Gateway PDA, which the pre-upgrade program reads at position 0 |
 
 ---
 
@@ -375,6 +394,7 @@ Given the ~64 account limit, **practical batch sizes** are:
 | RedelegationRecord | `["redelegation", delegator_pubkey]` | ario-gar |
 | EpochSettings | `["epoch_settings"]` | ario-gar |
 | Epoch | `["epoch", epoch_index.to_le_bytes()]` | ario-gar |
+| EpochRentReceipt | `["epoch_rent_receipt", epoch_index.to_le_bytes()]` | ario-gar |
 | Observation | `["observation", epoch_index.to_le_bytes(), observer_pubkey]` | ario-gar |
 
 ### ario-arns

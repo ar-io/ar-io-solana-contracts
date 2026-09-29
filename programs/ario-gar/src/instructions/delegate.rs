@@ -5,8 +5,9 @@ use anchor_spl::token::{self, Token, TokenAccount, Transfer as SplTransfer};
 use crate::error::GarError;
 use crate::state::*;
 use crate::{
-    DelegationClosedEvent, DelegationDecreasedEvent, DelegationEvent, RedelegationEvent,
-    RewardsCompoundedEvent, RATE_SCALE,
+    DelegatedStakeReconciledEvent, DelegationClosedEvent, DelegationDecreasedEvent,
+    DelegationEvent, RedelegationEvent, RewardsCompoundedEvent, SupplyCountersResyncedEvent,
+    RATE_SCALE,
 };
 
 pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
@@ -57,11 +58,16 @@ pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
         }
     }
 
-    // Settle pending rewards for existing delegation
+    // Settle pending rewards for existing delegation. ADR-0037: the settled
+    // amount is added to `settings.total_delegated` below, alongside the
+    // deposit — settlement raises `gateway.total_delegated_stake`, so the
+    // supply counter has to move with it.
     let delegation = &mut ctx.accounts.delegation;
-    if delegation.amount > 0 {
-        settle_delegate_rewards(gateway, delegation);
-    }
+    let settled = if delegation.amount > 0 {
+        settle_delegate_rewards(gateway, delegation)
+    } else {
+        0
+    };
 
     let is_new = delegation.amount == 0;
 
@@ -103,11 +109,13 @@ pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
         timestamp: clock.unix_timestamp,
     });
 
-    // Supply counter: delegated stake increased
+    // Supply counter: delegated stake increased by the deposit AND by any
+    // rewards settled into principal above (ADR-0037).
     let settings = &mut ctx.accounts.settings;
     settings.total_delegated = settings
         .total_delegated
         .checked_add(amount)
+        .and_then(|v| v.checked_add(settled))
         .ok_or(GarError::ArithmeticOverflow)?;
 
     Ok(())
@@ -122,8 +130,10 @@ pub fn decrease_delegate_stake(ctx: Context<DecreaseDelegateStake>, amount: u64)
 
     require!(amount > 0, GarError::InvalidAmount);
 
-    // Settle pending rewards before modifying amounts
-    settle_delegate_rewards(gateway, delegation);
+    // Settle pending rewards before modifying amounts. ADR-0037: the settled
+    // amount is added to `settings.total_delegated` below, before this
+    // withdrawal's `amount` is subtracted from it.
+    let settled = settle_delegate_rewards(gateway, delegation);
 
     require!(delegation.amount >= amount, GarError::InsufficientStake);
 
@@ -174,9 +184,13 @@ pub fn decrease_delegate_stake(ctx: Context<DecreaseDelegateStake>, amount: u64)
         .checked_add(1)
         .ok_or(GarError::ArithmeticOverflow)?;
 
-    // Supply counter: delegated stake moved to withdrawal
+    // Supply counter: rewards settled into principal are added (ADR-0037),
+    // then the withdrawn amount moves from delegated to withdrawn.
     let settings = &mut ctx.accounts.settings;
-    settings.total_delegated = settings.total_delegated.saturating_sub(amount);
+    settings.total_delegated = settings
+        .total_delegated
+        .saturating_add(settled)
+        .saturating_sub(amount);
     settings.total_withdrawn = settings
         .total_withdrawn
         .checked_add(amount)
@@ -192,7 +206,13 @@ pub fn close_empty_delegation(ctx: Context<CloseEmptyDelegation>) -> Result<()> 
     // (amount should be 0 per constraint, but settle to be safe with reward_debt)
     let gateway = &mut ctx.accounts.gateway;
     let delegation = &mut ctx.accounts.delegation;
-    settle_delegate_rewards(gateway, delegation);
+    // ADR-0037: this is the one settling instruction that needs no `settings`
+    // account. `settle_delegate_rewards` can only credit rewards when
+    // `delegation.amount > 0`, and this instruction is constrained to
+    // `amount == 0`, so the settled amount is always 0 and there is nothing to
+    // add to the supply counter. Asserted rather than assumed.
+    let settled = settle_delegate_rewards(gateway, delegation);
+    require!(settled == 0, GarError::InvalidParameter);
 
     let delegator_pk = delegation.delegator;
     let gateway_pk = delegation.gateway;
@@ -226,8 +246,10 @@ pub fn claim_delegate_from_leaving_gateway(
         GarError::GatewayNotJoined
     );
 
-    // Settle pending rewards before claiming
-    settle_delegate_rewards(gateway, delegation);
+    // Settle pending rewards before claiming. ADR-0037: `amount` below is read
+    // AFTER settlement, so it already includes the settled rewards — the supply
+    // counter must gain them before it loses `amount`, or it under-counts.
+    let settled = settle_delegate_rewards(gateway, delegation);
 
     let amount = delegation.amount;
     require!(amount > 0, GarError::InvalidAmount);
@@ -278,9 +300,13 @@ pub fn claim_delegate_from_leaving_gateway(
         timestamp: clock.unix_timestamp,
     });
 
-    // Supply counter: delegated stake moved to withdrawal
+    // Supply counter: rewards settled into principal are added (ADR-0037),
+    // then the claimed amount moves from delegated to withdrawn.
     let settings = &mut ctx.accounts.settings;
-    settings.total_delegated = settings.total_delegated.saturating_sub(amount);
+    settings.total_delegated = settings
+        .total_delegated
+        .saturating_add(settled)
+        .saturating_sub(amount);
     settings.total_withdrawn = settings
         .total_withdrawn
         .checked_add(amount)
@@ -322,8 +348,10 @@ pub fn claim_delegate_from_disabled_gateway(
         GarError::DelegationNotDisabled
     );
 
-    // Settle pending rewards before claiming
-    settle_delegate_rewards(gateway, delegation);
+    // Settle pending rewards before claiming. ADR-0037: `amount` below is read
+    // AFTER settlement, so it already includes the settled rewards — the supply
+    // counter must gain them before it loses `amount`, or it under-counts.
+    let settled = settle_delegate_rewards(gateway, delegation);
 
     let amount = delegation.amount;
     require!(amount > 0, GarError::InvalidAmount);
@@ -370,9 +398,13 @@ pub fn claim_delegate_from_disabled_gateway(
         timestamp: clock.unix_timestamp,
     });
 
-    // Supply counter: delegated stake moved to withdrawal
+    // Supply counter: rewards settled into principal are added (ADR-0037),
+    // then the claimed amount moves from delegated to withdrawn.
     let settings = &mut ctx.accounts.settings;
-    settings.total_delegated = settings.total_delegated.saturating_sub(amount);
+    settings.total_delegated = settings
+        .total_delegated
+        .saturating_add(settled)
+        .saturating_sub(amount);
     settings.total_withdrawn = settings
         .total_withdrawn
         .checked_add(amount)
@@ -474,9 +506,13 @@ pub fn redelegate_stake(ctx: Context<RedelegateStake>, amount: u64) -> Result<()
         }
     }
 
-    // Settle pending rewards on both delegations before balance checks
-    settle_delegate_rewards(source_gateway, source_delegation);
-    settle_delegate_rewards(target_gateway, target_delegation);
+    // Settle pending rewards on both delegations before balance checks.
+    // ADR-0037: both settlements raise their gateway's counter, so both amounts
+    // are added to the supply counter below. The redelegated principal itself
+    // moves between gateways and nets to zero there — only the fee leaves.
+    let settled_source = settle_delegate_rewards(source_gateway, source_delegation);
+    let settled_target = settle_delegate_rewards(target_gateway, target_delegation);
+    let settled = settled_source.saturating_add(settled_target);
 
     // Balance checks AFTER settlement (settlement may increase source_delegation.amount)
     require!(
@@ -571,10 +607,14 @@ pub fn redelegate_stake(ctx: Context<RedelegateStake>, amount: u64) -> Result<()
         .checked_add(RedelegationRecord::FEE_RESET_INTERVAL)
         .ok_or(GarError::ArithmeticOverflow)?;
 
-    // Supply counter: fee leaves the delegated pool (goes to protocol)
-    if fee > 0 {
+    // Supply counter: rewards settled into principal on both sides are added
+    // (ADR-0037); the fee leaves the delegated pool (goes to protocol).
+    if settled > 0 || fee > 0 {
         let settings = &mut ctx.accounts.settings;
-        settings.total_delegated = settings.total_delegated.saturating_sub(fee);
+        settings.total_delegated = settings
+            .total_delegated
+            .saturating_add(settled)
+            .saturating_sub(fee);
     }
 
     emit!(RedelegationEvent {
@@ -607,7 +647,7 @@ pub fn compound_delegation_rewards(ctx: Context<CompoundDelegationRewards>) -> R
     let before = delegation.amount;
     let delegator_pk = delegation.delegator;
     let gateway_pk = delegation.gateway;
-    settle_delegate_rewards(gateway, delegation);
+    let settled = settle_delegate_rewards(gateway, delegation);
     let compounded = delegation.amount.saturating_sub(before);
 
     emit!(RewardsCompoundedEvent {
@@ -616,6 +656,17 @@ pub fn compound_delegation_rewards(ctx: Context<CompoundDelegationRewards>) -> R
         compounded,
         timestamp: Clock::get()?.unix_timestamp,
     });
+
+    // Supply counter: compounding moves pending rewards into delegated
+    // principal, so the supply counter must rise with the gateway counter
+    // (ADR-0037). This is the site that made `total_delegated` drift.
+    if settled > 0 {
+        let settings = &mut ctx.accounts.settings;
+        settings.total_delegated = settings
+            .total_delegated
+            .checked_add(settled)
+            .ok_or(GarError::ArithmeticOverflow)?;
+    }
 
     Ok(())
 }
@@ -988,4 +1039,280 @@ pub struct CompoundDelegationRewards<'info> {
     /// enables the off-chain monitor's Invariant 1 health check and
     /// unblocks `finalize_gone` for gateways with dormant pending rewards.
     pub delegator: UncheckedAccount<'info>,
+
+    /// ADR-0037. Compounding is the only settling instruction that could add
+    /// rewards without a `settings` account, which is how
+    /// `GatewaySettings.total_delegated` fell 80,442.894868 ARIO behind the sum
+    /// of the gateway counters on mainnet.
+    ///
+    /// Deliberately the **LAST** account: Anchor treats extra trailing accounts
+    /// as `remaining_accounts`, so a client that appends the settings PDA works
+    /// against both the pre-ADR-0037 program (which ignores it) and this one.
+    /// That is what lets clients ship first and removes the flag day — an
+    /// un-upgraded client is refused only after the program upgrade lands.
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+    )]
+    pub settings: Box<Account<'info, GatewaySettings>>,
+}
+
+// =========================================
+// ADR-0037 — DELEGATED-STAKE RECONCILIATION
+// =========================================
+
+/// Lower a gateway's `total_delegated_stake` to the sum of the Delegation
+/// accounts that actually back it (ADR-0037).
+///
+/// # Why this exists
+///
+/// The AO import wrote each gateway's counter from AO's total, but created
+/// Delegation accounts only for delegators who had a Solana address. The stake
+/// of the other 2,122 delegations went to the migration authority's pot at
+/// genesis and never entered the stake pool. So 132 mainnet gateways count
+/// **2,226,210.675676 ARIO** that no Delegation account and no pool token backs.
+///
+/// `counter − Σ Delegation.amount` is invariant under every other instruction,
+/// so those counters can never reach zero on their own: `finalize_gone` is
+/// blocked for good on 65 leaving gateways, re-enabling delegation is
+/// impossible, stake weight and observer-selection odds are inflated, and each
+/// epoch a delegate share is carved out and divided by the inflated counter.
+///
+/// # Why it is safe
+///
+/// The program cannot enumerate a gateway's Delegation accounts or prove it has
+/// seen all of them, so completeness comes from **two independent sources
+/// having to agree**:
+///
+/// * the Delegation list comes from `getProgramAccounts`;
+/// * `expected_removed` comes from the genesis snapshot (the gateway's unmapped
+///   AO stake).
+///
+/// If a Delegation were left out, the final check fails unless *both* sources
+/// are wrong by exactly the same amount. The plan must therefore take
+/// `expected_removed` from the snapshot, never from the same read that produced
+/// the Delegation list.
+///
+/// The counter can only ever be **lowered**, and only to the sum of the
+/// Delegation accounts it was *shown*.
+///
+/// # The residual risk this cannot rule out
+///
+/// The program cannot enumerate a gateway's Delegations, so "shown" is not the
+/// same as "all". If the caller omits one **and** `expected_removed` is wrong by
+/// exactly that amount, the counter is set below the real sum. Both halves of
+/// the plan coming from the same `getProgramAccounts` read makes that the
+/// *default* outcome rather than a coincidence — which is precisely why
+/// `expected_removed` must come from the genesis snapshot instead.
+///
+/// The consequence is not cosmetic: drive a counter to 0 while real Delegations
+/// exist and `finalize_gone` will close the Gateway PDA that
+/// `claim_delegate_from_leaving_gateway` needs, stranding that stake
+/// permanently. Only run entries the audit marks `verified`, and treat the
+/// audit's under-count check (exit status 1) as a required post-step, not an
+/// optional one. See ADR-0037, "Negative / risks".
+///
+/// # No epoch gate
+///
+/// Weights are cached at tally, so lowering the denominator before a
+/// distribution only sends a larger share to real delegates. If the sum is 0 the
+/// share takes the existing orphaned path and stays in the treasury (ADR-025).
+pub fn admin_reconcile_delegated_stake<'info>(
+    ctx: Context<'_, '_, 'info, 'info, AdminReconcileDelegatedStake<'info>>,
+    expected_counter: u64,
+    expected_removed: u64,
+) -> Result<()> {
+    let gateway = &mut ctx.accounts.gateway;
+
+    // 1. Staleness guard. Any delegation activity since the plan was computed
+    //    fails the call without writing; re-read and retry. An attacker cannot
+    //    mislead the reconcile this way, only delay it.
+    require!(
+        gateway.total_delegated_stake == expected_counter,
+        GarError::StaleDelegatedStakeCounter
+    );
+
+    // 2/3. Validate every supplied account and sum the real delegations.
+    let mut sum: u64 = 0;
+    let remaining = ctx.remaining_accounts;
+    for (i, info) in remaining.iter().enumerate() {
+        // No duplicates — passing one twice would double-count its amount and
+        // therefore under-remove from the counter.
+        require!(
+            !remaining[..i].iter().any(|prev| prev.key() == info.key()),
+            GarError::DuplicateDelegationAccount
+        );
+
+        // Owner + discriminator + deserialization, all via Anchor.
+        let delegation = Account::<Delegation>::try_from(info)
+            .map_err(|_| error!(GarError::InvalidDelegationAccount))?;
+
+        // Must belong to THIS gateway...
+        require!(
+            delegation.gateway == gateway.operator,
+            GarError::InvalidDelegationAccount
+        );
+
+        // ...and sit at its canonical PDA, so a same-shaped account at a
+        // non-canonical address cannot be substituted.
+        //
+        // Derived with the delegation's STORED bump rather than
+        // `find_program_address`, per this repo's PDA convention: the search
+        // costs ~1.5k CU per call and this loop runs once per Delegation. The
+        // largest over-counted mainnet gateway has 50, where the difference is
+        // the better part of the default 200k budget. Safe because only this
+        // program creates Delegation accounts, and it does so through Anchor's
+        // `init` with the canonical bump — so a program-owned account carrying
+        // the `Delegation` discriminator is always at its canonical address.
+        let expected_pda = Pubkey::create_program_address(
+            &[
+                DELEGATION_SEED,
+                gateway.operator.as_ref(),
+                delegation.delegator.as_ref(),
+                &[delegation.bump],
+            ],
+            ctx.program_id,
+        )
+        .map_err(|_| error!(GarError::InvalidDelegationAccount))?;
+        require!(
+            info.key() == expected_pda,
+            GarError::InvalidDelegationAccount
+        );
+
+        // Both sides hold settled principal, so no settlement is needed here.
+        sum = sum
+            .checked_add(delegation.amount)
+            .ok_or(GarError::ArithmeticOverflow)?;
+    }
+
+    // 5. The two independent sources must agree, and the counter may only fall.
+    require!(expected_removed > 0, GarError::DelegationReconcileMismatch);
+    let computed_removed = expected_counter
+        .checked_sub(sum)
+        .ok_or(GarError::DelegationReconcileMismatch)?;
+    require!(
+        computed_removed == expected_removed,
+        GarError::DelegationReconcileMismatch
+    );
+
+    let previous = gateway.total_delegated_stake;
+    gateway.total_delegated_stake = sum;
+
+    let settings = &mut ctx.accounts.settings;
+    settings.total_delegated = settings
+        .total_delegated
+        .checked_sub(expected_removed)
+        .ok_or(GarError::ArithmeticUnderflow)?;
+
+    emit!(DelegatedStakeReconciledEvent {
+        gateway: gateway.operator,
+        previous,
+        removed: expected_removed,
+        new: sum,
+        delegations_counted: remaining.len() as u32,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+
+/// Set `GatewaySettings.total_staked` and `total_delegated` to audited values,
+/// once, after the settlement fix is deployed and **every**
+/// `admin_reconcile_delegated_stake` in the plan has actually been EXECUTED
+/// (ADR-0037) — not merely deployed.
+///
+/// Order matters and is not enforced on-chain. Each reconcile subtracts its own
+/// `expected_removed` from `total_delegated`; if this instruction runs first and
+/// sets the counter to the audited, phantom-free value, every later reconcile
+/// subtracts again from an already-corrected figure, double-removing until one
+/// fails with `ArithmeticUnderflow` and leaves the counters half-corrected.
+/// Run the whole reconcile plan, re-run the audit, then resync.
+///
+/// These counters are **reporting-only** — no instruction reads them for
+/// anything but updating them — so this cannot change a payout. It exists
+/// because two separate defects left them wrong: settlement never raised
+/// `total_delegated` (mainnet drift 80,442.894868 ARIO), and the seeded values
+/// included the phantom counters the reconcile removes. On staging,
+/// `total_staked` is additionally 525,057.873339 below Σ operator stake,
+/// because its supply backfill ran *before* the remediation imported more
+/// operator stake through `import_account`.
+///
+/// `total_withdrawn` is deliberately left alone; it is exact on both clusters.
+///
+/// `migrate_settings_supply_counters` is **not** reused for this: it has no
+/// staleness guard, and it stops working once migration is finalized.
+pub fn admin_resync_supply_counters(
+    ctx: Context<AdminResyncSupplyCounters>,
+    expected_staked: u64,
+    new_staked: u64,
+    expected_delegated: u64,
+    new_delegated: u64,
+) -> Result<()> {
+    let settings = &mut ctx.accounts.settings;
+
+    // Both expected values must match before either is overwritten, so a plan
+    // computed against a stale read cannot land.
+    require!(
+        settings.total_staked == expected_staked && settings.total_delegated == expected_delegated,
+        GarError::StaleSupplyCounters
+    );
+
+    settings.total_staked = new_staked;
+    settings.total_delegated = new_delegated;
+
+    emit!(SupplyCountersResyncedEvent {
+        previous_staked: expected_staked,
+        new_staked,
+        previous_delegated: expected_delegated,
+        new_delegated,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct AdminReconcileDelegatedStake<'info> {
+    /// Authority gate. On mainnet this is the hot wallet `45ZuEb1J…`; on
+    /// staging it is the Squads V3 vault, so each call is a 2-of-4 ceremony.
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+    )]
+    pub settings: Box<Account<'info, GatewaySettings>>,
+
+    #[account(
+        mut,
+        seeds = [GATEWAY_SEED, gateway.operator.as_ref()],
+        bump = gateway.bump,
+    )]
+    pub gateway: Account<'info, Gateway>,
+
+    pub authority: Signer<'info>,
+    // `remaining_accounts`: EVERY Delegation account of this gateway,
+    // read-only. The largest over-counted gateway has 50 today, which fits a v0
+    // transaction with a lookup table (~55 accounts, under the 64 account-lock
+    // limit).
+    //
+    // Cost scales with that count: each entry is deserialized, PDA-checked, and
+    // compared against the ones before it (the duplicate check is O(n²) in
+    // pubkey compares). At the 50-delegation end that will not fit the default
+    // 200k compute budget — prepend a `ComputeBudgetProgram.setComputeUnitLimit`
+    // instruction when reconciling a gateway with more than a handful.
+}
+
+#[derive(Accounts)]
+pub struct AdminResyncSupplyCounters<'info> {
+    #[account(
+        mut,
+        seeds = [SETTINGS_SEED],
+        bump = settings.bump,
+        has_one = authority @ GarError::Unauthorized,
+    )]
+    pub settings: Box<Account<'info, GatewaySettings>>,
+
+    pub authority: Signer<'info>,
 }

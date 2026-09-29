@@ -270,6 +270,18 @@ pre-version** account (old SIZE, no version bytes), not a full-size one with
 if a future escrow field exceeds `_reserved`, convert it to
 grow-then-deserialize. See [`docs/adrs/0020-…`](docs/adrs/0020-schema-migration-grow-then-deserialize.md).
 
+**Appended fields are only data once `version` says so.** Bytes past a borsh
+account's serialized end are **not** reliably zero: Anchor's `Account::exit` and
+`schema_migration::write_account` never clear them, so an account whose
+variable-length content ever shrank carries stale bytes there — exactly where a
+newly appended field is read before migration (30 of 620 mainnet Gateways did;
+see the ADR-0030 addendum). So, for every field appended at the end:
+
+* gate every read on `version >=` the version that introduced it;
+* in the migration arm, assign it **unconditionally** — never "only if zero";
+* make any instruction that writes it require the account to be migrated first;
+* build test fixtures with **stale tail bytes**, not zero padding.
+
 ## Build & Test Commands
 
 > Comprehensive testing guide (patterns, troubleshooting, Surfpool
@@ -377,6 +389,16 @@ bash scripts/start-localnet.sh
 # CU regression tracking (run on event-emission / instruction-path PRs)
 bash scripts/cu-baseline.sh                     # capture baseline
 bash scripts/cu-baseline.sh --diff              # show deltas vs baseline
+
+# Rollout pre-flight — READ-ONLY. Run BEFORE and AFTER every program upgrade
+# and every migration batch. 0 = clear, 1 = findings, 2 = NOTHING WAS VERIFIED
+# (usage, RPC, program-id or decoder failure). A 2 is not a softer 1 — it means
+# the check did not run, so it must never be read as "checked and fine".
+node scripts/preflight-wave2.mjs --cluster staging
+AR_IO_RPC_URL=<rpc> node scripts/preflight-wave2.mjs --cluster mainnet --json out.json
+# Runs without a built checkout: falls back to the published
+# @ar.io/solana-contracts and accepts --program-ids <path>, so it works on a
+# gateway box. Prints which client decoded and its exact version.
 
 # Optional: install the pre-push hook (cargo fmt --check + clippy -D warnings)
 bash scripts/install-git-hooks.sh
@@ -539,8 +561,40 @@ node scripts/idl-event-snapshot.mjs --update  # bless intentional additions
 ```
 
 Adding a new event always lands in two commits (new event in source +
-snapshot bump). The CI `build-test.yml` workflow runs the check on
-every PR.
+snapshot bump). **This check runs only in `release.yml` and
+`upgrade-mainnet.yml`, not on pull requests** — it needs built IDLs, and
+`build-test.yml` deliberately does no `anchor build`. So a breaking
+event change surfaces at release/upgrade time, not in review. Run it
+locally after `anchor build` on any event-touching PR.
+
+### Anchor error-code ABI policy
+
+Per ADR-035: error variants are **append-only**. Anchor derives codes
+positionally (`6000 + variant index`) and the number appears nowhere in
+the source, so **inserting a variant mid-enum silently renumbers every
+later code** — invisible in the diff, and breaking for every off-chain
+consumer that matches on the old numbers. The cranker and observer both
+branch on numeric GAR codes; a +2 drift cost mainnet epoch 523 every
+observation, and PR #128 nearly shifted the live `EpochWeightsClobbered`
+(6097) and `EpochNoLongerLive` (6098) hours after they shipped.
+
+New variants go at the **END** of the enum. To retire one, keep the
+variant (so its code stays bound to its name) and stop returning it —
+never delete or reorder.
+
+The frozen surface lives in
+[`error-code-snapshots.json`](error-code-snapshots.json):
+
+```bash
+node scripts/error-code-snapshot.mjs           # check vs snapshot
+node scripts/error-code-snapshot.mjs --update  # bless intentional APPENDS only
+```
+
+Unlike the event check this parses Rust source rather than the IDL, so
+it needs no toolchain and **does run on every PR** via
+`build-test.yml`. When reviewing a `error-code-snapshots.json` diff,
+confirm it contains only additions at the tail. `ario-ant-escrow` is
+deliberately excluded (never deployed, so no consumers).
 
 ## Reference Material
 
@@ -573,6 +627,12 @@ docs (start here, not the alphabetical list at the end):
   Lua-to-Solana mapping.
 * [`docs/WORKFLOWS.md`](docs/WORKFLOWS.md) — protocol workflows by
   actor type.
+* [`docs/WAVE2_ROLLOUT.md`](docs/WAVE2_ROLLOUT.md) — **the Wave 1 + Wave 2 GAR
+  rollout**: the ABI delta on `create_epoch` / `finalize_gone` /
+  `compound_delegation_rewards` (and the ordering rules that keep them working
+  against the pre-upgrade program), the 6102 two-meanings gotcha, why mainnet
+  is sequential rather than one upgrade, the pre-flight gate, and why
+  `ario-gar` must never be deployed `--final`.
 * [`docs/FUNDING_MODES.md`](docs/FUNDING_MODES.md) — integrator guide
   for fund-from-stakes (balance / delegation / operator / withdrawal /
   plan).
