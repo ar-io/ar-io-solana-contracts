@@ -39,10 +39,11 @@ edge exists.
 
 ## Status
 
-* **Devnet**: deployed by CI on every merge to `develop`. Program IDs
-  pinned in [`program-ids/staging.json`](program-ids/staging.json).
-* **Mainnet**: upgrades staged by CI on every merge to `main`, executed
-  by the AR.IO Squads multisig. Program IDs pinned in
+* **Devnet (staging)**: upgraded by running `upgrade-devnet.yml` by hand.
+  Program IDs pinned in [`program-ids/staging.json`](program-ids/staging.json).
+* **Mainnet**: upgrades staged by running `upgrade-mainnet.yml` by hand,
+  then executed by the program upgrade authority. `main` records the code
+  deployed to mainnet. Program IDs pinned in
   [`program-ids/mainnet.json`](program-ids/mainnet.json).
 
 ---
@@ -168,26 +169,37 @@ bash scripts/install-git-hooks.sh
 ```
 feature branch ─PR─▶ develop ─PR─▶ main
                        │              │
-                       │              └─▶ upgrade-mainnet workflow
+                       │              └─▶ upgrade-mainnet workflow (run by hand)
                        │                  → buffer staging, multisig hand-off
                        │
-                       └─▶ upgrade-devnet workflow
+                       └─▶ upgrade-devnet workflow (run by hand)
                            → live devnet upgrade + tarball release
 ```
 
 * Open PRs against `develop`. CI runs `build-test.yml` (lint, build,
   full test suite, IDL ABI stability check, escrow fuzz smoke) before
   the PR is mergeable.
-* Merging to `develop` triggers `upgrade-devnet.yml`: full build, deploy
-  to devnet, refresh `program-ids/staging.json` (auto-committed back to
-  `develop`), and publish a versioned release tarball with IDLs + .so +
-  keypairs so downstream clients can update or run their own Surfpool.
-* Cutting a mainnet release happens by opening a `develop → main` PR.
-  Required reviewers / branch protection on `main` are the human gate.
-  Merging triggers `upgrade-mainnet.yml`: build with mainnet feature
-  flags, stage upgrade buffers, transfer buffer authority to the
-  Squads V3 multisig vault (authority index 1), attach a buffer manifest
-  to a draft GitHub release. The multisig signers vote and execute the
+* Merging deploys nothing. The only workflow a push to `develop` or
+  `main` runs is `release-plz`, which opens a version-bump PR. Both
+  upgrade workflows run only when started by hand from the Actions tab.
+* To upgrade devnet, run `upgrade-devnet.yml`: full build, deploy to
+  devnet, refresh `program-ids/staging.json` (committed back to
+  `develop`), and publish a versioned release tarball with IDLs + .so so
+  downstream clients can update or run their own Surfpool.
+* After a mainnet upgrade, merge `develop → main` so `main` records the
+  deployed code. Required reviewers / branch protection on `main` are the
+  human gate.
+* To stage a mainnet upgrade, run `upgrade-mainnet.yml` (optionally for a
+  subset of programs): build with mainnet feature flags, stage upgrade
+  buffers, transfer buffer authority to the Squads V3 multisig vault
+  (authority index 1), attach a buffer manifest to a draft GitHub
+  release.
+* Both upgrade workflows build the ref you pick when you start them. Run
+  `upgrade-devnet.yml` from `develop`: it pushes its commit back with
+  `git push origin HEAD:develop`. Run `upgrade-mainnet.yml` from the
+  reviewed `develop` commit; the draft release records it
+  (`github.sha`). The later `develop → main` merge must include that
+  commit. The multisig signers vote and execute the
   upgrade separately from the legacy Squads (V3) app (CI never holds the
   upgrade key). Step-by-step admin ceremonies (program upgrades **and**
   privileged admin instructions) are in
@@ -246,7 +258,7 @@ The full troubleshooting tree is in [`TESTING.md`](TESTING.md).
 
 ## Release flow
 
-### Devnet — automated, on every merge to `develop`
+### Devnet: run `upgrade-devnet.yml` by hand
 
 CI is **upgrade-only**: it can push new bytecode to programs that already
 exist on devnet, but it cannot mint new program IDs. The only secret CI
@@ -347,10 +359,10 @@ land on devnet (today: only `ario_ant_escrow`):
      --new-upgrade-authority <DEVNET_AUTHORITY_PUBKEY>
    ```
 5. Add the resulting program ID to `program-ids/staging.json` under
-   `.programs.<name>` and commit. CI will pick it up automatically on
-   the next merge to `develop`.
+   `.programs.<name>` and commit. The next `upgrade-devnet.yml` run
+   picks it up.
 
-### Mainnet — gated, on every merge to `main`
+### Mainnet: run `upgrade-mainnet.yml` by hand
 
 `upgrade-mainnet.yml`:
 
