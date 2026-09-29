@@ -633,6 +633,10 @@ docs (start here, not the alphabetical list at the end):
   against the pre-upgrade program), the 6102 two-meanings gotcha, why mainnet
   is sequential rather than one upgrade, the pre-flight gate, and why
   `ario-gar` must never be deployed `--final`.
+* [`docs/MAINNET_UPGRADES.md`](docs/MAINNET_UPGRADES.md) — log of every
+  mainnet program upgrade: date, slot, source commit, deployed code SHA-256,
+  upgrade transaction, and which clients had to act. Add a row after each
+  verified upgrade.
 * [`docs/FUNDING_MODES.md`](docs/FUNDING_MODES.md) — integrator guide
   for fund-from-stakes (balance / delegation / operator / withdrawal /
   plan).
