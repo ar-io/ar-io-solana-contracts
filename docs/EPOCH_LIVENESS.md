@@ -62,6 +62,20 @@ instruction, and ADR-0036 refuses it until the latest epoch is distributed.
 `join_network` appends above the epoch's `active_gateway_count`, and a gateway
 that leaves keeps its slot until it is finalized.
 
+## Removing departed gateways
+
+A gateway that has left keeps its registry slot until `finalize_gone` closes
+it. ADR-0036 allows that only between an epoch's distribution and the next
+`create_epoch`. From `@ar.io/sdk` 4.5.0, `crankEpochStep` removes eligible
+gateways in that window before it creates the next epoch. Crankers on earlier
+versions call `finalize_gone` only from mid-epoch cleanup, where it always
+returns 6102.
+
+A removal that fails, or that another cranker's `create_epoch` gets ahead of,
+waits for the next window. It never holds up `create_epoch`. Departed gateways
+don't affect liveness either way: tally skips every gateway that isn't
+`Joined`, so they are never selected or paid.
+
 ## The backstop
 
 `admin_close_stale_epoch` writes off an ended, undistributed epoch by closing
@@ -107,3 +121,5 @@ cover the behaviour this file relies on:
   time. That catches every failure in the table early, whatever the cause.
 - Run `scripts/preflight-wave2.mjs` before any `ario-gar` upgrade. It checks
   that the latest epoch can be distributed.
+- Run crankers on `@ar.io/sdk` 4.5.0 or later, so departed gateways are
+  removed and stranded delegations are claimed.
