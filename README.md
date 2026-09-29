@@ -193,7 +193,13 @@ feature branch ─PR─▶ develop ─PR─▶ main
   subset of programs): build with mainnet feature flags, stage upgrade
   buffers, transfer buffer authority to the Squads V3 multisig vault
   (authority index 1), attach a buffer manifest to a draft GitHub
-  release. The multisig signers vote and execute the
+  release.
+* Both upgrade workflows build the ref you pick when you start them. Run
+  `upgrade-devnet.yml` from `develop`: it pushes its commit back with
+  `git push origin HEAD:develop`. Run `upgrade-mainnet.yml` from the
+  reviewed `develop` commit; the draft release records it
+  (`github.sha`). The later `develop → main` merge must include that
+  commit. The multisig signers vote and execute the
   upgrade separately from the legacy Squads (V3) app (CI never holds the
   upgrade key). Step-by-step admin ceremonies (program upgrades **and**
   privileged admin instructions) are in
