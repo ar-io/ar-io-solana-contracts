@@ -34433,3 +34433,294 @@ async fn read_delegation_amount(ctx: &mut ProgramTestContext, delegation_key: &P
         .unwrap()
         .amount
 }
+
+// =========================================
+// admin_set_tenure_weight
+// =========================================
+// Mainnet's EpochSettings was initialized with the 1-hour devnet tenure value
+// (3600) instead of 180 days, and only initialize_epochs wrote the field. This
+// setter is the repair path.
+
+fn set_tenure_ix(epoch_settings: Pubkey, signer: Pubkey, duration: i64, max: u64) -> Instruction {
+    Instruction {
+        program_id: ario_gar::ID,
+        accounts: ario_gar::accounts::UpdateEpochSettings {
+            epoch_settings,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_gar::instruction::AdminSetTenureWeight {
+            tenure_weight_duration: duration,
+            max_tenure_weight: max,
+        }
+        .data(),
+    }
+}
+
+#[tokio::test]
+async fn test_admin_set_tenure_weight() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+    let (es_key, _) = epoch_settings_pda();
+    let read = |data: Vec<u8>| EpochSettings::try_deserialize(&mut data.as_slice()).unwrap();
+
+    // The mainnet repair: 3600 -> 180 days. First put the account into the
+    // broken state, then fix it.
+    for (duration, max) in [(3_600i64, 4u64), (15_552_000, 4)] {
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[set_tenure_ix(es_key, authority.pubkey(), duration, max)],
+            Some(&payer_pk),
+            &[&ctx.payer, &authority],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+        let es = read(
+            ctx.banks_client
+                .get_account(es_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+        );
+        assert_eq!(es.tenure_weight_duration, duration);
+        assert_eq!(es.max_tenure_weight, max);
+    }
+    let before = ctx
+        .banks_client
+        .get_account(es_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+
+    // Non-authority signer is rejected.
+    let bad = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer_pk,
+                &bad.pubkey(),
+                10_000_000,
+            )],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[set_tenure_ix(es_key, bad.pubkey(), 3_600, 4)],
+                Some(&bad.pubkey()),
+                &[&bad],
+                blockhash,
+            ))
+            .await,
+        GarError::Unauthorized
+    );
+
+    // Zero / negative duration and zero cap are rejected.
+    for (duration, max) in [(0i64, 4u64), (-1, 4), (15_552_000, 0)] {
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        assert_anchor_error!(
+            ctx.banks_client
+                .process_transaction(Transaction::new_signed_with_payer(
+                    &[set_tenure_ix(es_key, authority.pubkey(), duration, max)],
+                    Some(&payer_pk),
+                    &[&ctx.payer, &authority],
+                    blockhash,
+                ))
+                .await,
+            GarError::InvalidParameter
+        );
+    }
+
+    // No rejected call changed a byte.
+    assert_eq!(
+        ctx.banks_client
+            .get_account(es_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        before
+    );
+}
+
+#[tokio::test]
+async fn test_tenure_weight_applied_at_tally() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 100, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+    let (gateway_key1, gateway_key2, _op2_pk) =
+        setup_two_gateways_with_leaver(&mut ctx, &setup).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (es_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // A short duration and a cap of 2, so the result is unmistakably different
+    // from the helper's 180-day default.
+    let duration: i64 = 50;
+    let max: u64 = 2;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[set_tenure_ix(es_key, authority.pubkey(), duration, max)],
+            Some(&payer_pk),
+            &[&ctx.payer, &authority],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    clock.unix_timestamp = 200;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::CreateEpoch {
+                    epoch_settings: es_key,
+                    epoch: epoch_key,
+                    registry: setup.registry_key,
+                    settings: setup.settings_key,
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    payer: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::CreateEpoch {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: es_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: tally_accounts,
+                data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let gw_data = ctx
+        .banks_client
+        .get_account(gateway_key1)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let gw = Gateway::try_deserialize(&mut gw_data.as_slice()).unwrap();
+    let running = (200 - gw.start_timestamp).max(0) as u128;
+    let scale = 1_000_000u128;
+    let expected = if running == 0 {
+        scale / duration as u128
+    } else {
+        (running * scale / duration as u128).min(max as u128 * scale)
+    } as u64;
+    let with_default = if running == 0 {
+        scale / 15_552_000
+    } else {
+        (running * scale / 15_552_000).min(4 * scale)
+    } as u64;
+    assert_eq!(
+        gw.weights.tenure_weight, expected,
+        "tally used the new tenure settings"
+    );
+    assert_ne!(
+        expected, with_default,
+        "test must distinguish new from default settings"
+    );
+}

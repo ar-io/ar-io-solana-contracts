@@ -7,8 +7,8 @@ use crate::error::GarError;
 use crate::state::*;
 use crate::{
     EpochClosedEvent, EpochCreatedEvent, EpochDurationUpdatedEvent, EpochPrescribedEvent,
-    EpochWeightsTalliedEvent, EpochsToggledEvent, RewardRatiosUpdatedEvent, MAX_REWARD_RATIO,
-    MIN_REWARD_RATIO, RATE_SCALE,
+    EpochWeightsTalliedEvent, EpochsToggledEvent, RewardRatiosUpdatedEvent,
+    TenureWeightUpdatedEvent, MAX_REWARD_RATIO, MIN_REWARD_RATIO, RATE_SCALE,
 };
 
 /// Enable/disable epoch processing.
@@ -103,6 +103,67 @@ pub fn admin_set_epoch_duration(
         old_genesis,
         new_genesis,
         settings.current_epoch_index
+    );
+
+    Ok(())
+}
+
+/// Authority-gated override of the **tenure weight** parameters —
+/// `EpochSettings.tenure_weight_duration` (seconds per unit of tenure weight)
+/// and `EpochSettings.max_tenure_weight` (the cap). `tally_weights` computes
+/// `tenure_weight = min(time_running / tenure_weight_duration,
+/// max_tenure_weight)` for every gateway, and that factor multiplies into the
+/// composite weight that drives observer selection.
+///
+/// **Why it exists:** before this instruction only `initialize_epochs` wrote
+/// these fields. Mainnet was initialized with the 1-hour devnet value (3600)
+/// instead of the production 180 days (15_552_000, Lua parity), so every
+/// gateway reached the maximum tenure weight an hour after joining and tenure
+/// stopped distinguishing new gateways from long-running ones. `import_account`
+/// cannot repair it: `EpochSettings` is deliberately excluded from the import
+/// allowlist (audit M-4, `migration.rs`).
+///
+/// **Validation:** the same as `initialize_epochs` — both values must be
+/// non-zero (a zero duration would divide by zero in the tenure formula; a
+/// zero cap would zero every composite weight and leave no eligible gateway).
+///
+/// **Timing:** takes effect at the NEXT `tally_weights`. Weights already
+/// tallied for the live epoch are unchanged, so the observers already
+/// prescribed for it are unaffected.
+///
+/// Authority-only. NOT migration-gated, so it stays usable after
+/// `finalize_migration`. Shares `UpdateEpochSettings` (`has_one = authority`)
+/// with `admin_set_epoch_duration` and `admin_set_reward_ratios`.
+pub fn admin_set_tenure_weight(
+    ctx: Context<UpdateEpochSettings>,
+    tenure_weight_duration: i64,
+    max_tenure_weight: u64,
+) -> Result<()> {
+    require!(tenure_weight_duration > 0, GarError::InvalidParameter);
+    require!(max_tenure_weight > 0, GarError::InvalidParameter);
+
+    let clock = Clock::get()?;
+    let settings = &mut ctx.accounts.epoch_settings;
+    let old_tenure_weight_duration = settings.tenure_weight_duration;
+    let old_max_tenure_weight = settings.max_tenure_weight;
+    settings.tenure_weight_duration = tenure_weight_duration;
+    settings.max_tenure_weight = max_tenure_weight;
+
+    emit!(TenureWeightUpdatedEvent {
+        admin: ctx.accounts.authority.key(),
+        old_tenure_weight_duration,
+        old_max_tenure_weight,
+        new_tenure_weight_duration: tenure_weight_duration,
+        new_max_tenure_weight: max_tenure_weight,
+        timestamp: clock.unix_timestamp,
+    });
+
+    msg!(
+        "EpochSettings tenure weight {}s/max {} → {}s/max {}",
+        old_tenure_weight_duration,
+        old_max_tenure_weight,
+        tenure_weight_duration,
+        max_tenure_weight
     );
 
     Ok(())
