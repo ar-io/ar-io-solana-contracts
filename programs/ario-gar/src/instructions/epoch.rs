@@ -118,8 +118,8 @@ pub fn admin_set_epoch_duration(
 /// **Why it exists:** before this instruction only `initialize_epochs` wrote
 /// these fields. Mainnet was initialized with the 1-hour devnet value (3600)
 /// instead of the production 180 days (15_552_000, Lua parity), so every
-/// gateway reached the maximum tenure weight an hour after joining and tenure
-/// stopped distinguishing new gateways from long-running ones. `import_account`
+/// gateway reached the maximum tenure weight (4) four hours after joining and
+/// tenure stopped distinguishing new gateways from long-running ones. `import_account`
 /// cannot repair it: `EpochSettings` is deliberately excluded from the import
 /// allowlist (audit M-4, `migration.rs`).
 ///
