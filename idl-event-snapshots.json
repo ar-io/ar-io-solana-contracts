@@ -1615,6 +1615,45 @@
       ]
     },
     {
+      "name": "TenureWeightUpdatedEvent",
+      "discriminator": [
+        206,
+        115,
+        113,
+        82,
+        147,
+        235,
+        150,
+        135
+      ],
+      "fields": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        },
+        {
+          "name": "old_tenure_weight_duration",
+          "type": "i64"
+        },
+        {
+          "name": "old_max_tenure_weight",
+          "type": "u64"
+        },
+        {
+          "name": "new_tenure_weight_duration",
+          "type": "i64"
+        },
+        {
+          "name": "new_max_tenure_weight",
+          "type": "u64"
+        },
+        {
+          "name": "timestamp",
+          "type": "i64"
+        }
+      ]
+    },
+    {
       "name": "WithdrawalCancelledEvent",
       "discriminator": [
         40,
