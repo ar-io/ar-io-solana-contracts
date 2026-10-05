@@ -903,6 +903,16 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | **Not retroactive** | No repayment. The phantom-credited share (~17,221 ARIO real delegates did not receive, ~2,970 ARIO taken from operator rewards) and 9,459.8 ARIO of remediation double-funding stay in the pool, unowned (decided 2026-09-17). `INVARIANTS.md` Invariant 2's "equally stale" argument is corrected in the same change — it held only until the first settlement. |
 | **Ordering** | Reconcile every planned gateway FIRST, then resync. Each reconcile subtracts its own `expected_removed`; running the resync first makes every later reconcile subtract from an already-corrected figure until one fails with `ArithmeticUnderflow`, leaving the counters half-corrected. The reconcile must also wait until BD-119 is live, because it makes up to 65 leaving gateways prunable and each prune moves a registry slot. |
 
+
+### BD-121: Existing Delegators Are Exempt from the Gateway Minimum — Divergence Closed (2026-10-05)
+
+| | |
+|---|---|
+| **Lua Behavior** | `gar.delegateStake` (`src/gar.lua:544-554`) applies the gateway's `minDelegatedStake` only to a delegator with no stake there. Once `delegatedStake ~= 0` the floor drops to 1 mARIO: "Consider if the operator increases the minimum amount after you've already staked." `redelegateStake` (`:1946-1957`) carries the identical branch. |
+| **Solana Behavior (before)** | `delegate_stake` required `amount >= gateway.settings.min_delegation_amount` on **every** deposit, before reading the existing delegation. A delegator holding 3,773.899792 ARIO at a gateway with a 500 ARIO minimum could not add 250 (mainnet, gateway `CNdAuzg2…`, delegator `2iPUSRQc…`, `DelegationBelowMinimum`). On 2026-10-05, 43 of 341 live delegations (12.6%) sat at a gateway whose minimum exceeds the 10 ARIO floor; the worst held 347x its gateway's minimum. `redelegate_stake`, `decrease_delegate_stake` and the stake-payment path already followed Lua. Undocumented; `WORKFLOWS.md` already described the Lua rule. |
+| **Solana Behavior (now)** | The minimum applies only when `delegation.amount == 0` (a new delegator, including a freshly `init_if_needed` account). Existing delegators may add any amount `> 0`. Deliberately NOT "the resulting total must meet the minimum": that rule still strands a delegator after an operator raises the minimum above their stake, which is the case the Lua comment exists for. |
+| **Why** | Parity, and so an operator raising the minimum cannot lock existing delegators out of topping up. Tests: `test_existing_delegator_can_add_below_gateway_minimum`, `test_operator_raised_minimum_does_not_strand_existing_delegator`. |
+
 ---
 
 ## Summary Statistics

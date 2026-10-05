@@ -34724,3 +34724,277 @@ async fn test_tenure_weight_applied_at_tally() {
         "test must distinguish new from default settings"
     );
 }
+
+// =========================================
+// delegate_stake minimum: existing delegators are exempt (Lua parity)
+// =========================================
+// gar.lua delegateStake drops the floor to 1 mARIO once a delegator already
+// holds stake, so an operator raising the minimum cannot strand delegators
+// already in. Mainnet repro (2026-10-05): gateway CNdAuzg2… (min 500 ARIO),
+// delegator 2iPUSRQc… holding 3,773.899792 ARIO could not add 250 ARIO.
+
+async fn fund_delegator(ctx: &mut ProgramTestContext, setup: &GarSetup) -> (Keypair, Keypair) {
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &ctx.payer.pubkey(),
+                &delegator.pubkey(),
+                10_000_000_000,
+            )],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+    let delegator_pk = delegator.pubkey();
+    create_token_account(ctx, &delegator_token, &setup.mint.pubkey(), &delegator_pk).await;
+    mint_tokens(
+        ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        100_000_000_000,
+    )
+    .await;
+    (delegator, delegator_token)
+}
+
+async fn send_delegate(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: Pubkey,
+    delegator: &Keypair,
+    delegator_token: &Keypair,
+    amount: u64,
+) -> std::result::Result<(), BanksClientError> {
+    let payer_pk = ctx.payer.pubkey();
+    let (delegation_key, _) = delegation_pda(&payer_pk, &delegator.pubkey());
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DelegateStake {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    delegation: delegation_key,
+                    delegator_token_account: delegator_token.pubkey(),
+                    stake_token_account: setup.stake_token.pubkey(),
+                    delegator: delegator.pubkey(),
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DelegateStake { amount }.data(),
+            }],
+            Some(&delegator.pubkey()),
+            &[delegator],
+            blockhash,
+        ))
+        .await
+}
+
+async fn set_gateway_min_delegation(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: Pubkey,
+    min: u64,
+) {
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::UpdateGatewaySettings {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    operator: payer_pk,
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::UpdateGatewaySettings {
+                    params: ario_gar::UpdateGatewayParams {
+                        label: None,
+                        fqdn: None,
+                        port: None,
+                        protocol: None,
+                        properties: None,
+                        note: None,
+                        allow_delegated_staking: None,
+                        delegate_reward_share_ratio: None,
+                        min_delegate_stake: Some(min),
+                    },
+                }
+                .data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+}
+
+async fn delegation_amount(ctx: &mut ProgramTestContext, delegator: &Pubkey) -> u64 {
+    let (key, _) = delegation_pda(&ctx.payer.pubkey(), delegator);
+    let data = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    Delegation::try_deserialize(&mut data.as_slice())
+        .unwrap()
+        .amount
+}
+
+#[tokio::test]
+async fn test_existing_delegator_can_add_below_gateway_minimum() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    // Mainnet shape: minimum 500 ARIO, holding 3,773.899792, adding 250.
+    set_gateway_min_delegation(&mut ctx, &setup, gateway_key, 500_000_000).await;
+    let (delegator, delegator_token) = fund_delegator(&mut ctx, &setup).await;
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        3_773_899_792,
+    )
+    .await
+    .unwrap();
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        250_000_000,
+    )
+    .await
+    .expect("an existing delegator can add less than the gateway minimum");
+    assert_eq!(
+        delegation_amount(&mut ctx, &delegator.pubkey()).await,
+        4_023_899_792
+    );
+
+    // A NEW delegator is still held to the minimum (init_if_needed reads 0).
+    let (newcomer, newcomer_token) = fund_delegator(&mut ctx, &setup).await;
+    assert_anchor_error!(
+        send_delegate(
+            &mut ctx,
+            &setup,
+            gateway_key,
+            &newcomer,
+            &newcomer_token,
+            250_000_000
+        )
+        .await,
+        GarError::DelegationBelowMinimum
+    );
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &newcomer,
+        &newcomer_token,
+        500_000_000,
+    )
+    .await
+    .expect("a new delegator at exactly the minimum succeeds");
+}
+
+#[tokio::test]
+async fn test_operator_raised_minimum_does_not_strand_existing_delegator() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    set_gateway_min_delegation(&mut ctx, &setup, gateway_key, 500_000_000).await;
+    let (delegator, delegator_token) = fund_delegator(&mut ctx, &setup).await;
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        600_000_000,
+    )
+    .await
+    .unwrap();
+
+    // The operator raises the minimum ABOVE the delegator's whole stake.
+    set_gateway_min_delegation(&mut ctx, &setup, gateway_key, 1_000_000_000).await;
+
+    // Lua: an existing delegator only needs to add >= 1 mARIO. A "resulting
+    // total must meet the minimum" rule would reject this (600.000001 < 1000).
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        1,
+    )
+    .await
+    .expect("an existing delegator can add 1 mARIO after the operator raised the minimum");
+    assert_eq!(
+        delegation_amount(&mut ctx, &delegator.pubkey()).await,
+        600_000_001
+    );
+
+    // Zero is still rejected (the `amount > 0` floor).
+    assert_anchor_error!(
+        send_delegate(
+            &mut ctx,
+            &setup,
+            gateway_key,
+            &delegator,
+            &delegator_token,
+            0
+        )
+        .await,
+        GarError::InvalidAmount
+    );
+}
