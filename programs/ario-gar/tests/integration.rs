@@ -34618,8 +34618,10 @@ async fn test_tenure_weight_applied_at_tally() {
 
     // A short duration and a cap of 2, so the result is unmistakably different
     // from the helper's 180-day default.
-    let duration: i64 = 50;
-    let max: u64 = 2;
+    // Long enough that neither the epoch-start nor the tally-time tenure hits
+    // the cap, so the two rules give different answers.
+    let duration: i64 = 1_000;
+    let max: u64 = 4;
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
@@ -34636,7 +34638,8 @@ async fn test_tenure_weight_applied_at_tally() {
         .get_sysvar::<solana_sdk::clock::Clock>()
         .await
         .unwrap();
-    clock.unix_timestamp = 200;
+    // Tally well after the epoch starts: tenure must not depend on this.
+    clock.unix_timestamp = 600;
     clock.slot = 1;
     ctx.set_sysvar(&clock);
 
@@ -34703,24 +34706,36 @@ async fn test_tenure_weight_applied_at_tally() {
         .unwrap()
         .data;
     let gw = Gateway::try_deserialize(&mut gw_data.as_slice()).unwrap();
-    let running = (200 - gw.start_timestamp).max(0) as u128;
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data[8..8 + std::mem::size_of::<Epoch>()]);
     let scale = 1_000_000u128;
-    let expected = if running == 0 {
-        scale / duration as u128
-    } else {
-        (running * scale / duration as u128).min(max as u128 * scale)
-    } as u64;
-    let with_default = if running == 0 {
-        scale / 15_552_000
-    } else {
-        (running * scale / 15_552_000).min(4 * scale)
-    } as u64;
+    let tenure_at = |t: i64, d: i64, m: u64| -> u64 {
+        let running = (t - gw.start_timestamp).max(0) as u128;
+        if running == 0 {
+            (scale / d as u128) as u64
+        } else {
+            (running * scale / d as u128).min(m as u128 * scale) as u64
+        }
+    };
+    let at_epoch_start = tenure_at(epoch.start_timestamp, duration, max);
     assert_eq!(
-        gw.weights.tenure_weight, expected,
-        "tally used the new tenure settings"
+        gw.weights.tenure_weight, at_epoch_start,
+        "tally used the new tenure settings, measured at the epoch start"
     );
     assert_ne!(
-        expected, with_default,
+        at_epoch_start,
+        tenure_at(600, duration, max),
+        "test must distinguish epoch-start tenure from tally-time tenure"
+    );
+    assert_ne!(
+        at_epoch_start,
+        tenure_at(epoch.start_timestamp, 15_552_000, 4),
         "test must distinguish new from default settings"
     );
 }

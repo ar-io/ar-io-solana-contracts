@@ -913,6 +913,16 @@ These Lua features are intentionally not ported to Solana, or are handled differ
 | **Solana Behavior (now)** | The minimum applies only when `delegation.amount == 0` (a new delegator, including a freshly `init_if_needed` account). Existing delegators may add any amount `> 0`. Deliberately NOT "the resulting total must meet the minimum": that rule still strands a delegator after an operator raises the minimum above their stake, which is the case the Lua comment exists for. |
 | **Why** | Parity, and so an operator raising the minimum cannot lock existing delegators out of topping up. Tests: `test_existing_delegator_can_add_below_gateway_minimum`, `test_operator_raised_minimum_does_not_strand_existing_delegator`. |
 
+
+### BD-122: Tenure Weight Is Measured at the Epoch Start — Divergence Closed (2026-10-05)
+
+| | |
+|---|---|
+| **Lua Behavior** | Gateway weights, including `tenureWeight`, are computed once per epoch at `epochStartTimestamp` (`gar.lua` weight update called from `epochs.lua` epoch creation). |
+| **Solana Behavior (before)** | `tally_weights` computed tenure from `Clock::unix_timestamp` at the moment each tally batch ran, so the same gateway's weight depended on when its batch landed. Invisible on mainnet while `tenure_weight_duration` was 3600 (every gateway sat at the cap), but significant once it is 180 days. |
+| **Solana Behavior (now)** | `tally_weights` passes `epoch.start_timestamp`: every batch of an epoch yields identical weights, however late it runs. Test: `test_tenure_weight_applied_at_tally` tallies 500 s after the epoch start and asserts the epoch-start value. |
+| **Why** | Lua parity, and deterministic weights per epoch. Ships with `admin_set_tenure_weight`, which restores mainnet's 180-day duration. |
+
 ---
 
 ## Summary Statistics

@@ -981,11 +981,15 @@ pub fn tally_weights(ctx: Context<TallyWeights>, _epoch_index: u64) -> Result<()
 
         // Compute weights
         let total_stake = gateway.total_stake();
+        // Tenure is measured at the epoch's start, not at this batch's clock
+        // (Lua gar.lua computes weights at epochStartTimestamp). Every batch
+        // of the same epoch then yields identical weights, however late it
+        // lands, so the timing of a tally batch cannot move observer odds.
         let weights = GatewayWeights::compute(
             total_stake,
             settings.min_operator_stake,
             gateway.start_timestamp,
-            clock.unix_timestamp,
+            epoch.start_timestamp,
             epoch_settings.tenure_weight_duration,
             epoch_settings.max_tenure_weight,
             &gateway.stats,
