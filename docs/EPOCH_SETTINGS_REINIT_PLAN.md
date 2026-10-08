@@ -1,5 +1,24 @@
 # Epoch Settings Reinit + Fast-Test Devnet — Implementation Plan
 
+> **Superseded for tenure (2026-10-08).** Don't close and re-initialize
+> `EpochSettings` to change the tenure ramp. Use `admin_set_tenure_weight`
+> (PR #158), which updates `tenure_weight_duration` and `max_tenure_weight`
+> in place and emits `TenureWeightUpdatedEvent` (see
+> [`EVENTS.md`](EVENTS.md)).
+>
+> The 1-hour devnet value described below (3600) also reached mainnet. Mainnet
+> was initialized on 2026-06-05 by running the migration repo's
+> `devnet-setup.ts` directly, without `TENURE_WEIGHT_DURATION_SECS`, so its
+> `?? 3600` default applied. Every gateway sat at the tenure cap until mainnet
+> was set back to `15_552_000 / 4` on 2026-10-08 (see
+> [`MAINNET_UPGRADES.md`](MAINNET_UPGRADES.md)). Since that upgrade, tenure is
+> also measured at the epoch start rather than at the tally batch's clock
+> (BD-122). Always pass tenure explicitly when initializing a cluster.
+>
+> The rest of this document is kept as historical context for a retired devnet
+> deployment. Its program ID and PDA addresses are not live. Archive it once
+> the conditions in [`archive/README.md`](archive/README.md) are met.
+
 **Status:** partially done. **Target:** devnet (`ario-gar` program ID
 `AF8QAEaR4hzsqeUDwEdeTXMYtdyFegTENBdnJro6WVLR`). **Driver:** observer/cranker
 iteration is impractical with production-realistic defaults (1-day epochs,

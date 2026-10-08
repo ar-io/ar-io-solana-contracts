@@ -34433,3 +34433,583 @@ async fn read_delegation_amount(ctx: &mut ProgramTestContext, delegation_key: &P
         .unwrap()
         .amount
 }
+
+// =========================================
+// admin_set_tenure_weight
+// =========================================
+// Mainnet's EpochSettings was initialized with the 1-hour devnet tenure value
+// (3600) instead of 180 days, and only initialize_epochs wrote the field. This
+// setter is the repair path.
+
+fn set_tenure_ix(epoch_settings: Pubkey, signer: Pubkey, duration: i64, max: u64) -> Instruction {
+    Instruction {
+        program_id: ario_gar::ID,
+        accounts: ario_gar::accounts::UpdateEpochSettings {
+            epoch_settings,
+            authority: signer,
+        }
+        .to_account_metas(None),
+        data: ario_gar::instruction::AdminSetTenureWeight {
+            tenure_weight_duration: duration,
+            max_tenure_weight: max,
+        }
+        .data(),
+    }
+}
+
+#[tokio::test]
+async fn test_admin_set_tenure_weight() {
+    let (mint, _mint_authority, _operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 1_000, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let payer_pk = ctx.payer.pubkey();
+    let (es_key, _) = epoch_settings_pda();
+    let read = |data: Vec<u8>| EpochSettings::try_deserialize(&mut data.as_slice()).unwrap();
+
+    // The mainnet repair: 3600 -> 180 days. First put the account into the
+    // broken state, then fix it.
+    for (duration, max) in [(3_600i64, 4u64), (15_552_000, 4)] {
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[set_tenure_ix(es_key, authority.pubkey(), duration, max)],
+            Some(&payer_pk),
+            &[&ctx.payer, &authority],
+            blockhash,
+        );
+        ctx.banks_client.process_transaction(tx).await.unwrap();
+        let es = read(
+            ctx.banks_client
+                .get_account(es_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+        );
+        assert_eq!(es.tenure_weight_duration, duration);
+        assert_eq!(es.max_tenure_weight, max);
+    }
+    let before = ctx
+        .banks_client
+        .get_account(es_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+
+    // Non-authority signer is rejected.
+    let bad = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &payer_pk,
+                &bad.pubkey(),
+                10_000_000,
+            )],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    assert_anchor_error!(
+        ctx.banks_client
+            .process_transaction(Transaction::new_signed_with_payer(
+                &[set_tenure_ix(es_key, bad.pubkey(), 3_600, 4)],
+                Some(&bad.pubkey()),
+                &[&bad],
+                blockhash,
+            ))
+            .await,
+        GarError::Unauthorized
+    );
+
+    // Zero / negative duration and zero cap are rejected.
+    for (duration, max) in [(0i64, 4u64), (-1, 4), (15_552_000, 0)] {
+        let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+        assert_anchor_error!(
+            ctx.banks_client
+                .process_transaction(Transaction::new_signed_with_payer(
+                    &[set_tenure_ix(es_key, authority.pubkey(), duration, max)],
+                    Some(&payer_pk),
+                    &[&ctx.payer, &authority],
+                    blockhash,
+                ))
+                .await,
+            GarError::InvalidParameter
+        );
+    }
+
+    // No rejected call changed a byte.
+    assert_eq!(
+        ctx.banks_client
+            .get_account(es_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        before
+    );
+}
+
+#[tokio::test]
+async fn test_tenure_weight_applied_at_tally() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let authority = Keypair::new();
+    let mut pt = program_test_with_gar(
+        &authority.pubkey(),
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    pre_create_epoch_settings(&mut pt, &authority.pubkey(), 100, 86_400, true);
+    pt.add_account(
+        authority.pubkey(),
+        solana_sdk::account::Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    mint_tokens(
+        &mut ctx,
+        &setup.mint.pubkey(),
+        &setup.protocol_token.pubkey(),
+        &setup.mint_authority,
+        1_000_000_000_000,
+    )
+    .await;
+    let (gateway_key1, gateway_key2, _op2_pk) =
+        setup_two_gateways_with_leaver(&mut ctx, &setup).await;
+
+    let payer_pk = ctx.payer.pubkey();
+    let (es_key, _) = epoch_settings_pda();
+    let (epoch_key, _) = epoch_pda(0);
+
+    // A short duration and a cap of 2, so the result is unmistakably different
+    // from the helper's 180-day default.
+    // Long enough that neither the epoch-start nor the tally-time tenure hits
+    // the cap, so the two rules give different answers.
+    let duration: i64 = 1_000;
+    let max: u64 = 4;
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[set_tenure_ix(es_key, authority.pubkey(), duration, max)],
+            Some(&payer_pk),
+            &[&ctx.payer, &authority],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let mut clock = ctx
+        .banks_client
+        .get_sysvar::<solana_sdk::clock::Clock>()
+        .await
+        .unwrap();
+    // Tally well after the epoch starts: tenure must not depend on this.
+    clock.unix_timestamp = 600;
+    clock.slot = 1;
+    ctx.set_sysvar(&clock);
+
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::CreateEpoch {
+                    epoch_settings: es_key,
+                    epoch: epoch_key,
+                    registry: setup.registry_key,
+                    settings: setup.settings_key,
+                    protocol_token_account: setup.protocol_token.pubkey(),
+                    payer: payer_pk,
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::CreateEpoch {}.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let mut tally_accounts = ario_gar::accounts::TallyWeights {
+        settings: setup.settings_key,
+        epoch_settings: es_key,
+        epoch: epoch_key,
+        registry: setup.registry_key,
+        payer: payer_pk,
+    }
+    .to_account_metas(None);
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key1,
+        false,
+    ));
+    tally_accounts.push(solana_sdk::instruction::AccountMeta::new(
+        gateway_key2,
+        false,
+    ));
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: tally_accounts,
+                data: ario_gar::instruction::TallyWeights { _epoch_index: 0 }.data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let gw_data = ctx
+        .banks_client
+        .get_account(gateway_key1)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let gw = Gateway::try_deserialize(&mut gw_data.as_slice()).unwrap();
+    let epoch_data = ctx
+        .banks_client
+        .get_account(epoch_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    let epoch: &Epoch = bytemuck::from_bytes(&epoch_data[8..8 + std::mem::size_of::<Epoch>()]);
+    let scale = 1_000_000u128;
+    let tenure_at = |t: i64, d: i64, m: u64| -> u64 {
+        let running = (t - gw.start_timestamp).max(0) as u128;
+        if running == 0 {
+            (scale / d as u128) as u64
+        } else {
+            (running * scale / d as u128).min(m as u128 * scale) as u64
+        }
+    };
+    let at_epoch_start = tenure_at(epoch.start_timestamp, duration, max);
+    assert_eq!(
+        gw.weights.tenure_weight, at_epoch_start,
+        "tally used the new tenure settings, measured at the epoch start"
+    );
+    assert_ne!(
+        at_epoch_start,
+        tenure_at(600, duration, max),
+        "test must distinguish epoch-start tenure from tally-time tenure"
+    );
+    assert_ne!(
+        at_epoch_start,
+        tenure_at(epoch.start_timestamp, 15_552_000, 4),
+        "test must distinguish new from default settings"
+    );
+}
+
+// =========================================
+// delegate_stake minimum: existing delegators are exempt (Lua parity)
+// =========================================
+// gar.lua delegateStake drops the floor to 1 mARIO once a delegator already
+// holds stake, so an operator raising the minimum cannot strand delegators
+// already in. Mainnet repro (2026-10-05): gateway CNdAuzg2… (min 500 ARIO),
+// delegator 2iPUSRQc… holding 3,773.899792 ARIO could not add 250 ARIO.
+
+async fn fund_delegator(ctx: &mut ProgramTestContext, setup: &GarSetup) -> (Keypair, Keypair) {
+    let delegator = Keypair::new();
+    let delegator_token = Keypair::new();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::transfer(
+                &ctx.payer.pubkey(),
+                &delegator.pubkey(),
+                10_000_000_000,
+            )],
+            Some(&ctx.payer.pubkey()),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+    let delegator_pk = delegator.pubkey();
+    create_token_account(ctx, &delegator_token, &setup.mint.pubkey(), &delegator_pk).await;
+    mint_tokens(
+        ctx,
+        &setup.mint.pubkey(),
+        &delegator_token.pubkey(),
+        &setup.mint_authority,
+        100_000_000_000,
+    )
+    .await;
+    (delegator, delegator_token)
+}
+
+async fn send_delegate(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: Pubkey,
+    delegator: &Keypair,
+    delegator_token: &Keypair,
+    amount: u64,
+) -> std::result::Result<(), BanksClientError> {
+    let payer_pk = ctx.payer.pubkey();
+    let (delegation_key, _) = delegation_pda(&payer_pk, &delegator.pubkey());
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::DelegateStake {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    delegation: delegation_key,
+                    delegator_token_account: delegator_token.pubkey(),
+                    stake_token_account: setup.stake_token.pubkey(),
+                    delegator: delegator.pubkey(),
+                    token_program: spl_token::id(),
+                    system_program: system_program::id(),
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::DelegateStake { amount }.data(),
+            }],
+            Some(&delegator.pubkey()),
+            &[delegator],
+            blockhash,
+        ))
+        .await
+}
+
+async fn set_gateway_min_delegation(
+    ctx: &mut ProgramTestContext,
+    setup: &GarSetup,
+    gateway_key: Pubkey,
+    min: u64,
+) {
+    let payer_pk = ctx.payer.pubkey();
+    let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
+    ctx.banks_client
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: ario_gar::ID,
+                accounts: ario_gar::accounts::UpdateGatewaySettings {
+                    settings: setup.settings_key,
+                    gateway: gateway_key,
+                    operator: payer_pk,
+                }
+                .to_account_metas(None),
+                data: ario_gar::instruction::UpdateGatewaySettings {
+                    params: ario_gar::UpdateGatewayParams {
+                        label: None,
+                        fqdn: None,
+                        port: None,
+                        protocol: None,
+                        properties: None,
+                        note: None,
+                        allow_delegated_staking: None,
+                        delegate_reward_share_ratio: None,
+                        min_delegate_stake: Some(min),
+                    },
+                }
+                .data(),
+            }],
+            Some(&payer_pk),
+            &[&ctx.payer],
+            blockhash,
+        ))
+        .await
+        .unwrap();
+}
+
+async fn delegation_amount(ctx: &mut ProgramTestContext, delegator: &Pubkey) -> u64 {
+    let (key, _) = delegation_pda(&ctx.payer.pubkey(), delegator);
+    let data = ctx
+        .banks_client
+        .get_account(key)
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    Delegation::try_deserialize(&mut data.as_slice())
+        .unwrap()
+        .amount
+}
+
+#[tokio::test]
+async fn test_existing_delegator_can_add_below_gateway_minimum() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    // Mainnet shape: minimum 500 ARIO, holding 3,773.899792, adding 250.
+    set_gateway_min_delegation(&mut ctx, &setup, gateway_key, 500_000_000).await;
+    let (delegator, delegator_token) = fund_delegator(&mut ctx, &setup).await;
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        3_773_899_792,
+    )
+    .await
+    .unwrap();
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        250_000_000,
+    )
+    .await
+    .expect("an existing delegator can add less than the gateway minimum");
+    assert_eq!(
+        delegation_amount(&mut ctx, &delegator.pubkey()).await,
+        4_023_899_792
+    );
+
+    // A NEW delegator is still held to the minimum (init_if_needed reads 0).
+    let (newcomer, newcomer_token) = fund_delegator(&mut ctx, &setup).await;
+    assert_anchor_error!(
+        send_delegate(
+            &mut ctx,
+            &setup,
+            gateway_key,
+            &newcomer,
+            &newcomer_token,
+            250_000_000
+        )
+        .await,
+        GarError::DelegationBelowMinimum
+    );
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &newcomer,
+        &newcomer_token,
+        500_000_000,
+    )
+    .await
+    .expect("a new delegator at exactly the minimum succeeds");
+}
+
+#[tokio::test]
+async fn test_operator_raised_minimum_does_not_strand_existing_delegator() {
+    let (mint, mint_authority, operator_token, stake_token, protocol_token) = prepare_gar_test();
+    let dummy = Pubkey::new_unique();
+    let mut pt = program_test_with_gar(
+        &dummy,
+        &mint.pubkey(),
+        &stake_token.pubkey(),
+        &protocol_token.pubkey(),
+    );
+    let mut ctx = pt.start_with_context().await;
+    let setup = setup_gar(
+        &mut ctx,
+        mint,
+        mint_authority,
+        operator_token,
+        stake_token,
+        protocol_token,
+    )
+    .await;
+    let gateway_key = join_gateway(&mut ctx, &setup, 20_000_000_000).await;
+
+    set_gateway_min_delegation(&mut ctx, &setup, gateway_key, 500_000_000).await;
+    let (delegator, delegator_token) = fund_delegator(&mut ctx, &setup).await;
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        600_000_000,
+    )
+    .await
+    .unwrap();
+
+    // The operator raises the minimum ABOVE the delegator's whole stake.
+    set_gateway_min_delegation(&mut ctx, &setup, gateway_key, 1_000_000_000).await;
+
+    // Lua: an existing delegator only needs to add >= 1 mARIO. A "resulting
+    // total must meet the minimum" rule would reject this (600.000001 < 1000).
+    send_delegate(
+        &mut ctx,
+        &setup,
+        gateway_key,
+        &delegator,
+        &delegator_token,
+        1,
+    )
+    .await
+    .expect("an existing delegator can add 1 mARIO after the operator raised the minimum");
+    assert_eq!(
+        delegation_amount(&mut ctx, &delegator.pubkey()).await,
+        600_000_001
+    );
+
+    // Zero is still rejected (the `amount > 0` floor).
+    assert_anchor_error!(
+        send_delegate(
+            &mut ctx,
+            &setup,
+            gateway_key,
+            &delegator,
+            &delegator_token,
+            0
+        )
+        .await,
+        GarError::InvalidAmount
+    );
+}

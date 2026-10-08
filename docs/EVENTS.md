@@ -37,7 +37,7 @@ Full API in `sdk/src/solana/events.ts`.
 | Program | Events | Highlights |
 |---|---|---|
 | `ario-core` | 14 | Token transfer, vault CRUD, primary-name lifecycle, supply/migration finalized, config updates, admin-authority transfer (ADR-026) |
-| `ario-gar` | 41 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), skipped-epoch discriminator (ADR-0034), multi-source funding plan, admin-authority transfer (ADR-026), EpochSettings authority transfer (ADR-0031), delegated operations address + metadata updates (ADR-0030), delegated-stake reconcile + supply-counter resync (ADR-0037) |
+| `ario-gar` | 42 | Gateway lifecycle, stake (operator/delegate/redelegate), withdrawals, epoch lifecycle (create→tally→prescribe→distribute→close), skipped-epoch discriminator (ADR-0034), multi-source funding plan, admin-authority transfer (ADR-026), EpochSettings authority transfer (ADR-0031), delegated operations address + metadata updates (ADR-0030), delegated-stake reconcile + supply-counter resync (ADR-0037), tenure-weight setter |
 | `ario-arns` | 13 | Name purchases (5 base events × `funding_source: u8` covering 25 emit variants), reassign/release, reservation lifecycle, prune, demand-factor updates, admin-authority transfer (ADR-026) |
 | `ario-ant` | 22 | Record CRUD + transfer + reconcile + sync_attributes + clear_attributes + asset transfer, controller add/remove, metadata (`field: u8`), record-metadata, ACL (`role: u8`), admin record/ACL/orphan closes, admin-authority transfer (ADR-026), `adopt_authority` (ADR-028) |
 | `ario-ant-escrow` | 5 | Unified shapes for 15 instructions via `asset_type: u8` (ANT/Tokens/Vault) + `claim_protocol: u8` (Arweave/Ethereum), admin purge |
@@ -71,6 +71,19 @@ Consumers that only need "this epoch finished" should keep watching
 `EpochDistributedEvent` alone and ignore the new event; it is still emitted for
 every completed epoch, skipped or not, which is what lets the cranker, observer
 and SDK advance without an upgrade.
+
+### Tenure weight setter
+
+`TenureWeightUpdatedEvent { admin: Pubkey, old_tenure_weight_duration: i64,
+old_max_tenure_weight: u64, new_tenure_weight_duration: i64,
+new_max_tenure_weight: u64, timestamp: i64 }` is emitted by
+`admin_set_tenure_weight`. The tenure parameters scale every gateway's
+composite weight, and so its odds of being prescribed as an observer. New
+values take effect at the next `tally_weights`.
+
+The instruction exists because mainnet's `EpochSettings` was initialized with
+the 1-hour devnet tenure value instead of 180 days, and nothing else could
+change it.
 
 ## Wire format
 

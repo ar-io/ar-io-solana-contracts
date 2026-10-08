@@ -7,7 +7,8 @@ after the upgrade is verified on chain.
 
 The event list is complete. It was rebuilt from each program's on-chain history
 (every `Deploy` and `Upgrade` instruction on its ProgramData account) on
-2026-09-29. Source commits and code hashes for the earlier events come from the
+2026-09-29. Later events are added from chain once each upgrade is verified.
+Source commits and code hashes for the earlier events come from the
 records listed in [Where the records come from](#where-the-records-come-from).
 Where no record survives, the table says so.
 
@@ -34,10 +35,11 @@ The following table lists each event, oldest first:
 | 2026-09-25 | `ario-gar` | Upgrade | 450460260 | `ce5831b` | ADR-0030 (gateway operations address, `update_gateway_metadata`), ADR-0031 (transferable epoch settings authority), gateway schema migration fixes. #127, #129, #137, #142. |
 | 2026-09-25 | `ario-arns` | Upgrade | 450471477 | `6693717` | The gateway operator discount honors the operations address. Purchase price and undername cap fixes. #129, #142, #144, #146, #147. |
 | 2026-09-27 | `ario-gar` | Upgrade | 451023184 | `e48b6b4` | ADR-0034 (a new epoch requires the previous one distributed; an epoch with no observations pays no rewards), ADR-0036 (`finalize_gone` only between epochs, so observations stay valid through an epoch), ADR-0037 (delegated stake reconcile and supply counter resync instructions), 30-day prune lock for excess stake. #145, #149. |
+| 2026-10-08 | `ario-gar` | Upgrade | 454578042 | `fd41e24` | `admin_set_tenure_weight`, to correct the tenure weight duration set at genesis; tenure measured at the epoch start (BD-122); existing delegators may add stake below the gateway minimum (BD-121). #158. |
 
 Programs were also enlarged with `ExtendProgram` before some upgrades, which
 changes size only: `ario-ant-escrow` on 2026-07-09, `ario-gar` on 2026-07-27,
-2026-08-30 and 2026-09-27, and `ario-ant` on 2026-08-10.
+2026-08-30, 2026-09-27 and 2026-10-08, and `ario-ant` on 2026-08-10.
 
 ## Verification data
 
@@ -60,6 +62,7 @@ before anyone kept a copy, so its hash can no longer be computed.
 | 2026-09-25 | `ario-gar` | 1,397,008 | `47a7ad067df2172603711333c777499dde1b708c16e0449800a87b271139b81c` | `3xJiPnUwU5DtKb5T8puhwC5rpg1sMtCGZ2sUTCdoceh1gGH7kiQzKNwBmfksiovkLGyjrcfSFtjBvDrGXa24jg56` |
 | 2026-09-25 | `ario-arns` | 1,197,512 | `1c7a3cc0762c45ebab570a5ed732997ac633ef0d372d9d23be126e15982cf254` | `5RrG4SgNaTo8mewo5j2m8LbjU5VLrV3k7roqWewnuqDu7gUeQRLv6knVhM2iEZ4eA8KRgawhfGXoDHEtKQurJBjd` |
 | 2026-09-27 | `ario-gar` | 1,425,728 | `006f4341344f59ad265ae1a7f2f332e638fa5b5f64c5ea3fa3f2946d50432bcb` | `R4Uzq6mj8jJNRHLfTY8UDYou7w6YF2xv5monn74Bav55SDzDBFLGhGJL2kjnizoxvmgMdacbd9x4QQTWyeS2mVc` |
+| 2026-10-08 | `ario-gar` | 1,431,096 | `2fc8c38e5a8fa7c0812487043561fef2a4ec2b4d0b7d6575ac44656645e1c6e8` | `4rX8MmsrY5uAk1yJCYZroSTWHWCDPghFJ1yGNVZoevK2kiXbfckECNCbquTDbqYJbXfeJxrPLjGYP4EKm2En45NA` |
 
 From 2026-09-15 on, each artifact is the staging-validated build of the same
 commit with mainnet program IDs. The two builds differ only in program-ID bytes.
@@ -67,7 +70,8 @@ commit with mainnet program IDs. The two builds differ only in program-ID bytes.
 ## Where the records come from
 
 - **Events, slots and transactions:** each program's on-chain history, read on
-  2026-09-29.
+  2026-09-29. The 2026-10-08 upgrade and both admin operations dated 2026-08-10
+  and 2026-10-08 were read from chain on 2026-10-08.
 - **Code still on chain:** `ario-core` (06-05), `ario-ant-escrow` (07-09) and
   `ario-ant` (08-10) have not been upgraded since, so their hashes were computed
   from the live program on 2026-09-29.
@@ -85,6 +89,10 @@ commit with mainnet program IDs. The two builds differ only in program-ID bytes.
 - **2026-08-30 source:** #121 (`9202f28`) is the only `ario-gar` change between
   the 08-10 and 08-30 upgrades. The `ario-gar` source didn't change between
   `9202f28` and the upgrade.
+- **2026-10-08 source:** built from `develop` at the #158 merge commit
+  `fd41e24` and reproduced byte for byte from it. Staging has run the same
+  commit since 2026-10-07 (code SHA-256 `f032a8cf…`); the two builds differ only
+  in program IDs.
 
 ## Verify the deployed code
 
@@ -109,6 +117,10 @@ program's code.
 The following changes to program state were made with admin instructions, not
 upgrades:
 
+- **2026-08-10:** the epoch reward split changed from 90/10 to 80/20
+  (gateways/observers) with `admin_set_reward_ratios`
+  (`3gzZ3SbdVhyGtiAkL61tiq8i7uG2nA62Lf78Pj35NBwHhsfmCfNygBxQxBsjNB3776ZZ9Ff11qr4GECWGSh2B9Vs`,
+  slot 438473095), after the `ario-gar` upgrade that added the instruction.
 - **2026-09-25:** all 578 gateways were migrated to gateway schema 1.2.0 with
   `migrate_gateway`, between the `ario-gar` and `ario-arns` upgrades.
 - **2026-09-28:** the delegated-stake correction from ADR-0037. 132
@@ -121,6 +133,13 @@ upgrades:
   tokens moved: the transactions touched no token account, and the stake pool
   balance was unchanged. Those delegators' ARIO is held for them through the
   claims service.
+- **2026-10-08:** `EpochSettings.tenure_weight_duration` changed from 3,600
+  seconds to 15,552,000 (180 days, the value Lua used) with
+  `admin_set_tenure_weight`
+  (`4BKKD53NG4V2NKZFVpME8v2Lxnbzgi1vdLQDm2KCvCfLSvauHLNtH6WirprZDMGPQTf9vaLKy8FE24Gw2RjbG5dN`,
+  slot 454578245). The 3,600 was a devnet value passed at genesis, which gave
+  every gateway the maximum tenure weight four hours after joining. Tenure
+  affects only observer selection. The new value applies from the next tally.
 
 ## Who had to act
 
@@ -155,3 +174,15 @@ depend on. See the addendum to ADR-0034.
 To remove departed gateways between epochs, a cranker must run `@ar.io/sdk`
 4.5.0 or later. Crankers on earlier versions call `finalize_gone` only from
 mid-epoch cleanup, where it always returns 6102.
+
+For the 2026-10-08 `ario-gar` upgrade, no client had to change: it adds one
+instruction and one event (`TenureWeightUpdatedEvent`) and changes no account
+layout or error code. Two behaviours changed:
+
+- `delegate_stake` applies the gateway's minimum only to a new delegator. A
+  client that refused top-ups below the minimum for existing delegators, such
+  as the network portal or the `@ar.io/sdk` CLI, can now allow any amount above
+  zero.
+- Observer selection weights use 180-day tenure measured at the epoch start,
+  from the first tally after the 2026-10-08 change. Gateways that joined
+  recently become less likely to be prescribed.

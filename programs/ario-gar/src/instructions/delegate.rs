@@ -19,10 +19,19 @@ pub fn delegate_stake(ctx: Context<DelegateStake>, amount: u64) -> Result<()> {
         gateway.settings.allow_delegated_staking,
         GarError::DelegationNotAllowed
     );
-    require!(
-        amount >= gateway.settings.min_delegation_amount,
-        GarError::DelegationBelowMinimum
-    );
+    // Existing delegators are exempt from the gateway minimum: Lua drops the
+    // floor to 1 mARIO once delegatedStake ~= 0 (gar.lua delegateStake), so an
+    // operator raising the minimum cannot strand delegators already in. The
+    // `amount > 0` check above is Lua's "at least one additional mARIO". Read
+    // before the handler mutates `delegation.amount`; a freshly initialized
+    // (init_if_needed) delegation reads 0, so a new delegator is still held to
+    // the minimum. Mirrors the guard on redelegate_stake below.
+    if ctx.accounts.delegation.amount == 0 {
+        require!(
+            amount >= gateway.settings.min_delegation_amount,
+            GarError::DelegationBelowMinimum
+        );
+    }
     require!(
         gateway.status == GatewayStatus::Joined,
         GarError::GatewayNotJoined

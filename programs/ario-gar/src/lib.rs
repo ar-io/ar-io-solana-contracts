@@ -367,6 +367,19 @@ pub mod ario_gar {
         )
     }
 
+    /// Override the tenure weight parameters — `EpochSettings.
+    /// tenure_weight_duration` (seconds) and `max_tenure_weight`. Both must be
+    /// non-zero, as in `initialize_epochs`. Authority-only; NOT
+    /// migration-gated. Takes effect at the next `tally_weights`. See
+    /// `instructions::epoch::admin_set_tenure_weight` for why it exists.
+    pub fn admin_set_tenure_weight(
+        ctx: Context<UpdateEpochSettings>,
+        tenure_weight_duration: i64,
+        max_tenure_weight: u64,
+    ) -> Result<()> {
+        instructions::epoch::admin_set_tenure_weight(ctx, tenure_weight_duration, max_tenure_weight)
+    }
+
     /// Authority-gated one-shot to set `current_epoch_index` to a non-zero
     /// starting value (and re-anchor `genesis_timestamp` so the first
     /// `create_epoch` fires immediately for that index). Use case:
@@ -1785,6 +1798,22 @@ pub struct SupplyCountersResyncedEvent {
     pub new_staked: u64,
     pub previous_delegated: u64,
     pub new_delegated: u64,
+    pub timestamp: i64,
+}
+
+/// Emitted by `admin_set_tenure_weight`. The tenure parameters scale every
+/// gateway's composite weight and so its odds of being prescribed as an
+/// observer. The new values take effect at the next `tally_weights`.
+///
+/// Declared last to preserve append-only event ordering (ADR-018); do not
+/// reorder.
+#[event]
+pub struct TenureWeightUpdatedEvent {
+    pub admin: Pubkey,
+    pub old_tenure_weight_duration: i64,
+    pub old_max_tenure_weight: u64,
+    pub new_tenure_weight_duration: i64,
+    pub new_max_tenure_weight: u64,
     pub timestamp: i64,
 }
 

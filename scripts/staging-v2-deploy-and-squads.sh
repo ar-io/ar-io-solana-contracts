@@ -318,7 +318,15 @@ cmd_prepare_upgrade() {
       need=$(( new_size + 45 ))   # 45-byte ProgramData header
       if [[ -n "$pd_cap" && "$need" -gt "$pd_cap" ]]; then
         extra=$(( need - pd_cap + 4096 ))   # +4KB cushion
-        warn "[$prog] new .so ($new_size B) exceeds ProgramData capacity ($pd_cap B); extending by $extra B (deployer-paid, refundable)."
+        # The runtime refuses an ExtendProgram below 10,240 bytes unless it extends
+        # to the maximum size ("requires a minimum of 10240 additional bytes or to
+        # extend to maximum size", hit on devnet 2026-10-05). The maximum is the
+        # 10 MiB account-data limit (MAX_PERMITTED_DATA_LENGTH).
+        max_pd=10485760
+        if (( need > max_pd )); then fail "[$prog] ProgramData would need $need B, above the 10 MiB account limit ($max_pd B); no extend can fit it."; fi
+        if (( extra < 10240 )); then extra=10240; fi
+        if (( pd_cap + extra > max_pd )); then extra=$(( max_pd - pd_cap )); fi
+        warn "[$prog] new .so ($new_size B) exceeds ProgramData capacity ($pd_cap B); extending by $extra B (deployer-paid, NOT refundable)."
         solana_auth program extend "$pid" "$extra"
       fi
     fi
