@@ -7,7 +7,8 @@ after the upgrade is verified on chain.
 
 The event list is complete. It was rebuilt from each program's on-chain history
 (every `Deploy` and `Upgrade` instruction on its ProgramData account) on
-2026-09-29. Source commits and code hashes for the earlier events come from the
+2026-09-29. Later events are added from chain once each upgrade is verified.
+Source commits and code hashes for the earlier events come from the
 records listed in [Where the records come from](#where-the-records-come-from).
 Where no record survives, the table says so.
 
@@ -69,7 +70,8 @@ commit with mainnet program IDs. The two builds differ only in program-ID bytes.
 ## Where the records come from
 
 - **Events, slots and transactions:** each program's on-chain history, read on
-  2026-09-29.
+  2026-09-29. The 2026-10-08 upgrade and both admin operations dated 2026-08-10
+  and 2026-10-08 were read from chain on 2026-10-08.
 - **Code still on chain:** `ario-core` (06-05), `ario-ant-escrow` (07-09) and
   `ario-ant` (08-10) have not been upgraded since, so their hashes were computed
   from the live program on 2026-09-29.
