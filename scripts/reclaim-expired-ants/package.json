@@ -1,0 +1,13 @@
+{
+  "name": "reclaim-expired-ants",
+  "private": true,
+  "type": "module",
+  "description": "Reclaim rent from custody-held ANTs whose ArNS name expired. Dry run by default.",
+  "scripts": {
+    "dry-run": "node reclaim.mjs"
+  },
+  "dependencies": {
+    "@ar.io/solana-contracts": "1.5.0",
+    "@solana/kit": "6.8.0"
+  }
+}
