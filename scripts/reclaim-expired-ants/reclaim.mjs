@@ -123,13 +123,24 @@ const MAX_TX_BYTES = 1232;
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
-const values = (n) => argv.flatMap((a, i) => (a === n ? [argv[i + 1]] : []));
+// Every option that takes an operand must get one: `--limit --execute` must not
+// read '--execute' as the limit and fall through to an unlimited run.
+const values = (n) =>
+  argv.flatMap((a, i) => {
+    if (a !== n) return [];
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith('--')) die(`${n} needs a value`);
+    return [v];
+  });
 const value = (n, d) => values(n).at(-1) ?? d;
 
 const CLUSTER = value('--cluster', 'mainnet');
 if (!['mainnet', 'fork'].includes(CLUSTER)) die('--cluster must be mainnet or fork');
 const EXECUTE = flag('--execute');
-const LIMIT = value('--limit') ? Number(value('--limit')) : Infinity;
+const LIMIT = flag('--limit') ? Number(value('--limit')) : Infinity;
+if (!(LIMIT === Infinity || (Number.isInteger(LIMIT) && LIMIT > 0))) {
+  die(`--limit needs a positive integer (got ${value('--limit')})`);
+}
 const ONLY = new Set(values('--asset'));
 const KEEP = new Set(value('--keep') ? JSON.parse(fs.readFileSync(value('--keep'), 'utf8')) : []);
 const JSON_OUT = value('--json');
