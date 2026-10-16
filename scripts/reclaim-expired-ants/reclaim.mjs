@@ -138,7 +138,7 @@ const CLUSTER = value('--cluster', 'mainnet');
 if (!['mainnet', 'fork'].includes(CLUSTER)) die('--cluster must be mainnet or fork');
 const EXECUTE = flag('--execute');
 const LIMIT = flag('--limit') ? Number(value('--limit')) : Infinity;
-if (!(LIMIT === Infinity || (Number.isInteger(LIMIT) && LIMIT > 0))) {
+if (flag('--limit') && !(Number.isInteger(LIMIT) && LIMIT > 0)) {
   die(`--limit needs a positive integer (got ${value('--limit')})`);
 }
 const ONLY = new Set(values('--asset'));
